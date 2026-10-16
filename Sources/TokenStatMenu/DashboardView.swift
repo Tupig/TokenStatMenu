@@ -111,10 +111,15 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private var localUsageCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
-                metric("历史输入 Token", localCount(model.localSnapshot.input))
-                metric("历史输出 Token", localCount(model.localSnapshot.output))
-                metric("历史总 Token", model.localSnapshot.sessionCount > 0 ? localCount(model.localSnapshot.total) : "未知")
-                metric("包含会话", "\(model.localSnapshot.sessionCount)")
+                metric("已核验小计 · 输入 Token", localCount(model.localSnapshot.input))
+                metric("已核验小计 · 输出 Token", localCount(model.localSnapshot.output))
+                metric(model.localSnapshot.hasCompleteAccounting ? "本次扫描记录量 · Token" : "已核验记录小计 · 总 Token",
+                    model.localSnapshot.knownThreadCount > 0 ? count(model.localSnapshot.total) : "未知")
+                metric("已核验线程", "\(model.localSnapshot.knownThreadCount)")
+                metric("未核验线程", "\(model.localSnapshot.unknownThreadCount)")
+                metric("未识别物理文件", "\(model.localSnapshot.unidentifiedFileCount)")
+                metric("已识别顶层对话", "\(model.localSnapshot.sessionCount)")
+                metric("已识别子代理 / 分叉", "\(model.localSnapshot.subagentCount) / \(model.localSnapshot.forkCount)")
                 metric("最近用量事件", model.localSnapshot.latestEventAt?.formatted(date: .abbreviated, time: .shortened) ?? "未发现")
                 if let turn = model.localSnapshot.lastTurn {
                     metric("上轮记录均速", String(format: "%.1f tok/s", turn.outputTPS))
@@ -122,7 +127,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 } else {
                     metric("上轮记录均速", "未知")
                 }
-                Text("上轮均速包含工具、网络和等待，只统计会话记录的 output；不是模型瞬时生成速度。缺少可信边界或累计基线时显示未知。本地 Codex 会话记录是历史累计值，不是实时速率、企业总量或账单。扫描最多纳入 32 个最新修改会话，每文件尾部最多 256 KiB（总计 8 MiB）。\(model.localSnapshot.isLimited ? "已达到扫描范围限制，较旧记录可能未包含。" : "")")
+                Text("仅汇总本次扫描中可核算的记录，未核验项不计入小计。顶层对话数不包含子代理和分叉；这里不是完整历史或企业账单。上轮均速含工具、网络和等待，不是模型瞬时生成速度。\(model.localSnapshot.isLimited ? "已达到扫描范围限制。" : "")")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
         } label: { Label("本地记录用量", systemImage: "doc.text.magnifyingglass") }
@@ -132,7 +137,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             VStack(alignment: .leading, spacing: 8) {
                 metric("5 小时额度", localQuotaDescription(model.fiveHourQuota))
                 metric("7 天额度", localQuotaDescription(model.sevenDayQuota))
-                Text("本地 rate_limits 始终只是历史参考，不论事件是否新鲜；不代表当前企业剩余额度，也不触发企业额度告警。保留源记录的已用比例、记录时间和原重置时间。")
+                Text("本地记录额度始终只是历史参考，不论事件是否新鲜；不代表当前企业剩余额度，也不触发企业额度告警。保留源记录的已用比例、记录时间和原重置时间。")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
             }
@@ -261,7 +266,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         HStack { Text(label).foregroundStyle(.secondary); Spacer(); Text(value).fontWeight(.medium).monospacedDigit().textSelection(.enabled) }.font(.system(size: 11))
     }
     private func count(_ n: Int) -> String { n.formatted() }
-    private func localCount(_ n: Int) -> String { model.localSnapshot.sessionCount == 0 ? "—" : count(n) }
+    private func localCount(_ n: Int) -> String { model.localSnapshot.knownThreadCount == 0 ? "—" : count(n) }
     private func count(_ n: Double) -> String { n.formatted(.number.precision(.fractionLength(0))) }
     private func measuredCount(_ n: Int) -> String {
         guard model.hasRequestData else { return "—" }

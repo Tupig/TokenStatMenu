@@ -20,16 +20,22 @@ final class TokenStatUISnapshotTests: XCTestCase {
     func testLocalStatusTitleUsesCompletedTurnAndRecordedSessionTotal() throws {
         let model = AppModel(preview: true)
         defer { model.shutdown() }
+        model.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
+            filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0)
         XCTAssertTrue(model.title.contains("上轮均:—"))
         model.localSnapshot = LocalCodexSnapshot(input: 125, output: 300, total: 425,
             sessionCount: 2, filesScanned: 2, isLimited: false,
             latestEventAt: Date(timeIntervalSince1970: 1_797_000_000), fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 2, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0,
             lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
                 completedAt: Date(timeIntervalSince1970: 1_797_000_000)))
-        XCTAssertEqual(model.title, "上轮均:15.0tok/s · Σ425 · 2会话")
-        XCTAssertTrue(model.dataNotice.contains("历史累计"))
+        XCTAssertEqual(model.title, "上轮均:15.0tok/s · Σ425 · 2顶层对话")
+        XCTAssertTrue(model.dataNotice.contains("当前扫描范围记录小计"))
         XCTAssertTrue(model.menuTooltip.contains("425"))
-        XCTAssertTrue(model.menuTooltip.contains("2会话"))
+        XCTAssertTrue(model.menuTooltip.contains("顶层对话 2"))
         XCTAssertTrue(model.menuTooltip.contains("含工具、网络和等待"))
         XCTAssertTrue(model.menuTooltip.contains("5 小时"))
         XCTAssertTrue(model.menuTooltip.contains("7 天"))
@@ -37,6 +43,8 @@ final class TokenStatUISnapshotTests: XCTestCase {
         model.localSnapshot = LocalCodexSnapshot(input: 1_234_200, output: 367, total: 1_234_567,
             sessionCount: 2, filesScanned: 2, isLimited: false,
             latestEventAt: Date(timeIntervalSince1970: 1_797_000_000), fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 2, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0,
             lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
                 completedAt: Date(timeIntervalSince1970: 1_797_000_000)))
         let fullTotal = 1_234_567.formatted(.number)
@@ -50,6 +58,103 @@ final class TokenStatUISnapshotTests: XCTestCase {
         model.fiveHourQuota = try QuotaReport.parse(futureQuotaData, config: AppConfiguration(),
             now: Date().addingTimeInterval(3600)).fiveHour
         XCTAssertTrue(model.menuTooltip.contains("异常时间戳"), "tooltip should label future quota data anomalous")
+    }
+
+    func testC12LocalAccountingUINeverLabelsPartialSubtotalAsComplete() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        let known = LocalCodexSnapshot(input: 30, output: 20, total: 50, sessionCount: 1,
+            filesScanned: 2, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 1, unknownThreadCount: 2, unidentifiedFileCount: 1,
+            subagentCount: 0, forkCount: 0)
+        XCTAssertFalse(known.hasCompleteAccounting)
+        model.localSnapshot = known
+        XCTAssertTrue(model.title.contains("小计50"))
+        XCTAssertTrue(model.title.contains("未核验3"))
+        XCTAssertFalse(model.title.contains("Σ50"))
+        XCTAssertTrue(model.menuTooltip.contains("输入 30"))
+        XCTAssertTrue(model.menuTooltip.contains("输出 20"))
+        XCTAssertTrue(model.menuTooltip.contains("总计 50"))
+        XCTAssertTrue(model.menuTooltip.contains("未核验线程 2"))
+        XCTAssertTrue(model.menuTooltip.contains("未识别文件 1"))
+        XCTAssertFalse(model.menuTooltip.contains("本次扫描记录量 50"))
+
+        model.localSnapshot = LocalCodexSnapshot(input: 8, output: 2, total: 10, sessionCount: 0,
+            filesScanned: 1, isLimited: true, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 1, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0)
+        XCTAssertFalse(model.localSnapshot.hasCompleteAccounting, "a scan limit prevents complete accounting")
+        XCTAssertTrue(model.title.contains("小计10"))
+        XCTAssertFalse(model.title.contains("Σ10"))
+
+        model.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
+            filesScanned: 2, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 2,
+            subagentCount: 0, forkCount: 0)
+        XCTAssertTrue(model.title.contains("Σ—"), "without any known thread, zero is unknown rather than an exact total")
+
+        model.localSnapshot = LocalCodexSnapshot(input: 30, output: 20, total: 50, sessionCount: 1,
+            filesScanned: 1, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 1, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0)
+        XCTAssertTrue(model.localSnapshot.hasCompleteAccounting)
+        XCTAssertTrue(model.title.contains("Σ50"), "complete metadata-backed accounting may show exact total")
+        XCTAssertTrue(model.menuTooltip.contains("本次扫描记录量 50"))
+    }
+
+    func testC12AccountingDashboardExportsSyntheticReviewRenders() throws {
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent("TokenStatMenu-C12-review", isDirectory: true)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        let scenarios: [(String, LocalCodexSnapshot)] = [
+            ("known-subagent-no-top-level", LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
+                filesScanned: 1, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+                knownThreadCount: 1, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 1, forkCount: 1)),
+            ("partial-accounting", LocalCodexSnapshot(input: 30, output: 20, total: 50, sessionCount: 1,
+                filesScanned: 4, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+                knownThreadCount: 1, unknownThreadCount: 2, unidentifiedFileCount: 1, subagentCount: 0, forkCount: 0)),
+            ("zero-known-threads", LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
+                filesScanned: 2, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+                knownThreadCount: 0, unknownThreadCount: 2, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0))
+        ]
+        var paths: [String] = []
+        for (scenario, snapshot) in scenarios {
+            let model = AppModel(preview: true)
+            model.config.dataSource = "localCodex"
+            model.localSnapshot = snapshot
+            for (scheme, appearance) in [(ColorScheme.light, NSAppearance.Name.aqua), (.dark, .darkAqua)] {
+                let content = DashboardView(model: model)
+                    .environment(\.colorScheme, scheme)
+                    .frame(width: 460, height: 700)
+                    .background(scheme == .dark ? Color(red: 0.13, green: 0.14, blue: 0.17) : Color(red: 0.96, green: 0.97, blue: 0.99))
+                let bounds = NSRect(x: 0, y: 0, width: 460, height: 700)
+                let host = NSHostingView(rootView: content)
+                let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
+                window.isReleasedWhenClosed = false
+                window.appearance = NSAppearance(named: appearance)
+                window.contentView = host
+                window.setFrameOrigin(NSPoint(x: -10000, y: -10000))
+                host.frame = bounds
+                host.layoutSubtreeIfNeeded()
+                RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+                host.layoutSubtreeIfNeeded()
+                guard let bitmap = host.bitmapImageRepForCachingDisplay(in: bounds) else {
+                    throw NSError(domain: "C12DashboardRender", code: 1)
+                }
+                host.cacheDisplay(in: bounds, to: bitmap)
+                guard let png = bitmap.representation(using: .png, properties: [:]) else {
+                    throw NSError(domain: "C12DashboardRender", code: 2)
+                }
+                let name = "\(scenario)-\(scheme == .dark ? "dark" : "light").png"
+                let url = output.appendingPathComponent(name)
+                try png.write(to: url)
+                XCTAssertGreaterThan(try Data(contentsOf: url).count, 0)
+                paths.append(url.path)
+                window.close()
+            }
+            model.shutdown()
+        }
+        print("C12 synthetic accounting Dashboard renders: \(paths.joined(separator: ", "))")
     }
 
     func testEnterpriseQuotaAlertsUseOnlyFreshIndependentWindows() throws {

@@ -18,7 +18,7 @@ flowchart LR
     Quota --> Menu
 ```
 
-本机记录模式与代理模式分别显示数据，不混合累计。代理模式用于观测实际流式请求，因为应用无法凭空读取其他进程的 TLS 流；它不修改系统代理，也不自动修改 Codex 或企业客户端配置。代理统计只覆盖启动后经过它的请求。
+本机记录模式与代理模式分别显示数据，不混合累计。企业额度的全自动接入仍未完成；本机记录也不提供逐 Token 的实时流，不应将本轮计量修复理解为已实现自动企业额度或瞬时速度。代理模式用于观测实际流式请求，因为应用无法凭空读取其他进程的 TLS 流；它不修改系统代理，也不自动修改 Codex 或企业客户端配置。代理统计只覆盖启动后经过它的请求。
 
 
 ## 分文件完整源码
@@ -411,6 +411,7 @@ public struct HTTPDecoder {
 import Foundation
 import CoreFoundation
 import Darwin
+import CryptoKit
 
 public struct LocalCodexSnapshot: Equatable {
     public let input: Int
@@ -423,11 +424,24 @@ public struct LocalCodexSnapshot: Equatable {
     public let fiveHour: WindowQuota?
     public let sevenDay: WindowQuota?
     public let lastTurn: LocalTurnSummary?
-    public init(input: Int, output: Int, total: Int, sessionCount: Int, filesScanned: Int, isLimited: Bool, latestEventAt: Date?, fiveHour: WindowQuota?, sevenDay: WindowQuota?, lastTurn: LocalTurnSummary? = nil) {
+    public let knownThreadCount: Int
+    public let unknownThreadCount: Int
+    public let unidentifiedFileCount: Int
+    public let subagentCount: Int
+    public let forkCount: Int
+    public var hasCompleteAccounting: Bool {
+        knownThreadCount > 0 && unknownThreadCount == 0 && unidentifiedFileCount == 0 && !isLimited
+    }
+
+    public init(input: Int, output: Int, total: Int, sessionCount: Int, filesScanned: Int,
+                isLimited: Bool, latestEventAt: Date?, fiveHour: WindowQuota?, sevenDay: WindowQuota?,
+                knownThreadCount: Int = 0, unknownThreadCount: Int = 0, unidentifiedFileCount: Int = 0,
+                subagentCount: Int = 0, forkCount: Int = 0, lastTurn: LocalTurnSummary? = nil) {
         self.input = input; self.output = output; self.total = total; self.sessionCount = sessionCount
         self.filesScanned = filesScanned; self.isLimited = isLimited; self.latestEventAt = latestEventAt
-        self.fiveHour = fiveHour; self.sevenDay = sevenDay
-        self.lastTurn = lastTurn
+        self.fiveHour = fiveHour; self.sevenDay = sevenDay; self.lastTurn = lastTurn
+        self.knownThreadCount = knownThreadCount; self.unknownThreadCount = unknownThreadCount
+        self.unidentifiedFileCount = unidentifiedFileCount; self.subagentCount = subagentCount; self.forkCount = forkCount
     }
 }
 
@@ -463,23 +477,22 @@ public struct LocalRefreshScheduler {
     }
 }
 
-/// Reads only bounded numeric usage metadata from Codex session JSONL files.
+/// Reads bounded Codex usage records; unknown identity or lineage stays unknown.
 public enum LocalCodexUsageReader {
     private static let maxEntries = 5_000
-    private static let maxSessions = 32
+    private static let maxFiles = 32
+    private static let headLimit = 64 * 1024
     private static let tailLimit = 256 * 1024
-    private static let byteLimit = 8 * 1024 * 1024
+    private static let byteLimit = 10 * 1024 * 1024
+    private static let maxIdentityBytes = 128
     private static let isoFormatter = ISO8601DateFormatter()
     private static let fractionalISOFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
+        let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return formatter
     }()
-    private static let uuidPattern = try! NSRegularExpression(pattern: "([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\\.jsonl$")
+    private static let uuidPattern = try! NSRegularExpression(pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
-    private struct Candidate { let name: String; let uuid: String; let modified: Date }
+    private struct Candidate { let name: String; let modified: Date }
     fileprivate struct Record { let date: Date; let input: Int; let output: Int; let total: Int; let five: WindowQuota?; let seven: WindowQuota?; let isRate: Bool }
-
     fileprivate struct FileSignature: Hashable {
         let device: UInt64; let inode: UInt64; let size: Int64
         let mtimeSec: Int64; let mtimeNSec: Int64; let ctimeSec: Int64; let ctimeNSec: Int64
@@ -490,29 +503,25 @@ public enum LocalCodexUsageReader {
         }
     }
     fileprivate struct ParsedEvent {
-        let date: Date
-        let type: String
-        let turnID: String?
-        let duration: Double?
-        let totalTokens: Int?
-        let outputTokens: Int?
-        let hasCumulativePayload: Bool
-        let usage: Record?
-        let rate: Record?
+        let date: Date; let type: String; let turnID: String?; let duration: Double?
+        let totalTokens: Int?; let outputTokens: Int?; let hasCumulativePayload: Bool
+        let usage: Record?; let rate: Record?; let quotaUpdate: QuotaUpdate; let threadID: String?
+        let rawOrdinal: Int; let ownSettingsMatch: Bool; let invalidLifecycleTimestamp: Bool
     }
-    fileprivate struct CachedFileSummary {
-        let token: Record?
-        let rate: Record?
-        let turn: LocalTurnSummary?
-        let latestEventAt: Date?
-        let tailLimited: Bool
+    fileprivate enum QuotaUpdate { case unchanged, replace(Record), clear }
+    private enum QuotaState { case absent, value(Record) }
+    fileprivate enum Lineage { case root, subagent, fork, unknown }
+    fileprivate struct FileSummary {
+        let identity: String?; let lineage: Lineage; let isFork: Bool; let sourceKnownTop: Bool
+        let contribution: Record?; let rate: Record?; let quotaDate: Date?; let turn: LocalTurnSummary?
+        let latestEventAt: Date?; let tailLimited: Bool; let headComplete: Bool; let hasFutureTurn: Bool
+        let contentHash: String?; let signature: FileSignature
     }
+    fileprivate struct CachedFileSummary { let summary: FileSummary }
     public final class Cache {
         public struct Diagnostics: Equatable {
-            public fileprivate(set) var bytesRead = 0
-            public fileprivate(set) var parsedFiles = 0
-            public fileprivate(set) var cacheHits = 0
-            public fileprivate(set) var safeOpens = 0
+            public fileprivate(set) var bytesRead = 0; public fileprivate(set) var parsedFiles = 0
+            public fileprivate(set) var cacheHits = 0; public fileprivate(set) var safeOpens = 0
         }
         public private(set) var diagnostics = Diagnostics()
         public var entryCount: Int { entries.count }
@@ -520,7 +529,6 @@ public enum LocalCodexUsageReader {
         fileprivate var rootIdentity: FileSignature?
         fileprivate var beforePostReadValidation: (() -> Void)?
         public init() {}
-        /// Internal deterministic race seam; available only to @testable checks.
         init(beforePostReadValidation: @escaping () -> Void) { self.beforePostReadValidation = beforePostReadValidation }
         fileprivate func resetDiagnostics() { diagnostics = Diagnostics() }
         fileprivate func opened() { diagnostics.safeOpens += 1 }
@@ -529,179 +537,367 @@ public enum LocalCodexUsageReader {
         fileprivate func parsed() { diagnostics.parsedFiles += 1 }
     }
 
-    public static func defaultSessionsDirectory(environment: [String: String] = ProcessInfo.processInfo.environment, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
-        if let configured = environment["CODEX_HOME"], configured.hasPrefix("/") {
-            return URL(fileURLWithPath: configured).appendingPathComponent("sessions")
-        }
+    public static func defaultSessionsDirectory(environment: [String: String] = ProcessInfo.processInfo.environment,
+                                                home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
+        if let configured = environment["CODEX_HOME"], configured.hasPrefix("/") { return URL(fileURLWithPath: configured).appendingPathComponent("sessions") }
         return home.appendingPathComponent(".codex").appendingPathComponent("sessions")
     }
-
     public static func scan(directory: URL, now: Date = Date()) throws -> LocalCodexSnapshot { try scan(directory: directory, now: now, cache: nil) }
+
     public static func scan(directory: URL, now: Date = Date(), cache: Cache?) throws -> LocalCodexSnapshot {
         cache?.resetDiagnostics()
-        let empty = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil)
+        func empty() -> LocalCodexSnapshot { LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil) }
         var st = stat()
-        guard lstat(directory.path, &st) == 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty }
-        guard (st.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty }
+        guard lstat(directory.path, &st) == 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty() }
+        guard (st.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty() }
         let rootFD = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-        guard rootFD >= 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty }
+        guard rootFD >= 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty() }
         defer { close(rootFD) }
         var opened = stat()
-        guard fstat(rootFD, &opened) == 0, (opened.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty }
-        let rootIdentity = FileSignature(opened)
-        if cache?.rootIdentity != rootIdentity { cache?.entries.removeAll(); cache?.rootIdentity = rootIdentity }
-        var candidates: [Candidate] = [], entries = 0, limited = false
-        var directories = [""]
+        guard fstat(rootFD, &opened) == 0, (opened.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty() }
+        let rootSignature = FileSignature(opened)
+        if cache?.rootIdentity != rootSignature { cache?.entries.removeAll(); cache?.rootIdentity = rootSignature }
+
+        var candidates: [Candidate] = [], directories = [""]
+        var discoveryLimited = false
+        var entries = 0, limited = false
         while let relative = directories.first, entries < maxEntries {
             directories.removeFirst()
             let dfd = relative.isEmpty ? dup(rootFD) : openDirectoryRelative(rootFD, relative)
             guard dfd >= 0, let listing = fdopendir(dfd) else { if dfd >= 0 { close(dfd) }; continue }
             while entries < maxEntries, let item = readdir(listing) {
-                let leaf = withUnsafePointer(to: &item.pointee.d_name) { ptr -> String in
-                    ptr.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) }
-                }
+                let leaf = withUnsafePointer(to: &item.pointee.d_name) { ptr in ptr.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) } }
                 if leaf == "." || leaf == ".." { continue }
                 entries += 1
                 let name = relative.isEmpty ? leaf : relative + "/" + leaf
-                var fst = stat()
-                guard fstatat(dfd, leaf, &fst, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
+                var fst = stat(); guard fstatat(dfd, leaf, &fst, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
                 if (fst.st_mode & S_IFMT) == S_IFDIR { directories.append(name); continue }
-                guard (fst.st_mode & S_IFMT) == S_IFREG else { continue }
-                let ns = name as NSString, range = NSRange(location: 0, length: ns.length)
-                guard let match = uuidPattern.firstMatch(in: name, range: range), let r = Range(match.range(at: 1), in: name) else { continue }
-                candidates.append(Candidate(name: name, uuid: String(name[r]).lowercased(), modified: Date(timeIntervalSince1970: Double(fst.st_mtimespec.tv_sec))))
-                if entries >= maxEntries { break }
+                guard (fst.st_mode & S_IFMT) == S_IFREG, name.lowercased().hasSuffix(".jsonl") else { continue }
+                candidates.append(Candidate(name: name, modified: Date(timeIntervalSince1970: Double(fst.st_mtimespec.tv_sec))))
             }
             closedir(listing)
         }
-        if entries >= maxEntries { limited = true }
-        var newestByUUID: [String: Candidate] = [:]
-        for candidate in candidates where newestByUUID[candidate.uuid].map({ $0.modified < candidate.modified }) ?? true { newestByUUID[candidate.uuid] = candidate }
-        candidates = Array(newestByUUID.values)
-        candidates.sort { $0.modified == $1.modified ? $0.uuid < $1.uuid : $0.modified > $1.modified }
-        if candidates.count > maxSessions { candidates = Array(candidates.prefix(maxSessions)); limited = true }
-        var usedBytes = 0, filesScanned = 0, input = 0, output = 0, total = 0, sessionCount = 0
-        var latestEvent: Date?, latestRate: Record?
-        var latestTurn: LocalTurnSummary?
-        var liveSignatures = Set<FileSignature>()
+        if entries >= maxEntries { limited = true; discoveryLimited = true }
+        candidates.sort { $0.modified == $1.modified ? $0.name < $1.name : $0.modified > $1.modified }
+        if candidates.count > maxFiles { candidates = Array(candidates.prefix(maxFiles)); limited = true; discoveryLimited = true }
+
+        var usedBytes = 0, filesScanned = 0, unidentified = 0, unsafeCandidate = false, coverageLimited = false
+        var summaries: [FileSummary] = [], liveSignatures = Set<FileSignature>()
         for candidate in candidates {
-            guard usedBytes < byteLimit else { limited = true; break }
-            let fd = openRelative(rootFD, candidate.name)
-            guard fd >= 0 else { continue }
+            let fd = openRelative(rootFD, candidate.name); guard fd >= 0 else { unsafeCandidate = true; continue }
             defer { close(fd) }
             cache?.opened()
-            var fst = stat()
-            guard fstat(fd, &fst) == 0, (fst.st_mode & S_IFMT) == S_IFREG, fst.st_size >= 0 else { continue }
-            let contained = isContained(fd: fd, rootFD: rootFD)
-            guard contained else { continue }
-            let signature = FileSignature(fst)
-            liveSignatures.insert(signature)
-            var summary = cache?.entries[signature]
-            if summary != nil { cache?.hit() }
-            else {
-            let remaining = byteLimit - usedBytes
-            let amount = min(Int(fst.st_size), tailLimit, remaining)
-            if amount <= 0 { limited = true; continue }
-            var data = Data(count: amount)
-            let offset = max(0, fst.st_size - off_t(amount))
-            let readCount = data.withUnsafeMutableBytes { raw -> Int in
-                guard let base = raw.baseAddress else { return 0 }
-                return pread(fd, base, amount, offset)
+            var fst = stat(); guard fstat(fd, &fst) == 0, (fst.st_mode & S_IFMT) == S_IFREG, fst.st_size >= 0 else { unsafeCandidate = true; continue }
+            guard isContained(fd: fd, rootFD: rootFD) else { unsafeCandidate = true; continue }
+            let signature = FileSignature(fst); liveSignatures.insert(signature)
+            if let cache, let old = cache.entries.keys.first(where: { $0.device == signature.device && $0.inode == signature.inode && $0 != signature }) {
+                let timestampChanged = old.mtimeSec != signature.mtimeSec || old.mtimeNSec != signature.mtimeNSec || old.ctimeSec != signature.ctimeSec || old.ctimeNSec != signature.ctimeNSec
+                if timestampChanged { cache.entries = cache.entries.filter { $0.key.device != signature.device || $0.key.inode != signature.inode } }
             }
-            guard readCount > 0 else { continue }
-            data.count = readCount
-            cache?.read(readCount)
-            usedBytes += readCount
-            if fst.st_size > off_t(amount) { limited = true }
-            var lines = data.split(separator: 10, omittingEmptySubsequences: false)
-            if offset > 0, !data.isEmpty { lines.removeFirst() }
-            if data.last != 10 { lines.removeLast() }
-            var parsed: [ParsedEvent] = []
-            var hasInvalidLifecycleTimestamp = false
-            for line in lines where !line.isEmpty {
-                guard let object = try? JSONSerialization.jsonObject(with: Data(line)), let root = object as? [String: Any],
-                      root["type"] as? String == "event_msg", let payload = root["payload"] as? [String: Any] else { continue }
-                let payloadType = payload["type"] as? String
-                guard let date = parseDate(root["timestamp"]) else {
-                    if ["task_started", "task_complete", "turn_aborted", "token_count"].contains(payloadType ?? "") {
-                        hasInvalidLifecycleTimestamp = true
-                    }
-                    continue
-                }
-                var tokenRecord: Record?, rateRecord: Record?, cumulativeTotal: Int?, cumulativeOutput: Int?
-                let usageInfo = payload["info"] as? [String: Any]
-                let cumulativePayload = usageInfo?["total_token_usage"] as? [String: Any]
-                let hasCumulativePayload = usageInfo?.keys.contains("total_token_usage") == true
-                if payloadType == "token_count", let usage = cumulativePayload,
-                   let i = integer(usage["input_tokens"]), let o = integer(usage["output_tokens"]), let t = integer(usage["total_tokens"]) {
-                    tokenRecord = Record(date: date, input: i, output: o, total: t, five: nil, seven: nil, isRate: false)
-                    cumulativeTotal = t; cumulativeOutput = o
-                }
-                if payloadType == "token_count" {
-                    let limits = payload["rate_limits"] as? [String: Any]
-                    let windows = [limits?["primary"], limits?["secondary"]]
-                    let fiveCandidates = windows.compactMap { window($0, minutes: 300, now: now, at: date) }
-                    let sevenCandidates = windows.compactMap { window($0, minutes: 10080, now: now, at: date) }
-                    let record = Record(date: date, input: 0, output: 0, total: 0,
-                        five: fiveCandidates.count == 1 ? fiveCandidates[0] : nil,
-                        seven: sevenCandidates.count == 1 ? sevenCandidates[0] : nil, isRate: true)
-                    rateRecord = record
-                }
-                let duration: Double?
-                if payload.keys.contains("duration_ms") {
-                    if let value = payload["duration_ms"] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(), value.doubleValue.isFinite, value.doubleValue >= 0 { duration = value.doubleValue }
-                    else { duration = .nan }
-                } else { duration = nil }
-                parsed.append(ParsedEvent(date: date, type: payloadType ?? "", turnID: payload["turn_id"] as? String,
-                    duration: duration, totalTokens: cumulativeTotal, outputTokens: cumulativeOutput,
-                    hasCumulativePayload: hasCumulativePayload, usage: tokenRecord, rate: rateRecord))
-            }
-            cache?.parsed()
-            cache?.beforePostReadValidation?()
-            var after = stat()
-            guard fstat(fd, &after) == 0, FileSignature(after) == signature else {
-                cache?.entries.removeValue(forKey: signature)
+            if fst.st_size < 0 { unsafeCandidate = true; continue }
+        if let cached = cache?.entries[signature] {
+                cache?.hit()
+                let cachedSummary = cached.summary
+                let refreshed = FileSummary(identity: cachedSummary.identity, lineage: cachedSummary.lineage,
+                    isFork: cachedSummary.isFork,
+                    sourceKnownTop: cachedSummary.sourceKnownTop, contribution: cachedSummary.contribution,
+                    rate: cachedSummary.rate,
+                    quotaDate: cachedSummary.quotaDate, turn: cachedSummary.hasFutureTurn ? nil : cachedSummary.turn, latestEventAt: cachedSummary.latestEventAt,
+                    tailLimited: cachedSummary.tailLimited, headComplete: cachedSummary.headComplete,
+                    hasFutureTurn: cachedSummary.hasFutureTurn, contentHash: cachedSummary.contentHash, signature: cachedSummary.signature)
+                summaries.append(refreshed); filesScanned += 1
+                if cached.summary.tailLimited || !cached.summary.headComplete { limited = true; coverageLimited = true }
+                if cached.summary.hasFutureTurn { cache?.entries.removeValue(forKey: signature); unsafeCandidate = true }
+                let cachedSize = Int(fst.st_size)
+                let cacheCost = min(cachedSize, headLimit) + max(0, min(tailLimit, cachedSize - headLimit))
+                if usedBytes + cacheCost > byteLimit { limited = true; coverageLimited = true; continue }
+                usedBytes += cacheCost
                 continue
             }
-            let token = parsed.compactMap(\.usage).filter { !$0.isRate }.last
-            let rate = parsed.compactMap(\.rate).reduce(nil as Record?) { latest, record in
-                latest == nil || latest!.date <= record.date ? record : latest
+        let size = Int(fst.st_size), headCount = min(size, headLimit)
+            let tailCount = size > headLimit ? min(tailLimit, size - headCount) : 0
+        let amount = headCount + tailCount
+            if amount == 0 { unidentified += 1; filesScanned += 1; continue }
+            guard amount > 0, usedBytes + amount <= byteLimit else { limited = true; coverageLimited = true; break }
+            usedBytes += amount
+            var bytes = Data(count: amount)
+            let readCount: Int = bytes.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress else { return 0 }
+                let h = pread(fd, base, headCount, 0); guard h == headCount else { return max(0, h) }
+                if tailCount > 0 { return h + max(0, pread(fd, base.advanced(by: headCount), tailCount, off_t(size - tailCount))) }
+                return h
             }
-            let turnSummaries = hasInvalidLifecycleTimestamp ? [] : completedTurns(in: parsed)
-            let hasFutureTurn = turnSummaries.contains { $0.completedAt > now }
-            let tailLimited = fst.st_size > off_t(amount)
-            let fileSummary = CachedFileSummary(token: token, rate: rate,
-                turn: turnSummaries.filter { $0.completedAt <= now }.max(by: { $0.completedAt < $1.completedAt }),
-                latestEventAt: token?.date, tailLimited: tailLimited)
-            summary = fileSummary
-            if let cache {
-                if hasFutureTurn { cache.entries.removeValue(forKey: signature) }
-                else { cache.entries[signature] = fileSummary }
-                if cache.entries.count > maxSessions {
-                    let excess = cache.entries.count - maxSessions
-                    for key in cache.entries.keys.prefix(excess) { cache.entries.removeValue(forKey: key) }
-                }
-            }
-            }
-            guard let summary else { continue }
+            guard readCount == amount else { cache?.read(readCount); unidentified += 1; limited = true; unsafeCandidate = true; continue }
+            bytes.count = readCount; cache?.read(readCount)
+            cache?.beforePostReadValidation?()
+            var after = stat(); guard fstat(fd, &after) == 0, FileSignature(after) == signature else { cache?.entries.removeValue(forKey: signature); unsafeCandidate = true; continue }
+            cache?.parsed()
+            let parsed = parseFile(bytes: bytes, size: size, now: now, signature: signature)
             filesScanned += 1
-            if summary.tailLimited { limited = true }
-            if let rate = summary.rate, latestRate == nil || latestRate!.date <= rate.date { latestRate = rate }
-            if let record = summary.token {
-                let (ni, oi) = input.addingReportingOverflow(record.input), (no, oo) = output.addingReportingOverflow(record.output), (nt, ot) = total.addingReportingOverflow(record.total)
-                guard !oi, !oo, !ot else { throw StatError.message("本地用量汇总超出可表示范围") }
-                input = ni; output = no; total = nt; sessionCount += 1
-                if latestEvent == nil || latestEvent! < record.date { latestEvent = record.date }
+            if parsed.identity == nil { unidentified += 1 }
+            if parsed.tailLimited || !parsed.headComplete { limited = true; coverageLimited = true }
+            summaries.append(parsed)
+            if let cache, parsed.identity != nil {
+                cache.entries[signature] = CachedFileSummary(summary: parsed)
+                if cache.entries.count > maxFiles { cache.entries.removeValue(forKey: cache.entries.keys.first!) }
             }
-            if let turn = summary.turn, turn.completedAt <= now,
-               latestTurn == nil || latestTurn!.completedAt < turn.completedAt { latestTurn = turn }
         }
         if let cache { cache.entries = cache.entries.filter { liveSignatures.contains($0.key) } }
-        return LocalCodexSnapshot(input: input, output: output, total: total, sessionCount: sessionCount, filesScanned: filesScanned, isLimited: limited, latestEventAt: latestEvent,
-            fiveHour: latestRate?.five, sevenDay: latestRate?.seven, lastTurn: latestTurn)
+        _ = discoveryLimited
+
+        // Same inode is one physical history. Same ID is one logical thread only if whole bytes match.
+        var physicalSeen = Set<FileSignature>()
+        summaries = summaries.filter { physicalSeen.insert($0.signature).inserted }
+        let allRates = summaries.compactMap { summary -> (Date, Record?)? in summary.quotaDate.map { ($0, summary.rate) } }
+        let quotaWinner = allRates.enumerated().reduce(nil as (offset: Int, element: (Date, Record?))?) { best, current in
+            guard let best else { return (current.offset, current.element) }
+            return current.element.0 >= best.element.0 ? (current.offset, current.element) : best
+        }?.element
+        var grouped: [String: [FileSummary]] = [:]
+        let unidentifiedCount = unidentified
+        for summary in summaries {
+            guard let identity = summary.identity else { continue }
+            grouped[identity, default: []].append(summary)
+        }
+        var known: [Record] = [], unknownThreads = 0, topLevelCount = 0, subagentCount = 0, forkCount = 0
+        var latestTurn: LocalTurnSummary?, latestEvent: Date?
+        for (_, variants) in grouped {
+            let hashes = variants.compactMap(\.contentHash)
+            guard variants.count == 1 || hashes.count == variants.count && Set(hashes).count == 1,
+                  variants.allSatisfy({ $0.lineage == variants[0].lineage && $0.isFork == variants[0].isFork }) else { unknownThreads += 1; continue }
+            let summary = variants[0]
+            if summary.lineage == .unknown { unknownThreads += 1 }
+            else {
+                if summary.sourceKnownTop && summary.lineage == .root { topLevelCount += 1 }
+                if summary.lineage == .subagent { subagentCount += 1 }
+                if summary.isFork { forkCount += 1 }
+                if let contribution = summary.contribution { known.append(contribution) } else { unknownThreads += 1 }
+            }
+            if let turn = summary.turn, turn.completedAt <= now, latestTurn == nil || turn.completedAt > latestTurn!.completedAt { latestTurn = turn }
+            if let event = summary.latestEventAt, latestEvent == nil || event > latestEvent! { latestEvent = event }
+        }
+        var input = 0, output = 0, total = 0
+        for record in known {
+            let (i, io) = input.addingReportingOverflow(record.input), (o, oo) = output.addingReportingOverflow(record.output), (t, ot) = total.addingReportingOverflow(record.total)
+            guard !io && !oo && !ot else { throw StatError.message("本地用量汇总超出可表示范围") }
+            input = i; output = o; total = t
+        }
+        let finalRate = quotaWinner?.1
+        return LocalCodexSnapshot(input: input, output: output, total: total, sessionCount: topLevelCount,
+            filesScanned: filesScanned, isLimited: limited || unsafeCandidate || coverageLimited, latestEventAt: latestEvent,
+            fiveHour: finalRate?.five, sevenDay: finalRate?.seven, knownThreadCount: known.count,
+            unknownThreadCount: unknownThreads, unidentifiedFileCount: unidentifiedCount,
+            subagentCount: subagentCount, forkCount: forkCount, lastTurn: latestTurn)
     }
 
-    private static func completedTurns(in events: [ParsedEvent]) -> [LocalTurnSummary] {
+    private static func parseFile(bytes: Data, size: Int, now: Date, signature: FileSignature) -> FileSummary {
+        let headLength = min(size, headLimit), tailLength = max(0, bytes.count - headLength)
+        let head = bytes.prefix(headLength), tail = tailLength > 0 ? bytes.suffix(tailLength) : Data()
+        let tailLimited = size > headLimit + tailLimit
+        let wholeFileRead = size <= headLimit + tailLimit
+        let headComplete = wholeFileRead || size <= headLimit || head.last == 10
+        let headLines = wholeFileRead ? completeLines(Data(bytes), startsAtFileStart: true, endsAtFileEnd: size <= bytes.count && bytes.last == 10) : completeLines(Data(head), startsAtFileStart: true, endsAtFileEnd: false)
+        let tailLines = !wholeFileRead && tailLength > 0 ? completeLines(Data(tail), startsAtFileStart: false, endsAtFileEnd: true) : []
+        let headSlots = headLines.enumerated().map { parseLine($0.element, fallbackOrdinal: $0.offset) }
+        let decodedHead = headSlots.compactMap { $0 }
+        let physicalRecordCountHead = headLines.count
+        let tailOrdinalBase = size > headLimit + tailLimit ? -1 : physicalRecordCountHead
+        let tailSlots = tailLines.enumerated().map { parseLine($0.element, fallbackOrdinal: tailOrdinalBase < 0 ? -1 : tailOrdinalBase + $0.offset) }
+        let decodedTail = tailSlots.compactMap { $0 }
+        var decoded = tailLength > 0 ? decodedHead + decodedTail : decodedHead
+        let continuousRead = wholeFileRead
+        let incompleteTail = bytes.last != 10
+            ? Data(bytes[(bytes.lastIndex(of: 10).map { bytes.index(after: $0) } ?? bytes.startIndex)...])
+            : Data()
+        let hasIncompleteTailFragment = !incompleteTail.isEmpty
+        let identity: String?
+        let firstPhysicalLine = completeLines(Data(bytes.prefix(headLength)), startsAtFileStart: true, endsAtFileEnd: size <= headLength).first
+        if let first = firstPhysicalLine, !first.isEmpty, let object = try? JSONSerialization.jsonObject(with: Data(first)),
+           let root = object as? [String: Any], root["type"] as? String == "session_meta",
+           let id = (root["payload"] as? [String: Any])?["id"] as? String, let normalized = normalizeUUID(id) { identity = normalized }
+        else { identity = nil }
+        guard let identity else {
+            return FileSummary(identity: nil, lineage: .unknown, isFork: false, sourceKnownTop: false, contribution: nil, rate: nil,
+                quotaDate: nil, turn: nil, latestEventAt: nil, tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false,
+                contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature)
+        }
+        func remap(_ event: ParsedEvent) -> ParsedEvent {
+            ParsedEvent(date: event.date, type: event.type, turnID: event.turnID, duration: event.duration,
+                totalTokens: event.totalTokens, outputTokens: event.outputTokens, hasCumulativePayload: event.hasCumulativePayload,
+                usage: event.usage, rate: event.rate, quotaUpdate: event.quotaUpdate, threadID: event.threadID,
+                rawOrdinal: event.rawOrdinal, ownSettingsMatch: event.type == "thread_settings_applied" && event.threadID == identity,
+                invalidLifecycleTimestamp: event.invalidLifecycleTimestamp)
+        }
+        let mappedHeadSlots = headSlots.map { $0.map(remap) }
+        let mappedTailSlots = tailSlots.map { $0.map(remap) }
+        decoded = (wholeFileRead ? mappedHeadSlots : mappedHeadSlots + mappedTailSlots).compactMap { $0 }
+        guard let firstMetaLine = firstPhysicalLine else { return FileSummary(identity: nil, lineage: .unknown, isFork: false, sourceKnownTop: false, contribution: nil, rate: nil, quotaDate: nil, turn: nil, latestEventAt: nil, tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false, contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature) }
+        let metadata = (try? JSONSerialization.jsonObject(with: Data(firstMetaLine))) as? [String: Any]
+        let payload = metadata?["payload"] as? [String: Any] ?? [:]
+        let (source, sourceSubagentKind) = sessionSource(payload["source"])
+        let threadSource = payload["thread_source"] as? String
+        let sourceIsRootString = payload["source"] as? String == source && isTopRootSource(source)
+        let subagent = isKnownSubagent(source: source, subagentKind: sourceSubagentKind, threadSource: threadSource, payload: payload)
+        let parentMarkers = ["forked_from_id", "parent_thread_id", "history_base"].contains { payload[$0] != nil && !(payload[$0] is NSNull) }
+        let hasHistoryStart = payload["subagent_history_start_ordinal"] != nil && !(payload["subagent_history_start_ordinal"] is NSNull)
+        let hasUnresolvedSubagentMarker = !subagent && (
+            payload["subagent"] != nil ||
+            (payload["thread_source"] != nil && payload["thread_source"] as? String != "user")
+                || ["agent_nickname", "agent_role", "agent_path"].contains { payload[$0] != nil }
+        )
+        let malformedLineage = hasMalformedLineage(payload)
+        let hasHistoryBase = payload["history_base"] != nil && !(payload["history_base"] is NSNull)
+        let inheritsHistory = parentMarkers || hasHistoryStart
+        let sourceKnown = sourceIsRootString || subagent
+        let lineage: Lineage = malformedLineage || hasUnresolvedSubagentMarker || !sourceKnown
+            ? .unknown : (subagent ? .subagent : (inheritsHistory ? .fork : .root))
+        let isFork = !malformedLineage && (parentMarkers || hasHistoryStart)
+        let sourceKnownTop = sourceIsRootString && !subagent && !inheritsHistory
+        let tokenEvents = decoded.filter { $0.type == "token_count" }
+        let cumulativeTokenEvents = tokenEvents.filter(\.hasCumulativePayload)
+        let validCounters = cumulativeTokenEvents.filter { $0.usage != nil }
+        let lastToken = cumulativeTokenEvents.last
+        let observedLineSegments = wholeFileRead ? [mappedHeadSlots] : [mappedHeadSlots, mappedTailSlots]
+        let latestCounterSegment = observedLineSegments.lastIndex(where: { $0.contains(where: { $0?.hasCumulativePayload == true }) })
+        let hasBadLineAfterLatestCounter: Bool = {
+            guard let segmentIndex = latestCounterSegment, let lineIndex = observedLineSegments[segmentIndex].lastIndex(where: { $0?.hasCumulativePayload == true }) else { return false }
+            return observedLineSegments[segmentIndex].dropFirst(lineIndex + 1).contains(where: { $0 == nil })
+        }()
+        let latestCounterInTail = !wholeFileRead && !mappedTailSlots.isEmpty && mappedTailSlots.contains(where: { $0?.hasCumulativePayload == true })
+        let forkHasCompleteLines = wholeFileRead && mappedHeadSlots.allSatisfy { $0 != nil } && incompleteTail.isEmpty
+        var contribution: Record? = nil
+        if lineage == .root {
+            if let lastToken, let usage = lastToken.usage,
+               !cumulativeTokenEvents.contains(where: \.invalidLifecycleTimestamp), !hasIncompleteTailFragment,
+               !hasBadLineAfterLatestCounter, (wholeFileRead || latestCounterInTail) { contribution = usage }
+        } else if (lineage == .subagent || lineage == .fork), !hasHistoryBase, headComplete, !tailLimited,
+                  continuousRead, forkHasCompleteLines, let delta = forkContribution(payload: payload, events: decoded) { contribution = delta }
+        let rateEvents = tokenEvents.map { ($0.date, $0.quotaUpdate) }
+        let resolvedQuota = resolveRate(rateEvents, now: now)
+        let rate = resolvedQuota.record
+        let turnSegments = observedLineSegments.flatMap { parsedSegments($0) }
+        let turn = turnSegments.compactMap { completedTurns(in: $0, now: now) }.max(by: { $0.completedAt < $1.completedAt })
+        let latestUsageDate = validCounters.last?.date
+        return FileSummary(identity: identity, lineage: lineage, isFork: isFork, sourceKnownTop: sourceKnownTop,
+            contribution: contribution, rate: rate, quotaDate: resolvedQuota.date, turn: turn, latestEventAt: latestUsageDate,
+            tailLimited: tailLimited, headComplete: headComplete,
+            hasFutureTurn: decoded.contains(where: { $0.type == "task_complete" && $0.date > now }),
+            contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature)
+    }
+
+    private static func forkContribution(payload: [String: Any], events: [ParsedEvent]) -> Record? {
+        let explicit = uint(payload["subagent_history_start_ordinal"])
+        let settings = events.filter(\.ownSettingsMatch)
+        let inferred = settings.first?.rawOrdinal
+        if let explicit, let inferred, explicit != UInt64(inferred) { return nil }
+        let boundary: Int
+        if let explicit, explicit <= UInt64(Int.max) { boundary = Int(explicit) }
+        else if payload["subagent_history_start_ordinal"] != nil && !(payload["subagent_history_start_ordinal"] is NSNull) { return nil }
+        else if let inferred { boundary = inferred }
+        else { return nil }
+        // Ordinals are zero-based record positions. Ensure every record through final counter was read.
+        guard boundary >= 0, events.contains(where: { $0.rawOrdinal == boundary }), events.allSatisfy({ $0.rawOrdinal >= 0 }) else { return nil }
+        let before = events.filter { $0.rawOrdinal >= 0 && $0.rawOrdinal < boundary && $0.type == "token_count" && $0.hasCumulativePayload }
+        let after = events.filter { $0.rawOrdinal >= boundary && $0.type == "token_count" && $0.hasCumulativePayload }
+        guard let baseline = before.last?.usage, let final = after.last?.usage,
+              after.allSatisfy({ $0.usage != nil }) else { return nil }
+        let history = events.filter { $0.rawOrdinal >= 0 && $0.rawOrdinal < boundary && $0.type == "token_count" && $0.hasCumulativePayload }
+        guard history.allSatisfy({ $0.usage != nil }) else { return nil }
+        let sequence = history.compactMap(\.usage) + after.compactMap(\.usage)
+        guard isMonotonic(sequence.map(\.input)), isMonotonic(sequence.map(\.output)), isMonotonic(sequence.map(\.total)) else { return nil }
+        let i = final.input - baseline.input, o = final.output - baseline.output, t = final.total - baseline.total
+        guard i >= 0, o >= 0, t >= 0 else { return nil }
+        return Record(date: final.date, input: i, output: o, total: t, five: nil, seven: nil, isRate: false)
+    }
+
+    private static func parseLine(_ line: Data.SubSequence, fallbackOrdinal: Int) -> ParsedEvent? {
+        guard let object = try? JSONSerialization.jsonObject(with: Data(line)), let root = object as? [String: Any],
+              let type = root["type"] as? String else { return nil }
+        let payload = root["payload"] as? [String: Any] ?? [:]
+        let date = parseDate(root["timestamp"]) ?? .distantPast
+        let eventType = type == "event_msg" ? (payload["type"] as? String ?? "") : type
+        var usage: Record?, rate: Record?
+        let info = payload["info"] as? [String: Any]
+        let cumulativePresent = info?.keys.contains("total_token_usage") == true
+        let cumulative = info?["total_token_usage"] as? [String: Any]
+        if eventType == "token_count", let cumulative,
+           let i = integer(cumulative["input_tokens"]), let o = integer(cumulative["output_tokens"]), let t = integer(cumulative["total_tokens"]) {
+            usage = Record(date: date, input: i, output: o, total: t, five: nil, seven: nil, isRate: false)
+        }
+        let quota = eventType == "token_count" ? quotaUpdate(payload["rate_limits"], at: date) : .unchanged
+        if case .replace(let r) = quota { rate = r }
+        let duration: Double?
+        if payload.keys.contains("duration_ms") {
+            if let n = payload["duration_ms"] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue.isFinite, n.doubleValue >= 0 { duration = n.doubleValue }
+            else { duration = .nan }
+        } else { duration = nil }
+        let ownID = normalizeUUID((payload["id"] as? String) ?? "")
+        let eventThread = normalizeUUID((payload["thread_id"] as? String) ?? "")
+        let invalidLifecycleTimestamp = ["task_started", "task_complete", "turn_aborted", "token_count"].contains(eventType) && parseDate(root["timestamp"]) == nil
+        return ParsedEvent(date: date, type: eventType, turnID: payload["turn_id"] as? String,
+            duration: duration, totalTokens: usage?.total, outputTokens: usage?.output,
+            hasCumulativePayload: cumulativePresent, usage: usage, rate: rate, quotaUpdate: quota,
+            threadID: eventThread, rawOrdinal: fallbackOrdinal,
+            ownSettingsMatch: eventType == "thread_settings_applied" && ownID != nil && eventThread == ownID,
+            invalidLifecycleTimestamp: invalidLifecycleTimestamp)
+    }
+
+    private static func completeLines(_ data: Data, startsAtFileStart: Bool, endsAtFileEnd: Bool) -> [Data.SubSequence] {
+        guard !data.isEmpty else { return [] }
+        var lines = data.split(separator: 10, omittingEmptySubsequences: false)
+        if !startsAtFileStart { lines.removeFirst() }
+        lines.removeLast()
+        _ = endsAtFileEnd
+        return lines
+    }
+
+    private static func parsedSegments(_ slots: [ParsedEvent?]) -> [[ParsedEvent]] {
+        var segments: [[ParsedEvent]] = [], current: [ParsedEvent] = []
+        for slot in slots {
+            if let event = slot { current.append(event) }
+            else if !current.isEmpty { segments.append(current); current.removeAll(keepingCapacity: true) }
+        }
+        if !current.isEmpty { segments.append(current) }
+        return segments
+    }
+
+    private static func quotaUpdate(_ value: Any?, at date: Date) -> QuotaUpdate {
+        guard let value else { return .unchanged }
+        guard !(value is NSNull), let object = value as? [String: Any] else { return .unchanged }
+        if object.isEmpty { return .clear }
+        guard object.keys.contains("primary") || object.keys.contains("secondary") else { return .unchanged }
+        var windows: [WindowQuota] = []
+        for key in ["primary", "secondary"] {
+            guard let slot = object[key], !(slot is NSNull) else { continue }
+            guard let item = slot as? [String: Any], let percent = number(item["used_percent"]), (0...100).contains(percent) else { return .unchanged }
+            let duration: Int?
+            if let raw = item["window_minutes"], !(raw is NSNull) { guard let n = integer(raw), n > 0 else { return .unchanged }; duration = n } else { duration = nil }
+            let reset: Date?
+            if let raw = item["resets_at"], !(raw is NSNull) { guard let seconds = integer(raw), let value = Double(exactly: seconds), value <= 253402300799 else { return .unchanged }; reset = Date(timeIntervalSince1970: value) } else { reset = nil }
+            windows.append(WindowQuota(minutes: duration ?? 0, usedPercent: percent, resetsAt: reset, fetchedAt: date))
+        }
+        if windows.count == 2, windows[0].minutes > 0, windows[1].minutes > 0, windows[0].minutes == windows[1].minutes { return .unchanged }
+        let five = windows.filter { $0.minutes == 300 }.only
+        let seven = windows.filter { $0.minutes == 10080 }.only
+        let record = Record(date: date, input: 0, output: 0, total: 0, five: five, seven: seven, isRate: true)
+        return .replace(record)
+    }
+
+    private static func resolveRate(_ updates: [(Date, QuotaUpdate)], now: Date) -> (record: Record?, date: Date?) {
+        var state = QuotaState.absent
+        var latestDate: Date?
+        for (date, update) in updates.enumerated().sorted(by: { lhs, rhs in lhs.element.0 == rhs.element.0 ? lhs.offset < rhs.offset : lhs.element.0 < rhs.element.0 }).map(\.element) {
+            switch update {
+            case .unchanged: break
+            case .clear: state = .absent; latestDate = date
+            case .replace(let record): state = .value(record); latestDate = date
+            }
+        }
+        if case .value(let value) = state { return (value, latestDate) }
+        return (nil, latestDate)
+    }
+
+    private static func completedTurns(in events: [ParsedEvent], now: Date) -> LocalTurnSummary? {
         var result: [LocalTurnSummary] = []
         for (startIndex, start) in events.enumerated() where start.type == "task_started" {
             guard let id = start.turnID, !id.isEmpty else { continue }
@@ -722,6 +918,7 @@ public enum LocalCodexUsageReader {
             guard !events.enumerated().contains(where: { $0.offset > startIndex && $0.offset < endIndex && $0.element.type == "task_started" }) else { continue }
             guard !events.enumerated().contains(where: { $0.offset > startIndex && $0.offset < endIndex && $0.element.type == "task_complete" && $0.element.turnID != id }) else { continue }
             guard !events[startIndex..<endIndex].contains(where: { $0.type == "turn_aborted" && ($0.turnID == nil || $0.turnID == id) }) else { continue }
+            guard !events[startIndex...endIndex].contains(where: \.invalidLifecycleTimestamp) else { continue }
             let intervalDates = events[startIndex...endIndex].map(\.date)
             guard zip(intervalDates, intervalDates.dropFirst()).allSatisfy({ $0 <= $1 }) else { continue }
             let earlierStarts = events[..<startIndex].filter { $0.type == "task_started" && $0.turnID == id }
@@ -734,10 +931,11 @@ public enum LocalCodexUsageReader {
             let baselineEvents = events[..<startIndex].filter {
                 $0.type == "token_count" && $0.hasCumulativePayload
             }
-            guard let baseline = baselineEvents.last, baseline.date <= start.date, let baselineTotal = baseline.totalTokens,
+            guard let baseline = baselineEvents.last, !baseline.invalidLifecycleTimestamp,
+                  baseline.date <= start.date, let baselineTotal = baseline.totalTokens,
                   let baselineOutput = baseline.outputTokens else { continue }
             let inTurn = events[(startIndex + 1)..<endIndex].filter { $0.type == "token_count" && $0.hasCumulativePayload }
-            guard !inTurn.isEmpty, inTurn.allSatisfy({ $0.totalTokens != nil && $0.outputTokens != nil }) else { continue }
+            guard !inTurn.isEmpty, inTurn.allSatisfy({ !$0.invalidLifecycleTimestamp && $0.totalTokens != nil && $0.outputTokens != nil }) else { continue }
             let totals = inTurn.compactMap(\.totalTokens), outputs = inTurn.compactMap(\.outputTokens)
             guard let lastTotal = totals.last, lastTotal >= baselineTotal, totals.first! >= baselineTotal,
                   let lastOutput = outputs.last, lastOutput >= baselineOutput, outputs.first! >= baselineOutput,
@@ -747,79 +945,115 @@ public enum LocalCodexUsageReader {
             guard duration.isFinite, duration >= 100 else { continue }
             let summary = LocalTurnSummary(outputTokens: lastOutput - baselineOutput,
                 durationSeconds: duration / 1000, completedAt: complete.date)
-            result.append(summary)
+            if complete.date <= now { result.append(summary) }
         }
-        return result
+        return result.max(by: { $0.completedAt < $1.completedAt })
     }
 
-    private static func integer(_ value: Any?) -> Int? {
-        guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
-        guard n.doubleValue.isFinite, n.doubleValue >= 0 else { return nil }
-        var decimal = n.decimalValue
-        var rounded = Decimal()
-        NSDecimalRound(&rounded, &decimal, 0, .plain)
-        guard rounded == decimal else { return nil }
-        let text = NSDecimalNumber(decimal: rounded).stringValue
-        guard let exact = Int(text), exact >= 0 else { return nil }
-        return exact
-    }
-    private static func openRelative(_ rootFD: Int32, _ path: String) -> Int32 {
-        let parts = path.split(separator: "/").map(String.init)
-        guard let leaf = parts.last else { return -1 }
-        var current = dup(rootFD)
-        guard current >= 0 else { return -1 }
-        for component in parts.dropLast() {
-            let next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-            close(current)
-            guard next >= 0 else { return -1 }
-            current = next
+    private static func sessionSource(_ raw: Any?) -> (String?, String?) {
+        guard let raw else { return (nil, nil) }
+        if let value = raw as? String { return (value, nil) }
+        guard let object = raw as? [String: Any], object.count == 1,
+              let nested = object["subagent"] else { return ("<invalid>", nil) }
+        if let kind = nested as? String, ["review", "compact", "memory_consolidation"].contains(kind) {
+            return ("subagent_\(kind)", kind)
         }
-        let result = openat(current, leaf, O_RDONLY | O_NOFOLLOW)
-        close(current)
+        if let value = nested as? [String: Any], value.count == 1, let details = value["thread_spawn"] as? [String: Any],
+           validThreadSpawn(details) { return ("subagent_thread_spawn", "thread_spawn") }
+        return ("<invalid>", nil)
+    }
+    private static func isKnownSubagent(source: String?, subagentKind: String?, threadSource: String?, payload: [String: Any]) -> Bool {
+        _ = source; _ = threadSource; _ = payload
+        return ["review", "compact", "memory_consolidation", "thread_spawn"].contains(subagentKind ?? "")
+    }
+    private static func validThreadSpawn(_ object: [String: Any]) -> Bool {
+        guard let parent = object["parent_thread_id"] as? String, normalizeUUID(parent) != nil,
+              let depth = object["depth"] as? NSNumber, CFGetTypeID(depth) != CFBooleanGetTypeID(),
+              !["f", "d"].contains(String(cString: depth.objCType)), Int32(depth.stringValue) != nil else { return false }
+        return true
+    }
+    private static func hasMalformedLineage(_ payload: [String: Any]) -> Bool {
+        if payload["subagent"] != nil { return true }
+        for key in ["forked_from_id", "parent_thread_id"] where payload[key] != nil && !(payload[key] is NSNull) {
+            guard let value = payload[key] as? String, normalizeUUID(value) != nil else { return true }
+        }
+        if let raw = payload["subagent_history_start_ordinal"], !(raw is NSNull), uint(raw) == nil { return true }
+        if let raw = payload["history_base"], !(raw is NSNull) {
+            guard let base = raw as? [String: Any], let id = base["thread_id"] as? String,
+                  normalizeUUID(id) != nil, uint(base["end_ordinal_exclusive"]) != nil,
+                  uint(base["end_byte_offset"]) != nil else { return true }
+        }
+        if payload["source"] != nil, sessionSource(payload["source"]).0 == "<invalid>" { return true }
+        return false
+    }
+    private static func isTopRootSource(_ source: String?) -> Bool { ["cli", "vscode", "exec", "mcp"].contains(source ?? "") }
+    private static func normalizeUUID(_ value: String) -> String? {
+        guard value.utf8.count <= maxIdentityBytes else { return nil }
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        guard uuidPattern.firstMatch(in: value, range: range) != nil, UUID(uuidString: value) != nil else { return nil }
+        return value.lowercased()
+    }
+    private static func uint(_ value: Any?) -> UInt64? {
+        guard let n = integer(value), let u = UInt64(exactly: n) else { return nil }; return u
+    }
+    private static func isMonotonic(_ values: [Int]) -> Bool { zip(values, values.dropFirst()).allSatisfy { $0 <= $1 } }
+    private static func integer(_ value: Any?) -> Int? {
+        guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue.isFinite, n.doubleValue >= 0 else { return nil }
+        let decimal = n.decimalValue
+        var rounded = Decimal()
+        var copy = decimal
+        NSDecimalRound(&rounded, &copy, 0, .plain)
+        guard rounded == decimal else { return nil }
+        let type = String(cString: n.objCType)
+        guard let result = Int(n.stringValue), result >= 0 else { return nil }
+        if ["f", "d"].contains(type), Double(result) != n.doubleValue { return nil }
         return result
     }
-    private static func openDirectoryRelative(_ rootFD: Int32, _ path: String) -> Int32 {
-        let parts = path.split(separator: "/").map(String.init)
-        var current = dup(rootFD)
-        guard current >= 0 else { return -1 }
-        for component in parts {
-            let next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-            close(current)
-            guard next >= 0 else { return -1 }
-            current = next
+    private static func number(_ value: Any?) -> Double? {
+        guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue.isFinite else { return nil }; return n.doubleValue
+    }
+    private static func parseDate(_ value: Any?) -> Date? {
+        guard let raw = value as? String else { return nil }
+        return fractionalISOFormatter.date(from: raw) ?? isoFormatter.date(from: raw)
+    }
+    private static func window(_ value: Any?, minutes: Int, now: Date, at date: Date) -> WindowQuota? {
+        guard let object = value as? [String: Any], integer(object["window_minutes"]) == minutes,
+              let percent = number(object["used_percent"]), (0...100).contains(percent) else { return nil }
+        let reset = integer(object["resets_at"]).flatMap { Date(timeIntervalSince1970: Double($0)) }
+        _ = now
+        return WindowQuota(minutes: minutes, usedPercent: percent, resetsAt: reset, fetchedAt: date)
+    }
+    private static func completedTurns(in events: [ParsedEvent]) -> [LocalTurnSummary] { completedTurns(in: events, now: .distantFuture).map { [$0] } ?? [] }
+    private static func openRelative(_ rootFD: Int32, _ path: String) -> Int32 {
+        let parts = path.split(separator: "/").map(String.init); guard let leaf = parts.last else { return -1 }
+        var current = dup(rootFD); guard current >= 0 else { return -1 }
+        for component in parts.dropLast() {
+            let next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW); close(current)
+            guard next >= 0 else { return -1 }; current = next
         }
+        let fd = openat(current, leaf, O_RDONLY | O_NOFOLLOW); close(current); return fd
+    }
+    private static func openDirectoryRelative(_ rootFD: Int32, _ path: String) -> Int32 {
+        let parts = path.split(separator: "/").map(String.init); var current = dup(rootFD); guard current >= 0 else { return -1 }
+        for component in parts { let next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW); close(current); guard next >= 0 else { return -1 }; current = next }
         return current
     }
     private static func isContained(fd: Int32, rootFD: Int32) -> Bool {
-        func path(_ descriptor: Int32) -> String? {
-            var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
-            guard fcntl(descriptor, F_GETPATH, &buffer) == 0 else { return nil }
-            let raw = String(cString: buffer)
-            return raw.withCString { pointer in
-                guard let resolved = realpath(pointer, nil) else { return nil }
-                defer { free(resolved) }
-                return String(cString: resolved)
-            }
-        }
-        guard let root = path(rootFD), let file = path(fd) else { return false }
-        return file.hasPrefix(root.hasSuffix("/") ? root : root + "/")
-    }
-    private static func parseDate(_ value: Any?) -> Date? {
-        guard let s = value as? String else { return nil }
-        return isoFormatter.date(from: s) ?? fractionalISOFormatter.date(from: s)
-    }
-    private static func window(_ value: Any?, minutes: Int, now: Date, at date: Date) -> WindowQuota? {
-        guard let v = value as? [String: Any], let raw = v["used_percent"] as? NSNumber,
-              CFGetTypeID(raw) != CFBooleanGetTypeID(), raw.doubleValue.isFinite, (0...100).contains(raw.doubleValue),
-              let duration = integer(v["window_minutes"]), duration == minutes else { return nil }
-        var reset: Date?
-        if let n = v["resets_at"] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(),
-           n.doubleValue.isFinite, n.doubleValue > 0, n.doubleValue < 100_000_000_000 {
-            reset = Date(timeIntervalSince1970: n.doubleValue)
-        }
-        return WindowQuota(minutes: minutes, usedPercent: raw.doubleValue, resetsAt: reset, fetchedAt: date)
+        var pathBuffer = [CChar](repeating: 0, count: Int(PATH_MAX)); var rootBuffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let p = fcntl(fd, F_GETPATH, &pathBuffer), r = fcntl(rootFD, F_GETPATH, &rootBuffer)
+        guard p == 0, r == 0 else { return false }
+        let path = String(cString: pathBuffer), root = String(cString: rootBuffer)
+        return path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
     }
 }
+
+private extension Data {
+    func fullContentHashIfComplete(fileSize: Int) -> String? {
+        guard count == fileSize else { return nil }
+        return SHA256.hash(data: self).map { String(format: "%02x", $0) }.joined()
+    }
+}
+private extension Array { var only: Element? { count == 1 ? first : nil } }
 ```
 
 ### Sources/TokenStatCore/MetricsEngine.swift
@@ -1542,7 +1776,7 @@ struct SpeedPoint: Identifiable {
     let isTestFixture = CommandLine.arguments.contains("--test-fixture")
     @Published var config = AppConfiguration()
     @Published var stats = MetricsSnapshot()
-    @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil)
+    @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
     @Published var quota: QuotaSnapshot?
     @Published var fiveHourQuota: WindowQuota?
     @Published var sevenDayQuota: WindowQuota?
@@ -1636,17 +1870,20 @@ struct SpeedPoint: Identifiable {
     var currencyFactor: Double { config.currency == "CNY" ? config.usdToCNY : 1 }
     var currencySymbol: String { config.currency == "CNY" ? "¥" : "$" }
     var quotaSource: QuotaSource { config.dataSource == "localCodex" ? .localCodex : .enterprise }
-    var hasRequestData: Bool { config.dataSource == "localCodex" ? localSnapshot.sessionCount > 0 : stats.requests > 0 }
+    var hasRequestData: Bool { config.dataSource == "localCodex" ? localSnapshot.knownThreadCount > 0 : stats.requests > 0 }
     var dataNotice: String {
         if isTestFixture { return "模拟测试 · 以下速度、Token、费用和配额均非企业真实数据" }
-        if config.dataSource == "localCodex" { return "本地 Codex 会话记录 · 历史累计用量，不代表企业总量或实时用量；账号与组织归属未核验" }
+        if config.dataSource == "localCodex" { return "本地 Codex 当前扫描范围记录小计 · 不代表账单或实时用量；账号与组织归属未核验" }
         return hasRequestData ? "本次启动 · 仅统计经过本机代理的请求" : "未采集到请求数据 · 尚未观测到客户端流量"
     }
     var title: String {
         if config.dataSource == "localCodex" {
             let rate = localSnapshot.lastTurn.map { String(format: "%.1ftok/s", $0.outputTPS) } ?? "—"
-            let total = localSnapshot.sessionCount > 0 ? formatCompactCount(localSnapshot.total) : "—"
-            return (isTestFixture ? "测试 " : "") + "上轮均:\(rate) · Σ\(total) · \(localSnapshot.sessionCount)会话"
+            let uncertainty = localSnapshot.unknownThreadCount + localSnapshot.unidentifiedFileCount
+            let total = localSnapshot.hasCompleteAccounting ? "Σ\(formatCompactCount(localSnapshot.total))"
+                : localSnapshot.knownThreadCount > 0 ? "小计\(formatCompactCount(localSnapshot.total)) · 未核验\(uncertainty)" : "Σ— · 未核验\(uncertainty)"
+            let sessions = localSnapshot.hasCompleteAccounting ? " · \(localSnapshot.sessionCount)顶层对话" : ""
+            return (isTestFixture ? "测试 " : "") + "上轮均:\(rate) · \(total)\(sessions)"
         }
         let value = !hasRequestData ? "T:—" : stats.active > 0
             ? String(format: "T:≈%.1ftok/s", stats.outputTPS) : "T:0.0tok/s"
@@ -1659,8 +1896,15 @@ struct SpeedPoint: Identifiable {
         }
         let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
         let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
-        let coverage = "扫描上限：最多32个会话文件、每文件尾部256KiB、总计8MiB；" + (localSnapshot.isLimited ? "本次达到上限，记录可能不完整" : "本次已检查 \(localSnapshot.filesScanned) 个会话文件，\(localSnapshot.sessionCount) 个含有效累计用量")
-        return "本地 Codex 历史累计：\(formatCount(localSnapshot.total)) tokens · \(localSnapshot.sessionCount)会话\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+        let coverage = "扫描范围最多32个物理文件；不是全部对话；每文件头64KiB与尾256KiB，总计10MiB；" + (localSnapshot.isLimited ? "本次达到扫描上限" : "本次安全检查 \(localSnapshot.filesScanned) 个物理文件")
+        let input = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.input) : "未知"
+        let output = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.output) : "未知"
+        let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "已核验记录小计"
+        let total = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.total) : "未知"
+        return "本地 Codex 当前扫描范围记录：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+    }
+    private var accountingDetail: String {
+        "已核验线程 \(localSnapshot.knownThreadCount) · 未核验线程 \(localSnapshot.unknownThreadCount) · 未识别文件 \(localSnapshot.unidentifiedFileCount) · 子代理 \(localSnapshot.subagentCount) · 分叉 \(localSnapshot.forkCount) · 顶层对话 \(localSnapshot.sessionCount)"
     }
     private func quotaDescription(_ quota: WindowQuota?, source: QuotaSource) -> String {
         let presentation = WindowQuotaCard.presentation(for: quota, refreshSeconds: config.refreshSeconds, source: source)
@@ -1779,7 +2023,7 @@ struct SpeedPoint: Identifiable {
                                 self.localSnapshot = result; self.fiveHourQuota = result.fiveHour; self.sevenDayQuota = result.sevenDay
                                 self.quotaError = result.latestEventAt == nil ? "未发现有效本地用量记录" : "额度来自 Codex 会话事件，可能已过期"
                             } else {
-                                self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil)
+                                self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
                                 self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
                             }
                         }
@@ -1946,10 +2190,15 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private var localUsageCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
-                metric("历史输入 Token", localCount(model.localSnapshot.input))
-                metric("历史输出 Token", localCount(model.localSnapshot.output))
-                metric("历史总 Token", model.localSnapshot.sessionCount > 0 ? localCount(model.localSnapshot.total) : "未知")
-                metric("包含会话", "\(model.localSnapshot.sessionCount)")
+                metric("已核验小计 · 输入 Token", localCount(model.localSnapshot.input))
+                metric("已核验小计 · 输出 Token", localCount(model.localSnapshot.output))
+                metric(model.localSnapshot.hasCompleteAccounting ? "本次扫描记录量 · Token" : "已核验记录小计 · 总 Token",
+                    model.localSnapshot.knownThreadCount > 0 ? count(model.localSnapshot.total) : "未知")
+                metric("已核验线程", "\(model.localSnapshot.knownThreadCount)")
+                metric("未核验线程", "\(model.localSnapshot.unknownThreadCount)")
+                metric("未识别物理文件", "\(model.localSnapshot.unidentifiedFileCount)")
+                metric("已识别顶层对话", "\(model.localSnapshot.sessionCount)")
+                metric("已识别子代理 / 分叉", "\(model.localSnapshot.subagentCount) / \(model.localSnapshot.forkCount)")
                 metric("最近用量事件", model.localSnapshot.latestEventAt?.formatted(date: .abbreviated, time: .shortened) ?? "未发现")
                 if let turn = model.localSnapshot.lastTurn {
                     metric("上轮记录均速", String(format: "%.1f tok/s", turn.outputTPS))
@@ -1957,7 +2206,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 } else {
                     metric("上轮记录均速", "未知")
                 }
-                Text("上轮均速包含工具、网络和等待，只统计会话记录的 output；不是模型瞬时生成速度。缺少可信边界或累计基线时显示未知。本地 Codex 会话记录是历史累计值，不是实时速率、企业总量或账单。扫描最多纳入 32 个最新修改会话，每文件尾部最多 256 KiB（总计 8 MiB）。\(model.localSnapshot.isLimited ? "已达到扫描范围限制，较旧记录可能未包含。" : "")")
+                Text("仅汇总本次扫描中可核算的记录，未核验项不计入小计。顶层对话数不包含子代理和分叉；这里不是完整历史或企业账单。上轮均速含工具、网络和等待，不是模型瞬时生成速度。\(model.localSnapshot.isLimited ? "已达到扫描范围限制。" : "")")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
         } label: { Label("本地记录用量", systemImage: "doc.text.magnifyingglass") }
@@ -1967,7 +2216,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             VStack(alignment: .leading, spacing: 8) {
                 metric("5 小时额度", localQuotaDescription(model.fiveHourQuota))
                 metric("7 天额度", localQuotaDescription(model.sevenDayQuota))
-                Text("本地 rate_limits 始终只是历史参考，不论事件是否新鲜；不代表当前企业剩余额度，也不触发企业额度告警。保留源记录的已用比例、记录时间和原重置时间。")
+                Text("本地记录额度始终只是历史参考，不论事件是否新鲜；不代表当前企业剩余额度，也不触发企业额度告警。保留源记录的已用比例、记录时间和原重置时间。")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
             }
@@ -2096,7 +2345,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         HStack { Text(label).foregroundStyle(.secondary); Spacer(); Text(value).fontWeight(.medium).monospacedDigit().textSelection(.enabled) }.font(.system(size: 11))
     }
     private func count(_ n: Int) -> String { n.formatted() }
-    private func localCount(_ n: Int) -> String { model.localSnapshot.sessionCount == 0 ? "—" : count(n) }
+    private func localCount(_ n: Int) -> String { model.localSnapshot.knownThreadCount == 0 ? "—" : count(n) }
     private func count(_ n: Double) -> String { n.formatted(.number.precision(.fractionLength(0))) }
     private func measuredCount(_ n: Int) -> String {
         guard model.hasRequestData else { return "—" }
@@ -2176,7 +2425,7 @@ import TokenStatCore
                     priceSection
                     quotaSection
                 } else {
-                    Text("从 ~/.codex/sessions 读取有限范围的历史用量统计，不连接本机代理，不读取密钥。切换到代理模式可恢复企业接口配置。")
+                    Text("从 ~/.codex/sessions 的有限范围中读取当前扫描范围记录。依据记录中的来源与父子关系区分顶层对话、子代理和分叉；无法核验的记录单独标示，不把未知贡献当作零或完整总量。仅读取有界文件片段，不连接本机代理、不读取凭据或企业接口。切换到代理模式可恢复企业接口配置。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 otherSection
@@ -3170,7 +3419,10 @@ extension CoreChecks {
         check(aggregate.input == 6 && aggregate.output == 9 && aggregate.total == 15,
             "local Codex totals use each session's last cumulative counter, including a lower reset value")
         check(aggregate.sessionCount == 2 && aggregate.latestEventAt == now.addingTimeInterval(-60),
-            "local Codex reports unique session count and latest event timestamp")
+            "local Codex reports metadata-backed top-level count and latest event timestamp")
+        check(aggregate.knownThreadCount == 2 && aggregate.unknownThreadCount == 0
+            && aggregate.unidentifiedFileCount == 0 && aggregate.hasCompleteAccounting,
+            "two valid root metadata records produce complete accounting independently of session count")
         check(aggregate.input == 6 && aggregate.output == 9,
             "cached input and reasoning output subfields are not added twice")
         let rescanned = try LocalCodexUsageReader.scan(directory: aggregateRoot, now: now)
@@ -3179,8 +3431,25 @@ extension CoreChecks {
             "repeated local Codex scans replace the snapshot instead of accumulating it")
         let reflectedFields = Set(Mirror(reflecting: aggregate).children.compactMap(\.label))
         check(reflectedFields == Set(["input", "output", "total", "sessionCount", "filesScanned",
-            "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn"]),
-            "local Codex snapshot exposes only bounded numeric turn and aggregate metadata")
+            "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn", "knownThreadCount",
+            "unknownThreadCount", "unidentifiedFileCount", "subagentCount", "forkCount"]),
+            "local Codex snapshot reflection exposes only the bounded metadata fields")
+
+        let exactZeroRoot = try fixtureDirectory("metadata-backed-exact-zero")
+        try writeSession(in: exactZeroRoot, uuid: "12121212-1212-4212-8212-121212121213",
+            events: [tokenEvent(at: now, input: 0, output: 0)], modified: now)
+        let exactZero = try LocalCodexUsageReader.scan(directory: exactZeroRoot, now: now)
+        check(exactZero.knownThreadCount == 1 && exactZero.hasCompleteAccounting
+            && exactZero.total == 0,
+            "a metadata-backed known zero is distinguishable from absence of any known thread")
+        try? FileManager.default.removeItem(at: exactZeroRoot.deletingLastPathComponent())
+
+        let noEvidenceRoot = try fixtureDirectory("no-accounting-evidence")
+        let noEvidence = try LocalCodexUsageReader.scan(directory: noEvidenceRoot, now: now)
+        check(noEvidence.knownThreadCount == 0 && noEvidence.unknownThreadCount == 0
+            && noEvidence.unidentifiedFileCount == 0 && !noEvidence.hasCompleteAccounting,
+            "no files is unknown coverage, not a complete exact zero")
+        try? FileManager.default.removeItem(at: noEvidenceRoot.deletingLastPathComponent())
 
         let turnRoot = try fixtureDirectory("completed-turn")
         let turnID = "abababab-abab-4bab-8bab-aaaaaaaaaaaa"
@@ -3336,6 +3605,14 @@ extension CoreChecks {
             ("reused-id", [turnTokenEvent(at: now.addingTimeInterval(-5), output: 1), turnBoundary(at: now.addingTimeInterval(-4), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-3), output: 2), turnBoundary(at: now.addingTimeInterval(-2), type: "task_complete", id: "x", durationMS: 1000), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now, output: 3), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
             ("post-complete-usage", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000), turnTokenEvent(at: now, output: 4)]),
             ("mismatched-id", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "y", durationMS: 1000)]),
+            ("missing-start-timestamp-with-duration", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1),
+                turnBoundaryWithoutTimestamp(type: "task_started", id: "x"),
+                turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2),
+                turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("missing-baseline-timestamp-with-duration", [turnTokenEventWithoutTimestamp(output: 1),
+                turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"),
+                turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2),
+                turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
             ("aborted", [turnTokenEvent(at: now.addingTimeInterval(-3), output: 1), turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now.addingTimeInterval(-0.5), type: "turn_aborted", id: "x"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
             ("future-complete", [turnTokenEvent(at: now.addingTimeInterval(-3), output: 1), turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now.addingTimeInterval(1), type: "task_complete", id: "x", durationMS: 1000)]),
             ("timestamp-regression", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
@@ -3432,9 +3709,11 @@ extension CoreChecks {
         truncatedBytes.removeLast(min(10, truncatedBytes.count))
         try truncatedBytes.write(to: cachedPath)
         let truncatedCache = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
-        check(truncatedCache.input == 2 && truncatedCache.output == 3
+        check(truncatedCache.input == 0 && truncatedCache.output == 0
+            && truncatedCache.knownThreadCount == 0 && truncatedCache.unknownThreadCount == 1
+            && !truncatedCache.hasCompleteAccounting
             && cache.diagnostics.cacheHits == 0 && cache.diagnostics.bytesRead > 0,
-            "truncating a cached file reparses and falls back to its remaining valid line")
+            "truncating a cached latest cumulative line reparses and makes the thread unknown")
         let otherRoot = try fixtureDirectory("cache-other-root")
         try writeSession(in: otherRoot, uuid: "aeaeaeae-aeae-4eae-8eae-aaaaaaaaaaaa",
             events: [tokenEvent(at: now, input: 9, output: 9)], modified: now)
@@ -3520,14 +3799,607 @@ extension CoreChecks {
         try FileManager.default.moveItem(at: lowercaseFixture,
             to: duplicateRoot.appendingPathComponent("rollout-primary-\(duplicateID).jsonl"))
         try writeSession(in: duplicateRoot, uuid: duplicateID.uppercased(),
-            events: [tokenEvent(at: now.addingTimeInterval(-10), input: 8, output: 9)], modified: now)
+            events: [tokenEvent(at: now.addingTimeInterval(-10), input: 8, output: 9)], modified: now,
+            metadataID: duplicateID.uppercased())
         let uppercaseFixture = sessionURL(in: duplicateRoot, uuid: duplicateID.uppercased())
         try FileManager.default.moveItem(at: uppercaseFixture,
             to: duplicateRoot.appendingPathComponent("rollout-alias-\(duplicateID.uppercased()).jsonl"))
         let duplicate = try LocalCodexUsageReader.scan(directory: duplicateRoot, now: now)
-        check(duplicate.sessionCount == 1 && duplicate.input == 8 && duplicate.output == 9,
-            "UUID suffix aliases canonicalize and newest modified duplicate contributes once")
+        check(duplicate.sessionCount == 0 && duplicate.knownThreadCount == 0
+            && duplicate.unknownThreadCount == 1 && !duplicate.hasCompleteAccounting,
+            "same metadata UUID with non-identical rollouts is an unknown conflict group, never an mtime winner")
         try? FileManager.default.removeItem(at: duplicateRoot.deletingLastPathComponent())
+
+        let identicalRoot = try fixtureDirectory("byte-identical-rollout-copy")
+        let identicalID = "abab2222-2222-4222-8222-222222222222"
+        try writeSession(in: identicalRoot, uuid: identicalID,
+            events: [tokenEvent(at: now, input: 8, output: 9)], modified: now)
+        let original = sessionURL(in: identicalRoot, uuid: identicalID)
+        let copy = identicalRoot.appendingPathComponent("rollout-copy-ffffffff-ffff-4fff-8fff-ffffffffffff.jsonl")
+        try FileManager.default.copyItem(at: original, to: copy)
+        let identical = try LocalCodexUsageReader.scan(directory: identicalRoot, now: now)
+        check(identical.knownThreadCount == 1 && identical.unknownThreadCount == 0
+            && identical.input == 8 && identical.output == 9,
+            "complete byte-identical physical rollouts collapse to one known logical thread")
+        let hardlink = identicalRoot.appendingPathComponent("rollout-hardlink.jsonl")
+        try FileManager.default.linkItem(at: original, to: hardlink)
+        let hardlinked = try LocalCodexUsageReader.scan(directory: identicalRoot, now: now)
+        check(hardlinked.knownThreadCount == 1 && hardlinked.unknownThreadCount == 0
+            && hardlinked.input == 8 && hardlinked.output == 9,
+            "hardlinked physical paths collapse by inode identity")
+        try? FileManager.default.removeItem(at: identicalRoot.deletingLastPathComponent())
+
+        let unprovenDuplicateRoot = try fixtureDirectory("duplicate-unproven-middle")
+        let unprovenID = "abab2323-2323-4323-8323-232323232323"
+        var firstMiddle = Data(repeating: 0x61, count: 400 * 1024)
+        var secondMiddle = firstMiddle
+        secondMiddle.replaceSubrange(100 * 1024..<100 * 1024 + 1, with: [0x62])
+        firstMiddle.append(10)
+        secondMiddle.append(10)
+        let unprovenSecondName = "rollout-copy-\(unprovenID).jsonl"
+        let unprovenFirstName = "rollout-primary-\(unprovenID).jsonl"
+        try writeSession(in: unprovenDuplicateRoot, uuid: unprovenID,
+            events: [tokenEvent(at: now, input: 8, output: 9)], modified: now,
+            prefix: firstMiddle)
+        try FileManager.default.moveItem(at: sessionURL(in: unprovenDuplicateRoot, uuid: unprovenID),
+            to: unprovenDuplicateRoot.appendingPathComponent(unprovenFirstName))
+        try writeSession(in: unprovenDuplicateRoot, uuid: unprovenID.uppercased(),
+            events: [tokenEvent(at: now, input: 8, output: 9)], modified: now,
+            prefix: secondMiddle, metadataID: unprovenID)
+        try FileManager.default.moveItem(at: sessionURL(in: unprovenDuplicateRoot, uuid: unprovenID.uppercased()),
+            to: unprovenDuplicateRoot.appendingPathComponent(unprovenSecondName))
+        let unprovenDuplicate = try LocalCodexUsageReader.scan(directory: unprovenDuplicateRoot, now: now)
+        check(unprovenDuplicate.knownThreadCount == 0 && unprovenDuplicate.unknownThreadCount == 1,
+            "matching bounded head and tail cannot prove whole-file identity when middle bytes differ")
+        try? FileManager.default.removeItem(at: unprovenDuplicateRoot.deletingLastPathComponent())
+
+        let identityRoot = try fixtureDirectory("metadata-identity-and-classification")
+        let identities = [
+            ("15151515-1515-4515-8515-151515151515", "cli" as Any?),
+            ("16161616-1616-4616-8616-161616161616", "vscode" as Any?),
+            ("17171717-1717-4717-8717-171717171717", "exec" as Any?),
+            ("18181818-1818-4818-8818-181818181818", "mcp" as Any?)
+        ]
+        for item in identities {
+            try writeSession(in: identityRoot, uuid: item.0,
+                events: [tokenEvent(at: now, input: 1, output: 2)], modified: now,
+                metadataSource: item.1)
+        }
+        let laterAncestorID = "19191919-1919-4919-8919-191919191919"
+        let childID = "20202020-2020-4020-8020-202020202020"
+        let ancestorMeta = sessionMetadata(id: laterAncestorID, source: "cli")
+        try writeSession(in: identityRoot, uuid: "21212121-2121-4121-8121-212121212121",
+            events: [ancestorMeta, tokenEvent(at: now, input: 3, output: 4)], modified: now,
+            metadataID: childID, metadataSource: ["subagent": "review"],
+            metadataFields: ["parent_thread_id": firstID])
+        let unidentifiedMetadata = try fixtureDirectory("metadata-unidentified-files")
+        try writeSession(in: unidentifiedMetadata, uuid: "22222222-2222-4222-8222-222222222222",
+            events: [tokenEvent(at: now, input: 9, output: 9)], modified: now,
+            metadata: sessionMetadata(id: nil, source: "cli"))
+        try writeSession(in: unidentifiedMetadata, uuid: "23232323-2323-4323-8323-232323232323",
+            events: [tokenEvent(at: now, input: 8, output: 8)], modified: now,
+            metadata: tokenEvent(at: now, input: 0, output: 0))
+        try writeSession(in: unidentifiedMetadata, uuid: "24242424-2424-4424-8424-242424242424",
+            events: [tokenEvent(at: now, input: 7, output: 7)], modified: now,
+            metadataID: "not-a-uuid", metadataSource: "cli")
+        try writeSession(in: unidentifiedMetadata, uuid: "25252525-2525-4525-8525-252525252525",
+            events: [tokenEvent(at: now, input: 6, output: 6)], modified: now,
+            metadataSource: "futureSource")
+        try writeSession(in: unidentifiedMetadata, uuid: "26262626-2626-4626-8626-262626262626",
+            events: [tokenEvent(at: now, input: 5, output: 5)], modified: now, metadataSource: nil)
+        try writeSession(in: unidentifiedMetadata, uuid: "27272727-2727-4727-8727-272727272727",
+            events: [tokenEvent(at: now, input: 4, output: 4)], modified: now,
+            metadataSource: ["custom": ["name": "fixture"]])
+        try writeSession(in: unidentifiedMetadata, uuid: "28282828-2828-4828-8828-282828282828",
+            events: [tokenEvent(at: now, input: 3, output: 3)], modified: now,
+            metadataSource: ["internal": "fixture"])
+        try writeSession(in: unidentifiedMetadata, uuid: "29292929-2929-4929-8929-292929292929",
+            events: [tokenEvent(at: now, input: 2, output: 2)], modified: now,
+            metadataSource: ["subagent": "unsupported_kind"])
+        let classified = try LocalCodexUsageReader.scan(directory: identityRoot, now: now)
+        let unclassified = try LocalCodexUsageReader.scan(directory: unidentifiedMetadata, now: now)
+        check(classified.knownThreadCount == 4 && classified.subagentCount == 1
+            && classified.sessionCount == 4 && classified.input == 4 && classified.output == 8
+            && classified.unknownThreadCount == 1,
+            "recognized child source without a provable fork baseline remains unknown while first metadata identity is retained")
+        check(unclassified.knownThreadCount == 0 && unclassified.unknownThreadCount == 5
+            && unclassified.unidentifiedFileCount == 3
+            && unclassified.sessionCount == 0 && !unclassified.hasCompleteAccounting,
+            "missing, invalid, non-first, and unknown-source metadata never falls back to filename identity or root classification")
+        let optionalSubagentRoot = try fixtureDirectory("subagent-optional-display-metadata")
+        let optionalSubagentID = "2d2d2d2d-2d2d-4d2d-8d2d-2d2d2d2d2d2d"
+        try writeSession(in: optionalSubagentRoot, uuid: optionalSubagentID,
+            events: [tokenEvent(at: now, input: 4, output: 5)], modified: now,
+            metadataID: optionalSubagentID, metadataSource: ["subagent": "review"],
+            metadataFields: ["agent_nickname": "Synthetic Reviewer", "agent_role": "review"])
+        let optionalSubagent = try LocalCodexUsageReader.scan(directory: optionalSubagentRoot, now: now)
+        check(optionalSubagent.knownThreadCount == 0 && optionalSubagent.unknownThreadCount == 1
+            && optionalSubagent.subagentCount == 1 && optionalSubagent.sessionCount == 0
+            && optionalSubagent.input == 0 && optionalSubagent.output == 0,
+            "recognized child classification with optional display metadata remains a subagent while missing lineage baseline is unknown")
+        try? FileManager.default.removeItem(at: optionalSubagentRoot.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: identityRoot.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: unidentifiedMetadata.deletingLastPathComponent())
+
+        let strictSourceCases: [(String, Any)] = [
+            ("uppercase root source", "CLI"),
+            ("subagent-like root string", "subagent_review"),
+            ("internal-like root string", "internal_guardian"),
+            ("object root source", ["cli": true]),
+            ("invalid nested parent UUID", ["subagent": ["thread_spawn": ["parent_thread_id": "badUUID", "depth": 1]]]),
+            ("boolean nested depth", ["subagent": ["thread_spawn": ["parent_thread_id": firstID, "depth": true]]]),
+            ("overflow nested depth", ["subagent": ["thread_spawn": ["parent_thread_id": firstID, "depth": 2_147_483_648]]]),
+            ("uint64 maximum nested depth", ["subagent": ["thread_spawn": ["parent_thread_id": firstID, "depth": NSNumber(value: UInt64.max)]]])
+        ]
+        for (index, testCase) in strictSourceCases.enumerated() {
+            let strictSourceRoot = try fixtureDirectory("strict-source-\(index)")
+            let id = String(format: "2c2c2c2c-2c2c-4c2c-8c2c-%012d", index + 1)
+            try writeSession(in: strictSourceRoot, uuid: id,
+                events: [tokenEvent(at: now, input: 4, output: 5)], modified: now,
+                metadataID: id, metadataSource: testCase.1)
+            let strictSource = try LocalCodexUsageReader.scan(directory: strictSourceRoot, now: now)
+            check(strictSource.knownThreadCount == 0 && strictSource.unknownThreadCount == 1
+                && strictSource.sessionCount == 0 && strictSource.subagentCount == 0,
+                "strict metadata source rejects \(testCase.0) instead of classifying a root")
+            try? FileManager.default.removeItem(at: strictSourceRoot.deletingLastPathComponent())
+        }
+
+        let lateMetadataRoot = try fixtureDirectory("metadata-after-head-limit")
+        let lateMetadataRecord = sessionMetadata(id: "2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a", source: "cli")
+        var firstCompleteRecord = Data("{\"type\":\"unrelated\",\"padding\":\"".utf8)
+        firstCompleteRecord.append(Data(repeating: 0x61, count: 70 * 1024))
+        firstCompleteRecord.append(Data("\"}\n".utf8))
+        var oversizedMetadata = lateMetadataRecord
+        oversizedMetadata.append(10)
+        firstCompleteRecord.append(oversizedMetadata)
+        try writeSession(in: lateMetadataRoot, uuid: "2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a",
+            events: [tokenEvent(at: now, input: 1, output: 1)], modified: now,
+            metadata: firstCompleteRecord)
+        let lateMetadataSnapshot = try LocalCodexUsageReader.scan(directory: lateMetadataRoot, now: now)
+        check(lateMetadataSnapshot.unidentifiedFileCount == 1 && lateMetadataSnapshot.knownThreadCount == 0,
+            "first metadata outside the bounded head cannot establish identity by later search")
+        try? FileManager.default.removeItem(at: lateMetadataRoot.deletingLastPathComponent())
+
+        for (label, firstRecord) in [("blank", Data(" \n".utf8)),
+                                     ("non-meta", try tokenEvent(at: now, input: 0, output: 0))] {
+            let firstRecordRoot = try fixtureDirectory("first-record-\(label)")
+            try writeSession(in: firstRecordRoot, uuid: "2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b",
+                events: [tokenEvent(at: now, input: 1, output: 1)], modified: now,
+                metadata: firstRecord)
+            let firstRecordSnapshot = try LocalCodexUsageReader.scan(directory: firstRecordRoot, now: now)
+            check(firstRecordSnapshot.unidentifiedFileCount == 1 && firstRecordSnapshot.knownThreadCount == 0,
+                "\(label) first complete physical record is not skipped to recover a later metadata identity")
+            try? FileManager.default.removeItem(at: firstRecordRoot.deletingLastPathComponent())
+        }
+
+        let forkRoot = try fixtureDirectory("fork-explicit-boundary")
+        let parentID = "30303030-3030-4030-8030-303030303030"
+        let forkID = "31313131-3131-4131-8131-313131313131"
+        try writeSession(in: forkRoot, uuid: parentID,
+            events: [tokenEvent(at: now.addingTimeInterval(-5), input: 100, output: 50)], modified: now,
+            metadataSource: "cli")
+        let spawnSource: [String: Any] = ["subagent": ["thread_spawn": ["parent_thread_id": parentID, "depth": 1]]]
+        try writeSession(in: forkRoot, uuid: forkID, events: [
+            tokenEvent(at: now.addingTimeInterval(-4), input: 100, output: 50), // ordinal 1: inherited
+            ordinaryEvent(at: now.addingTimeInterval(-3), type: "user_message"), // ordinal 2
+            tokenEvent(at: now.addingTimeInterval(-2), input: 110, output: 55), // ordinal 3: exclusive boundary is first own record
+            tokenEvent(at: now.addingTimeInterval(-1), input: 120, output: 60), // ordinal 4: child continues
+            sessionMetadata(id: parentID, source: "cli"), // copied ancestor must not replace ordinal-0 child identity
+            tokenEvent(at: now, input: 130, output: 65)
+        ], modified: now, metadataID: forkID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 3])
+        let forked = try LocalCodexUsageReader.scan(directory: forkRoot, now: now)
+        check(forked.input == 130 && forked.output == 65 && forked.total == 195
+            && forked.knownThreadCount == 2 && forked.subagentCount == 1 && forked.forkCount == 1
+            && forked.sessionCount == 1 && forked.hasCompleteAccounting,
+            "parent plus explicit copied-fork delta excludes inherited baseline once and preserves first metadata identity")
+        try? FileManager.default.removeItem(at: forkRoot.deletingLastPathComponent())
+
+        let settingsForkRoot = try fixtureDirectory("fork-thread-settings-boundary")
+        let settingsForkID = "32323232-3232-4232-8232-323232323232"
+        let settingsBoundary = try threadSettingsApplied(at: now.addingTimeInterval(-2), threadID: settingsForkID)
+        try writeSession(in: settingsForkRoot, uuid: settingsForkID, events: [
+            tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20), // baseline before boundary
+            settingsBoundary, // own thread boundary
+            tokenEvent(at: now.addingTimeInterval(-1), input: 55, output: 30),
+            tokenEvent(at: now, input: 60, output: 32)
+        ], modified: now, metadataID: settingsForkID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID])
+        let settingsFork = try LocalCodexUsageReader.scan(directory: settingsForkRoot, now: now)
+        check(settingsFork.input == 20 && settingsFork.output == 12 && settingsFork.total == 32
+            && settingsFork.knownThreadCount == 1 && settingsFork.subagentCount == 1
+            && settingsFork.forkCount == 1 && settingsFork.sessionCount == 0,
+            "thread_settings_applied boundary matches current thread and counts only post-baseline delta")
+        try? FileManager.default.removeItem(at: settingsForkRoot.deletingLastPathComponent())
+
+        let quotaOnlyForkRoot = try fixtureDirectory("fork-quota-only-token-event")
+        let quotaOnlyForkID = "32323232-3232-4232-8232-323232323233"
+        let forkQuotaLimits: [String: Any] = ["primary": ["used_percent": 45, "window_minutes": 300]]
+        try writeSession(in: quotaOnlyForkRoot, uuid: quotaOnlyForkID, events: [
+            tokenEvent(at: now.addingTimeInterval(-4), input: 100, output: 50),
+            ordinaryEvent(at: now.addingTimeInterval(-3), type: "user_message"),
+            tokenEvent(at: now.addingTimeInterval(-2), input: 110, output: 55),
+            quotaOnlyEvent(at: now.addingTimeInterval(-1), rateLimits: forkQuotaLimits),
+            tokenEvent(at: now, input: 120, output: 60)
+        ], modified: now, metadataID: quotaOnlyForkID, metadataSource: "cli",
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 2])
+        let quotaOnlyFork = try LocalCodexUsageReader.scan(directory: quotaOnlyForkRoot, now: now)
+        check(quotaOnlyFork.input == 20 && quotaOnlyFork.output == 10 && quotaOnlyFork.total == 30
+            && quotaOnlyFork.knownThreadCount == 1 && quotaOnlyFork.unknownThreadCount == 0
+            && quotaOnlyFork.forkCount == 1 && quotaOnlyFork.sessionCount == 0
+            && quotaOnlyFork.fiveHour?.usedPercent == 45,
+            "quota-only token_count between cumulative fork counters does not poison the child delta")
+        try? FileManager.default.removeItem(at: quotaOnlyForkRoot.deletingLastPathComponent())
+
+        let resumeSettingsRoot = try fixtureDirectory("fork-resume-settings")
+        let resumeID = "33333333-3333-4333-8333-333333333334"
+        try writeSession(in: resumeSettingsRoot, uuid: resumeID, events: [
+            tokenEvent(at: now.addingTimeInterval(-4), input: 40, output: 20),
+            threadSettingsApplied(at: now.addingTimeInterval(-3), threadID: resumeID),
+            tokenEvent(at: now.addingTimeInterval(-2), input: 55, output: 30),
+            threadSettingsApplied(at: now.addingTimeInterval(-1), threadID: resumeID), // resume is not a new boundary
+            tokenEvent(at: now, input: 60, output: 32)
+        ], modified: now, metadataID: resumeID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID])
+        let resumedSettingsFork = try LocalCodexUsageReader.scan(directory: resumeSettingsRoot, now: now)
+        check(resumedSettingsFork.input == 20 && resumedSettingsFork.output == 12
+            && resumedSettingsFork.knownThreadCount == 1 && resumedSettingsFork.unknownThreadCount == 0,
+            "later matching resume settings do not invalidate the first own initialization boundary")
+        try? FileManager.default.removeItem(at: resumeSettingsRoot.deletingLastPathComponent())
+
+        let wrongSettingsRoot = try fixtureDirectory("fork-wrong-settings-thread")
+        let wrongSettingsID = "33333333-3333-4333-8333-333333333335"
+        try writeSession(in: wrongSettingsRoot, uuid: wrongSettingsID, events: [
+            tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+            threadSettingsApplied(at: now.addingTimeInterval(-2), threadID: parentID),
+            tokenEvent(at: now.addingTimeInterval(-1), input: 55, output: 30),
+            threadSettingsApplied(at: now, threadID: wrongSettingsID),
+            tokenEvent(at: now.addingTimeInterval(1), input: 60, output: 32)
+        ], modified: now, metadataID: wrongSettingsID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID])
+        let wrongSettingsFork = try LocalCodexUsageReader.scan(directory: wrongSettingsRoot, now: now)
+        check(wrongSettingsFork.input == 5 && wrongSettingsFork.output == 2
+            && wrongSettingsFork.knownThreadCount == 1,
+            "thread settings for another thread are ignored and preceding cumulative usage remains the baseline")
+        try? FileManager.default.removeItem(at: wrongSettingsRoot.deletingLastPathComponent())
+
+        let contradictoryBoundaryRoot = try fixtureDirectory("fork-contradictory-boundary")
+        let contradictoryID = "33333333-3333-4333-8333-333333333336"
+        try writeSession(in: contradictoryBoundaryRoot, uuid: contradictoryID, events: [
+            tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+            threadSettingsApplied(at: now.addingTimeInterval(-2), threadID: contradictoryID),
+            tokenEvent(at: now.addingTimeInterval(-1), input: 55, output: 30),
+            tokenEvent(at: now, input: 60, output: 32)
+        ], modified: now, metadataID: contradictoryID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 3])
+        let contradictoryBoundary = try LocalCodexUsageReader.scan(directory: contradictoryBoundaryRoot, now: now)
+        check(contradictoryBoundary.knownThreadCount == 0 && contradictoryBoundary.unknownThreadCount == 1,
+            "explicit ordinal and first matching own settings boundary disagreement makes the fork unknown")
+        try? FileManager.default.removeItem(at: contradictoryBoundaryRoot.deletingLastPathComponent())
+
+        let gapForkRoot = try fixtureDirectory("fork-unobserved-middle-gap")
+        let gapForkID = "34343434-3434-4434-8434-343434343434"
+        var gapPrefix = Data()
+        gapPrefix.append(try ordinaryEvent(at: now.addingTimeInterval(-10), type: "user_message")) // ordinal 1
+        gapPrefix.append(10)
+        gapPrefix.append(try tokenEvent(at: now.addingTimeInterval(-9), input: 100, output: 50)) // ordinal 2 baseline
+        gapPrefix.append(10)
+        gapPrefix.append(try tokenEvent(at: now.addingTimeInterval(-8.5), input: 101, output: 51)) // ordinal 3 first own record
+        gapPrefix.append(10)
+        for index in 0..<5_000 {
+            gapPrefix.append(try tokenEvent(at: now.addingTimeInterval(-8 + Double(index) / 10_000),
+                input: 102 + index, output: 52 + index))
+            gapPrefix.append(10)
+        }
+        try writeSession(in: gapForkRoot, uuid: gapForkID,
+            events: [tokenEvent(at: now, input: 5_101, output: 5_051)], modified: now,
+            prefix: gapPrefix, metadataID: gapForkID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 3])
+        let gapFork = try LocalCodexUsageReader.scan(directory: gapForkRoot, now: now)
+        check(gapFork.knownThreadCount == 0 && gapFork.unknownThreadCount == 1
+            && gapFork.isLimited && !gapFork.hasCompleteAccounting,
+            "fork contribution is unknown when bounded head/tail reads leave an unobserved cumulative gap")
+        try? FileManager.default.removeItem(at: gapForkRoot.deletingLastPathComponent())
+
+        let invalidForkEvidence: [(String, [Data])] = try [
+            ("missing", [ordinaryEvent(at: now.addingTimeInterval(-2), type: "user_message"),
+                ordinaryEvent(at: now.addingTimeInterval(-1), type: "assistant_reasoning"),
+                tokenEvent(at: now, input: 55, output: 65)]),
+            ("input rollback", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                tokenEvent(at: now.addingTimeInterval(-1), input: 39, output: 21),
+                tokenEvent(at: now, input: 45, output: 25)]),
+            ("output rollback", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                tokenEvent(at: now.addingTimeInterval(-1), input: 41, output: 19),
+                tokenEvent(at: now, input: 45, output: 25)]),
+            ("input missing", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                rawTokenEvent(at: now.addingTimeInterval(-1), inputLiteral: "null", outputLiteral: "21", totalLiteral: "42"),
+                tokenEvent(at: now, input: 45, output: 25)]),
+            ("output missing", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                rawTokenEvent(at: now.addingTimeInterval(-1), inputLiteral: "41", outputLiteral: "null", totalLiteral: "42"),
+                tokenEvent(at: now, input: 45, output: 25)]),
+            ("total missing", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                rawTokenEvent(at: now.addingTimeInterval(-1), inputLiteral: "41", outputLiteral: "21", totalLiteral: "null"),
+                tokenEvent(at: now, input: 45, output: 25)]),
+            ("total rollback", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                rawTokenEvent(at: now.addingTimeInterval(-1), inputLiteral: "41", outputLiteral: "21", totalLiteral: "1"),
+                tokenEvent(at: now, input: 45, output: 25)])
+        ]
+        for (label, records) in invalidForkEvidence {
+            let missingBaselineRoot = try fixtureDirectory("fork-invalid-baseline-\(label)")
+            let missingBaselineID = "35353535-3535-4535-8535-353535353535"
+            try writeSession(in: missingBaselineRoot, uuid: missingBaselineID, events: records, modified: now,
+                metadataID: missingBaselineID, metadataSource: spawnSource,
+                metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 3])
+            let missingBaseline = try LocalCodexUsageReader.scan(directory: missingBaselineRoot, now: now)
+            check(missingBaseline.knownThreadCount == 0 && missingBaseline.unknownThreadCount == 1
+                && missingBaseline.input == 0,
+                "fork with \(label) baseline evidence is unknown, not a guessed contribution")
+            try? FileManager.default.removeItem(at: missingBaselineRoot.deletingLastPathComponent())
+        }
+
+        let quotaUpdateRoot = try fixtureDirectory("quota-update-contract")
+        let quotaTime = now.addingTimeInterval(-30)
+        let validLimits: [String: Any] = [
+            "primary": ["used_percent": 25, "window_minutes": 300, "resets_at": Int(now.timeIntervalSince1970) + 3600],
+            "secondary": ["used_percent": 70, "window_minutes": 10080, "resets_at": Int(now.timeIntervalSince1970) + 7200]
+        ]
+        let duplicateDurations: [String: Any] = [
+            "primary": ["used_percent": 10, "window_minutes": 300],
+            "secondary": ["used_percent": 90, "window_minutes": 300]
+        ]
+        try writeSession(in: quotaUpdateRoot, uuid: "36363636-3636-4636-8636-363636363636", events: [
+            tokenEvent(at: quotaTime, input: 1, output: 1, rateLimits: validLimits)
+        ], modified: now)
+        func appendQuotaFixture(_ suffix: Int, _ timestamp: Date, _ value: Any?) throws -> LocalCodexSnapshot {
+            let uuid = String(format: "37373737-3737-4737-8737-%012d", suffix)
+            try writeSession(in: quotaUpdateRoot, uuid: uuid, events: [
+                tokenEvent(at: timestamp, input: suffix, output: suffix, rateLimits: value)
+            ], modified: now, metadataID: uuid)
+            return try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+        }
+        let preservedCases: [(String, Any?)] = [
+            ("missing", nil), ("null", NSNull()), ("non-object", "not-an-object"),
+            ("unrelated", ["other": ["used_percent": 99]]),
+            ("boolean percent", ["primary": ["used_percent": true, "window_minutes": 300]]),
+            ("out-of-range percent", ["primary": ["used_percent": 101, "window_minutes": 300]]),
+            ("boolean duration", ["primary": ["used_percent": 40, "window_minutes": true]]),
+            ("duplicate duration", duplicateDurations),
+            ("negative reset", ["primary": ["used_percent": 40, "window_minutes": 300, "resets_at": -1]]),
+            ("fractional reset", ["primary": ["used_percent": 40, "window_minutes": 300, "resets_at": 1.5]]),
+            ("null slot", ["primary": NSNull(), "secondary": NSNull()]),
+            ("non-object slot", ["primary": "invalid"]),
+            ("missing used percent", ["primary": ["window_minutes": 300]])
+        ]
+        var quotaCheckIndex = 0
+        for (label, value) in preservedCases {
+            if label == "null slot" {
+                quotaCheckIndex += 1
+                let clearID = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+                try writeSession(in: quotaUpdateRoot, uuid: clearID, events: [
+                    tokenEvent(at: quotaTime.addingTimeInterval(Double(quotaCheckIndex)), input: 1, output: 1,
+                        rateLimits: [:])
+                ], modified: now, metadataID: clearID)
+                let cleared = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+                check(cleared.fiveHour == nil && cleared.sevenDay == nil,
+                    "valid empty object clears quota before nullable-window case")
+                quotaCheckIndex += 1
+                let restoreID = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+                try writeSession(in: quotaUpdateRoot, uuid: restoreID, events: [
+                    tokenEvent(at: quotaTime.addingTimeInterval(Double(quotaCheckIndex)), input: 1, output: 1,
+                        rateLimits: validLimits)
+                ], modified: now, metadataID: restoreID)
+                quotaCheckIndex += 1
+                let nullSlotsID = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+                try writeSession(in: quotaUpdateRoot, uuid: nullSlotsID, events: [
+                    tokenEvent(at: quotaTime.addingTimeInterval(Double(quotaCheckIndex)), input: 1, output: 1,
+                        rateLimits: ["primary": NSNull(), "secondary": NSNull()])
+                ], modified: now, metadataID: nullSlotsID)
+                let nullSlots = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+                check(nullSlots.fiveHour == nil && nullSlots.sevenDay == nil,
+                    "valid null windows replace the prior snapshot with an empty snapshot")
+                quotaCheckIndex += 1
+                let nullRestoreID = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+                try writeSession(in: quotaUpdateRoot, uuid: nullRestoreID, events: [
+                    tokenEvent(at: quotaTime.addingTimeInterval(Double(quotaCheckIndex)), input: 1, output: 1,
+                        rateLimits: validLimits)
+                ], modified: now, metadataID: nullRestoreID)
+                quotaCheckIndex += 1
+                continue
+            }
+            quotaCheckIndex += 1
+            let before = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+            check(before.fiveHour?.usedPercent == 25 && before.sevenDay?.usedPercent == 70,
+                "known quota snapshot restored before \(label) case")
+            let snapshot = try appendQuotaFixture(quotaCheckIndex,
+                quotaTime.addingTimeInterval(Double(quotaCheckIndex)), value)
+            check(snapshot.fiveHour?.usedPercent == 25 && snapshot.sevenDay?.usedPercent == 70,
+                "\(label) quota update preserves previous valid snapshot")
+        }
+        quotaCheckIndex += 1
+        let replacementTime = quotaTime.addingTimeInterval(Double(quotaCheckIndex))
+        let replacementFixture = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+        try writeSession(in: quotaUpdateRoot, uuid: replacementFixture, events: [
+            tokenEvent(at: replacementTime, input: 8, output: 8,
+                rateLimits: ["primary": ["used_percent": 35, "window_minutes": 300, "resets_at": NSNull()]])
+        ], modified: now, metadataID: replacementFixture)
+        let wholeReplacement = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+        check(wholeReplacement.fiveHour?.usedPercent == 35 && wholeReplacement.fiveHour?.resetsAt == nil
+            && wholeReplacement.sevenDay == nil,
+            "valid partial quota object replaces its sibling instead of merging windows across events")
+        quotaCheckIndex += 1
+        let unsupportedTime = quotaTime.addingTimeInterval(Double(quotaCheckIndex))
+        let unsupportedFixture = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+        try writeSession(in: quotaUpdateRoot, uuid: unsupportedFixture, events: [
+            tokenEvent(at: unsupportedTime, input: 9, output: 9,
+                rateLimits: ["primary": ["used_percent": 45]])
+        ], modified: now, metadataID: unsupportedFixture)
+        let unsupportedDuration = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+        check(unsupportedDuration.fiveHour == nil && unsupportedDuration.sevenDay == nil,
+            "valid window lacking optional duration replaces snapshot but cannot map to a supported bucket")
+        quotaCheckIndex += 1
+        let epochTime = quotaTime.addingTimeInterval(Double(quotaCheckIndex))
+        let epochFixture = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+        try writeSession(in: quotaUpdateRoot, uuid: epochFixture, events: [
+            tokenEvent(at: epochTime, input: 10, output: 10,
+                rateLimits: ["primary": ["used_percent": 45, "window_minutes": 300, "resets_at": 0]])
+        ], modified: now, metadataID: epochFixture)
+        let epochReset = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+        check(epochReset.fiveHour?.resetsAt == Date(timeIntervalSince1970: 0)
+            && epochReset.fiveHour?.isFresh(at: now, refreshSeconds: 60) == false,
+            "nonnegative integer epoch reset is retained as historical time, not current quota")
+        quotaCheckIndex += 1
+        let clearTime = quotaTime.addingTimeInterval(Double(quotaCheckIndex))
+        let clearFixture = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+        try writeSession(in: quotaUpdateRoot, uuid: clearFixture, events: [
+            tokenEvent(at: clearTime, input: 11, output: 11, rateLimits: [:])
+        ], modified: now, metadataID: clearFixture)
+        let explicitlyCleared = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+        check(explicitlyCleared.fiveHour == nil && explicitlyCleared.sevenDay == nil,
+            "explicit valid empty quota object clears prior snapshot")
+        try? FileManager.default.removeItem(at: quotaUpdateRoot.deletingLastPathComponent())
+
+        let quotaOnlyRoot = try fixtureDirectory("quota-only-event-does-not-clear-usage")
+        let quotaOnlyID = "40404040-4040-4040-8040-404040404041"
+        try writeSession(in: quotaOnlyRoot, uuid: quotaOnlyID, events: [
+            tokenEvent(at: now.addingTimeInterval(-1), input: 20, output: 10),
+            quotaOnlyEvent(at: now, rateLimits: validLimits)
+        ], modified: now)
+        let quotaOnly = try LocalCodexUsageReader.scan(directory: quotaOnlyRoot, now: now)
+        check(quotaOnly.input == 20 && quotaOnly.output == 10 && quotaOnly.total == 30
+            && quotaOnly.knownThreadCount == 1 && quotaOnly.unknownThreadCount == 0
+            && quotaOnly.fiveHour?.usedPercent == 25 && quotaOnly.sevenDay?.usedPercent == 70,
+            "quota update without cumulative usage preserves the thread's last valid token counters")
+        try? FileManager.default.removeItem(at: quotaOnlyRoot.deletingLastPathComponent())
+
+        let unknownSourceForkRoot = try fixtureDirectory("unknown-source-fork-not-root")
+        let unknownSourceForkID = "40404040-4040-4040-8040-404040404042"
+        try writeSession(in: unknownSourceForkRoot, uuid: unknownSourceForkID, events: [
+            tokenEvent(at: now.addingTimeInterval(-2), input: 10, output: 5),
+            ordinaryEvent(at: now.addingTimeInterval(-1), type: "user_message"),
+            tokenEvent(at: now, input: 12, output: 6)
+        ], modified: now, metadataID: unknownSourceForkID, metadataSource: nil,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 2])
+        let unknownSourceFork = try LocalCodexUsageReader.scan(directory: unknownSourceForkRoot, now: now)
+        check(unknownSourceFork.knownThreadCount == 0 && unknownSourceFork.unknownThreadCount == 1
+            && unknownSourceFork.sessionCount == 0 && unknownSourceFork.subagentCount == 0
+            && unknownSourceFork.input == 0,
+            "unknown source with otherwise valid fork baseline remains unknown and cannot become a root")
+        try? FileManager.default.removeItem(at: unknownSourceForkRoot.deletingLastPathComponent())
+
+        let cliDisplayRoot = try fixtureDirectory("cli-display-metadata-not-subagent")
+        let cliDisplayID = "40404040-4040-4040-8040-404040404043"
+        try writeSession(in: cliDisplayRoot, uuid: cliDisplayID,
+            events: [tokenEvent(at: now, input: 3, output: 4)], modified: now,
+            metadataID: cliDisplayID, metadataSource: "cli",
+            metadataFields: ["agent_nickname": "Synthetic CLI", "agent_role": "review", "thread_source": "user"])
+        let cliDisplay = try LocalCodexUsageReader.scan(directory: cliDisplayRoot, now: now)
+        check(cliDisplay.knownThreadCount == 0 && cliDisplay.unknownThreadCount == 1
+            && cliDisplay.sessionCount == 0 && cliDisplay.subagentCount == 0
+            && cliDisplay.input == 0 && cliDisplay.output == 0,
+            "CLI source with child display metadata is unknown rather than a trusted root or a subagent")
+        try? FileManager.default.removeItem(at: cliDisplayRoot.deletingLastPathComponent())
+
+        let nonUserChildRoot = try fixtureDirectory("subagent-nonuser-thread-source")
+        let nonUserChildID = "40404040-4040-4040-8040-404040404044"
+        try writeSession(in: nonUserChildRoot, uuid: nonUserChildID,
+            events: [tokenEvent(at: now, input: 6, output: 4)], modified: now,
+            metadataID: nonUserChildID, metadataSource: ["subagent": "review"],
+            metadataFields: ["thread_source": "automation", "agent_role": "review"])
+        let nonUserChild = try LocalCodexUsageReader.scan(directory: nonUserChildRoot, now: now)
+        check(nonUserChild.knownThreadCount == 0 && nonUserChild.unknownThreadCount == 1
+            && nonUserChild.sessionCount == 0 && nonUserChild.subagentCount == 1
+            && nonUserChild.input == 0 && nonUserChild.output == 0,
+            "recognized subagent source with non-user thread_source remains classified as child while missing baseline is unknown")
+        try? FileManager.default.removeItem(at: nonUserChildRoot.deletingLastPathComponent())
+
+        for (label, historyBase) in [
+            ("integer", 123 as Any), ("object", ["ordinal": 5] as Any),
+            ("schema-valid reference", ["thread_id": parentID, "end_ordinal_exclusive": 4,
+                                        "end_byte_offset": 1024] as Any)
+        ] {
+            let unknownLineageRoot = try fixtureDirectory("unknown-parent-lineage-\(label)")
+            try writeSession(in: unknownLineageRoot, uuid: "33333333-3333-4333-8333-333333333333",
+                events: [tokenEvent(at: now, input: 55, output: 66)], modified: now,
+                metadataFields: ["history_base": historyBase])
+            let unknownLineage = try LocalCodexUsageReader.scan(directory: unknownLineageRoot, now: now)
+            check(unknownLineage.knownThreadCount == 0 && unknownLineage.unknownThreadCount == 1
+                && unknownLineage.input == 0 && !unknownLineage.hasCompleteAccounting,
+                "Referenced/history_base \(label) lineage is unknown without cross-file subtraction")
+            try? FileManager.default.removeItem(at: unknownLineageRoot.deletingLastPathComponent())
+        }
+
+        let referencedSubagentRoot = try fixtureDirectory("referenced-history-classifies-child")
+        let referencedSubagentID = "33333333-3333-4333-8333-333333333339"
+        try writeSession(in: referencedSubagentRoot, uuid: referencedSubagentID,
+            events: [tokenEvent(at: now, input: 55, output: 66)], modified: now,
+            metadataID: referencedSubagentID, metadataSource: ["subagent": "review"],
+            metadataFields: ["history_base": ["thread_id": parentID,
+                "end_ordinal_exclusive": 4, "end_byte_offset": 1024]])
+        let referencedSubagent = try LocalCodexUsageReader.scan(directory: referencedSubagentRoot, now: now)
+        check(referencedSubagent.knownThreadCount == 0 && referencedSubagent.unknownThreadCount == 1
+            && referencedSubagent.subagentCount == 1 && referencedSubagent.sessionCount == 0
+            && referencedSubagent.input == 0,
+            "trusted source plus history_base classifies child while its unsupported contribution remains unknown")
+        try? FileManager.default.removeItem(at: referencedSubagentRoot.deletingLastPathComponent())
+
+        let cliForkRoot = try fixtureDirectory("cli-with-fork-marker")
+        let cliForkID = "33333333-3333-4333-8333-333333333337"
+        try writeSession(in: cliForkRoot, uuid: cliForkID, events: [
+            tokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 50), // inherited baseline
+            ordinaryEvent(at: now.addingTimeInterval(-2), type: "user_message"), // explicit ordinal 2 boundary
+            tokenEvent(at: now.addingTimeInterval(-1), input: 110, output: 55), // first own usage
+            tokenEvent(at: now, input: 120, output: 60)
+        ], modified: now, metadataID: cliForkID, metadataSource: "cli",
+            metadataFields: ["forked_from_id": parentID, "parent_thread_id": parentID,
+                             "subagent_history_start_ordinal": 2])
+        let cliFork = try LocalCodexUsageReader.scan(directory: cliForkRoot, now: now)
+        check(cliFork.input == 20 && cliFork.output == 10 && cliFork.total == 30
+            && cliFork.sessionCount == 0 && cliFork.forkCount == 1 && cliFork.knownThreadCount == 1,
+            "cli source plus proven parent/fork markers contributes only its delta, never root full cumulative")
+        try? FileManager.default.removeItem(at: cliForkRoot.deletingLastPathComponent())
+
+        let cliForkMissingBaselineRoot = try fixtureDirectory("cli-fork-missing-baseline")
+        let cliForkMissingID = "33333333-3333-4333-8333-333333333338"
+        try writeSession(in: cliForkMissingBaselineRoot, uuid: cliForkMissingID, events: [
+            ordinaryEvent(at: now.addingTimeInterval(-2), type: "user_message"),
+            tokenEvent(at: now.addingTimeInterval(-1), input: 110, output: 55),
+            tokenEvent(at: now, input: 120, output: 60)
+        ], modified: now, metadataID: cliForkMissingID, metadataSource: "cli",
+            metadataFields: ["forked_from_id": parentID, "parent_thread_id": parentID,
+                             "subagent_history_start_ordinal": 2])
+        let cliForkMissingBaseline = try LocalCodexUsageReader.scan(directory: cliForkMissingBaselineRoot, now: now)
+        check(cliForkMissingBaseline.knownThreadCount == 0 && cliForkMissingBaseline.unknownThreadCount == 1
+            && cliForkMissingBaseline.sessionCount == 0 && cliForkMissingBaseline.input == 0,
+            "cli source cannot override a valid fork marker when its required baseline is missing")
+        try? FileManager.default.removeItem(at: cliForkMissingBaselineRoot.deletingLastPathComponent())
+
+        let illegalLineageRoot = try fixtureDirectory("illegal-lineage-not-root")
+        for (index, fields) in [
+            ["forked_from_id": "parent"], ["parent_thread_id": "parent"],
+            ["subagent": "unknown"], ["subagent_history_start_ordinal": -1]
+        ].enumerated() {
+            let id = String(format: "33333333-3333-4333-8333-%012d", index + 10)
+            try writeSession(in: illegalLineageRoot, uuid: id,
+                events: [tokenEvent(at: now, input: 55, output: 66)], modified: now,
+                metadataID: id, metadataFields: fields)
+        }
+        let illegalLineage = try LocalCodexUsageReader.scan(directory: illegalLineageRoot, now: now)
+        check(illegalLineage.knownThreadCount == 0 && illegalLineage.unknownThreadCount == 4
+            && illegalLineage.sessionCount == 0 && !illegalLineage.hasCompleteAccounting,
+            "invalid parent, fork, source, and ordinal markers cannot silently classify as roots")
+        try? FileManager.default.removeItem(at: illegalLineageRoot.deletingLastPathComponent())
+
+        let corruptLatestRoot = try fixtureDirectory("root-corrupt-latest-counter")
+        let corruptID = "41414141-4141-4141-8141-414141414141"
+        try writeSession(in: corruptLatestRoot, uuid: corruptID, events: [
+            tokenEvent(at: now.addingTimeInterval(-1), input: 50, output: 60),
+            rawTokenEvent(at: now, inputLiteral: "true", outputLiteral: "70")
+        ], modified: now)
+        let corruptLatest = try LocalCodexUsageReader.scan(directory: corruptLatestRoot, now: now)
+        check(corruptLatest.knownThreadCount == 0 && corruptLatest.unknownThreadCount == 1
+            && corruptLatest.input == 0 && corruptLatest.output == 0,
+            "malformed latest cumulative record makes root contribution unknown instead of reverting")
+        try? FileManager.default.removeItem(at: corruptLatestRoot.deletingLastPathComponent())
 
         let invalidRoot = try fixtureDirectory("invalid-counts")
         let validID = "44444444-4444-4444-8444-444444444444"
@@ -3540,8 +4412,10 @@ extension CoreChecks {
                 events: [rawTokenEvent(at: now, inputLiteral: literal, outputLiteral: "1")], modified: now)
         }
         let invalid = try LocalCodexUsageReader.scan(directory: invalidRoot, now: now)
-        check(invalid.input == 5 && invalid.output == 7 && invalid.sessionCount == 1,
-            "negative, fractional, boolean, overflowing and non-finite counters are rejected")
+        check(invalid.input == 5 && invalid.output == 7 && invalid.sessionCount == 6
+            && invalid.knownThreadCount == 1 && invalid.unknownThreadCount == 5
+            && !invalid.hasCompleteAccounting,
+            "negative, fractional, boolean, overflowing and non-finite counters are unknown without invalidating known subtotal")
         try? FileManager.default.removeItem(at: invalidRoot.deletingLastPathComponent())
 
         let exactRoot = try fixtureDirectory("exact-large-integer")
@@ -3560,8 +4434,9 @@ extension CoreChecks {
         try writeSession(in: truncatedRoot, uuid: "66666666-6666-4666-8666-666666666666",
             events: [complete], modified: now, prefix: paddedPrefix, suffix: Data("{\"partial\":".utf8))
         let truncated = try LocalCodexUsageReader.scan(directory: truncatedRoot, now: now)
-        check(truncated.input == 12 && truncated.output == 13,
-            "tail scan ignores the truncated first fragment and incomplete final JSON line")
+        check(truncated.knownThreadCount == 0 && truncated.unknownThreadCount == 1
+            && truncated.input == 0 && truncated.output == 0 && !truncated.hasCompleteAccounting,
+            "a nonempty incomplete final physical record makes the latest thread contribution unknown")
         try? FileManager.default.removeItem(at: truncatedRoot.deletingLastPathComponent())
 
         let quotaRoot = try fixtureDirectory("quota-snapshots")
@@ -3603,7 +4478,7 @@ extension CoreChecks {
         ], modified: now)
         let equalQuota = try LocalCodexUsageReader.scan(directory: equalQuotaRoot, now: now)
         check(equalQuota.fiveHour == nil && equalQuota.sevenDay == nil,
-            "same-timestamp later snapshot with missing windows clears older quota data")
+            "same-timestamp explicit empty rate_limits object clears older quota data")
         try? FileManager.default.removeItem(at: equalQuotaRoot.deletingLastPathComponent())
 
         let missingWindowRoot = try fixtureDirectory("missing-window")
@@ -3699,13 +4574,69 @@ extension CoreChecks {
         }
         let boundedCache = LocalCodexUsageReader.Cache()
         let bounded = try LocalCodexUsageReader.scan(directory: boundedRoot, now: now, cache: boundedCache)
-        check(bounded.sessionCount == 32 && bounded.isLimited,
-            "scan selects at most 32 sessions, reads only each bounded tail, and marks omitted history")
+        check(bounded.sessionCount == 32 && bounded.knownThreadCount == 32 && bounded.isLimited
+            && !bounded.hasCompleteAccounting,
+            "scan selects at most 32 metadata-classified roots and marks bounded coverage incomplete")
         let warmBounded = try LocalCodexUsageReader.scan(directory: boundedRoot, now: now, cache: boundedCache)
         check(boundedCache.diagnostics.cacheHits == 32 && boundedCache.diagnostics.bytesRead == 0
             && boundedCache.entryCount == 32 && warmBounded.isLimited,
-            "warm cache hits all 32 retained sessions without content reads and preserves tail limitation")
+            "warm cache hits all 32 retained file summaries without content reads and preserves limitation")
         try? FileManager.default.removeItem(at: boundedRoot.deletingLastPathComponent())
+
+        let readBudgetRoot = try fixtureDirectory("head-tail-10mib-budget")
+        var largePadding = Data(repeating: 0x78, count: 400 * 1024)
+        largePadding.append(10)
+        for index in 0..<32 {
+            let uuid = String(format: "45454545-4545-4545-8545-%012d", index + 1)
+            try writeSession(in: readBudgetRoot, uuid: uuid,
+                events: [tokenEvent(at: now, input: 2, output: 3)], modified: now,
+                prefix: largePadding)
+        }
+        let budgetCache = LocalCodexUsageReader.Cache()
+        let budgetSnapshot = try LocalCodexUsageReader.scan(directory: readBudgetRoot, now: now, cache: budgetCache)
+        check(budgetCache.diagnostics.bytesRead <= 10 * 1024 * 1024
+            && budgetCache.diagnostics.bytesRead > 8 * 1024 * 1024
+            && budgetSnapshot.knownThreadCount == 32 && budgetSnapshot.isLimited
+            && !budgetSnapshot.hasCompleteAccounting,
+            "32 files read only within aggregate 10 MiB head+tail budget and cannot claim complete totals")
+        try? FileManager.default.removeItem(at: readBudgetRoot.deletingLastPathComponent())
+
+        let continuousBoundaryRoot = try fixtureDirectory("continuous-records-cross-head-boundary")
+        let continuousID = "46464646-4646-4646-8646-464646464646"
+        let oneRecord = try ordinaryEvent(at: now.addingTimeInterval(-2), type: "user_message")
+        var continuousPrefix = Data()
+        continuousPrefix.append(try tokenEvent(at: now.addingTimeInterval(-3), input: 4, output: 2))
+        continuousPrefix.append(10)
+        continuousPrefix.append(try ordinaryEvent(at: now.addingTimeInterval(-2.5), type: "user_message"))
+        continuousPrefix.append(10)
+        while continuousPrefix.count < 70 * 1024 {
+            continuousPrefix.append(oneRecord)
+            continuousPrefix.append(10)
+        }
+        try writeSession(in: continuousBoundaryRoot, uuid: continuousID,
+            events: [tokenEvent(at: now, input: 10, output: 5)], modified: now,
+            prefix: continuousPrefix, metadataID: continuousID,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 2])
+        let continuousFileBytes = try Data(contentsOf: sessionURL(in: continuousBoundaryRoot, uuid: continuousID))
+        check(continuousFileBytes[64 * 1024 - 1] != 10,
+            "continuous boundary fixture places the actual file head cutoff inside a complete JSON record")
+        let continuousBoundary = try LocalCodexUsageReader.scan(directory: continuousBoundaryRoot, now: now)
+        check(!continuousBoundary.isLimited && continuousBoundary.input == 6
+            && continuousBoundary.output == 3 && continuousBoundary.total == 9
+            && continuousBoundary.knownThreadCount == 1 && continuousBoundary.unknownThreadCount == 0,
+            "a fully retained 64-320KiB file with valid records crossing the head boundary is not a read gap")
+        try? FileManager.default.removeItem(at: continuousBoundaryRoot.deletingLastPathComponent())
+
+        let emptyThenValidRoot = try fixtureDirectory("empty-file-does-not-stop-scan")
+        let emptyFirstPath = emptyThenValidRoot.appendingPathComponent("rollout-empty-00000000-0000-4000-8000-000000000000.jsonl")
+        try Data().write(to: emptyFirstPath)
+        try writeSession(in: emptyThenValidRoot, uuid: "47474747-4747-4747-8747-474747474747",
+            events: [tokenEvent(at: now, input: 7, output: 9)], modified: now)
+        let emptyThenValid = try LocalCodexUsageReader.scan(directory: emptyThenValidRoot, now: now)
+        check(emptyThenValid.knownThreadCount == 1 && emptyThenValid.input == 7 && emptyThenValid.output == 9
+            && emptyThenValid.unidentifiedFileCount == 1 && emptyThenValid.sessionCount == 1,
+            "an empty invalid file does not prevent discovery and accounting of a later valid file")
+        try? FileManager.default.removeItem(at: emptyThenValidRoot.deletingLastPathComponent())
 
         let entryRoot = try fixtureDirectory("bounded-entries")
         for _ in 0..<5001 {
@@ -3745,8 +4676,12 @@ extension CoreChecks {
     }
 
     private static func writeSession(in directory: URL, uuid: String, events: [Data], modified: Date,
-                                     prefix: Data = Data(), suffix: Data = Data()) throws {
-        var data = prefix
+                                     prefix: Data = Data(), suffix: Data = Data(),
+                                     metadataID: String? = nil, metadataSource: Any? = "cli",
+                                     metadataFields: [String: Any] = [:], metadata: Data? = nil) throws {
+        var data = metadata ?? sessionMetadata(id: metadataID ?? uuid, source: metadataSource, fields: metadataFields)
+        if !data.isEmpty { data.append(10) }
+        data.append(prefix)
         for event in events { data.append(event); data.append(10) }
         data.append(suffix)
         let url = sessionURL(in: directory, uuid: uuid)
@@ -3755,23 +4690,60 @@ extension CoreChecks {
     }
 
     private static func tokenEvent(at timestamp: Date, input: Int, output: Int, cached: Int = 0,
-                                   reasoning: Int = 0, rateLimits: [String: Any]? = nil) throws -> Data {
+                                   reasoning: Int = 0, rateLimits: Any? = nil) throws -> Data {
         var usage: [String: Any] = ["input_tokens": input, "output_tokens": output, "total_tokens": input + output]
         if cached > 0 { usage["cached_input_tokens"] = cached }
         if reasoning > 0 { usage["reasoning_output_tokens"] = reasoning }
         let info: [String: Any] = ["total_token_usage": usage]
-        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
-            "payload": ["type": "token_count", "info": info, "rate_limits": rateLimits ?? [:]]]
+        var payload: [String: Any] = ["type": "token_count", "info": info]
+        if let rateLimits { payload["rate_limits"] = rateLimits }
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg", "payload": payload]
         return try JSONSerialization.data(withJSONObject: event)
     }
 
-    private static func rawTokenEvent(at timestamp: Date, inputLiteral: String, outputLiteral: String) -> Data {
+    private static func quotaOnlyEvent(at timestamp: Date, rateLimits: Any) throws -> Data {
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
+            "payload": ["type": "token_count", "info": [:], "rate_limits": rateLimits]]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func ordinaryEvent(at timestamp: Date, type: String) throws -> Data {
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
+            "payload": ["type": type]]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func threadSettingsApplied(at timestamp: Date, threadID: String) throws -> Data {
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
+            "payload": ["type": "thread_settings_applied", "thread_id": threadID,
+                        "thread_settings": ["model": "synthetic"]]]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func sessionMetadata(id: String?, source: Any?, fields: [String: Any] = [:]) -> Data {
+        var payload = fields
+        if let id { payload["id"] = id }
+        if let source { payload["source"] = source }
+        let object: [String: Any] = ["type": "session_meta", "payload": payload]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+    }
+
+    private static func rawTokenEvent(at timestamp: Date, inputLiteral: String, outputLiteral: String,
+                                     totalLiteral: String? = nil) -> Data {
         let time = iso(timestamp)
-        return Data("{\"timestamp\":\"\(time)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\(inputLiteral),\"output_tokens\":\(outputLiteral),\"total_tokens\":1}}}}".utf8)
+        let totalJSON = totalLiteral ?? "1"
+        return Data("{\"timestamp\":\"\(time)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\(inputLiteral),\"output_tokens\":\(outputLiteral),\"total_tokens\":\(totalJSON)}}}}".utf8)
     }
 
     private static func turnTokenEvent(at timestamp: Date, output: Int) throws -> Data {
         let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
+            "payload": ["type": "token_count", "info": ["total_token_usage": [
+                "input_tokens": 0, "output_tokens": output, "total_tokens": output]]]]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func turnTokenEventWithoutTimestamp(output: Int) throws -> Data {
+        let event: [String: Any] = ["type": "event_msg",
             "payload": ["type": "token_count", "info": ["total_token_usage": [
                 "input_tokens": 0, "output_tokens": output, "total_tokens": output]]]]
         return try JSONSerialization.data(withJSONObject: event)
@@ -3785,6 +4757,12 @@ extension CoreChecks {
         else if durationLiteral == "null" { payload["duration_ms"] = NSNull() }
         else if let durationLiteral { payload["duration_ms"] = durationLiteral }
         let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg", "payload": payload]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func turnBoundaryWithoutTimestamp(type: String, id: String) throws -> Data {
+        let event: [String: Any] = ["type": "event_msg",
+            "payload": ["type": type, "turn_id": id]]
         return try JSONSerialization.data(withJSONObject: event)
     }
 
@@ -3828,16 +4806,22 @@ final class TokenStatUISnapshotTests: XCTestCase {
     func testLocalStatusTitleUsesCompletedTurnAndRecordedSessionTotal() throws {
         let model = AppModel(preview: true)
         defer { model.shutdown() }
+        model.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
+            filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0)
         XCTAssertTrue(model.title.contains("上轮均:—"))
         model.localSnapshot = LocalCodexSnapshot(input: 125, output: 300, total: 425,
             sessionCount: 2, filesScanned: 2, isLimited: false,
             latestEventAt: Date(timeIntervalSince1970: 1_797_000_000), fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 2, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0,
             lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
                 completedAt: Date(timeIntervalSince1970: 1_797_000_000)))
-        XCTAssertEqual(model.title, "上轮均:15.0tok/s · Σ425 · 2会话")
-        XCTAssertTrue(model.dataNotice.contains("历史累计"))
+        XCTAssertEqual(model.title, "上轮均:15.0tok/s · Σ425 · 2顶层对话")
+        XCTAssertTrue(model.dataNotice.contains("当前扫描范围记录小计"))
         XCTAssertTrue(model.menuTooltip.contains("425"))
-        XCTAssertTrue(model.menuTooltip.contains("2会话"))
+        XCTAssertTrue(model.menuTooltip.contains("顶层对话 2"))
         XCTAssertTrue(model.menuTooltip.contains("含工具、网络和等待"))
         XCTAssertTrue(model.menuTooltip.contains("5 小时"))
         XCTAssertTrue(model.menuTooltip.contains("7 天"))
@@ -3845,6 +4829,8 @@ final class TokenStatUISnapshotTests: XCTestCase {
         model.localSnapshot = LocalCodexSnapshot(input: 1_234_200, output: 367, total: 1_234_567,
             sessionCount: 2, filesScanned: 2, isLimited: false,
             latestEventAt: Date(timeIntervalSince1970: 1_797_000_000), fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 2, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0,
             lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
                 completedAt: Date(timeIntervalSince1970: 1_797_000_000)))
         let fullTotal = 1_234_567.formatted(.number)
@@ -3858,6 +4844,103 @@ final class TokenStatUISnapshotTests: XCTestCase {
         model.fiveHourQuota = try QuotaReport.parse(futureQuotaData, config: AppConfiguration(),
             now: Date().addingTimeInterval(3600)).fiveHour
         XCTAssertTrue(model.menuTooltip.contains("异常时间戳"), "tooltip should label future quota data anomalous")
+    }
+
+    func testC12LocalAccountingUINeverLabelsPartialSubtotalAsComplete() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        let known = LocalCodexSnapshot(input: 30, output: 20, total: 50, sessionCount: 1,
+            filesScanned: 2, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 1, unknownThreadCount: 2, unidentifiedFileCount: 1,
+            subagentCount: 0, forkCount: 0)
+        XCTAssertFalse(known.hasCompleteAccounting)
+        model.localSnapshot = known
+        XCTAssertTrue(model.title.contains("小计50"))
+        XCTAssertTrue(model.title.contains("未核验3"))
+        XCTAssertFalse(model.title.contains("Σ50"))
+        XCTAssertTrue(model.menuTooltip.contains("输入 30"))
+        XCTAssertTrue(model.menuTooltip.contains("输出 20"))
+        XCTAssertTrue(model.menuTooltip.contains("总计 50"))
+        XCTAssertTrue(model.menuTooltip.contains("未核验线程 2"))
+        XCTAssertTrue(model.menuTooltip.contains("未识别文件 1"))
+        XCTAssertFalse(model.menuTooltip.contains("本次扫描记录量 50"))
+
+        model.localSnapshot = LocalCodexSnapshot(input: 8, output: 2, total: 10, sessionCount: 0,
+            filesScanned: 1, isLimited: true, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 1, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0)
+        XCTAssertFalse(model.localSnapshot.hasCompleteAccounting, "a scan limit prevents complete accounting")
+        XCTAssertTrue(model.title.contains("小计10"))
+        XCTAssertFalse(model.title.contains("Σ10"))
+
+        model.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
+            filesScanned: 2, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 2,
+            subagentCount: 0, forkCount: 0)
+        XCTAssertTrue(model.title.contains("Σ—"), "without any known thread, zero is unknown rather than an exact total")
+
+        model.localSnapshot = LocalCodexSnapshot(input: 30, output: 20, total: 50, sessionCount: 1,
+            filesScanned: 1, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 1, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0)
+        XCTAssertTrue(model.localSnapshot.hasCompleteAccounting)
+        XCTAssertTrue(model.title.contains("Σ50"), "complete metadata-backed accounting may show exact total")
+        XCTAssertTrue(model.menuTooltip.contains("本次扫描记录量 50"))
+    }
+
+    func testC12AccountingDashboardExportsSyntheticReviewRenders() throws {
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent("TokenStatMenu-C12-review", isDirectory: true)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        let scenarios: [(String, LocalCodexSnapshot)] = [
+            ("known-subagent-no-top-level", LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
+                filesScanned: 1, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+                knownThreadCount: 1, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 1, forkCount: 1)),
+            ("partial-accounting", LocalCodexSnapshot(input: 30, output: 20, total: 50, sessionCount: 1,
+                filesScanned: 4, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+                knownThreadCount: 1, unknownThreadCount: 2, unidentifiedFileCount: 1, subagentCount: 0, forkCount: 0)),
+            ("zero-known-threads", LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
+                filesScanned: 2, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+                knownThreadCount: 0, unknownThreadCount: 2, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0))
+        ]
+        var paths: [String] = []
+        for (scenario, snapshot) in scenarios {
+            let model = AppModel(preview: true)
+            model.config.dataSource = "localCodex"
+            model.localSnapshot = snapshot
+            for (scheme, appearance) in [(ColorScheme.light, NSAppearance.Name.aqua), (.dark, .darkAqua)] {
+                let content = DashboardView(model: model)
+                    .environment(\.colorScheme, scheme)
+                    .frame(width: 460, height: 700)
+                    .background(scheme == .dark ? Color(red: 0.13, green: 0.14, blue: 0.17) : Color(red: 0.96, green: 0.97, blue: 0.99))
+                let bounds = NSRect(x: 0, y: 0, width: 460, height: 700)
+                let host = NSHostingView(rootView: content)
+                let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
+                window.isReleasedWhenClosed = false
+                window.appearance = NSAppearance(named: appearance)
+                window.contentView = host
+                window.setFrameOrigin(NSPoint(x: -10000, y: -10000))
+                host.frame = bounds
+                host.layoutSubtreeIfNeeded()
+                RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+                host.layoutSubtreeIfNeeded()
+                guard let bitmap = host.bitmapImageRepForCachingDisplay(in: bounds) else {
+                    throw NSError(domain: "C12DashboardRender", code: 1)
+                }
+                host.cacheDisplay(in: bounds, to: bitmap)
+                guard let png = bitmap.representation(using: .png, properties: [:]) else {
+                    throw NSError(domain: "C12DashboardRender", code: 2)
+                }
+                let name = "\(scenario)-\(scheme == .dark ? "dark" : "light").png"
+                let url = output.appendingPathComponent(name)
+                try png.write(to: url)
+                XCTAssertGreaterThan(try Data(contentsOf: url).count, 0)
+                paths.append(url.path)
+                window.close()
+            }
+            model.shutdown()
+        }
+        print("C12 synthetic accounting Dashboard renders: \(paths.joined(separator: ", "))")
     }
 
     func testEnterpriseQuotaAlertsUseOnlyFreshIndependentWindows() throws {
@@ -4567,10 +5650,13 @@ def main():
             local_home = WORK / "local-codex"
             session_dir = local_home / "sessions" / "2026" / "10" / "17"
             session_dir.mkdir(parents=True)
+            session_meta = {"type": "session_meta", "payload": {
+                "id": "12345678-1234-4234-8234-123456789abc", "source": "cli"}}
             event = {"timestamp": "2026-10-17T03:00:00Z", "type": "event_msg", "payload": {
                 "type": "token_count", "info": {"total_token_usage": {
                     "input_tokens": 23, "output_tokens": 7, "total_tokens": 30}}, "rate_limits": {}}}
-            (session_dir / "rollout-fixture-12345678-1234-4234-8234-123456789abc.jsonl").write_text(json.dumps(event) + "\n")
+            (session_dir / "rollout-fixture-12345678-1234-4234-8234-123456789abc.jsonl").write_text(
+                json.dumps(session_meta) + "\n" + json.dumps(event) + "\n")
             local_config = WORK / "local.plist"
             with local_config.open("wb") as handle:
                 plistlib.dump({"port": 19879, "dataSource": "localCodex"}, handle)
@@ -4580,7 +5666,7 @@ def main():
                 "--test-fixture", "--disable-discovery", "--diagnostics-output", str(local_diagnostic)]
             subprocess.run(local_command, check=True)
             local = wait_for(lambda: (r if (r := json.loads(local_diagnostic.read_text())).get("hasRequestData") else None))
-            assert local["title"] == "测试 上轮均:— · Σ30 · 1会话" and local["isTestFixture"], local
+            assert local["title"] == "测试 上轮均:— · Σ30 · 1顶层对话" and local["isTestFixture"], local
             assert "模拟测试" in local["dataNotice"], local
             assert (local.get("quotaUsed") is None and local.get("fiveHourUsedPercent") is None
                 and local.get("sevenDayUsedPercent") is None), local
@@ -5092,7 +6178,7 @@ cd TokenStatMenu
 
 ## 首次配置与接入
 
-首次启动默认使用本机 Codex 记录：每次后台扫描完成后等待 5 秒再扫描，未变化文件仅校验元数据并复用内存中的数值摘要，读取已知 sessions 目录内最近最多 32 个会话、每个文件尾部最多 256 KiB。没有有效计量事件时显示未知，不把缺失当作零。未配置的新安装使用本机来源；已有明确代理配置保持代理模式。
+首次启动默认使用本机 Codex 记录：每次后台扫描完成后等待 5 秒再扫描，未变化文件仅校验元数据并复用内存中的数值摘要，只枚举已知 sessions 目录内最多 5,000 个目录项，在枚举范围按修改时间排序选取最多 32 个物理文件；不是整个账户最新 32 个对话的保证。每文件读取头部最多 64 KiB 与尾部最多 256 KiB，重叠不重复读取，单次总量最多 10 MiB。没有有效计量事件时显示未知，不把缺失当作零。未配置的新安装使用本机来源；已有明确代理配置保持代理模式。
 
 以下步骤用于需要流式速度估算的**代理模式**，先在设置中切换数据来源：
 
@@ -5125,6 +6211,15 @@ curl -N http://127.0.0.1:18765/v1/chat/completions \
 Codex 如使用 Responses，需要通过其受支持的自定义 provider 配置将请求接入本机 `/v1`。企业客户端可能自行覆盖配置或使用额外认证，必须按该客户端接入方式处理。本项目没有更改你现在的 Codex 或企业网关配置。
 
 ## 关键计算口径
+
+### 本机记录身份与计量范围
+
+- 逻辑线程身份来自文件第一条完整 `session_meta.payload.id`，不使用文件名尾部 UUID：同一线程的不同 rollout 文件可能有不同文件名。祖先 metadata 不覆盖首条身份。
+- 同 inode 或能在预算内证明全文一致的副本只计一次；同一线程存在内容冲突或无法完整比较的版本时，整组标为未核算，不按修改时间猜哪份正确。
+- 根线程使用最后有效累计作为来源记录量。它可能受上游上下文处理影响，不是企业计费流水。最后明确累计损坏时不会偷偷采用旧值。
+- 复制式分叉只在初始化边界、继承基线及最终累计间的记录完整连续时，逐项计算输入、输出、总量的差。缺失、回退、越界或中间未读取时标为未核算。引用式父历史目前未核算，不减去父线程当前总量，也不把子线程继承量重复加入。
+- 小计保留可核算线程的值，未知项不会当作零。达到扫描上限时也不显示成完整 `Σ`。这些限制会导致无法提供完整历史总量，界面会如实说明。
+- `rate_limits` 缺失或为 `null` 表示没有新的额度证据，不清除已读范围内的历史快照；合法显式空对象 `{}` 清除，合法非空窗口对象整体替换，不补接其他事件的窗口。异常对象被拒绝。本地记录没有提供的 5 小时窗口仍是未知。
 
 ### SSE 与 Token 计数
 
@@ -5159,7 +6254,7 @@ OpenAI 兼容网关可能拒绝 `stream_options.include_usage`；可在设置关
 
 ## 本机网关自动发现与隐私
 
-本机记录模式仅扫描 `$CODEX_HOME/sessions`（未设置则 `~/.codex/sessions`）。扫描有文件数、枚举数和字节上限，拒绝符号链接；只保留计量数值、时间及扫描状态。会话文件可能含有正文，因此读取文件尾部会短暂接触这些字节，但不会保留、导出或上传正文。本机模式不读取认证文件或钥匙串，也不启动代理或访问配额接口。
+本机记录模式仅扫描 `$CODEX_HOME/sessions`（未设置则 `~/.codex/sessions`）。扫描有文件数、枚举数和字节上限，拒绝符号链接；只保留计量数值、时间及扫描状态。会话文件可能含有正文，因此有界读取头部与尾部会短暂接触这些字节，但不会保留、导出或上传正文。仅在内存缓存受限的身份/摘要与计量数值，以验证去重和读取变化；这些标识不进入公开快照或日志。本机模式不读取认证文件或钥匙串，也不启动代理或访问配额接口。
 
 代理模式的网关发现会在启动时及点击“重新扫描”时读取 `$CODEX_HOME/config.toml`（未设置则 `~/.codex/config.toml`），只提取 `model`、`model_provider`、`profile` 以及 provider 的 `base_url`、`wire_api`。支持常见的单行字符串 TOML 与活动 profile；不支持的复杂形式不猜测、不导入。配置文件限制 1MB，不做目录递归扫描。
 

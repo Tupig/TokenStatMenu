@@ -16,7 +16,7 @@ struct SpeedPoint: Identifiable {
     let isTestFixture = CommandLine.arguments.contains("--test-fixture")
     @Published var config = AppConfiguration()
     @Published var stats = MetricsSnapshot()
-    @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil)
+    @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
     @Published var quota: QuotaSnapshot?
     @Published var fiveHourQuota: WindowQuota?
     @Published var sevenDayQuota: WindowQuota?
@@ -110,17 +110,20 @@ struct SpeedPoint: Identifiable {
     var currencyFactor: Double { config.currency == "CNY" ? config.usdToCNY : 1 }
     var currencySymbol: String { config.currency == "CNY" ? "¥" : "$" }
     var quotaSource: QuotaSource { config.dataSource == "localCodex" ? .localCodex : .enterprise }
-    var hasRequestData: Bool { config.dataSource == "localCodex" ? localSnapshot.sessionCount > 0 : stats.requests > 0 }
+    var hasRequestData: Bool { config.dataSource == "localCodex" ? localSnapshot.knownThreadCount > 0 : stats.requests > 0 }
     var dataNotice: String {
         if isTestFixture { return "模拟测试 · 以下速度、Token、费用和配额均非企业真实数据" }
-        if config.dataSource == "localCodex" { return "本地 Codex 会话记录 · 历史累计用量，不代表企业总量或实时用量；账号与组织归属未核验" }
+        if config.dataSource == "localCodex" { return "本地 Codex 当前扫描范围记录小计 · 不代表账单或实时用量；账号与组织归属未核验" }
         return hasRequestData ? "本次启动 · 仅统计经过本机代理的请求" : "未采集到请求数据 · 尚未观测到客户端流量"
     }
     var title: String {
         if config.dataSource == "localCodex" {
             let rate = localSnapshot.lastTurn.map { String(format: "%.1ftok/s", $0.outputTPS) } ?? "—"
-            let total = localSnapshot.sessionCount > 0 ? formatCompactCount(localSnapshot.total) : "—"
-            return (isTestFixture ? "测试 " : "") + "上轮均:\(rate) · Σ\(total) · \(localSnapshot.sessionCount)会话"
+            let uncertainty = localSnapshot.unknownThreadCount + localSnapshot.unidentifiedFileCount
+            let total = localSnapshot.hasCompleteAccounting ? "Σ\(formatCompactCount(localSnapshot.total))"
+                : localSnapshot.knownThreadCount > 0 ? "小计\(formatCompactCount(localSnapshot.total)) · 未核验\(uncertainty)" : "Σ— · 未核验\(uncertainty)"
+            let sessions = localSnapshot.hasCompleteAccounting ? " · \(localSnapshot.sessionCount)顶层对话" : ""
+            return (isTestFixture ? "测试 " : "") + "上轮均:\(rate) · \(total)\(sessions)"
         }
         let value = !hasRequestData ? "T:—" : stats.active > 0
             ? String(format: "T:≈%.1ftok/s", stats.outputTPS) : "T:0.0tok/s"
@@ -133,8 +136,15 @@ struct SpeedPoint: Identifiable {
         }
         let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
         let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
-        let coverage = "扫描上限：最多32个会话文件、每文件尾部256KiB、总计8MiB；" + (localSnapshot.isLimited ? "本次达到上限，记录可能不完整" : "本次已检查 \(localSnapshot.filesScanned) 个会话文件，\(localSnapshot.sessionCount) 个含有效累计用量")
-        return "本地 Codex 历史累计：\(formatCount(localSnapshot.total)) tokens · \(localSnapshot.sessionCount)会话\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+        let coverage = "扫描范围最多32个物理文件；不是全部对话；每文件头64KiB与尾256KiB，总计10MiB；" + (localSnapshot.isLimited ? "本次达到扫描上限" : "本次安全检查 \(localSnapshot.filesScanned) 个物理文件")
+        let input = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.input) : "未知"
+        let output = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.output) : "未知"
+        let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "已核验记录小计"
+        let total = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.total) : "未知"
+        return "本地 Codex 当前扫描范围记录：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+    }
+    private var accountingDetail: String {
+        "已核验线程 \(localSnapshot.knownThreadCount) · 未核验线程 \(localSnapshot.unknownThreadCount) · 未识别文件 \(localSnapshot.unidentifiedFileCount) · 子代理 \(localSnapshot.subagentCount) · 分叉 \(localSnapshot.forkCount) · 顶层对话 \(localSnapshot.sessionCount)"
     }
     private func quotaDescription(_ quota: WindowQuota?, source: QuotaSource) -> String {
         let presentation = WindowQuotaCard.presentation(for: quota, refreshSeconds: config.refreshSeconds, source: source)
@@ -253,7 +263,7 @@ struct SpeedPoint: Identifiable {
                                 self.localSnapshot = result; self.fiveHourQuota = result.fiveHour; self.sevenDayQuota = result.sevenDay
                                 self.quotaError = result.latestEventAt == nil ? "未发现有效本地用量记录" : "额度来自 Codex 会话事件，可能已过期"
                             } else {
-                                self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil)
+                                self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
                                 self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
                             }
                         }

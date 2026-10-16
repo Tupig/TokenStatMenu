@@ -174,10 +174,13 @@ def main():
             local_home = WORK / "local-codex"
             session_dir = local_home / "sessions" / "2026" / "10" / "17"
             session_dir.mkdir(parents=True)
+            session_meta = {"type": "session_meta", "payload": {
+                "id": "12345678-1234-4234-8234-123456789abc", "source": "cli"}}
             event = {"timestamp": "2026-10-17T03:00:00Z", "type": "event_msg", "payload": {
                 "type": "token_count", "info": {"total_token_usage": {
                     "input_tokens": 23, "output_tokens": 7, "total_tokens": 30}}, "rate_limits": {}}}
-            (session_dir / "rollout-fixture-12345678-1234-4234-8234-123456789abc.jsonl").write_text(json.dumps(event) + "\n")
+            (session_dir / "rollout-fixture-12345678-1234-4234-8234-123456789abc.jsonl").write_text(
+                json.dumps(session_meta) + "\n" + json.dumps(event) + "\n")
             local_config = WORK / "local.plist"
             with local_config.open("wb") as handle:
                 plistlib.dump({"port": 19879, "dataSource": "localCodex"}, handle)
@@ -187,7 +190,7 @@ def main():
                 "--test-fixture", "--disable-discovery", "--diagnostics-output", str(local_diagnostic)]
             subprocess.run(local_command, check=True)
             local = wait_for(lambda: (r if (r := json.loads(local_diagnostic.read_text())).get("hasRequestData") else None))
-            assert local["title"] == "测试 上轮均:— · Σ30 · 1会话" and local["isTestFixture"], local
+            assert local["title"] == "测试 上轮均:— · Σ30 · 1顶层对话" and local["isTestFixture"], local
             assert "模拟测试" in local["dataNotice"], local
             assert (local.get("quotaUsed") is None and local.get("fiveHourUsedPercent") is None
                 and local.get("sevenDayUsedPercent") is None), local

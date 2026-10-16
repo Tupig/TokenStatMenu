@@ -46,7 +46,10 @@ extension CoreChecks {
         check(aggregate.input == 6 && aggregate.output == 9 && aggregate.total == 15,
             "local Codex totals use each session's last cumulative counter, including a lower reset value")
         check(aggregate.sessionCount == 2 && aggregate.latestEventAt == now.addingTimeInterval(-60),
-            "local Codex reports unique session count and latest event timestamp")
+            "local Codex reports metadata-backed top-level count and latest event timestamp")
+        check(aggregate.knownThreadCount == 2 && aggregate.unknownThreadCount == 0
+            && aggregate.unidentifiedFileCount == 0 && aggregate.hasCompleteAccounting,
+            "two valid root metadata records produce complete accounting independently of session count")
         check(aggregate.input == 6 && aggregate.output == 9,
             "cached input and reasoning output subfields are not added twice")
         let rescanned = try LocalCodexUsageReader.scan(directory: aggregateRoot, now: now)
@@ -55,8 +58,25 @@ extension CoreChecks {
             "repeated local Codex scans replace the snapshot instead of accumulating it")
         let reflectedFields = Set(Mirror(reflecting: aggregate).children.compactMap(\.label))
         check(reflectedFields == Set(["input", "output", "total", "sessionCount", "filesScanned",
-            "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn"]),
-            "local Codex snapshot exposes only bounded numeric turn and aggregate metadata")
+            "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn", "knownThreadCount",
+            "unknownThreadCount", "unidentifiedFileCount", "subagentCount", "forkCount"]),
+            "local Codex snapshot reflection exposes only the bounded metadata fields")
+
+        let exactZeroRoot = try fixtureDirectory("metadata-backed-exact-zero")
+        try writeSession(in: exactZeroRoot, uuid: "12121212-1212-4212-8212-121212121213",
+            events: [tokenEvent(at: now, input: 0, output: 0)], modified: now)
+        let exactZero = try LocalCodexUsageReader.scan(directory: exactZeroRoot, now: now)
+        check(exactZero.knownThreadCount == 1 && exactZero.hasCompleteAccounting
+            && exactZero.total == 0,
+            "a metadata-backed known zero is distinguishable from absence of any known thread")
+        try? FileManager.default.removeItem(at: exactZeroRoot.deletingLastPathComponent())
+
+        let noEvidenceRoot = try fixtureDirectory("no-accounting-evidence")
+        let noEvidence = try LocalCodexUsageReader.scan(directory: noEvidenceRoot, now: now)
+        check(noEvidence.knownThreadCount == 0 && noEvidence.unknownThreadCount == 0
+            && noEvidence.unidentifiedFileCount == 0 && !noEvidence.hasCompleteAccounting,
+            "no files is unknown coverage, not a complete exact zero")
+        try? FileManager.default.removeItem(at: noEvidenceRoot.deletingLastPathComponent())
 
         let turnRoot = try fixtureDirectory("completed-turn")
         let turnID = "abababab-abab-4bab-8bab-aaaaaaaaaaaa"
@@ -212,6 +232,14 @@ extension CoreChecks {
             ("reused-id", [turnTokenEvent(at: now.addingTimeInterval(-5), output: 1), turnBoundary(at: now.addingTimeInterval(-4), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-3), output: 2), turnBoundary(at: now.addingTimeInterval(-2), type: "task_complete", id: "x", durationMS: 1000), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now, output: 3), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
             ("post-complete-usage", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000), turnTokenEvent(at: now, output: 4)]),
             ("mismatched-id", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "y", durationMS: 1000)]),
+            ("missing-start-timestamp-with-duration", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1),
+                turnBoundaryWithoutTimestamp(type: "task_started", id: "x"),
+                turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2),
+                turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("missing-baseline-timestamp-with-duration", [turnTokenEventWithoutTimestamp(output: 1),
+                turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"),
+                turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2),
+                turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
             ("aborted", [turnTokenEvent(at: now.addingTimeInterval(-3), output: 1), turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now.addingTimeInterval(-0.5), type: "turn_aborted", id: "x"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
             ("future-complete", [turnTokenEvent(at: now.addingTimeInterval(-3), output: 1), turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now.addingTimeInterval(1), type: "task_complete", id: "x", durationMS: 1000)]),
             ("timestamp-regression", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
@@ -308,9 +336,11 @@ extension CoreChecks {
         truncatedBytes.removeLast(min(10, truncatedBytes.count))
         try truncatedBytes.write(to: cachedPath)
         let truncatedCache = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
-        check(truncatedCache.input == 2 && truncatedCache.output == 3
+        check(truncatedCache.input == 0 && truncatedCache.output == 0
+            && truncatedCache.knownThreadCount == 0 && truncatedCache.unknownThreadCount == 1
+            && !truncatedCache.hasCompleteAccounting
             && cache.diagnostics.cacheHits == 0 && cache.diagnostics.bytesRead > 0,
-            "truncating a cached file reparses and falls back to its remaining valid line")
+            "truncating a cached latest cumulative line reparses and makes the thread unknown")
         let otherRoot = try fixtureDirectory("cache-other-root")
         try writeSession(in: otherRoot, uuid: "aeaeaeae-aeae-4eae-8eae-aaaaaaaaaaaa",
             events: [tokenEvent(at: now, input: 9, output: 9)], modified: now)
@@ -396,14 +426,607 @@ extension CoreChecks {
         try FileManager.default.moveItem(at: lowercaseFixture,
             to: duplicateRoot.appendingPathComponent("rollout-primary-\(duplicateID).jsonl"))
         try writeSession(in: duplicateRoot, uuid: duplicateID.uppercased(),
-            events: [tokenEvent(at: now.addingTimeInterval(-10), input: 8, output: 9)], modified: now)
+            events: [tokenEvent(at: now.addingTimeInterval(-10), input: 8, output: 9)], modified: now,
+            metadataID: duplicateID.uppercased())
         let uppercaseFixture = sessionURL(in: duplicateRoot, uuid: duplicateID.uppercased())
         try FileManager.default.moveItem(at: uppercaseFixture,
             to: duplicateRoot.appendingPathComponent("rollout-alias-\(duplicateID.uppercased()).jsonl"))
         let duplicate = try LocalCodexUsageReader.scan(directory: duplicateRoot, now: now)
-        check(duplicate.sessionCount == 1 && duplicate.input == 8 && duplicate.output == 9,
-            "UUID suffix aliases canonicalize and newest modified duplicate contributes once")
+        check(duplicate.sessionCount == 0 && duplicate.knownThreadCount == 0
+            && duplicate.unknownThreadCount == 1 && !duplicate.hasCompleteAccounting,
+            "same metadata UUID with non-identical rollouts is an unknown conflict group, never an mtime winner")
         try? FileManager.default.removeItem(at: duplicateRoot.deletingLastPathComponent())
+
+        let identicalRoot = try fixtureDirectory("byte-identical-rollout-copy")
+        let identicalID = "abab2222-2222-4222-8222-222222222222"
+        try writeSession(in: identicalRoot, uuid: identicalID,
+            events: [tokenEvent(at: now, input: 8, output: 9)], modified: now)
+        let original = sessionURL(in: identicalRoot, uuid: identicalID)
+        let copy = identicalRoot.appendingPathComponent("rollout-copy-ffffffff-ffff-4fff-8fff-ffffffffffff.jsonl")
+        try FileManager.default.copyItem(at: original, to: copy)
+        let identical = try LocalCodexUsageReader.scan(directory: identicalRoot, now: now)
+        check(identical.knownThreadCount == 1 && identical.unknownThreadCount == 0
+            && identical.input == 8 && identical.output == 9,
+            "complete byte-identical physical rollouts collapse to one known logical thread")
+        let hardlink = identicalRoot.appendingPathComponent("rollout-hardlink.jsonl")
+        try FileManager.default.linkItem(at: original, to: hardlink)
+        let hardlinked = try LocalCodexUsageReader.scan(directory: identicalRoot, now: now)
+        check(hardlinked.knownThreadCount == 1 && hardlinked.unknownThreadCount == 0
+            && hardlinked.input == 8 && hardlinked.output == 9,
+            "hardlinked physical paths collapse by inode identity")
+        try? FileManager.default.removeItem(at: identicalRoot.deletingLastPathComponent())
+
+        let unprovenDuplicateRoot = try fixtureDirectory("duplicate-unproven-middle")
+        let unprovenID = "abab2323-2323-4323-8323-232323232323"
+        var firstMiddle = Data(repeating: 0x61, count: 400 * 1024)
+        var secondMiddle = firstMiddle
+        secondMiddle.replaceSubrange(100 * 1024..<100 * 1024 + 1, with: [0x62])
+        firstMiddle.append(10)
+        secondMiddle.append(10)
+        let unprovenSecondName = "rollout-copy-\(unprovenID).jsonl"
+        let unprovenFirstName = "rollout-primary-\(unprovenID).jsonl"
+        try writeSession(in: unprovenDuplicateRoot, uuid: unprovenID,
+            events: [tokenEvent(at: now, input: 8, output: 9)], modified: now,
+            prefix: firstMiddle)
+        try FileManager.default.moveItem(at: sessionURL(in: unprovenDuplicateRoot, uuid: unprovenID),
+            to: unprovenDuplicateRoot.appendingPathComponent(unprovenFirstName))
+        try writeSession(in: unprovenDuplicateRoot, uuid: unprovenID.uppercased(),
+            events: [tokenEvent(at: now, input: 8, output: 9)], modified: now,
+            prefix: secondMiddle, metadataID: unprovenID)
+        try FileManager.default.moveItem(at: sessionURL(in: unprovenDuplicateRoot, uuid: unprovenID.uppercased()),
+            to: unprovenDuplicateRoot.appendingPathComponent(unprovenSecondName))
+        let unprovenDuplicate = try LocalCodexUsageReader.scan(directory: unprovenDuplicateRoot, now: now)
+        check(unprovenDuplicate.knownThreadCount == 0 && unprovenDuplicate.unknownThreadCount == 1,
+            "matching bounded head and tail cannot prove whole-file identity when middle bytes differ")
+        try? FileManager.default.removeItem(at: unprovenDuplicateRoot.deletingLastPathComponent())
+
+        let identityRoot = try fixtureDirectory("metadata-identity-and-classification")
+        let identities = [
+            ("15151515-1515-4515-8515-151515151515", "cli" as Any?),
+            ("16161616-1616-4616-8616-161616161616", "vscode" as Any?),
+            ("17171717-1717-4717-8717-171717171717", "exec" as Any?),
+            ("18181818-1818-4818-8818-181818181818", "mcp" as Any?)
+        ]
+        for item in identities {
+            try writeSession(in: identityRoot, uuid: item.0,
+                events: [tokenEvent(at: now, input: 1, output: 2)], modified: now,
+                metadataSource: item.1)
+        }
+        let laterAncestorID = "19191919-1919-4919-8919-191919191919"
+        let childID = "20202020-2020-4020-8020-202020202020"
+        let ancestorMeta = sessionMetadata(id: laterAncestorID, source: "cli")
+        try writeSession(in: identityRoot, uuid: "21212121-2121-4121-8121-212121212121",
+            events: [ancestorMeta, tokenEvent(at: now, input: 3, output: 4)], modified: now,
+            metadataID: childID, metadataSource: ["subagent": "review"],
+            metadataFields: ["parent_thread_id": firstID])
+        let unidentifiedMetadata = try fixtureDirectory("metadata-unidentified-files")
+        try writeSession(in: unidentifiedMetadata, uuid: "22222222-2222-4222-8222-222222222222",
+            events: [tokenEvent(at: now, input: 9, output: 9)], modified: now,
+            metadata: sessionMetadata(id: nil, source: "cli"))
+        try writeSession(in: unidentifiedMetadata, uuid: "23232323-2323-4323-8323-232323232323",
+            events: [tokenEvent(at: now, input: 8, output: 8)], modified: now,
+            metadata: tokenEvent(at: now, input: 0, output: 0))
+        try writeSession(in: unidentifiedMetadata, uuid: "24242424-2424-4424-8424-242424242424",
+            events: [tokenEvent(at: now, input: 7, output: 7)], modified: now,
+            metadataID: "not-a-uuid", metadataSource: "cli")
+        try writeSession(in: unidentifiedMetadata, uuid: "25252525-2525-4525-8525-252525252525",
+            events: [tokenEvent(at: now, input: 6, output: 6)], modified: now,
+            metadataSource: "futureSource")
+        try writeSession(in: unidentifiedMetadata, uuid: "26262626-2626-4626-8626-262626262626",
+            events: [tokenEvent(at: now, input: 5, output: 5)], modified: now, metadataSource: nil)
+        try writeSession(in: unidentifiedMetadata, uuid: "27272727-2727-4727-8727-272727272727",
+            events: [tokenEvent(at: now, input: 4, output: 4)], modified: now,
+            metadataSource: ["custom": ["name": "fixture"]])
+        try writeSession(in: unidentifiedMetadata, uuid: "28282828-2828-4828-8828-282828282828",
+            events: [tokenEvent(at: now, input: 3, output: 3)], modified: now,
+            metadataSource: ["internal": "fixture"])
+        try writeSession(in: unidentifiedMetadata, uuid: "29292929-2929-4929-8929-292929292929",
+            events: [tokenEvent(at: now, input: 2, output: 2)], modified: now,
+            metadataSource: ["subagent": "unsupported_kind"])
+        let classified = try LocalCodexUsageReader.scan(directory: identityRoot, now: now)
+        let unclassified = try LocalCodexUsageReader.scan(directory: unidentifiedMetadata, now: now)
+        check(classified.knownThreadCount == 4 && classified.subagentCount == 1
+            && classified.sessionCount == 4 && classified.input == 4 && classified.output == 8
+            && classified.unknownThreadCount == 1,
+            "recognized child source without a provable fork baseline remains unknown while first metadata identity is retained")
+        check(unclassified.knownThreadCount == 0 && unclassified.unknownThreadCount == 5
+            && unclassified.unidentifiedFileCount == 3
+            && unclassified.sessionCount == 0 && !unclassified.hasCompleteAccounting,
+            "missing, invalid, non-first, and unknown-source metadata never falls back to filename identity or root classification")
+        let optionalSubagentRoot = try fixtureDirectory("subagent-optional-display-metadata")
+        let optionalSubagentID = "2d2d2d2d-2d2d-4d2d-8d2d-2d2d2d2d2d2d"
+        try writeSession(in: optionalSubagentRoot, uuid: optionalSubagentID,
+            events: [tokenEvent(at: now, input: 4, output: 5)], modified: now,
+            metadataID: optionalSubagentID, metadataSource: ["subagent": "review"],
+            metadataFields: ["agent_nickname": "Synthetic Reviewer", "agent_role": "review"])
+        let optionalSubagent = try LocalCodexUsageReader.scan(directory: optionalSubagentRoot, now: now)
+        check(optionalSubagent.knownThreadCount == 0 && optionalSubagent.unknownThreadCount == 1
+            && optionalSubagent.subagentCount == 1 && optionalSubagent.sessionCount == 0
+            && optionalSubagent.input == 0 && optionalSubagent.output == 0,
+            "recognized child classification with optional display metadata remains a subagent while missing lineage baseline is unknown")
+        try? FileManager.default.removeItem(at: optionalSubagentRoot.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: identityRoot.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: unidentifiedMetadata.deletingLastPathComponent())
+
+        let strictSourceCases: [(String, Any)] = [
+            ("uppercase root source", "CLI"),
+            ("subagent-like root string", "subagent_review"),
+            ("internal-like root string", "internal_guardian"),
+            ("object root source", ["cli": true]),
+            ("invalid nested parent UUID", ["subagent": ["thread_spawn": ["parent_thread_id": "badUUID", "depth": 1]]]),
+            ("boolean nested depth", ["subagent": ["thread_spawn": ["parent_thread_id": firstID, "depth": true]]]),
+            ("overflow nested depth", ["subagent": ["thread_spawn": ["parent_thread_id": firstID, "depth": 2_147_483_648]]]),
+            ("uint64 maximum nested depth", ["subagent": ["thread_spawn": ["parent_thread_id": firstID, "depth": NSNumber(value: UInt64.max)]]])
+        ]
+        for (index, testCase) in strictSourceCases.enumerated() {
+            let strictSourceRoot = try fixtureDirectory("strict-source-\(index)")
+            let id = String(format: "2c2c2c2c-2c2c-4c2c-8c2c-%012d", index + 1)
+            try writeSession(in: strictSourceRoot, uuid: id,
+                events: [tokenEvent(at: now, input: 4, output: 5)], modified: now,
+                metadataID: id, metadataSource: testCase.1)
+            let strictSource = try LocalCodexUsageReader.scan(directory: strictSourceRoot, now: now)
+            check(strictSource.knownThreadCount == 0 && strictSource.unknownThreadCount == 1
+                && strictSource.sessionCount == 0 && strictSource.subagentCount == 0,
+                "strict metadata source rejects \(testCase.0) instead of classifying a root")
+            try? FileManager.default.removeItem(at: strictSourceRoot.deletingLastPathComponent())
+        }
+
+        let lateMetadataRoot = try fixtureDirectory("metadata-after-head-limit")
+        let lateMetadataRecord = sessionMetadata(id: "2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a", source: "cli")
+        var firstCompleteRecord = Data("{\"type\":\"unrelated\",\"padding\":\"".utf8)
+        firstCompleteRecord.append(Data(repeating: 0x61, count: 70 * 1024))
+        firstCompleteRecord.append(Data("\"}\n".utf8))
+        var oversizedMetadata = lateMetadataRecord
+        oversizedMetadata.append(10)
+        firstCompleteRecord.append(oversizedMetadata)
+        try writeSession(in: lateMetadataRoot, uuid: "2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a",
+            events: [tokenEvent(at: now, input: 1, output: 1)], modified: now,
+            metadata: firstCompleteRecord)
+        let lateMetadataSnapshot = try LocalCodexUsageReader.scan(directory: lateMetadataRoot, now: now)
+        check(lateMetadataSnapshot.unidentifiedFileCount == 1 && lateMetadataSnapshot.knownThreadCount == 0,
+            "first metadata outside the bounded head cannot establish identity by later search")
+        try? FileManager.default.removeItem(at: lateMetadataRoot.deletingLastPathComponent())
+
+        for (label, firstRecord) in [("blank", Data(" \n".utf8)),
+                                     ("non-meta", try tokenEvent(at: now, input: 0, output: 0))] {
+            let firstRecordRoot = try fixtureDirectory("first-record-\(label)")
+            try writeSession(in: firstRecordRoot, uuid: "2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b",
+                events: [tokenEvent(at: now, input: 1, output: 1)], modified: now,
+                metadata: firstRecord)
+            let firstRecordSnapshot = try LocalCodexUsageReader.scan(directory: firstRecordRoot, now: now)
+            check(firstRecordSnapshot.unidentifiedFileCount == 1 && firstRecordSnapshot.knownThreadCount == 0,
+                "\(label) first complete physical record is not skipped to recover a later metadata identity")
+            try? FileManager.default.removeItem(at: firstRecordRoot.deletingLastPathComponent())
+        }
+
+        let forkRoot = try fixtureDirectory("fork-explicit-boundary")
+        let parentID = "30303030-3030-4030-8030-303030303030"
+        let forkID = "31313131-3131-4131-8131-313131313131"
+        try writeSession(in: forkRoot, uuid: parentID,
+            events: [tokenEvent(at: now.addingTimeInterval(-5), input: 100, output: 50)], modified: now,
+            metadataSource: "cli")
+        let spawnSource: [String: Any] = ["subagent": ["thread_spawn": ["parent_thread_id": parentID, "depth": 1]]]
+        try writeSession(in: forkRoot, uuid: forkID, events: [
+            tokenEvent(at: now.addingTimeInterval(-4), input: 100, output: 50), // ordinal 1: inherited
+            ordinaryEvent(at: now.addingTimeInterval(-3), type: "user_message"), // ordinal 2
+            tokenEvent(at: now.addingTimeInterval(-2), input: 110, output: 55), // ordinal 3: exclusive boundary is first own record
+            tokenEvent(at: now.addingTimeInterval(-1), input: 120, output: 60), // ordinal 4: child continues
+            sessionMetadata(id: parentID, source: "cli"), // copied ancestor must not replace ordinal-0 child identity
+            tokenEvent(at: now, input: 130, output: 65)
+        ], modified: now, metadataID: forkID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 3])
+        let forked = try LocalCodexUsageReader.scan(directory: forkRoot, now: now)
+        check(forked.input == 130 && forked.output == 65 && forked.total == 195
+            && forked.knownThreadCount == 2 && forked.subagentCount == 1 && forked.forkCount == 1
+            && forked.sessionCount == 1 && forked.hasCompleteAccounting,
+            "parent plus explicit copied-fork delta excludes inherited baseline once and preserves first metadata identity")
+        try? FileManager.default.removeItem(at: forkRoot.deletingLastPathComponent())
+
+        let settingsForkRoot = try fixtureDirectory("fork-thread-settings-boundary")
+        let settingsForkID = "32323232-3232-4232-8232-323232323232"
+        let settingsBoundary = try threadSettingsApplied(at: now.addingTimeInterval(-2), threadID: settingsForkID)
+        try writeSession(in: settingsForkRoot, uuid: settingsForkID, events: [
+            tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20), // baseline before boundary
+            settingsBoundary, // own thread boundary
+            tokenEvent(at: now.addingTimeInterval(-1), input: 55, output: 30),
+            tokenEvent(at: now, input: 60, output: 32)
+        ], modified: now, metadataID: settingsForkID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID])
+        let settingsFork = try LocalCodexUsageReader.scan(directory: settingsForkRoot, now: now)
+        check(settingsFork.input == 20 && settingsFork.output == 12 && settingsFork.total == 32
+            && settingsFork.knownThreadCount == 1 && settingsFork.subagentCount == 1
+            && settingsFork.forkCount == 1 && settingsFork.sessionCount == 0,
+            "thread_settings_applied boundary matches current thread and counts only post-baseline delta")
+        try? FileManager.default.removeItem(at: settingsForkRoot.deletingLastPathComponent())
+
+        let quotaOnlyForkRoot = try fixtureDirectory("fork-quota-only-token-event")
+        let quotaOnlyForkID = "32323232-3232-4232-8232-323232323233"
+        let forkQuotaLimits: [String: Any] = ["primary": ["used_percent": 45, "window_minutes": 300]]
+        try writeSession(in: quotaOnlyForkRoot, uuid: quotaOnlyForkID, events: [
+            tokenEvent(at: now.addingTimeInterval(-4), input: 100, output: 50),
+            ordinaryEvent(at: now.addingTimeInterval(-3), type: "user_message"),
+            tokenEvent(at: now.addingTimeInterval(-2), input: 110, output: 55),
+            quotaOnlyEvent(at: now.addingTimeInterval(-1), rateLimits: forkQuotaLimits),
+            tokenEvent(at: now, input: 120, output: 60)
+        ], modified: now, metadataID: quotaOnlyForkID, metadataSource: "cli",
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 2])
+        let quotaOnlyFork = try LocalCodexUsageReader.scan(directory: quotaOnlyForkRoot, now: now)
+        check(quotaOnlyFork.input == 20 && quotaOnlyFork.output == 10 && quotaOnlyFork.total == 30
+            && quotaOnlyFork.knownThreadCount == 1 && quotaOnlyFork.unknownThreadCount == 0
+            && quotaOnlyFork.forkCount == 1 && quotaOnlyFork.sessionCount == 0
+            && quotaOnlyFork.fiveHour?.usedPercent == 45,
+            "quota-only token_count between cumulative fork counters does not poison the child delta")
+        try? FileManager.default.removeItem(at: quotaOnlyForkRoot.deletingLastPathComponent())
+
+        let resumeSettingsRoot = try fixtureDirectory("fork-resume-settings")
+        let resumeID = "33333333-3333-4333-8333-333333333334"
+        try writeSession(in: resumeSettingsRoot, uuid: resumeID, events: [
+            tokenEvent(at: now.addingTimeInterval(-4), input: 40, output: 20),
+            threadSettingsApplied(at: now.addingTimeInterval(-3), threadID: resumeID),
+            tokenEvent(at: now.addingTimeInterval(-2), input: 55, output: 30),
+            threadSettingsApplied(at: now.addingTimeInterval(-1), threadID: resumeID), // resume is not a new boundary
+            tokenEvent(at: now, input: 60, output: 32)
+        ], modified: now, metadataID: resumeID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID])
+        let resumedSettingsFork = try LocalCodexUsageReader.scan(directory: resumeSettingsRoot, now: now)
+        check(resumedSettingsFork.input == 20 && resumedSettingsFork.output == 12
+            && resumedSettingsFork.knownThreadCount == 1 && resumedSettingsFork.unknownThreadCount == 0,
+            "later matching resume settings do not invalidate the first own initialization boundary")
+        try? FileManager.default.removeItem(at: resumeSettingsRoot.deletingLastPathComponent())
+
+        let wrongSettingsRoot = try fixtureDirectory("fork-wrong-settings-thread")
+        let wrongSettingsID = "33333333-3333-4333-8333-333333333335"
+        try writeSession(in: wrongSettingsRoot, uuid: wrongSettingsID, events: [
+            tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+            threadSettingsApplied(at: now.addingTimeInterval(-2), threadID: parentID),
+            tokenEvent(at: now.addingTimeInterval(-1), input: 55, output: 30),
+            threadSettingsApplied(at: now, threadID: wrongSettingsID),
+            tokenEvent(at: now.addingTimeInterval(1), input: 60, output: 32)
+        ], modified: now, metadataID: wrongSettingsID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID])
+        let wrongSettingsFork = try LocalCodexUsageReader.scan(directory: wrongSettingsRoot, now: now)
+        check(wrongSettingsFork.input == 5 && wrongSettingsFork.output == 2
+            && wrongSettingsFork.knownThreadCount == 1,
+            "thread settings for another thread are ignored and preceding cumulative usage remains the baseline")
+        try? FileManager.default.removeItem(at: wrongSettingsRoot.deletingLastPathComponent())
+
+        let contradictoryBoundaryRoot = try fixtureDirectory("fork-contradictory-boundary")
+        let contradictoryID = "33333333-3333-4333-8333-333333333336"
+        try writeSession(in: contradictoryBoundaryRoot, uuid: contradictoryID, events: [
+            tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+            threadSettingsApplied(at: now.addingTimeInterval(-2), threadID: contradictoryID),
+            tokenEvent(at: now.addingTimeInterval(-1), input: 55, output: 30),
+            tokenEvent(at: now, input: 60, output: 32)
+        ], modified: now, metadataID: contradictoryID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 3])
+        let contradictoryBoundary = try LocalCodexUsageReader.scan(directory: contradictoryBoundaryRoot, now: now)
+        check(contradictoryBoundary.knownThreadCount == 0 && contradictoryBoundary.unknownThreadCount == 1,
+            "explicit ordinal and first matching own settings boundary disagreement makes the fork unknown")
+        try? FileManager.default.removeItem(at: contradictoryBoundaryRoot.deletingLastPathComponent())
+
+        let gapForkRoot = try fixtureDirectory("fork-unobserved-middle-gap")
+        let gapForkID = "34343434-3434-4434-8434-343434343434"
+        var gapPrefix = Data()
+        gapPrefix.append(try ordinaryEvent(at: now.addingTimeInterval(-10), type: "user_message")) // ordinal 1
+        gapPrefix.append(10)
+        gapPrefix.append(try tokenEvent(at: now.addingTimeInterval(-9), input: 100, output: 50)) // ordinal 2 baseline
+        gapPrefix.append(10)
+        gapPrefix.append(try tokenEvent(at: now.addingTimeInterval(-8.5), input: 101, output: 51)) // ordinal 3 first own record
+        gapPrefix.append(10)
+        for index in 0..<5_000 {
+            gapPrefix.append(try tokenEvent(at: now.addingTimeInterval(-8 + Double(index) / 10_000),
+                input: 102 + index, output: 52 + index))
+            gapPrefix.append(10)
+        }
+        try writeSession(in: gapForkRoot, uuid: gapForkID,
+            events: [tokenEvent(at: now, input: 5_101, output: 5_051)], modified: now,
+            prefix: gapPrefix, metadataID: gapForkID, metadataSource: spawnSource,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 3])
+        let gapFork = try LocalCodexUsageReader.scan(directory: gapForkRoot, now: now)
+        check(gapFork.knownThreadCount == 0 && gapFork.unknownThreadCount == 1
+            && gapFork.isLimited && !gapFork.hasCompleteAccounting,
+            "fork contribution is unknown when bounded head/tail reads leave an unobserved cumulative gap")
+        try? FileManager.default.removeItem(at: gapForkRoot.deletingLastPathComponent())
+
+        let invalidForkEvidence: [(String, [Data])] = try [
+            ("missing", [ordinaryEvent(at: now.addingTimeInterval(-2), type: "user_message"),
+                ordinaryEvent(at: now.addingTimeInterval(-1), type: "assistant_reasoning"),
+                tokenEvent(at: now, input: 55, output: 65)]),
+            ("input rollback", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                tokenEvent(at: now.addingTimeInterval(-1), input: 39, output: 21),
+                tokenEvent(at: now, input: 45, output: 25)]),
+            ("output rollback", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                tokenEvent(at: now.addingTimeInterval(-1), input: 41, output: 19),
+                tokenEvent(at: now, input: 45, output: 25)]),
+            ("input missing", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                rawTokenEvent(at: now.addingTimeInterval(-1), inputLiteral: "null", outputLiteral: "21", totalLiteral: "42"),
+                tokenEvent(at: now, input: 45, output: 25)]),
+            ("output missing", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                rawTokenEvent(at: now.addingTimeInterval(-1), inputLiteral: "41", outputLiteral: "null", totalLiteral: "42"),
+                tokenEvent(at: now, input: 45, output: 25)]),
+            ("total missing", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                rawTokenEvent(at: now.addingTimeInterval(-1), inputLiteral: "41", outputLiteral: "21", totalLiteral: "null"),
+                tokenEvent(at: now, input: 45, output: 25)]),
+            ("total rollback", [tokenEvent(at: now.addingTimeInterval(-3), input: 40, output: 20),
+                rawTokenEvent(at: now.addingTimeInterval(-1), inputLiteral: "41", outputLiteral: "21", totalLiteral: "1"),
+                tokenEvent(at: now, input: 45, output: 25)])
+        ]
+        for (label, records) in invalidForkEvidence {
+            let missingBaselineRoot = try fixtureDirectory("fork-invalid-baseline-\(label)")
+            let missingBaselineID = "35353535-3535-4535-8535-353535353535"
+            try writeSession(in: missingBaselineRoot, uuid: missingBaselineID, events: records, modified: now,
+                metadataID: missingBaselineID, metadataSource: spawnSource,
+                metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 3])
+            let missingBaseline = try LocalCodexUsageReader.scan(directory: missingBaselineRoot, now: now)
+            check(missingBaseline.knownThreadCount == 0 && missingBaseline.unknownThreadCount == 1
+                && missingBaseline.input == 0,
+                "fork with \(label) baseline evidence is unknown, not a guessed contribution")
+            try? FileManager.default.removeItem(at: missingBaselineRoot.deletingLastPathComponent())
+        }
+
+        let quotaUpdateRoot = try fixtureDirectory("quota-update-contract")
+        let quotaTime = now.addingTimeInterval(-30)
+        let validLimits: [String: Any] = [
+            "primary": ["used_percent": 25, "window_minutes": 300, "resets_at": Int(now.timeIntervalSince1970) + 3600],
+            "secondary": ["used_percent": 70, "window_minutes": 10080, "resets_at": Int(now.timeIntervalSince1970) + 7200]
+        ]
+        let duplicateDurations: [String: Any] = [
+            "primary": ["used_percent": 10, "window_minutes": 300],
+            "secondary": ["used_percent": 90, "window_minutes": 300]
+        ]
+        try writeSession(in: quotaUpdateRoot, uuid: "36363636-3636-4636-8636-363636363636", events: [
+            tokenEvent(at: quotaTime, input: 1, output: 1, rateLimits: validLimits)
+        ], modified: now)
+        func appendQuotaFixture(_ suffix: Int, _ timestamp: Date, _ value: Any?) throws -> LocalCodexSnapshot {
+            let uuid = String(format: "37373737-3737-4737-8737-%012d", suffix)
+            try writeSession(in: quotaUpdateRoot, uuid: uuid, events: [
+                tokenEvent(at: timestamp, input: suffix, output: suffix, rateLimits: value)
+            ], modified: now, metadataID: uuid)
+            return try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+        }
+        let preservedCases: [(String, Any?)] = [
+            ("missing", nil), ("null", NSNull()), ("non-object", "not-an-object"),
+            ("unrelated", ["other": ["used_percent": 99]]),
+            ("boolean percent", ["primary": ["used_percent": true, "window_minutes": 300]]),
+            ("out-of-range percent", ["primary": ["used_percent": 101, "window_minutes": 300]]),
+            ("boolean duration", ["primary": ["used_percent": 40, "window_minutes": true]]),
+            ("duplicate duration", duplicateDurations),
+            ("negative reset", ["primary": ["used_percent": 40, "window_minutes": 300, "resets_at": -1]]),
+            ("fractional reset", ["primary": ["used_percent": 40, "window_minutes": 300, "resets_at": 1.5]]),
+            ("null slot", ["primary": NSNull(), "secondary": NSNull()]),
+            ("non-object slot", ["primary": "invalid"]),
+            ("missing used percent", ["primary": ["window_minutes": 300]])
+        ]
+        var quotaCheckIndex = 0
+        for (label, value) in preservedCases {
+            if label == "null slot" {
+                quotaCheckIndex += 1
+                let clearID = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+                try writeSession(in: quotaUpdateRoot, uuid: clearID, events: [
+                    tokenEvent(at: quotaTime.addingTimeInterval(Double(quotaCheckIndex)), input: 1, output: 1,
+                        rateLimits: [:])
+                ], modified: now, metadataID: clearID)
+                let cleared = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+                check(cleared.fiveHour == nil && cleared.sevenDay == nil,
+                    "valid empty object clears quota before nullable-window case")
+                quotaCheckIndex += 1
+                let restoreID = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+                try writeSession(in: quotaUpdateRoot, uuid: restoreID, events: [
+                    tokenEvent(at: quotaTime.addingTimeInterval(Double(quotaCheckIndex)), input: 1, output: 1,
+                        rateLimits: validLimits)
+                ], modified: now, metadataID: restoreID)
+                quotaCheckIndex += 1
+                let nullSlotsID = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+                try writeSession(in: quotaUpdateRoot, uuid: nullSlotsID, events: [
+                    tokenEvent(at: quotaTime.addingTimeInterval(Double(quotaCheckIndex)), input: 1, output: 1,
+                        rateLimits: ["primary": NSNull(), "secondary": NSNull()])
+                ], modified: now, metadataID: nullSlotsID)
+                let nullSlots = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+                check(nullSlots.fiveHour == nil && nullSlots.sevenDay == nil,
+                    "valid null windows replace the prior snapshot with an empty snapshot")
+                quotaCheckIndex += 1
+                let nullRestoreID = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+                try writeSession(in: quotaUpdateRoot, uuid: nullRestoreID, events: [
+                    tokenEvent(at: quotaTime.addingTimeInterval(Double(quotaCheckIndex)), input: 1, output: 1,
+                        rateLimits: validLimits)
+                ], modified: now, metadataID: nullRestoreID)
+                quotaCheckIndex += 1
+                continue
+            }
+            quotaCheckIndex += 1
+            let before = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+            check(before.fiveHour?.usedPercent == 25 && before.sevenDay?.usedPercent == 70,
+                "known quota snapshot restored before \(label) case")
+            let snapshot = try appendQuotaFixture(quotaCheckIndex,
+                quotaTime.addingTimeInterval(Double(quotaCheckIndex)), value)
+            check(snapshot.fiveHour?.usedPercent == 25 && snapshot.sevenDay?.usedPercent == 70,
+                "\(label) quota update preserves previous valid snapshot")
+        }
+        quotaCheckIndex += 1
+        let replacementTime = quotaTime.addingTimeInterval(Double(quotaCheckIndex))
+        let replacementFixture = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+        try writeSession(in: quotaUpdateRoot, uuid: replacementFixture, events: [
+            tokenEvent(at: replacementTime, input: 8, output: 8,
+                rateLimits: ["primary": ["used_percent": 35, "window_minutes": 300, "resets_at": NSNull()]])
+        ], modified: now, metadataID: replacementFixture)
+        let wholeReplacement = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+        check(wholeReplacement.fiveHour?.usedPercent == 35 && wholeReplacement.fiveHour?.resetsAt == nil
+            && wholeReplacement.sevenDay == nil,
+            "valid partial quota object replaces its sibling instead of merging windows across events")
+        quotaCheckIndex += 1
+        let unsupportedTime = quotaTime.addingTimeInterval(Double(quotaCheckIndex))
+        let unsupportedFixture = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+        try writeSession(in: quotaUpdateRoot, uuid: unsupportedFixture, events: [
+            tokenEvent(at: unsupportedTime, input: 9, output: 9,
+                rateLimits: ["primary": ["used_percent": 45]])
+        ], modified: now, metadataID: unsupportedFixture)
+        let unsupportedDuration = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+        check(unsupportedDuration.fiveHour == nil && unsupportedDuration.sevenDay == nil,
+            "valid window lacking optional duration replaces snapshot but cannot map to a supported bucket")
+        quotaCheckIndex += 1
+        let epochTime = quotaTime.addingTimeInterval(Double(quotaCheckIndex))
+        let epochFixture = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+        try writeSession(in: quotaUpdateRoot, uuid: epochFixture, events: [
+            tokenEvent(at: epochTime, input: 10, output: 10,
+                rateLimits: ["primary": ["used_percent": 45, "window_minutes": 300, "resets_at": 0]])
+        ], modified: now, metadataID: epochFixture)
+        let epochReset = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+        check(epochReset.fiveHour?.resetsAt == Date(timeIntervalSince1970: 0)
+            && epochReset.fiveHour?.isFresh(at: now, refreshSeconds: 60) == false,
+            "nonnegative integer epoch reset is retained as historical time, not current quota")
+        quotaCheckIndex += 1
+        let clearTime = quotaTime.addingTimeInterval(Double(quotaCheckIndex))
+        let clearFixture = String(format: "37373737-3737-4737-8737-%012d", quotaCheckIndex)
+        try writeSession(in: quotaUpdateRoot, uuid: clearFixture, events: [
+            tokenEvent(at: clearTime, input: 11, output: 11, rateLimits: [:])
+        ], modified: now, metadataID: clearFixture)
+        let explicitlyCleared = try LocalCodexUsageReader.scan(directory: quotaUpdateRoot, now: now)
+        check(explicitlyCleared.fiveHour == nil && explicitlyCleared.sevenDay == nil,
+            "explicit valid empty quota object clears prior snapshot")
+        try? FileManager.default.removeItem(at: quotaUpdateRoot.deletingLastPathComponent())
+
+        let quotaOnlyRoot = try fixtureDirectory("quota-only-event-does-not-clear-usage")
+        let quotaOnlyID = "40404040-4040-4040-8040-404040404041"
+        try writeSession(in: quotaOnlyRoot, uuid: quotaOnlyID, events: [
+            tokenEvent(at: now.addingTimeInterval(-1), input: 20, output: 10),
+            quotaOnlyEvent(at: now, rateLimits: validLimits)
+        ], modified: now)
+        let quotaOnly = try LocalCodexUsageReader.scan(directory: quotaOnlyRoot, now: now)
+        check(quotaOnly.input == 20 && quotaOnly.output == 10 && quotaOnly.total == 30
+            && quotaOnly.knownThreadCount == 1 && quotaOnly.unknownThreadCount == 0
+            && quotaOnly.fiveHour?.usedPercent == 25 && quotaOnly.sevenDay?.usedPercent == 70,
+            "quota update without cumulative usage preserves the thread's last valid token counters")
+        try? FileManager.default.removeItem(at: quotaOnlyRoot.deletingLastPathComponent())
+
+        let unknownSourceForkRoot = try fixtureDirectory("unknown-source-fork-not-root")
+        let unknownSourceForkID = "40404040-4040-4040-8040-404040404042"
+        try writeSession(in: unknownSourceForkRoot, uuid: unknownSourceForkID, events: [
+            tokenEvent(at: now.addingTimeInterval(-2), input: 10, output: 5),
+            ordinaryEvent(at: now.addingTimeInterval(-1), type: "user_message"),
+            tokenEvent(at: now, input: 12, output: 6)
+        ], modified: now, metadataID: unknownSourceForkID, metadataSource: nil,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 2])
+        let unknownSourceFork = try LocalCodexUsageReader.scan(directory: unknownSourceForkRoot, now: now)
+        check(unknownSourceFork.knownThreadCount == 0 && unknownSourceFork.unknownThreadCount == 1
+            && unknownSourceFork.sessionCount == 0 && unknownSourceFork.subagentCount == 0
+            && unknownSourceFork.input == 0,
+            "unknown source with otherwise valid fork baseline remains unknown and cannot become a root")
+        try? FileManager.default.removeItem(at: unknownSourceForkRoot.deletingLastPathComponent())
+
+        let cliDisplayRoot = try fixtureDirectory("cli-display-metadata-not-subagent")
+        let cliDisplayID = "40404040-4040-4040-8040-404040404043"
+        try writeSession(in: cliDisplayRoot, uuid: cliDisplayID,
+            events: [tokenEvent(at: now, input: 3, output: 4)], modified: now,
+            metadataID: cliDisplayID, metadataSource: "cli",
+            metadataFields: ["agent_nickname": "Synthetic CLI", "agent_role": "review", "thread_source": "user"])
+        let cliDisplay = try LocalCodexUsageReader.scan(directory: cliDisplayRoot, now: now)
+        check(cliDisplay.knownThreadCount == 0 && cliDisplay.unknownThreadCount == 1
+            && cliDisplay.sessionCount == 0 && cliDisplay.subagentCount == 0
+            && cliDisplay.input == 0 && cliDisplay.output == 0,
+            "CLI source with child display metadata is unknown rather than a trusted root or a subagent")
+        try? FileManager.default.removeItem(at: cliDisplayRoot.deletingLastPathComponent())
+
+        let nonUserChildRoot = try fixtureDirectory("subagent-nonuser-thread-source")
+        let nonUserChildID = "40404040-4040-4040-8040-404040404044"
+        try writeSession(in: nonUserChildRoot, uuid: nonUserChildID,
+            events: [tokenEvent(at: now, input: 6, output: 4)], modified: now,
+            metadataID: nonUserChildID, metadataSource: ["subagent": "review"],
+            metadataFields: ["thread_source": "automation", "agent_role": "review"])
+        let nonUserChild = try LocalCodexUsageReader.scan(directory: nonUserChildRoot, now: now)
+        check(nonUserChild.knownThreadCount == 0 && nonUserChild.unknownThreadCount == 1
+            && nonUserChild.sessionCount == 0 && nonUserChild.subagentCount == 1
+            && nonUserChild.input == 0 && nonUserChild.output == 0,
+            "recognized subagent source with non-user thread_source remains classified as child while missing baseline is unknown")
+        try? FileManager.default.removeItem(at: nonUserChildRoot.deletingLastPathComponent())
+
+        for (label, historyBase) in [
+            ("integer", 123 as Any), ("object", ["ordinal": 5] as Any),
+            ("schema-valid reference", ["thread_id": parentID, "end_ordinal_exclusive": 4,
+                                        "end_byte_offset": 1024] as Any)
+        ] {
+            let unknownLineageRoot = try fixtureDirectory("unknown-parent-lineage-\(label)")
+            try writeSession(in: unknownLineageRoot, uuid: "33333333-3333-4333-8333-333333333333",
+                events: [tokenEvent(at: now, input: 55, output: 66)], modified: now,
+                metadataFields: ["history_base": historyBase])
+            let unknownLineage = try LocalCodexUsageReader.scan(directory: unknownLineageRoot, now: now)
+            check(unknownLineage.knownThreadCount == 0 && unknownLineage.unknownThreadCount == 1
+                && unknownLineage.input == 0 && !unknownLineage.hasCompleteAccounting,
+                "Referenced/history_base \(label) lineage is unknown without cross-file subtraction")
+            try? FileManager.default.removeItem(at: unknownLineageRoot.deletingLastPathComponent())
+        }
+
+        let referencedSubagentRoot = try fixtureDirectory("referenced-history-classifies-child")
+        let referencedSubagentID = "33333333-3333-4333-8333-333333333339"
+        try writeSession(in: referencedSubagentRoot, uuid: referencedSubagentID,
+            events: [tokenEvent(at: now, input: 55, output: 66)], modified: now,
+            metadataID: referencedSubagentID, metadataSource: ["subagent": "review"],
+            metadataFields: ["history_base": ["thread_id": parentID,
+                "end_ordinal_exclusive": 4, "end_byte_offset": 1024]])
+        let referencedSubagent = try LocalCodexUsageReader.scan(directory: referencedSubagentRoot, now: now)
+        check(referencedSubagent.knownThreadCount == 0 && referencedSubagent.unknownThreadCount == 1
+            && referencedSubagent.subagentCount == 1 && referencedSubagent.sessionCount == 0
+            && referencedSubagent.input == 0,
+            "trusted source plus history_base classifies child while its unsupported contribution remains unknown")
+        try? FileManager.default.removeItem(at: referencedSubagentRoot.deletingLastPathComponent())
+
+        let cliForkRoot = try fixtureDirectory("cli-with-fork-marker")
+        let cliForkID = "33333333-3333-4333-8333-333333333337"
+        try writeSession(in: cliForkRoot, uuid: cliForkID, events: [
+            tokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 50), // inherited baseline
+            ordinaryEvent(at: now.addingTimeInterval(-2), type: "user_message"), // explicit ordinal 2 boundary
+            tokenEvent(at: now.addingTimeInterval(-1), input: 110, output: 55), // first own usage
+            tokenEvent(at: now, input: 120, output: 60)
+        ], modified: now, metadataID: cliForkID, metadataSource: "cli",
+            metadataFields: ["forked_from_id": parentID, "parent_thread_id": parentID,
+                             "subagent_history_start_ordinal": 2])
+        let cliFork = try LocalCodexUsageReader.scan(directory: cliForkRoot, now: now)
+        check(cliFork.input == 20 && cliFork.output == 10 && cliFork.total == 30
+            && cliFork.sessionCount == 0 && cliFork.forkCount == 1 && cliFork.knownThreadCount == 1,
+            "cli source plus proven parent/fork markers contributes only its delta, never root full cumulative")
+        try? FileManager.default.removeItem(at: cliForkRoot.deletingLastPathComponent())
+
+        let cliForkMissingBaselineRoot = try fixtureDirectory("cli-fork-missing-baseline")
+        let cliForkMissingID = "33333333-3333-4333-8333-333333333338"
+        try writeSession(in: cliForkMissingBaselineRoot, uuid: cliForkMissingID, events: [
+            ordinaryEvent(at: now.addingTimeInterval(-2), type: "user_message"),
+            tokenEvent(at: now.addingTimeInterval(-1), input: 110, output: 55),
+            tokenEvent(at: now, input: 120, output: 60)
+        ], modified: now, metadataID: cliForkMissingID, metadataSource: "cli",
+            metadataFields: ["forked_from_id": parentID, "parent_thread_id": parentID,
+                             "subagent_history_start_ordinal": 2])
+        let cliForkMissingBaseline = try LocalCodexUsageReader.scan(directory: cliForkMissingBaselineRoot, now: now)
+        check(cliForkMissingBaseline.knownThreadCount == 0 && cliForkMissingBaseline.unknownThreadCount == 1
+            && cliForkMissingBaseline.sessionCount == 0 && cliForkMissingBaseline.input == 0,
+            "cli source cannot override a valid fork marker when its required baseline is missing")
+        try? FileManager.default.removeItem(at: cliForkMissingBaselineRoot.deletingLastPathComponent())
+
+        let illegalLineageRoot = try fixtureDirectory("illegal-lineage-not-root")
+        for (index, fields) in [
+            ["forked_from_id": "parent"], ["parent_thread_id": "parent"],
+            ["subagent": "unknown"], ["subagent_history_start_ordinal": -1]
+        ].enumerated() {
+            let id = String(format: "33333333-3333-4333-8333-%012d", index + 10)
+            try writeSession(in: illegalLineageRoot, uuid: id,
+                events: [tokenEvent(at: now, input: 55, output: 66)], modified: now,
+                metadataID: id, metadataFields: fields)
+        }
+        let illegalLineage = try LocalCodexUsageReader.scan(directory: illegalLineageRoot, now: now)
+        check(illegalLineage.knownThreadCount == 0 && illegalLineage.unknownThreadCount == 4
+            && illegalLineage.sessionCount == 0 && !illegalLineage.hasCompleteAccounting,
+            "invalid parent, fork, source, and ordinal markers cannot silently classify as roots")
+        try? FileManager.default.removeItem(at: illegalLineageRoot.deletingLastPathComponent())
+
+        let corruptLatestRoot = try fixtureDirectory("root-corrupt-latest-counter")
+        let corruptID = "41414141-4141-4141-8141-414141414141"
+        try writeSession(in: corruptLatestRoot, uuid: corruptID, events: [
+            tokenEvent(at: now.addingTimeInterval(-1), input: 50, output: 60),
+            rawTokenEvent(at: now, inputLiteral: "true", outputLiteral: "70")
+        ], modified: now)
+        let corruptLatest = try LocalCodexUsageReader.scan(directory: corruptLatestRoot, now: now)
+        check(corruptLatest.knownThreadCount == 0 && corruptLatest.unknownThreadCount == 1
+            && corruptLatest.input == 0 && corruptLatest.output == 0,
+            "malformed latest cumulative record makes root contribution unknown instead of reverting")
+        try? FileManager.default.removeItem(at: corruptLatestRoot.deletingLastPathComponent())
 
         let invalidRoot = try fixtureDirectory("invalid-counts")
         let validID = "44444444-4444-4444-8444-444444444444"
@@ -416,8 +1039,10 @@ extension CoreChecks {
                 events: [rawTokenEvent(at: now, inputLiteral: literal, outputLiteral: "1")], modified: now)
         }
         let invalid = try LocalCodexUsageReader.scan(directory: invalidRoot, now: now)
-        check(invalid.input == 5 && invalid.output == 7 && invalid.sessionCount == 1,
-            "negative, fractional, boolean, overflowing and non-finite counters are rejected")
+        check(invalid.input == 5 && invalid.output == 7 && invalid.sessionCount == 6
+            && invalid.knownThreadCount == 1 && invalid.unknownThreadCount == 5
+            && !invalid.hasCompleteAccounting,
+            "negative, fractional, boolean, overflowing and non-finite counters are unknown without invalidating known subtotal")
         try? FileManager.default.removeItem(at: invalidRoot.deletingLastPathComponent())
 
         let exactRoot = try fixtureDirectory("exact-large-integer")
@@ -436,8 +1061,9 @@ extension CoreChecks {
         try writeSession(in: truncatedRoot, uuid: "66666666-6666-4666-8666-666666666666",
             events: [complete], modified: now, prefix: paddedPrefix, suffix: Data("{\"partial\":".utf8))
         let truncated = try LocalCodexUsageReader.scan(directory: truncatedRoot, now: now)
-        check(truncated.input == 12 && truncated.output == 13,
-            "tail scan ignores the truncated first fragment and incomplete final JSON line")
+        check(truncated.knownThreadCount == 0 && truncated.unknownThreadCount == 1
+            && truncated.input == 0 && truncated.output == 0 && !truncated.hasCompleteAccounting,
+            "a nonempty incomplete final physical record makes the latest thread contribution unknown")
         try? FileManager.default.removeItem(at: truncatedRoot.deletingLastPathComponent())
 
         let quotaRoot = try fixtureDirectory("quota-snapshots")
@@ -479,7 +1105,7 @@ extension CoreChecks {
         ], modified: now)
         let equalQuota = try LocalCodexUsageReader.scan(directory: equalQuotaRoot, now: now)
         check(equalQuota.fiveHour == nil && equalQuota.sevenDay == nil,
-            "same-timestamp later snapshot with missing windows clears older quota data")
+            "same-timestamp explicit empty rate_limits object clears older quota data")
         try? FileManager.default.removeItem(at: equalQuotaRoot.deletingLastPathComponent())
 
         let missingWindowRoot = try fixtureDirectory("missing-window")
@@ -575,13 +1201,69 @@ extension CoreChecks {
         }
         let boundedCache = LocalCodexUsageReader.Cache()
         let bounded = try LocalCodexUsageReader.scan(directory: boundedRoot, now: now, cache: boundedCache)
-        check(bounded.sessionCount == 32 && bounded.isLimited,
-            "scan selects at most 32 sessions, reads only each bounded tail, and marks omitted history")
+        check(bounded.sessionCount == 32 && bounded.knownThreadCount == 32 && bounded.isLimited
+            && !bounded.hasCompleteAccounting,
+            "scan selects at most 32 metadata-classified roots and marks bounded coverage incomplete")
         let warmBounded = try LocalCodexUsageReader.scan(directory: boundedRoot, now: now, cache: boundedCache)
         check(boundedCache.diagnostics.cacheHits == 32 && boundedCache.diagnostics.bytesRead == 0
             && boundedCache.entryCount == 32 && warmBounded.isLimited,
-            "warm cache hits all 32 retained sessions without content reads and preserves tail limitation")
+            "warm cache hits all 32 retained file summaries without content reads and preserves limitation")
         try? FileManager.default.removeItem(at: boundedRoot.deletingLastPathComponent())
+
+        let readBudgetRoot = try fixtureDirectory("head-tail-10mib-budget")
+        var largePadding = Data(repeating: 0x78, count: 400 * 1024)
+        largePadding.append(10)
+        for index in 0..<32 {
+            let uuid = String(format: "45454545-4545-4545-8545-%012d", index + 1)
+            try writeSession(in: readBudgetRoot, uuid: uuid,
+                events: [tokenEvent(at: now, input: 2, output: 3)], modified: now,
+                prefix: largePadding)
+        }
+        let budgetCache = LocalCodexUsageReader.Cache()
+        let budgetSnapshot = try LocalCodexUsageReader.scan(directory: readBudgetRoot, now: now, cache: budgetCache)
+        check(budgetCache.diagnostics.bytesRead <= 10 * 1024 * 1024
+            && budgetCache.diagnostics.bytesRead > 8 * 1024 * 1024
+            && budgetSnapshot.knownThreadCount == 32 && budgetSnapshot.isLimited
+            && !budgetSnapshot.hasCompleteAccounting,
+            "32 files read only within aggregate 10 MiB head+tail budget and cannot claim complete totals")
+        try? FileManager.default.removeItem(at: readBudgetRoot.deletingLastPathComponent())
+
+        let continuousBoundaryRoot = try fixtureDirectory("continuous-records-cross-head-boundary")
+        let continuousID = "46464646-4646-4646-8646-464646464646"
+        let oneRecord = try ordinaryEvent(at: now.addingTimeInterval(-2), type: "user_message")
+        var continuousPrefix = Data()
+        continuousPrefix.append(try tokenEvent(at: now.addingTimeInterval(-3), input: 4, output: 2))
+        continuousPrefix.append(10)
+        continuousPrefix.append(try ordinaryEvent(at: now.addingTimeInterval(-2.5), type: "user_message"))
+        continuousPrefix.append(10)
+        while continuousPrefix.count < 70 * 1024 {
+            continuousPrefix.append(oneRecord)
+            continuousPrefix.append(10)
+        }
+        try writeSession(in: continuousBoundaryRoot, uuid: continuousID,
+            events: [tokenEvent(at: now, input: 10, output: 5)], modified: now,
+            prefix: continuousPrefix, metadataID: continuousID,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 2])
+        let continuousFileBytes = try Data(contentsOf: sessionURL(in: continuousBoundaryRoot, uuid: continuousID))
+        check(continuousFileBytes[64 * 1024 - 1] != 10,
+            "continuous boundary fixture places the actual file head cutoff inside a complete JSON record")
+        let continuousBoundary = try LocalCodexUsageReader.scan(directory: continuousBoundaryRoot, now: now)
+        check(!continuousBoundary.isLimited && continuousBoundary.input == 6
+            && continuousBoundary.output == 3 && continuousBoundary.total == 9
+            && continuousBoundary.knownThreadCount == 1 && continuousBoundary.unknownThreadCount == 0,
+            "a fully retained 64-320KiB file with valid records crossing the head boundary is not a read gap")
+        try? FileManager.default.removeItem(at: continuousBoundaryRoot.deletingLastPathComponent())
+
+        let emptyThenValidRoot = try fixtureDirectory("empty-file-does-not-stop-scan")
+        let emptyFirstPath = emptyThenValidRoot.appendingPathComponent("rollout-empty-00000000-0000-4000-8000-000000000000.jsonl")
+        try Data().write(to: emptyFirstPath)
+        try writeSession(in: emptyThenValidRoot, uuid: "47474747-4747-4747-8747-474747474747",
+            events: [tokenEvent(at: now, input: 7, output: 9)], modified: now)
+        let emptyThenValid = try LocalCodexUsageReader.scan(directory: emptyThenValidRoot, now: now)
+        check(emptyThenValid.knownThreadCount == 1 && emptyThenValid.input == 7 && emptyThenValid.output == 9
+            && emptyThenValid.unidentifiedFileCount == 1 && emptyThenValid.sessionCount == 1,
+            "an empty invalid file does not prevent discovery and accounting of a later valid file")
+        try? FileManager.default.removeItem(at: emptyThenValidRoot.deletingLastPathComponent())
 
         let entryRoot = try fixtureDirectory("bounded-entries")
         for _ in 0..<5001 {
@@ -621,8 +1303,12 @@ extension CoreChecks {
     }
 
     private static func writeSession(in directory: URL, uuid: String, events: [Data], modified: Date,
-                                     prefix: Data = Data(), suffix: Data = Data()) throws {
-        var data = prefix
+                                     prefix: Data = Data(), suffix: Data = Data(),
+                                     metadataID: String? = nil, metadataSource: Any? = "cli",
+                                     metadataFields: [String: Any] = [:], metadata: Data? = nil) throws {
+        var data = metadata ?? sessionMetadata(id: metadataID ?? uuid, source: metadataSource, fields: metadataFields)
+        if !data.isEmpty { data.append(10) }
+        data.append(prefix)
         for event in events { data.append(event); data.append(10) }
         data.append(suffix)
         let url = sessionURL(in: directory, uuid: uuid)
@@ -631,23 +1317,60 @@ extension CoreChecks {
     }
 
     private static func tokenEvent(at timestamp: Date, input: Int, output: Int, cached: Int = 0,
-                                   reasoning: Int = 0, rateLimits: [String: Any]? = nil) throws -> Data {
+                                   reasoning: Int = 0, rateLimits: Any? = nil) throws -> Data {
         var usage: [String: Any] = ["input_tokens": input, "output_tokens": output, "total_tokens": input + output]
         if cached > 0 { usage["cached_input_tokens"] = cached }
         if reasoning > 0 { usage["reasoning_output_tokens"] = reasoning }
         let info: [String: Any] = ["total_token_usage": usage]
-        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
-            "payload": ["type": "token_count", "info": info, "rate_limits": rateLimits ?? [:]]]
+        var payload: [String: Any] = ["type": "token_count", "info": info]
+        if let rateLimits { payload["rate_limits"] = rateLimits }
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg", "payload": payload]
         return try JSONSerialization.data(withJSONObject: event)
     }
 
-    private static func rawTokenEvent(at timestamp: Date, inputLiteral: String, outputLiteral: String) -> Data {
+    private static func quotaOnlyEvent(at timestamp: Date, rateLimits: Any) throws -> Data {
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
+            "payload": ["type": "token_count", "info": [:], "rate_limits": rateLimits]]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func ordinaryEvent(at timestamp: Date, type: String) throws -> Data {
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
+            "payload": ["type": type]]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func threadSettingsApplied(at timestamp: Date, threadID: String) throws -> Data {
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
+            "payload": ["type": "thread_settings_applied", "thread_id": threadID,
+                        "thread_settings": ["model": "synthetic"]]]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func sessionMetadata(id: String?, source: Any?, fields: [String: Any] = [:]) -> Data {
+        var payload = fields
+        if let id { payload["id"] = id }
+        if let source { payload["source"] = source }
+        let object: [String: Any] = ["type": "session_meta", "payload": payload]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+    }
+
+    private static func rawTokenEvent(at timestamp: Date, inputLiteral: String, outputLiteral: String,
+                                     totalLiteral: String? = nil) -> Data {
         let time = iso(timestamp)
-        return Data("{\"timestamp\":\"\(time)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\(inputLiteral),\"output_tokens\":\(outputLiteral),\"total_tokens\":1}}}}".utf8)
+        let totalJSON = totalLiteral ?? "1"
+        return Data("{\"timestamp\":\"\(time)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\(inputLiteral),\"output_tokens\":\(outputLiteral),\"total_tokens\":\(totalJSON)}}}}".utf8)
     }
 
     private static func turnTokenEvent(at timestamp: Date, output: Int) throws -> Data {
         let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
+            "payload": ["type": "token_count", "info": ["total_token_usage": [
+                "input_tokens": 0, "output_tokens": output, "total_tokens": output]]]]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func turnTokenEventWithoutTimestamp(output: Int) throws -> Data {
+        let event: [String: Any] = ["type": "event_msg",
             "payload": ["type": "token_count", "info": ["total_token_usage": [
                 "input_tokens": 0, "output_tokens": output, "total_tokens": output]]]]
         return try JSONSerialization.data(withJSONObject: event)
@@ -661,6 +1384,12 @@ extension CoreChecks {
         else if durationLiteral == "null" { payload["duration_ms"] = NSNull() }
         else if let durationLiteral { payload["duration_ms"] = durationLiteral }
         let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg", "payload": payload]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func turnBoundaryWithoutTimestamp(type: String, id: String) throws -> Data {
+        let event: [String: Any] = ["type": "event_msg",
+            "payload": ["type": type, "turn_id": id]]
         return try JSONSerialization.data(withJSONObject: event)
     }
 

@@ -27,7 +27,7 @@ import TokenStatCore
                     priceSection
                     quotaSection
                 } else {
-                    Text("从 ~/.codex/sessions 读取有限范围的历史用量统计，不连接本机代理，不读取密钥。切换到代理模式可恢复企业接口配置。")
+                    Text("从 ~/.codex/sessions 的有限范围中读取当前扫描范围记录。依据记录中的来源与父子关系区分顶层对话、子代理和分叉；无法核验的记录单独标示，不把未知贡献当作零或完整总量。仅读取有界文件片段，不连接本机代理、不读取凭据或企业接口。切换到代理模式可恢复企业接口配置。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 otherSection
