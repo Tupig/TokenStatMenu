@@ -422,10 +422,44 @@ public struct LocalCodexSnapshot: Equatable {
     public let latestEventAt: Date?
     public let fiveHour: WindowQuota?
     public let sevenDay: WindowQuota?
-    public init(input: Int, output: Int, total: Int, sessionCount: Int, filesScanned: Int, isLimited: Bool, latestEventAt: Date?, fiveHour: WindowQuota?, sevenDay: WindowQuota?) {
+    public let lastTurn: LocalTurnSummary?
+    public init(input: Int, output: Int, total: Int, sessionCount: Int, filesScanned: Int, isLimited: Bool, latestEventAt: Date?, fiveHour: WindowQuota?, sevenDay: WindowQuota?, lastTurn: LocalTurnSummary? = nil) {
         self.input = input; self.output = output; self.total = total; self.sessionCount = sessionCount
         self.filesScanned = filesScanned; self.isLimited = isLimited; self.latestEventAt = latestEventAt
         self.fiveHour = fiveHour; self.sevenDay = sevenDay
+        self.lastTurn = lastTurn
+    }
+}
+
+public struct LocalTurnSummary: Equatable {
+    public let outputTokens: Int
+    public let durationSeconds: Double
+    public let completedAt: Date
+    public var outputTPS: Double { Double(outputTokens) / durationSeconds }
+    public init(outputTokens: Int, durationSeconds: Double, completedAt: Date) {
+        self.outputTokens = outputTokens; self.durationSeconds = durationSeconds; self.completedAt = completedAt
+    }
+}
+
+/// Completion-relative, generation-aware schedule for local usage scans.
+public struct LocalRefreshScheduler {
+    private(set) public var generation = 0
+    private var inFlight: Int?
+    private var nextDue = Date.distantPast
+    public init() {}
+    public mutating func begin(now: Date) -> Int? {
+        guard inFlight == nil, now >= nextDue else { return nil }
+        inFlight = generation
+        return generation
+    }
+    @discardableResult public mutating func complete(generation token: Int, now: Date) -> Bool {
+        guard inFlight == token, generation == token else { return false }
+        inFlight = nil; nextDue = now.addingTimeInterval(5)
+        return true
+    }
+    @discardableResult public mutating func invalidate() -> Int {
+        generation += 1; inFlight = nil; nextDue = .distantPast
+        return generation
     }
 }
 
@@ -435,10 +469,65 @@ public enum LocalCodexUsageReader {
     private static let maxSessions = 32
     private static let tailLimit = 256 * 1024
     private static let byteLimit = 8 * 1024 * 1024
+    private static let isoFormatter = ISO8601DateFormatter()
+    private static let fractionalISOFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
     private static let uuidPattern = try! NSRegularExpression(pattern: "([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\\.jsonl$")
 
     private struct Candidate { let name: String; let uuid: String; let modified: Date }
-    private struct Record { let date: Date; let input: Int; let output: Int; let total: Int; let five: WindowQuota?; let seven: WindowQuota?; let isRate: Bool }
+    fileprivate struct Record { let date: Date; let input: Int; let output: Int; let total: Int; let five: WindowQuota?; let seven: WindowQuota?; let isRate: Bool }
+
+    fileprivate struct FileSignature: Hashable {
+        let device: UInt64; let inode: UInt64; let size: Int64
+        let mtimeSec: Int64; let mtimeNSec: Int64; let ctimeSec: Int64; let ctimeNSec: Int64
+        init(_ st: stat) {
+            device = UInt64(st.st_dev); inode = UInt64(st.st_ino); size = Int64(st.st_size)
+            mtimeSec = Int64(st.st_mtimespec.tv_sec); mtimeNSec = Int64(st.st_mtimespec.tv_nsec)
+            ctimeSec = Int64(st.st_ctimespec.tv_sec); ctimeNSec = Int64(st.st_ctimespec.tv_nsec)
+        }
+    }
+    fileprivate struct ParsedEvent {
+        let date: Date
+        let type: String
+        let turnID: String?
+        let duration: Double?
+        let totalTokens: Int?
+        let outputTokens: Int?
+        let hasCumulativePayload: Bool
+        let usage: Record?
+        let rate: Record?
+    }
+    fileprivate struct CachedFileSummary {
+        let token: Record?
+        let rate: Record?
+        let turn: LocalTurnSummary?
+        let latestEventAt: Date?
+        let tailLimited: Bool
+    }
+    public final class Cache {
+        public struct Diagnostics: Equatable {
+            public fileprivate(set) var bytesRead = 0
+            public fileprivate(set) var parsedFiles = 0
+            public fileprivate(set) var cacheHits = 0
+            public fileprivate(set) var safeOpens = 0
+        }
+        public private(set) var diagnostics = Diagnostics()
+        public var entryCount: Int { entries.count }
+        fileprivate var entries: [FileSignature: CachedFileSummary] = [:]
+        fileprivate var rootIdentity: FileSignature?
+        fileprivate var beforePostReadValidation: (() -> Void)?
+        public init() {}
+        /// Internal deterministic race seam; available only to @testable checks.
+        init(beforePostReadValidation: @escaping () -> Void) { self.beforePostReadValidation = beforePostReadValidation }
+        fileprivate func resetDiagnostics() { diagnostics = Diagnostics() }
+        fileprivate func opened() { diagnostics.safeOpens += 1 }
+        fileprivate func hit() { diagnostics.cacheHits += 1 }
+        fileprivate func read(_ count: Int) { diagnostics.bytesRead += count }
+        fileprivate func parsed() { diagnostics.parsedFiles += 1 }
+    }
 
     public static func defaultSessionsDirectory(environment: [String: String] = ProcessInfo.processInfo.environment, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
         if let configured = environment["CODEX_HOME"], configured.hasPrefix("/") {
@@ -447,16 +536,20 @@ public enum LocalCodexUsageReader {
         return home.appendingPathComponent(".codex").appendingPathComponent("sessions")
     }
 
-    public static func scan(directory: URL, now: Date = Date()) throws -> LocalCodexSnapshot {
+    public static func scan(directory: URL, now: Date = Date()) throws -> LocalCodexSnapshot { try scan(directory: directory, now: now, cache: nil) }
+    public static func scan(directory: URL, now: Date = Date(), cache: Cache?) throws -> LocalCodexSnapshot {
+        cache?.resetDiagnostics()
         let empty = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil)
         var st = stat()
-        guard lstat(directory.path, &st) == 0 else { if errno == ENOENT { return empty }; return empty }
-        guard (st.st_mode & S_IFMT) == S_IFDIR else { return empty }
+        guard lstat(directory.path, &st) == 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty }
+        guard (st.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty }
         let rootFD = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-        guard rootFD >= 0 else { return empty }
+        guard rootFD >= 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty }
         defer { close(rootFD) }
         var opened = stat()
-        guard fstat(rootFD, &opened) == 0, (opened.st_mode & S_IFMT) == S_IFDIR else { return empty }
+        guard fstat(rootFD, &opened) == 0, (opened.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty }
+        let rootIdentity = FileSignature(opened)
+        if cache?.rootIdentity != rootIdentity { cache?.entries.removeAll(); cache?.rootIdentity = rootIdentity }
         var candidates: [Candidate] = [], entries = 0, limited = false
         var directories = [""]
         while let relative = directories.first, entries < maxEntries {
@@ -489,15 +582,23 @@ public enum LocalCodexUsageReader {
         if candidates.count > maxSessions { candidates = Array(candidates.prefix(maxSessions)); limited = true }
         var usedBytes = 0, filesScanned = 0, input = 0, output = 0, total = 0, sessionCount = 0
         var latestEvent: Date?, latestRate: Record?
+        var latestTurn: LocalTurnSummary?
+        var liveSignatures = Set<FileSignature>()
         for candidate in candidates {
             guard usedBytes < byteLimit else { limited = true; break }
             let fd = openRelative(rootFD, candidate.name)
             guard fd >= 0 else { continue }
             defer { close(fd) }
+            cache?.opened()
             var fst = stat()
             guard fstat(fd, &fst) == 0, (fst.st_mode & S_IFMT) == S_IFREG, fst.st_size >= 0 else { continue }
             let contained = isContained(fd: fd, rootFD: rootFD)
             guard contained else { continue }
+            let signature = FileSignature(fst)
+            liveSignatures.insert(signature)
+            var summary = cache?.entries[signature]
+            if summary != nil { cache?.hit() }
+            else {
             let remaining = byteLimit - usedBytes
             let amount = min(Int(fst.st_size), tailLimit, remaining)
             if amount <= 0 { limited = true; continue }
@@ -509,21 +610,32 @@ public enum LocalCodexUsageReader {
             }
             guard readCount > 0 else { continue }
             data.count = readCount
-            usedBytes += readCount; filesScanned += 1
+            cache?.read(readCount)
+            usedBytes += readCount
             if fst.st_size > off_t(amount) { limited = true }
             var lines = data.split(separator: 10, omittingEmptySubsequences: false)
             if offset > 0, !data.isEmpty { lines.removeFirst() }
             if data.last != 10 { lines.removeLast() }
-            var lastToken: Record?
+            var parsed: [ParsedEvent] = []
+            var hasInvalidLifecycleTimestamp = false
             for line in lines where !line.isEmpty {
                 guard let object = try? JSONSerialization.jsonObject(with: Data(line)), let root = object as? [String: Any],
                       root["type"] as? String == "event_msg", let payload = root["payload"] as? [String: Any] else { continue }
-                guard let date = parseDate(root["timestamp"]) else { continue }
                 let payloadType = payload["type"] as? String
-                if payloadType == "token_count", let info = payload["info"] as? [String: Any],
-                   let usage = info["total_token_usage"] as? [String: Any],
+                guard let date = parseDate(root["timestamp"]) else {
+                    if ["task_started", "task_complete", "turn_aborted", "token_count"].contains(payloadType ?? "") {
+                        hasInvalidLifecycleTimestamp = true
+                    }
+                    continue
+                }
+                var tokenRecord: Record?, rateRecord: Record?, cumulativeTotal: Int?, cumulativeOutput: Int?
+                let usageInfo = payload["info"] as? [String: Any]
+                let cumulativePayload = usageInfo?["total_token_usage"] as? [String: Any]
+                let hasCumulativePayload = usageInfo?.keys.contains("total_token_usage") == true
+                if payloadType == "token_count", let usage = cumulativePayload,
                    let i = integer(usage["input_tokens"]), let o = integer(usage["output_tokens"]), let t = integer(usage["total_tokens"]) {
-                    lastToken = Record(date: date, input: i, output: o, total: t, five: nil, seven: nil, isRate: false)
+                    tokenRecord = Record(date: date, input: i, output: o, total: t, five: nil, seven: nil, isRate: false)
+                    cumulativeTotal = t; cumulativeOutput = o
                 }
                 if payloadType == "token_count" {
                     let limits = payload["rate_limits"] as? [String: Any]
@@ -533,18 +645,111 @@ public enum LocalCodexUsageReader {
                     let record = Record(date: date, input: 0, output: 0, total: 0,
                         five: fiveCandidates.count == 1 ? fiveCandidates[0] : nil,
                         seven: sevenCandidates.count == 1 ? sevenCandidates[0] : nil, isRate: true)
-                    if latestRate == nil || latestRate!.date <= date { latestRate = record }
+                    rateRecord = record
+                }
+                let duration: Double?
+                if payload.keys.contains("duration_ms") {
+                    if let value = payload["duration_ms"] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(), value.doubleValue.isFinite, value.doubleValue >= 0 { duration = value.doubleValue }
+                    else { duration = .nan }
+                } else { duration = nil }
+                parsed.append(ParsedEvent(date: date, type: payloadType ?? "", turnID: payload["turn_id"] as? String,
+                    duration: duration, totalTokens: cumulativeTotal, outputTokens: cumulativeOutput,
+                    hasCumulativePayload: hasCumulativePayload, usage: tokenRecord, rate: rateRecord))
+            }
+            cache?.parsed()
+            cache?.beforePostReadValidation?()
+            var after = stat()
+            guard fstat(fd, &after) == 0, FileSignature(after) == signature else {
+                cache?.entries.removeValue(forKey: signature)
+                continue
+            }
+            let token = parsed.compactMap(\.usage).filter { !$0.isRate }.last
+            let rate = parsed.compactMap(\.rate).reduce(nil as Record?) { latest, record in
+                latest == nil || latest!.date <= record.date ? record : latest
+            }
+            let turnSummaries = hasInvalidLifecycleTimestamp ? [] : completedTurns(in: parsed)
+            let hasFutureTurn = turnSummaries.contains { $0.completedAt > now }
+            let tailLimited = fst.st_size > off_t(amount)
+            let fileSummary = CachedFileSummary(token: token, rate: rate,
+                turn: turnSummaries.filter { $0.completedAt <= now }.max(by: { $0.completedAt < $1.completedAt }),
+                latestEventAt: token?.date, tailLimited: tailLimited)
+            summary = fileSummary
+            if let cache {
+                if hasFutureTurn { cache.entries.removeValue(forKey: signature) }
+                else { cache.entries[signature] = fileSummary }
+                if cache.entries.count > maxSessions {
+                    let excess = cache.entries.count - maxSessions
+                    for key in cache.entries.keys.prefix(excess) { cache.entries.removeValue(forKey: key) }
                 }
             }
-            if let record = lastToken {
+            }
+            guard let summary else { continue }
+            filesScanned += 1
+            if summary.tailLimited { limited = true }
+            if let rate = summary.rate, latestRate == nil || latestRate!.date <= rate.date { latestRate = rate }
+            if let record = summary.token {
                 let (ni, oi) = input.addingReportingOverflow(record.input), (no, oo) = output.addingReportingOverflow(record.output), (nt, ot) = total.addingReportingOverflow(record.total)
                 guard !oi, !oo, !ot else { throw StatError.message("本地用量汇总超出可表示范围") }
                 input = ni; output = no; total = nt; sessionCount += 1
                 if latestEvent == nil || latestEvent! < record.date { latestEvent = record.date }
             }
+            if let turn = summary.turn, turn.completedAt <= now,
+               latestTurn == nil || latestTurn!.completedAt < turn.completedAt { latestTurn = turn }
         }
+        if let cache { cache.entries = cache.entries.filter { liveSignatures.contains($0.key) } }
         return LocalCodexSnapshot(input: input, output: output, total: total, sessionCount: sessionCount, filesScanned: filesScanned, isLimited: limited, latestEventAt: latestEvent,
-            fiveHour: latestRate?.five, sevenDay: latestRate?.seven)
+            fiveHour: latestRate?.five, sevenDay: latestRate?.seven, lastTurn: latestTurn)
+    }
+
+    private static func completedTurns(in events: [ParsedEvent]) -> [LocalTurnSummary] {
+        var result: [LocalTurnSummary] = []
+        for (startIndex, start) in events.enumerated() where start.type == "task_started" {
+            guard let id = start.turnID, !id.isEmpty else { continue }
+            var activeIDs: [String] = []
+            for event in events[..<startIndex] {
+                if event.type == "task_started", let activeID = event.turnID { activeIDs.append(activeID) }
+                if event.type == "task_complete", let completedID = event.turnID,
+                   let index = activeIDs.lastIndex(of: completedID) { activeIDs.remove(at: index) }
+                if event.type == "turn_aborted" {
+                    if let abortedID = event.turnID, let index = activeIDs.lastIndex(of: abortedID) { activeIDs.remove(at: index) }
+                    else if event.turnID == nil { activeIDs.removeAll() }
+                }
+            }
+            guard activeIDs.isEmpty else { continue }
+            let completes = events.enumerated().filter { $0.element.type == "task_complete" && $0.element.turnID == id && $0.offset > startIndex }
+            guard let (endIndex, complete) = completes.first else { continue }
+            // Reused identifiers and overlapping turns make token attribution ambiguous.
+            guard !events.enumerated().contains(where: { $0.offset > startIndex && $0.offset < endIndex && $0.element.type == "task_started" }) else { continue }
+            guard !events.enumerated().contains(where: { $0.offset > startIndex && $0.offset < endIndex && $0.element.type == "task_complete" && $0.element.turnID != id }) else { continue }
+            guard !events[startIndex..<endIndex].contains(where: { $0.type == "turn_aborted" && ($0.turnID == nil || $0.turnID == id) }) else { continue }
+            let intervalDates = events[startIndex...endIndex].map(\.date)
+            guard zip(intervalDates, intervalDates.dropFirst()).allSatisfy({ $0 <= $1 }) else { continue }
+            let earlierStarts = events[..<startIndex].filter { $0.type == "task_started" && $0.turnID == id }
+            guard earlierStarts.isEmpty else { continue }
+            guard !events.enumerated().contains(where: { $0.offset > endIndex && $0.element.type == "task_started" && $0.element.turnID == id }) else { continue }
+            var durationMS: Double?
+            if let duration = complete.duration { durationMS = duration }
+            else { durationMS = complete.date.timeIntervalSince(start.date) * 1000 }
+            guard let durationMS, durationMS.isFinite, durationMS >= 100 else { continue }
+            let baselineEvents = events[..<startIndex].filter {
+                $0.type == "token_count" && $0.hasCumulativePayload
+            }
+            guard let baseline = baselineEvents.last, baseline.date <= start.date, let baselineTotal = baseline.totalTokens,
+                  let baselineOutput = baseline.outputTokens else { continue }
+            let inTurn = events[(startIndex + 1)..<endIndex].filter { $0.type == "token_count" && $0.hasCumulativePayload }
+            guard !inTurn.isEmpty, inTurn.allSatisfy({ $0.totalTokens != nil && $0.outputTokens != nil }) else { continue }
+            let totals = inTurn.compactMap(\.totalTokens), outputs = inTurn.compactMap(\.outputTokens)
+            guard let lastTotal = totals.last, lastTotal >= baselineTotal, totals.first! >= baselineTotal,
+                  let lastOutput = outputs.last, lastOutput >= baselineOutput, outputs.first! >= baselineOutput,
+                  zip(totals, totals.dropFirst()).allSatisfy({ $0 <= $1 }),
+                  zip(outputs, outputs.dropFirst()).allSatisfy({ $0 <= $1 }) else { continue }
+            let duration = complete.duration ?? complete.date.timeIntervalSince(start.date) * 1000
+            guard duration.isFinite, duration >= 100 else { continue }
+            let summary = LocalTurnSummary(outputTokens: lastOutput - baselineOutput,
+                durationSeconds: duration / 1000, completedAt: complete.date)
+            result.append(summary)
+        }
+        return result
     }
 
     private static func integer(_ value: Any?) -> Int? {
@@ -601,10 +806,7 @@ public enum LocalCodexUsageReader {
     }
     private static func parseDate(_ value: Any?) -> Date? {
         guard let s = value as? String else { return nil }
-        let formatter = ISO8601DateFormatter()
-        if let date = formatter.date(from: s) { return date }
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: s)
+        return isoFormatter.date(from: s) ?? fractionalISOFormatter.date(from: s)
     }
     private static func window(_ value: Any?, minutes: Int, now: Date, at date: Date) -> WindowQuota? {
         guard let v = value as? [String: Any], let raw = v["used_percent"] as? NSNumber,
@@ -1325,7 +1527,7 @@ public enum UsageDecoder {
 import AppKit
 import Combine
 #if SWIFT_PACKAGE
-import TokenStatCore
+@preconcurrency import TokenStatCore
 #endif
 import UniformTypeIdentifiers
 
@@ -1361,6 +1563,9 @@ struct SpeedPoint: Identifiable {
     private var quotaFetch: Task<Void, Never>?
     private var localScan: DispatchWorkItem?
     private var localScanRunning = false
+    private let localScanQueue = DispatchQueue(label: "TokenStatMenu.localCodexScan", qos: .utility)
+    private var localCache = LocalCodexUsageReader.Cache()
+    private var localRefreshScheduler = LocalRefreshScheduler()
     private var proxyWasStarted = false
     private var isShuttingDown = false
     private var generation = 0
@@ -1411,7 +1616,7 @@ struct SpeedPoint: Identifiable {
             }
         }
     }
-    func shutdown() { isShuttingDown = true; generation += 1; timer?.invalidate(); quotaLoop?.cancel(); quotaFetch?.cancel(); localScan?.cancel(); if proxyWasStarted { proxy.stop() } }
+    func shutdown() { isShuttingDown = true; generation += 1; _ = localRefreshScheduler.invalidate(); timer?.invalidate(); quotaLoop?.cancel(); quotaFetch?.cancel(); localScan?.cancel(); if proxyWasStarted { proxy.stop() } }
     func tick() {
         stats = engine.snapshot()
         let now = Date()
@@ -1437,11 +1642,31 @@ struct SpeedPoint: Identifiable {
         return hasRequestData ? "本次启动 · 仅统计经过本机代理的请求" : "未采集到请求数据 · 尚未观测到客户端流量"
     }
     var title: String {
-        if config.dataSource == "localCodex" { return (isTestFixture ? "测试 " : "") + "T:—" }
+        if config.dataSource == "localCodex" {
+            let rate = localSnapshot.lastTurn.map { String(format: "%.1ftok/s", $0.outputTPS) } ?? "—"
+            let total = localSnapshot.sessionCount > 0 ? formatCompactCount(localSnapshot.total) : "—"
+            return (isTestFixture ? "测试 " : "") + "上轮均:\(rate) · Σ\(total) · \(localSnapshot.sessionCount)会话"
+        }
         let value = !hasRequestData ? "T:—" : stats.active > 0
             ? String(format: "T:≈%.1ftok/s", stats.outputTPS) : "T:0.0tok/s"
-        return (isTestFixture ? "测试 " : "") + value
+        let total = stats.requests > 0 ? formatCompactCount(stats.total) : "—"
+        return (isTestFixture ? "测试 " : "") + "\(value) · Σ\(total) · 请求\(stats.requests)"
     }
+    var menuTooltip: String {
+        guard config.dataSource == "localCodex" else { return "\(dataNotice) · \(proxyStatus)" }
+        let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
+        let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
+        let coverage = "扫描上限：最多32个会话文件、每文件尾部256KiB、总计8MiB；" + (localSnapshot.isLimited ? "本次达到上限，记录可能不完整" : "本次已检查 \(localSnapshot.filesScanned) 个会话文件，\(localSnapshot.sessionCount) 个含有效累计用量")
+        return "本地 Codex 历史累计：\(formatCount(localSnapshot.total)) tokens · \(localSnapshot.sessionCount)会话\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n5 小时额度：\(quotaDescription(fiveHourQuota))\n7 天额度：\(quotaDescription(sevenDayQuota))"
+    }
+    private func quotaDescription(_ quota: WindowQuota?) -> String {
+        guard let quota else { return "未提供" }
+        let status = WindowQuotaCard.presentation(for: quota, refreshSeconds: config.refreshSeconds).statusLabel
+        let reset = quota.resetsAt.map { "，原重置时间 \($0.formatted())" } ?? "，重置时间未知"
+        return "\(status)，上游已用 \(String(format: "%.1f", quota.usedPercent))%\(reset)"
+    }
+    private func formatCount(_ value: Int) -> String { value.formatted(.number) }
+    private func formatCompactCount(_ value: Int) -> String { value.formatted(.number.notation(.compactName)) }
     var alertColor: NSColor {
         let windows = [fiveHourQuota, sevenDayQuota].compactMap { $0 }
             .filter { $0.isFresh(refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
@@ -1487,6 +1712,8 @@ struct SpeedPoint: Identifiable {
     }
     private func startServices() {
         generation += 1; quotaLoop?.cancel(); quotaFetch?.cancel(); quotaFetch = nil; quotaLoading = false
+        _ = localRefreshScheduler.invalidate()
+        localCache = LocalCodexUsageReader.Cache()
         localScan?.cancel(); localScan = nil
         quota = nil; quotaError = config.usageURL.isEmpty ? "未配置企业用量接口，已用量未知" : "等待企业接口"
         fiveHourQuota = nil; sevenDayQuota = nil
@@ -1517,15 +1744,20 @@ struct SpeedPoint: Identifiable {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             Task { @MainActor in
-                guard !self.isShuttingDown, self.generation == version, !self.localScanRunning,
+                guard !self.isShuttingDown, self.generation == version,
                       self.config.dataSource == "localCodex" else { return }
+                guard !self.localScanRunning else { return }
+                guard let scanGeneration = self.localRefreshScheduler.begin(now: Date()) else {
+                    self.scheduleLocalScan(immediate: false); return
+                }
                 self.localScanRunning = true
                 let directory = LocalCodexUsageReader.defaultSessionsDirectory()
-                DispatchQueue.global(qos: .utility).async {
-                    let result = try? LocalCodexUsageReader.scan(directory: directory)
+                let cache = self.localCache
+                self.localScanQueue.async {
+                    let result = try? LocalCodexUsageReader.scan(directory: directory, now: Date(), cache: cache)
                     Task { @MainActor in
-                        guard self.generation == version else {
-                            self.localScanRunning = false
+                        self.localScanRunning = false
+                        guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
                             if self.config.dataSource == "localCodex", !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
                             return
                         }
@@ -1538,14 +1770,13 @@ struct SpeedPoint: Identifiable {
                                 self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
                             }
                         }
-                        self.localScanRunning = false
                         if self.config.dataSource == "localCodex" { self.scheduleLocalScan() }
                     }
                 }
             }
         }
         localScan = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0 : 30), execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0 : 5), execute: work)
     }
     func refreshQuota() {
         guard config.dataSource == "proxy", !config.usageURL.isEmpty, !quotaLoading else { return }
@@ -1704,10 +1935,16 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             VStack(alignment: .leading, spacing: 10) {
                 metric("历史输入 Token", localCount(model.localSnapshot.input))
                 metric("历史输出 Token", localCount(model.localSnapshot.output))
-                metric("历史总 Token", localCount(model.localSnapshot.total))
+                metric("历史总 Token", model.localSnapshot.sessionCount > 0 ? localCount(model.localSnapshot.total) : "未知")
                 metric("包含会话", "\(model.localSnapshot.sessionCount)")
                 metric("最近用量事件", model.localSnapshot.latestEventAt?.formatted(date: .abbreviated, time: .shortened) ?? "未发现")
-                Text("本地 Codex 会话记录中的历史累计值；不是实时速率、企业总量或账单。扫描最多纳入 32 个最新修改会话，每文件尾部最多 256 KiB（单轮总计 8 MiB）。\(model.localSnapshot.isLimited ? "已达到扫描范围限制，较旧记录可能未包含。" : "")")
+                if let turn = model.localSnapshot.lastTurn {
+                    metric("上轮记录均速", String(format: "%.1f tok/s", turn.outputTPS))
+                    metric("上轮完成时间", turn.completedAt.formatted(date: .abbreviated, time: .shortened))
+                } else {
+                    metric("上轮记录均速", "未知")
+                }
+                Text("上轮均速包含工具、网络和等待，只统计会话记录的 output；不是模型瞬时生成速度。缺少可信边界或累计基线时显示未知。本地 Codex 会话记录是历史累计值，不是实时速率、企业总量或账单。扫描最多纳入 32 个最新修改会话，每文件尾部最多 256 KiB（总计 8 MiB）。\(model.localSnapshot.isLimited ? "已达到扫描范围限制，较旧记录可能未包含。" : "")")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
         } label: { Label("本地记录用量", systemImage: "doc.text.magnifyingglass") }
@@ -1715,13 +1952,19 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private var localQuotaCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
-                metric("5 小时额度", model.fiveHourQuota.map { String(format: "%.0f%% 已用", $0.usedPercent) } ?? "未知")
-                metric("7 天额度", model.sevenDayQuota.map { String(format: "%.0f%% 已用", $0.usedPercent) } ?? "未知")
+                metric("5 小时额度", localQuotaDescription(model.fiveHourQuota))
+                metric("7 天额度", localQuotaDescription(model.sevenDayQuota))
                 Text("额度来自最近的本地 rate_limits 事件；仅作历史快照，过期或未来时间不会作为当前额度。")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
             }
         } label: { Label("本地额度快照", systemImage: "chart.bar") }
+    }
+    private func localQuotaDescription(_ quota: WindowQuota?) -> String {
+        let state = WindowQuotaCard.presentation(for: quota, refreshSeconds: model.config.refreshSeconds)
+        guard let percent = state.usedPercent else { return state.statusLabel }
+        let reset = state.resetsAt.map { " · \($0.formatted(date: .abbreviated, time: .shortened))重置" } ?? " · 重置时间未知"
+        return "\(state.statusLabel) · 上游已用 \(String(format: "%.1f", percent))%\(reset)"
     }
     private var sessionCard: some View {
         GroupBox {
@@ -2071,8 +2314,7 @@ import SwiftUI
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: color
             ])
         }
-        let measurement = model.config.dataSource == "localCodex" ? "本地历史快照 · 速度缺少可靠计时" : "输出估算速度（5 秒窗口）"
-        item.button?.toolTip = "\(model.dataNotice) · \(measurement) · \(model.proxyStatus)"
+        item.button?.toolTip = model.menuTooltip
         writeDiagnosticsIfRequested()
     }
     @objc func toggle() {
@@ -2360,13 +2602,29 @@ import SwiftUI
 import TokenStatCore
 #endif
 
+struct WindowQuotaPresentation: Equatable {
+    let isFresh: Bool
+    let usedPercent: Double?
+    let resetsAt: Date?
+    let statusLabel: String
+}
+
 struct WindowQuotaCard: View {
     let title: String
     let quota: WindowQuota?
     let color: Color
     let refreshSeconds: Double
+    static func presentation(for quota: WindowQuota?, at now: Date = Date(), refreshSeconds: Double) -> WindowQuotaPresentation {
+        guard let quota else { return WindowQuotaPresentation(isFresh: false, usedPercent: nil, resetsAt: nil, statusLabel: "未提供") }
+        if quota.fetchedAt > now { return WindowQuotaPresentation(isFresh: false, usedPercent: quota.usedPercent, resetsAt: quota.resetsAt, statusLabel: "异常时间戳") }
+        let fresh = quota.isFresh(at: now, refreshSeconds: refreshSeconds)
+        let staleLabel = quota.resetsAt.map { $0 <= now } == true ? "历史额度 · 已过期" : "历史额度"
+        return WindowQuotaPresentation(isFresh: fresh, usedPercent: quota.usedPercent, resetsAt: quota.resetsAt,
+            statusLabel: fresh ? "当前额度" : staleLabel)
+    }
     var body: some View {
-        let fresh = quota?.isFresh(refreshSeconds: refreshSeconds) == true
+        let presentation = Self.presentation(for: quota, refreshSeconds: refreshSeconds)
+        let fresh = presentation.isFresh
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -2382,17 +2640,16 @@ struct WindowQuotaCard: View {
                         Capsule().fill(color).frame(width: geometry.size.width * quota.remainingPercent / 100)
                     }
                 }.frame(height: 5)
-                if let quota {
-                    Text(String(format: "上游已用 %.1f%%", quota.usedPercent))
+                if let used = presentation.usedPercent {
+                    Text(String(format: "上游已用 %.1f%%", used))
                         .font(.system(size: 10)).foregroundStyle(.secondary)
-                    if !fresh {
-                        Text("已过期 · 等待刷新").foregroundStyle(.orange)
-                    } else if let reset = quota.resetsAt {
-                        Text(reset.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute()) + " 重置")
+                    if !fresh { Text(presentation.statusLabel + " · 等待刷新").foregroundStyle(.orange) }
+                    if let reset = presentation.resetsAt {
+                        Text((fresh ? "重置于 " : "原重置时间 ") + reset.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute()))
                             .foregroundStyle(.secondary)
-                    } else { Text("重置时间未提供").foregroundStyle(.secondary) }
+                    } else if fresh { Text("重置时间未提供").foregroundStyle(.secondary) }
                 } else {
-                    Text("接口未提供 / 字段未匹配").foregroundStyle(.secondary)
+                    Text(presentation.statusLabel).foregroundStyle(.secondary)
                     Text("重置时间未知").foregroundStyle(.secondary)
                 }
             }.font(.system(size: 9)).frame(maxWidth: .infinity, alignment: .leading)
@@ -2813,11 +3070,35 @@ extension CoreChecks {
 ```swift
 import CoreFoundation
 import Foundation
-import TokenStatCore
+@testable import TokenStatCore
 
 extension CoreChecks {
     static func localCodexUsageChecks() throws {
         let now = Date(timeIntervalSince1970: 1_797_000_000)
+
+        var refresh = LocalRefreshScheduler()
+        let firstGeneration = refresh.begin(now: now)
+        check(firstGeneration != nil && refresh.begin(now: now.addingTimeInterval(1)) == nil,
+            "local scheduler allows one startup scan and never overlaps an in-flight scan")
+        if let generation = firstGeneration {
+            check(refresh.complete(generation: generation, now: now.addingTimeInterval(3)),
+                "local scheduler accepts completion for the active generation")
+            check(refresh.begin(now: now.addingTimeInterval(7.9)) == nil
+                && refresh.begin(now: now.addingTimeInterval(8)) != nil,
+                "next local scan is due five seconds after the prior scan completes")
+        } else {
+            check(false, "local scheduler accepts completion for the active generation")
+            check(false, "next local scan is due five seconds after the prior scan completes")
+        }
+        var cancelledRefresh = LocalRefreshScheduler()
+        let staleGeneration = cancelledRefresh.begin(now: now)
+        _ = cancelledRefresh.invalidate()
+        if let staleGeneration {
+            check(!cancelledRefresh.complete(generation: staleGeneration, now: now.addingTimeInterval(10)),
+                "mode/root invalidation rejects a late local scan result")
+        } else {
+            check(false, "mode/root invalidation rejects a late local scan result")
+        }
 
         let aggregateRoot = try fixtureDirectory("aggregate")
         defer { try? FileManager.default.removeItem(at: aggregateRoot.deletingLastPathComponent()) }
@@ -2844,8 +3125,338 @@ extension CoreChecks {
             "repeated local Codex scans replace the snapshot instead of accumulating it")
         let reflectedFields = Set(Mirror(reflecting: aggregate).children.compactMap(\.label))
         check(reflectedFields == Set(["input", "output", "total", "sessionCount", "filesScanned",
-            "isLimited", "latestEventAt", "fiveHour", "sevenDay"]),
-            "local Codex snapshot contains only numeric, timestamp, quota and scan metadata")
+            "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn"]),
+            "local Codex snapshot exposes only bounded numeric turn and aggregate metadata")
+
+        let turnRoot = try fixtureDirectory("completed-turn")
+        let turnID = "abababab-abab-4bab-8bab-aaaaaaaaaaaa"
+        try writeSession(in: turnRoot, uuid: turnID, events: [
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 100),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "turn-1"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 140),
+            turnBoundary(at: now, type: "task_complete", id: "turn-1", durationMS: 1000)
+        ], modified: now)
+        let completedTurn = try LocalCodexUsageReader.scan(directory: turnRoot, now: now)
+        check(completedTurn.lastTurn?.outputTokens == 40
+            && completedTurn.lastTurn?.durationSeconds == 1
+            && completedTurn.lastTurn?.outputTPS == 40,
+            "completed local turn speed uses last in-turn cumulative output delta over whole turn duration")
+        if let turn = completedTurn.lastTurn {
+            let fields = Mirror(reflecting: turn).children
+            let turnFields = Set(fields.compactMap(\.label))
+            check(turnFields == Set(["outputTokens", "durationSeconds", "completedAt"])
+                && fields.allSatisfy { !($0.value is String) && !($0.value is URL) && !($0.value is Data) },
+                "turn reflection exposes only narrow numeric and timestamp fields, with no identifier or path")
+        } else {
+            check(false, "turn reflection exposes only narrow numeric and timestamp fields, with no identifier or path")
+        }
+        try? FileManager.default.removeItem(at: turnRoot.deletingLastPathComponent())
+
+        let equalTimestampRoot = try fixtureDirectory("equal-turn-timestamps")
+        try writeSession(in: equalTimestampRoot, uuid: "acacacac-acac-4cac-8cac-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 3),
+            turnBoundary(at: now, type: "task_started", id: "turn-equal"),
+            turnTokenEvent(at: now, output: 8),
+            turnBoundary(at: now, type: "task_complete", id: "turn-equal", durationMS: 100)
+        ], modified: now)
+        let equalTimestamps = try LocalCodexUsageReader.scan(directory: equalTimestampRoot, now: now)
+        check(equalTimestamps.lastTurn?.outputTokens == 5
+            && equalTimestamps.lastTurn?.durationSeconds == 0.1,
+            "equal adjacent timestamps are valid in JSONL order when duration_ms establishes a valid turn")
+        try? FileManager.default.removeItem(at: equalTimestampRoot.deletingLastPathComponent())
+
+        let invalidDurationRoot = try fixtureDirectory("invalid-turn-duration")
+        try writeSession(in: invalidDurationRoot, uuid: "adadadad-adad-4dad-8dad-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 3),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "turn-bad"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 8),
+            turnBoundary(at: now, type: "task_complete", id: "turn-bad", durationLiteral: "true")
+        ], modified: now)
+        let invalidDuration = try LocalCodexUsageReader.scan(directory: invalidDurationRoot, now: now)
+        check(invalidDuration.lastTurn == nil,
+            "present invalid duration_ms rejects a turn instead of falling back to timestamps")
+        try? FileManager.default.removeItem(at: invalidDurationRoot.deletingLastPathComponent())
+
+        let laterBaselineRoot = try fixtureDirectory("late-timestamp-baseline")
+        try writeSession(in: laterBaselineRoot, uuid: "bebebebe-bebe-4ebe-8ebe-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-3), output: 1),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "late-baseline"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.25), output: 3),
+            turnBoundary(at: now, type: "task_complete", id: "late-baseline", durationMS: 1000)
+        ], modified: now)
+        let lateBaseline = try LocalCodexUsageReader.scan(directory: laterBaselineRoot, now: now)
+        check(lateBaseline.lastTurn == nil,
+            "reader cannot skip a later-recorded baseline whose timestamp is after start to use an earlier baseline")
+        try? FileManager.default.removeItem(at: laterBaselineRoot.deletingLastPathComponent())
+
+        let nestedTurnsRoot = try fixtureDirectory("outer-incomplete-inner-complete")
+        try writeSession(in: nestedTurnsRoot, uuid: "bebebebe-bebe-4ebe-8ebe-bbbbbbbbbbbb", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-4), output: 1),
+            turnBoundary(at: now.addingTimeInterval(-3), type: "task_started", id: "outer"),
+            turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "inner"),
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 4),
+            turnBoundary(at: now, type: "task_complete", id: "inner", durationMS: 1000)
+        ], modified: now)
+        let nestedTurns = try LocalCodexUsageReader.scan(directory: nestedTurnsRoot, now: now)
+        check(nestedTurns.lastTurn == nil,
+            "an inner complete turn cannot be accepted while an outer overlapping turn remains open")
+        try? FileManager.default.removeItem(at: nestedTurnsRoot.deletingLastPathComponent())
+
+        let malformedExplicitRoot = try fixtureDirectory("malformed-explicit-usage")
+        try writeSession(in: malformedExplicitRoot, uuid: "bfbfbfbf-bfbf-4bfb-8bfb-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 1),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "bad-usage"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2),
+            rawTokenEvent(at: now.addingTimeInterval(-0.25), inputLiteral: "null", outputLiteral: "3"),
+            turnBoundary(at: now, type: "task_complete", id: "bad-usage", durationMS: 1000)
+        ], modified: now)
+        let malformedExplicit = try LocalCodexUsageReader.scan(directory: malformedExplicitRoot, now: now)
+        check(malformedExplicit.lastTurn == nil,
+            "explicit null or malformed cumulative usage cannot be ignored after valid in-turn usage")
+        try? FileManager.default.removeItem(at: malformedExplicitRoot.deletingLastPathComponent())
+
+        var oversizedPrefix = Data(repeating: 0x78, count: 256 * 1024 + 32)
+        oversizedPrefix.append(10)
+        let tailCompleteRoot = try fixtureDirectory("tail-complete-turn")
+        try writeSession(in: tailCompleteRoot, uuid: "babababa-baba-4bab-8bab-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 2),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "tail"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 5),
+            turnBoundary(at: now, type: "task_complete", id: "tail", durationMS: 1000)
+        ], modified: now, prefix: oversizedPrefix)
+        let tailComplete = try LocalCodexUsageReader.scan(directory: tailCompleteRoot, now: now)
+        check(tailComplete.lastTurn?.outputTokens == 3,
+            "a complete turn retained within the bounded tail remains eligible")
+        try? FileManager.default.removeItem(at: tailCompleteRoot.deletingLastPathComponent())
+
+        let tailMissingBaselineRoot = try fixtureDirectory("tail-missing-baseline")
+        try writeSession(in: tailMissingBaselineRoot, uuid: "bcbabcbc-bcbc-4bcb-8bcb-aaaaaaaaaaaa", events: [
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "tail"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 5),
+            turnBoundary(at: now, type: "task_complete", id: "tail", durationMS: 1000)
+        ], modified: now, prefix: oversizedPrefix)
+        let tailMissingBaseline = try LocalCodexUsageReader.scan(directory: tailMissingBaselineRoot, now: now)
+        check(tailMissingBaseline.lastTurn == nil,
+            "a truncated tail missing the cumulative baseline cannot produce turn speed")
+        try? FileManager.default.removeItem(at: tailMissingBaselineRoot.deletingLastPathComponent())
+
+        let fallbackRoot = try fixtureDirectory("turn-duration-fallback")
+        try writeSession(in: fallbackRoot, uuid: "afafafaf-afaf-4faf-8faf-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 10),
+            turnBoundary(at: now.addingTimeInterval(-0.5), type: "task_started", id: "turn-fallback"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.25), output: 30),
+            turnBoundary(at: now, type: "task_complete", id: "turn-fallback")
+        ], modified: now)
+        let fallback = try LocalCodexUsageReader.scan(directory: fallbackRoot, now: now)
+        check(fallback.lastTurn?.outputTokens == 20 && fallback.lastTurn?.durationSeconds == 0.5,
+            "absent duration_ms falls back to start-to-completion event timestamp duration")
+        try? FileManager.default.removeItem(at: fallbackRoot.deletingLastPathComponent())
+
+        let activeAfterCompletionRoot = try fixtureDirectory("completed-before-active")
+        try writeSession(in: activeAfterCompletionRoot, uuid: "baababaa-baba-4bab-8bab-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-4), output: 10),
+            turnBoundary(at: now.addingTimeInterval(-3), type: "task_started", id: "completed"),
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 30),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_complete", id: "completed", durationMS: 2000),
+            turnTokenEvent(at: now.addingTimeInterval(-0.9), output: 30),
+            turnBoundary(at: now.addingTimeInterval(-0.8), type: "task_started", id: "latest"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.6), output: 50),
+            turnBoundary(at: now.addingTimeInterval(-0.3), type: "task_complete", id: "latest", durationMS: 500),
+            turnBoundary(at: now.addingTimeInterval(-0.2), type: "task_started", id: "still-active"),
+            turnTokenEvent(at: now, output: 80)
+        ], modified: now)
+        let retainedCompleted = try LocalCodexUsageReader.scan(directory: activeAfterCompletionRoot, now: now)
+        check(retainedCompleted.lastTurn?.outputTokens == 20 && retainedCompleted.lastTurn?.durationSeconds == 0.5,
+            "the most recent completed turn wins, and a still-active turn does not replace it")
+        try? FileManager.default.removeItem(at: activeAfterCompletionRoot.deletingLastPathComponent())
+
+        let rejectedTurnCases: [(String, [Data])] = try [
+            ("missing-baseline", [turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now, output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("invalid-explicit-baseline", [rawTokenEvent(at: now.addingTimeInterval(-2), inputLiteral: "0", outputLiteral: "-1"), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("invalid-later-in-turn-usage", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.75), output: 2), rawTokenEvent(at: now.addingTimeInterval(-0.5), inputLiteral: "0", outputLiteral: "-1"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("missing-start", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("missing-complete", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now, output: 2)]),
+            ("missing-in-turn-usage", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("overlap", [turnTokenEvent(at: now.addingTimeInterval(-4), output: 1), turnBoundary(at: now.addingTimeInterval(-3), type: "task_started", id: "x"), turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "y"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now.addingTimeInterval(-0.5), type: "task_complete", id: "x", durationMS: 2000), turnBoundary(at: now, type: "task_complete", id: "y", durationMS: 1000)]),
+            ("reused-id", [turnTokenEvent(at: now.addingTimeInterval(-5), output: 1), turnBoundary(at: now.addingTimeInterval(-4), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-3), output: 2), turnBoundary(at: now.addingTimeInterval(-2), type: "task_complete", id: "x", durationMS: 1000), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now, output: 3), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("post-complete-usage", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000), turnTokenEvent(at: now, output: 4)]),
+            ("mismatched-id", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "y", durationMS: 1000)]),
+            ("aborted", [turnTokenEvent(at: now.addingTimeInterval(-3), output: 1), turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now.addingTimeInterval(-0.5), type: "turn_aborted", id: "x"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("future-complete", [turnTokenEvent(at: now.addingTimeInterval(-3), output: 1), turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now.addingTimeInterval(1), type: "task_complete", id: "x", durationMS: 1000)]),
+            ("timestamp-regression", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("null-duration", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationLiteral: "null")]),
+            ("negative-duration", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: -1)]),
+            ("too-short-duration", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 99)]),
+            ("rollback", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 10), turnBoundary(at: now.addingTimeInterval(-1.5), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 15), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 12), turnTokenEvent(at: now.addingTimeInterval(-0.25), output: 18), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)])
+        ]
+        for (label, events) in rejectedTurnCases {
+            let root = try fixtureDirectory("turn-reject-\(label)")
+            let uuid = UUID().uuidString.lowercased()
+            try writeSession(in: root, uuid: uuid, events: events, modified: now)
+            let result = try LocalCodexUsageReader.scan(directory: root, now: now)
+            check(result.lastTurn == nil, "invalid turn evidence is rejected: \(label)")
+            try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
+        }
+        let duplicateCompletionRoot = try fixtureDirectory("duplicate-turn-completion")
+        try writeSession(in: duplicateCompletionRoot, uuid: "bbabbbab-babb-4bab-8bab-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-3), output: 1),
+            turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "once"),
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 2),
+            turnBoundary(at: now.addingTimeInterval(-0.5), type: "task_complete", id: "once", durationMS: 1000),
+            turnBoundary(at: now, type: "task_complete", id: "once", durationMS: 1000)
+        ], modified: now)
+        let duplicateCompletion = try LocalCodexUsageReader.scan(directory: duplicateCompletionRoot, now: now)
+        check(duplicateCompletion.lastTurn?.outputTokens == 1,
+            "duplicate completion does not double-count the same completed turn")
+        try? FileManager.default.removeItem(at: duplicateCompletionRoot.deletingLastPathComponent())
+
+        let cacheRoot = try fixtureDirectory("warm-cache")
+        try writeSession(in: cacheRoot, uuid: "aeaeaeae-aeae-4eae-8eae-aaaaaaaaaaaa",
+            events: [tokenEvent(at: now, input: 2, output: 3)], modified: now)
+        let cache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        _ = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        let diagnostics = cache.diagnostics
+        check(diagnostics.cacheHits == 1 && diagnostics.bytesRead == 0
+            && diagnostics.parsedFiles == 0 && diagnostics.safeOpens == 1,
+            "unchanged local session is safely reopened and served from numeric cache without reading or parsing bytes")
+        let freshnessRoot = try fixtureDirectory("cache-quota-freshness")
+        try writeSession(in: freshnessRoot, uuid: "c3c3c3c3-c3c3-4c3c-8c3c-aaaaaaaaaaaa", events: [
+            tokenEvent(at: now, input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 20, sevenDay: nil, reset: now.addingTimeInterval(3600)))
+        ], modified: now)
+        let freshnessCache = LocalCodexUsageReader.Cache()
+        let freshSnapshot = try LocalCodexUsageReader.scan(directory: freshnessRoot, now: now, cache: freshnessCache)
+        let staleSnapshot = try LocalCodexUsageReader.scan(directory: freshnessRoot, now: now.addingTimeInterval(180), cache: freshnessCache)
+        check(freshSnapshot.fiveHour?.isFresh(at: now, refreshSeconds: 60) == true
+            && staleSnapshot.fiveHour?.isFresh(at: now.addingTimeInterval(180), refreshSeconds: 60) == false
+            && freshnessCache.diagnostics.cacheHits == 1,
+            "cache hit reevaluates quota freshness against the current scan time")
+        try? FileManager.default.removeItem(at: freshnessRoot.deletingLastPathComponent())
+
+        let futureOnRollbackRoot = try fixtureDirectory("cache-now-rollback")
+        let futureCompletion = now.addingTimeInterval(10)
+        try writeSession(in: futureOnRollbackRoot, uuid: "c5c5c5c5-c5c5-4c5c-8c5c-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 1),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "future"),
+            turnTokenEvent(at: now, output: 2),
+            turnBoundary(at: futureCompletion, type: "task_complete", id: "future", durationMS: 1000)
+        ], modified: now)
+        let rollbackCache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: futureOnRollbackRoot, now: futureCompletion.addingTimeInterval(1), cache: rollbackCache)
+        let afterRollback = try LocalCodexUsageReader.scan(directory: futureOnRollbackRoot, now: now, cache: rollbackCache)
+        check(afterRollback.lastTurn == nil && rollbackCache.diagnostics.cacheHits == 1,
+            "warm numeric cache revalidates completion time when the scan clock moves backward")
+        try? FileManager.default.removeItem(at: futureOnRollbackRoot.deletingLastPathComponent())
+        let cachedPath = sessionURL(in: cacheRoot, uuid: "aeaeaeae-aeae-4eae-8eae-aaaaaaaaaaaa")
+        var appended = try Data(contentsOf: cachedPath)
+        appended.append(try tokenEvent(at: now, input: 3, output: 4)); appended.append(10)
+        try appended.write(to: cachedPath)
+        let changedCache = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        check(changedCache.input == 3 && changedCache.output == 4
+            && cache.diagnostics.cacheHits == 0 && cache.diagnostics.bytesRead > 0,
+            "appending to a cached local session invalidates its prior numeric summary")
+        var sameSizeRewrite = try Data(contentsOf: cachedPath)
+        // Keep the JSONL byte count stable while changing its numeric payload.
+        let originalBytes = Data("\"input_tokens\":3".utf8)
+        let rewrittenBytes = Data("\"input_tokens\":4".utf8)
+        if let range = sameSizeRewrite.range(of: originalBytes) {
+            sameSizeRewrite.replaceSubrange(range, with: rewrittenBytes)
+        } else {
+            check(false, "same-size cache rewrite fixture locates the input count")
+        }
+        let originalFileSize = try Data(contentsOf: cachedPath).count
+        check(sameSizeRewrite.count == originalFileSize,
+            "same-size cache rewrite fixture preserves byte count")
+        try sameSizeRewrite.write(to: cachedPath)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(2)], ofItemAtPath: cachedPath.path)
+        let rewrittenCache = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        check(rewrittenCache.input == 4 && rewrittenCache.output == 4 && cache.diagnostics.cacheHits == 0,
+            "same-size rewrite with changed file metadata invalidates cached summary")
+        var truncatedBytes = try Data(contentsOf: cachedPath)
+        truncatedBytes.removeLast(min(10, truncatedBytes.count))
+        try truncatedBytes.write(to: cachedPath)
+        let truncatedCache = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        check(truncatedCache.input == 2 && truncatedCache.output == 3
+            && cache.diagnostics.cacheHits == 0 && cache.diagnostics.bytesRead > 0,
+            "truncating a cached file reparses and falls back to its remaining valid line")
+        let otherRoot = try fixtureDirectory("cache-other-root")
+        try writeSession(in: otherRoot, uuid: "aeaeaeae-aeae-4eae-8eae-aaaaaaaaaaaa",
+            events: [tokenEvent(at: now, input: 9, output: 9)], modified: now)
+        let rootIsolated = try LocalCodexUsageReader.scan(directory: otherRoot, now: now, cache: cache)
+        check(rootIsolated.input == 9 && rootIsolated.output == 9
+            && cache.diagnostics.cacheHits == 0 && cache.entryCount <= 32,
+            "same UUID, size and mtime under another root do not hit prior root's cache")
+        try? FileManager.default.removeItem(at: otherRoot.deletingLastPathComponent())
+        let sameRootA = try fixtureDirectory("same-identity-root-a")
+        let sameRootB = try fixtureDirectory("same-identity-root-b")
+        let sharedUUID = "c1c1c1c1-c1c1-4c1c-8c1c-aaaaaaaaaaaa"
+        try writeSession(in: sameRootA, uuid: sharedUUID,
+            events: [tokenEvent(at: now, input: 5, output: 6)], modified: now)
+        try writeSession(in: sameRootB, uuid: sharedUUID,
+            events: [tokenEvent(at: now, input: 7, output: 8)], modified: now)
+        let rootProofCache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: sameRootA, now: now, cache: rootProofCache)
+        let rootProofResult = try LocalCodexUsageReader.scan(directory: sameRootB, now: now, cache: rootProofCache)
+        check(rootProofResult.input == 7 && rootProofResult.output == 8
+            && rootProofCache.diagnostics.cacheHits == 0,
+            "identical UUID, byte size and modification time remain isolated by root identity")
+        try? FileManager.default.removeItem(at: sameRootA.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: sameRootB.deletingLastPathComponent())
+        let inodeRoot = try fixtureDirectory("inode-replacement")
+        let inodeUUID = "c2c2c2c2-c2c2-4c2c-8c2c-aaaaaaaaaaaa"
+        try writeSession(in: inodeRoot, uuid: inodeUUID,
+            events: [tokenEvent(at: now, input: 1, output: 2)], modified: now)
+        let inodeCache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: inodeRoot, now: now, cache: inodeCache)
+        try Data("replacement".utf8).write(to: sessionURL(in: inodeRoot, uuid: inodeUUID), options: .atomic)
+        let inodeReplaced = try LocalCodexUsageReader.scan(directory: inodeRoot, now: now, cache: inodeCache)
+        check(inodeReplaced.input == 0 && inodeCache.diagnostics.cacheHits == 0,
+            "atomic same-path replacement invalidates cached descriptor identity")
+        try? FileManager.default.removeItem(at: inodeRoot.deletingLastPathComponent())
+        let isolatedCache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: isolatedCache)
+        check(isolatedCache.entryCount == 1 && cache.entryCount == 1,
+            "reader cache instances isolate roots and retain only bounded numeric summaries")
+        _ = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        try FileManager.default.removeItem(at: cachedPath)
+        let outside = FileManager.default.temporaryDirectory.appendingPathComponent("tokenstat-cache-outside-\(UUID().uuidString).jsonl")
+        try Data("secret".utf8).write(to: outside)
+        try FileManager.default.createSymbolicLink(at: cachedPath, withDestinationURL: outside)
+        let replacedBySymlink = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        check(replacedBySymlink.input == 0 && replacedBySymlink.output == 0,
+            "deleted cached file replaced by symlink is not served from stale cache")
+        try? FileManager.default.removeItem(at: outside)
+        try? FileManager.default.removeItem(at: cacheRoot.deletingLastPathComponent())
+
+        let cappedCacheRoot = try fixtureDirectory("cache-cap")
+        for index in 0..<33 {
+            let uuid = String(format: "bcbcbcbc-bcbc-4bcb-8bcb-%012d", index + 1)
+            try writeSession(in: cappedCacheRoot, uuid: uuid,
+                events: [tokenEvent(at: now, input: 1, output: 1)], modified: now.addingTimeInterval(Double(index)))
+        }
+        let cappedCache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: cappedCacheRoot, now: now, cache: cappedCache)
+        check(cappedCache.entryCount <= 32, "per-reader numeric cache retains at most 32 summaries")
+        try? FileManager.default.removeItem(at: cappedCacheRoot.deletingLastPathComponent())
+
+        let raceRoot = try fixtureDirectory("metadata-race")
+        let racedURL = sessionURL(in: raceRoot, uuid: "bdcdbdcd-bdcd-4bcd-8bcd-aaaaaaaaaaaa")
+        try writeSession(in: raceRoot, uuid: "bdcdbdcd-bdcd-4bcd-8bcd-aaaaaaaaaaaa",
+            events: [tokenEvent(at: now, input: 100, output: 100)], modified: now)
+        try writeSession(in: raceRoot, uuid: "bebdbebd-bebd-4beb-8beb-aaaaaaaaaaaa",
+            events: [tokenEvent(at: now, input: 7, output: 8)], modified: now)
+        var raced = false
+        let raceCache = LocalCodexUsageReader.Cache(beforePostReadValidation: {
+            guard !raced else { return }
+            raced = true
+            try? Data("replacement".utf8).write(to: racedURL)
+        })
+        let raceResult = try LocalCodexUsageReader.scan(directory: raceRoot, now: now, cache: raceCache)
+        check(raceResult.input == 7 && raceResult.output == 8,
+            "metadata change during read drops only that file while retaining other safe file results")
+        try? FileManager.default.removeItem(at: raceRoot.deletingLastPathComponent())
 
         let duplicateRoot = try fixtureDirectory("duplicate")
         let duplicateID = "abc33333-3333-4333-8333-333333333333"
@@ -2916,6 +3527,30 @@ extension CoreChecks {
         check(quotaSnapshot.fiveHour?.fetchedAt == latestTime && quotaSnapshot.sevenDay?.fetchedAt == latestTime,
             "local quota freshness preserves the source event timestamp")
         try? FileManager.default.removeItem(at: quotaRoot.deletingLastPathComponent())
+
+        let reverseQuotaRoot = try fixtureDirectory("quota-event-timestamps")
+        try writeSession(in: reverseQuotaRoot, uuid: "c4c4c4c4-c4c4-4c4c-8c4c-aaaaaaaaaaaa", events: [
+            tokenEvent(at: now.addingTimeInterval(-10), input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 61, sevenDay: 71, reset: now.addingTimeInterval(3600))),
+            tokenEvent(at: now.addingTimeInterval(-20), input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 11, sevenDay: 21, reset: now.addingTimeInterval(3600)))
+        ], modified: now)
+        let reverseQuota = try LocalCodexUsageReader.scan(directory: reverseQuotaRoot, now: now)
+        check(reverseQuota.fiveHour?.usedPercent == 61 && reverseQuota.sevenDay?.usedPercent == 71,
+            "older timestamp appearing later in the file cannot replace the newest quota snapshot")
+        try? FileManager.default.removeItem(at: reverseQuotaRoot.deletingLastPathComponent())
+
+        let equalQuotaRoot = try fixtureDirectory("quota-equal-timestamp-clear")
+        let equalQuotaTime = now.addingTimeInterval(-10)
+        try writeSession(in: equalQuotaRoot, uuid: "c6c6c6c6-c6c6-4c6c-8c6c-aaaaaaaaaaaa", events: [
+            tokenEvent(at: equalQuotaTime, input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 61, sevenDay: 71, reset: now.addingTimeInterval(3600))),
+            tokenEvent(at: equalQuotaTime, input: 1, output: 1, rateLimits: [:])
+        ], modified: now)
+        let equalQuota = try LocalCodexUsageReader.scan(directory: equalQuotaRoot, now: now)
+        check(equalQuota.fiveHour == nil && equalQuota.sevenDay == nil,
+            "same-timestamp later snapshot with missing windows clears older quota data")
+        try? FileManager.default.removeItem(at: equalQuotaRoot.deletingLastPathComponent())
 
         let missingWindowRoot = try fixtureDirectory("missing-window")
         try writeSession(in: missingWindowRoot, uuid: "99999999-9999-4999-8999-999999999999",
@@ -3008,9 +3643,14 @@ extension CoreChecks {
                 events: [tokenEvent(at: now, input: 1, output: 1)],
                 modified: now.addingTimeInterval(Double(index)), prefix: pad)
         }
-        let bounded = try LocalCodexUsageReader.scan(directory: boundedRoot, now: now)
+        let boundedCache = LocalCodexUsageReader.Cache()
+        let bounded = try LocalCodexUsageReader.scan(directory: boundedRoot, now: now, cache: boundedCache)
         check(bounded.sessionCount == 32 && bounded.isLimited,
             "scan selects at most 32 sessions, reads only each bounded tail, and marks omitted history")
+        let warmBounded = try LocalCodexUsageReader.scan(directory: boundedRoot, now: now, cache: boundedCache)
+        check(boundedCache.diagnostics.cacheHits == 32 && boundedCache.diagnostics.bytesRead == 0
+            && boundedCache.entryCount == 32 && warmBounded.isLimited,
+            "warm cache hits all 32 retained sessions without content reads and preserves tail limitation")
         try? FileManager.default.removeItem(at: boundedRoot.deletingLastPathComponent())
 
         let entryRoot = try fixtureDirectory("bounded-entries")
@@ -3076,6 +3716,24 @@ extension CoreChecks {
         return Data("{\"timestamp\":\"\(time)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\(inputLiteral),\"output_tokens\":\(outputLiteral),\"total_tokens\":1}}}}".utf8)
     }
 
+    private static func turnTokenEvent(at timestamp: Date, output: Int) throws -> Data {
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
+            "payload": ["type": "token_count", "info": ["total_token_usage": [
+                "input_tokens": 0, "output_tokens": output, "total_tokens": output]]]]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func turnBoundary(at timestamp: Date, type: String, id: String,
+                                     durationMS: Int? = nil, durationLiteral: String? = nil) throws -> Data {
+        var payload: [String: Any] = ["type": type, "turn_id": id]
+        if let durationMS { payload["duration_ms"] = durationMS }
+        if durationLiteral == "true" { payload["duration_ms"] = true }
+        else if durationLiteral == "null" { payload["duration_ms"] = NSNull() }
+        else if let durationLiteral { payload["duration_ms"] = durationLiteral }
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg", "payload": payload]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
     private static func rateLimits(fiveHour: Int?, sevenDay: Int?, reset: Date) -> [String: Any] {
         var value: [String: Any] = [:]
         if let fiveHour { value["primary"] = ["used_percent": fiveHour, "window_minutes": 300, "resets_at": reset.timeIntervalSince1970] }
@@ -3098,6 +3756,7 @@ import AppKit
 import SnapshotTesting
 import SwiftUI
 import XCTest
+import TokenStatCore
 @testable import TokenStatMenu
 
 @MainActor
@@ -3110,6 +3769,118 @@ final class TokenStatUISnapshotTests: XCTestCase {
     func testSettingsLightAndDark() {
         assertDashboard(_appearance: .aqua, settings: true, name: "settings-light")
         assertDashboard(_appearance: .darkAqua, settings: true, name: "settings-dark")
+    }
+
+    func testLocalStatusTitleUsesCompletedTurnAndRecordedSessionTotal() throws {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        XCTAssertTrue(model.title.contains("上轮均:—"))
+        model.localSnapshot = LocalCodexSnapshot(input: 125, output: 300, total: 425,
+            sessionCount: 2, filesScanned: 2, isLimited: false,
+            latestEventAt: Date(timeIntervalSince1970: 1_797_000_000), fiveHour: nil, sevenDay: nil,
+            lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
+                completedAt: Date(timeIntervalSince1970: 1_797_000_000)))
+        XCTAssertEqual(model.title, "上轮均:15.0tok/s · Σ425 · 2会话")
+        XCTAssertTrue(model.dataNotice.contains("历史累计"))
+        XCTAssertTrue(model.menuTooltip.contains("425"))
+        XCTAssertTrue(model.menuTooltip.contains("2会话"))
+        XCTAssertTrue(model.menuTooltip.contains("含工具、网络和等待"))
+        XCTAssertTrue(model.menuTooltip.contains("5 小时"))
+        XCTAssertTrue(model.menuTooltip.contains("7 天"))
+        XCTAssertTrue(model.menuTooltip.contains("32"), "tooltip should describe the bounded session/file coverage")
+        model.localSnapshot = LocalCodexSnapshot(input: 1_234_200, output: 367, total: 1_234_567,
+            sessionCount: 2, filesScanned: 2, isLimited: false,
+            latestEventAt: Date(timeIntervalSince1970: 1_797_000_000), fiveHour: nil, sevenDay: nil,
+            lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
+                completedAt: Date(timeIntervalSince1970: 1_797_000_000)))
+        let fullTotal = 1_234_567.formatted(.number)
+        XCTAssertTrue(model.title.hasPrefix("上轮均:15.0tok/s · Σ"))
+        XCTAssertFalse(model.title.contains("Σ" + fullTotal), "status title should compact large totals")
+        XCTAssertTrue(model.menuTooltip.contains(fullTotal), "tooltip should retain the full cumulative total")
+        let futureQuotaData = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": [
+            "primary": ["usedPercent": 88, "windowDurationMins": 300,
+                        "resetsAt": Date().addingTimeInterval(7200).timeIntervalSince1970]
+        ]]])
+        model.fiveHourQuota = try QuotaReport.parse(futureQuotaData, config: AppConfiguration(),
+            now: Date().addingTimeInterval(3600)).fiveHour
+        XCTAssertTrue(model.menuTooltip.contains("异常时间戳"), "tooltip should label future quota data anomalous")
+    }
+
+    func testLocalQuotaAlertsUseOnlyFreshIndependentWindows() throws {
+        let now = Date()
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        func quota(five: Double?, seven: Double?, fetchedAt: Date, reset: Date) throws -> QuotaReport {
+            var limits: [String: Any] = [:]
+            if let five { limits["primary"] = ["usedPercent": five, "windowDurationMins": 300, "resetsAt": reset.timeIntervalSince1970] }
+            if let seven { limits["secondary"] = ["usedPercent": seven, "windowDurationMins": 10080, "resetsAt": reset.timeIntervalSince1970] }
+            let object: [String: Any] = ["result": ["rateLimits": limits]]
+            return try QuotaReport.parse(JSONSerialization.data(withJSONObject: object), config: AppConfiguration(), now: fetchedAt)
+        }
+        let fresh = try quota(five: 96, seven: 20, fetchedAt: now, reset: now.addingTimeInterval(3600))
+        model.fiveHourQuota = fresh.fiveHour
+        model.sevenDayQuota = fresh.sevenDay
+        XCTAssertEqual(model.alertColor, .systemRed)
+
+        let stale = try quota(five: 99, seven: 20, fetchedAt: now.addingTimeInterval(-3600), reset: now.addingTimeInterval(3600))
+        model.fiveHourQuota = stale.fiveHour
+        model.sevenDayQuota = fresh.sevenDay
+        XCTAssertEqual(model.alertColor, .labelColor, "stale 5-hour quota must not override its fresh 7-day sibling")
+
+        let freshSevenDay = try quota(five: 20, seven: 96, fetchedAt: now, reset: now.addingTimeInterval(3600))
+        model.fiveHourQuota = stale.fiveHour
+        model.sevenDayQuota = freshSevenDay.sevenDay
+        XCTAssertEqual(model.alertColor, .systemRed, "fresh 7-day alert remains active when the 5-hour sibling is stale")
+
+        let future = try quota(five: 99, seven: nil, fetchedAt: now.addingTimeInterval(3600), reset: now.addingTimeInterval(7200))
+        model.fiveHourQuota = future.fiveHour
+        model.sevenDayQuota = nil
+        XCTAssertEqual(model.alertColor, .labelColor, "future-dated quota must not contribute to current alerts")
+
+        let resetExpired = try quota(five: 99, seven: nil, fetchedAt: now, reset: now.addingTimeInterval(-1))
+        model.fiveHourQuota = resetExpired.fiveHour
+        model.sevenDayQuota = nil
+        XCTAssertEqual(model.alertColor, .labelColor, "reset-expired quota must not contribute to current alerts")
+    }
+
+    func testHistoricalQuotaPresentationPreservesOriginalSourceValues() throws {
+        let now = Date(timeIntervalSince1970: 1_797_000_000)
+        let data = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": [
+            "primary": ["usedPercent": 73, "windowDurationMins": 300,
+                        "resetsAt": now.addingTimeInterval(-120).timeIntervalSince1970]
+        ]]])
+        let parsed = try QuotaReport.parse(data, config: AppConfiguration(), now: now.addingTimeInterval(-3600))
+        let historic = try XCTUnwrap(parsed.fiveHour)
+        let viewState = WindowQuotaCard.presentation(for: historic, at: now, refreshSeconds: 60)
+        XCTAssertFalse(viewState.isFresh)
+        XCTAssertEqual(viewState.usedPercent, 73)
+        XCTAssertEqual(viewState.resetsAt, historic.resetsAt)
+        XCTAssertTrue(viewState.statusLabel.contains("历史"))
+        XCTAssertTrue(viewState.statusLabel.contains("已过期"))
+
+        let freshData = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": [
+            "primary": ["usedPercent": 73, "windowDurationMins": 300,
+                        "resetsAt": now.addingTimeInterval(7200).timeIntervalSince1970]
+        ]]])
+        let freshReport = try QuotaReport.parse(freshData, config: AppConfiguration(), now: now)
+        let fresh = WindowQuotaCard.presentation(for: try XCTUnwrap(freshReport.fiveHour), at: now, refreshSeconds: 60)
+        XCTAssertTrue(fresh.isFresh)
+        XCTAssertTrue(fresh.statusLabel.contains("当前"))
+        let futureReport = try QuotaReport.parse(freshData, config: AppConfiguration(), now: now.addingTimeInterval(3600))
+        let future = WindowQuotaCard.presentation(for: try XCTUnwrap(futureReport.fiveHour), at: now, refreshSeconds: 60)
+        XCTAssertFalse(future.isFresh)
+        XCTAssertTrue(future.statusLabel.contains("异常"))
+        let staleReport = try QuotaReport.parse(freshData, config: AppConfiguration(), now: now.addingTimeInterval(-3600))
+        let stale = WindowQuotaCard.presentation(for: try XCTUnwrap(staleReport.fiveHour), at: now, refreshSeconds: 60)
+        XCTAssertFalse(stale.isFresh)
+        XCTAssertEqual(stale.usedPercent, 73)
+        XCTAssertEqual(stale.resetsAt, freshReport.fiveHour?.resetsAt)
+        XCTAssertTrue(stale.statusLabel.contains("历史"))
+        XCTAssertFalse(stale.statusLabel.contains("已过期"))
+        let absent = WindowQuotaCard.presentation(for: nil, at: now, refreshSeconds: 60)
+        XCTAssertFalse(absent.isFresh)
+        XCTAssertNil(absent.usedPercent)
+        XCTAssertTrue(absent.statusLabel.contains("未提供"))
     }
 
     func testImageMatcherDetectsDeliberateMismatchWithoutRecording() {
@@ -3409,7 +4180,7 @@ def main():
         assert "fixture-auth" not in diagnostic.read_text(), ui
         assert ui["fiveHourUsedPercent"] == 25 and ui["sevenDayUsedPercent"] == 70, ui
         assert ui["quotaUsed"] == 850000 and ui["alert"] == "yellow", ui
-        assert ui["title"] == "测试 T:—" and ui["statusItemVisible"], ui
+        assert ui["title"] == "测试 T:— · Σ— · 请求0" and ui["statusItemVisible"], ui
         assert ui["isTestFixture"] and not ui["hasRequestData"], ui
         assert "模拟测试" in ui["dataNotice"], ui
         assert snapshot()["requests"] == 0, "startup must not manufacture usage"
@@ -3427,7 +4198,16 @@ def main():
             active = wait_for(lambda: (s if (s := snapshot())["active"] == 3 and s["outputTPS"] > 0 else None))
             assert active["estimatedRequests"] >= 3
             print("Live concurrent output TPS:", active["outputTPS"], flush=True)
-            ui = wait_for(lambda: (r if (r := json.loads(diagnostic.read_text()))["active"] == 3 and r["title"].startswith("测试 T:≈") and r["title"] != "测试 T:≈0.0tok/s" else None))
+            def live_title(value):
+                title = value.get("title", "")
+                if value.get("active") != 3 or not title.startswith("测试 T:≈") or "tok/s" not in title or "Σ" not in title:
+                    return None
+                speed = title.split("≈", 1)[1].split("tok/s", 1)[0]
+                try:
+                    return value if float(speed) > 0 else None
+                except ValueError:
+                    return None
+            ui = wait_for(lambda: (r if (r := json.loads(diagnostic.read_text())) and live_title(r) else None))
             print("Actual AppKit menu title:", ui["title"], flush=True)
             for job in jobs:
                 assert job.result()[0] == 200
@@ -3478,7 +4258,7 @@ def main():
             normal_command[normal_command.index(str(diagnostic))] = str(normal_diagnostic)
             subprocess.run(normal_command, check=True)
             normal = wait_for(lambda: json.loads(normal_diagnostic.read_text()))
-            assert normal["title"] == "T:—" and not normal["isTestFixture"], normal
+            assert normal["title"] == "T:— · Σ— · 请求0" and not normal["isTestFixture"], normal
             assert not normal["hasRequestData"] and "未采集" in normal["dataNotice"], normal
             assert normal.get("fiveHourUsedPercent") is None and normal.get("sevenDayUsedPercent") is None, normal
             assert normal.get("quotaUsed") is None and normal["alert"] == "normal", normal
@@ -3502,7 +4282,7 @@ def main():
                 "--test-fixture", "--disable-discovery", "--diagnostics-output", str(local_diagnostic)]
             subprocess.run(local_command, check=True)
             local = wait_for(lambda: (r if (r := json.loads(local_diagnostic.read_text())).get("hasRequestData") else None))
-            assert local["title"] == "测试 T:—" and local["isTestFixture"], local
+            assert local["title"] == "测试 上轮均:— · Σ30 · 1会话" and local["isTestFixture"], local
             assert "模拟测试" in local["dataNotice"], local
             assert (local.get("quotaUsed") is None and local.get("fiveHourUsedPercent") is None
                 and local.get("sevenDayUsedPercent") is None), local
@@ -4014,11 +4794,11 @@ cd TokenStatMenu
 
 ## 首次配置与接入
 
-首次启动默认使用本机 Codex 记录：每约 30 秒在后台扫描一次，读取已知 sessions 目录内最近最多 32 个会话、每个文件尾部最多 256 KiB。没有有效计量事件时显示未知，不把缺失当作零。未配置的新安装使用本机来源；已有明确代理配置保持代理模式。
+首次启动默认使用本机 Codex 记录：每次后台扫描完成后等待 5 秒再扫描，未变化文件仅校验元数据并复用内存中的数值摘要，读取已知 sessions 目录内最近最多 32 个会话、每个文件尾部最多 256 KiB。没有有效计量事件时显示未知，不把缺失当作零。未配置的新安装使用本机来源；已有明确代理配置保持代理模式。
 
 以下步骤用于需要流式速度估算的**代理模式**，先在设置中切换数据来源：
 
-1. 点击菜单栏 `T:—` → **设置**。
+1. 点击菜单栏统计文字 → **设置**。
 2. 设置页会自动发现本机 Codex 配置中的网关；核对来源后点“填入”。也可手动填写上游完整 Endpoint，例如 `https://你的网关/v1/chat/completions`；填写企业推理 API Key。Ollama 本机无需 Key。
 3. 模型覆盖留空时使用客户端请求的 `model`；填写时会覆盖所有经过代理请求的模型。
 4. 保存设置，回到面板，分别复制 **Base URL** 与 **本机令牌**。
@@ -4117,7 +4897,8 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter Tok
 
 常见情况：
 
-- **标题一直 — 或 0**：本机记录模式没有可靠实时生成耗时，速度为 `—` 是明确的能力边界。代理模式需确认请求确实经过本机代理并使用本机令牌；没有请求不能显示吞吐量。
+- **均速一直 —**：本机模式需要在同一有界尾部中找到开始前累计、匹配的轮次开始、轮内用量更新与正常完成。缺少其中任何一项时不计算；历史导入量和扫描间隔不会用来伪造速度。代理模式需确认请求确实经过本机代理并使用本机令牌。
+- **5 小时没有数据**：只有来源确实提供 300 分钟窗口才能显示。7 天窗口不能换算成 5 小时，企业网关也未必具有官方订阅额度。面板区分来源未提供、历史快照、时间异常和重置时间已过；历史原值不会触发当前额度告警。
 - **企业配额未知**：本机来源只显示记录中已有的额度快照，可能缺失或过期，且账户未经核验。代理来源需检查用量 URL、独立 Key、字段路径和月份；推理 API 的 Key 不一定能访问计费接口。
 - **图标不见**：macOS 可能关闭菜单栏项目或因刘海/其他图标拥挤而隐藏，任何 App 都不能保证绕过系统布局。检查“系统设置 → 菜单栏”。从 Finder 再次打开应用会主动打开面板。
 - **关闭面板即退出**：本项目持有 status item 和 app delegate，并显式禁止最后窗口关闭时退出。

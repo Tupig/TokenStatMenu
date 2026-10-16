@@ -85,7 +85,7 @@ def main():
         assert "fixture-auth" not in diagnostic.read_text(), ui
         assert ui["fiveHourUsedPercent"] == 25 and ui["sevenDayUsedPercent"] == 70, ui
         assert ui["quotaUsed"] == 850000 and ui["alert"] == "yellow", ui
-        assert ui["title"] == "测试 T:—" and ui["statusItemVisible"], ui
+        assert ui["title"] == "测试 T:— · Σ— · 请求0" and ui["statusItemVisible"], ui
         assert ui["isTestFixture"] and not ui["hasRequestData"], ui
         assert "模拟测试" in ui["dataNotice"], ui
         assert snapshot()["requests"] == 0, "startup must not manufacture usage"
@@ -103,7 +103,16 @@ def main():
             active = wait_for(lambda: (s if (s := snapshot())["active"] == 3 and s["outputTPS"] > 0 else None))
             assert active["estimatedRequests"] >= 3
             print("Live concurrent output TPS:", active["outputTPS"], flush=True)
-            ui = wait_for(lambda: (r if (r := json.loads(diagnostic.read_text()))["active"] == 3 and r["title"].startswith("测试 T:≈") and r["title"] != "测试 T:≈0.0tok/s" else None))
+            def live_title(value):
+                title = value.get("title", "")
+                if value.get("active") != 3 or not title.startswith("测试 T:≈") or "tok/s" not in title or "Σ" not in title:
+                    return None
+                speed = title.split("≈", 1)[1].split("tok/s", 1)[0]
+                try:
+                    return value if float(speed) > 0 else None
+                except ValueError:
+                    return None
+            ui = wait_for(lambda: (r if (r := json.loads(diagnostic.read_text())) and live_title(r) else None))
             print("Actual AppKit menu title:", ui["title"], flush=True)
             for job in jobs:
                 assert job.result()[0] == 200
@@ -154,7 +163,7 @@ def main():
             normal_command[normal_command.index(str(diagnostic))] = str(normal_diagnostic)
             subprocess.run(normal_command, check=True)
             normal = wait_for(lambda: json.loads(normal_diagnostic.read_text()))
-            assert normal["title"] == "T:—" and not normal["isTestFixture"], normal
+            assert normal["title"] == "T:— · Σ— · 请求0" and not normal["isTestFixture"], normal
             assert not normal["hasRequestData"] and "未采集" in normal["dataNotice"], normal
             assert normal.get("fiveHourUsedPercent") is None and normal.get("sevenDayUsedPercent") is None, normal
             assert normal.get("quotaUsed") is None and normal["alert"] == "normal", normal
@@ -178,7 +187,7 @@ def main():
                 "--test-fixture", "--disable-discovery", "--diagnostics-output", str(local_diagnostic)]
             subprocess.run(local_command, check=True)
             local = wait_for(lambda: (r if (r := json.loads(local_diagnostic.read_text())).get("hasRequestData") else None))
-            assert local["title"] == "测试 T:—" and local["isTestFixture"], local
+            assert local["title"] == "测试 上轮均:— · Σ30 · 1会话" and local["isTestFixture"], local
             assert "模拟测试" in local["dataNotice"], local
             assert (local.get("quotaUsed") is None and local.get("fiveHourUsedPercent") is None
                 and local.get("sevenDayUsedPercent") is None), local

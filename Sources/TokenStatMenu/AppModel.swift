@@ -1,7 +1,7 @@
 import AppKit
 import Combine
 #if SWIFT_PACKAGE
-import TokenStatCore
+@preconcurrency import TokenStatCore
 #endif
 import UniformTypeIdentifiers
 
@@ -37,6 +37,9 @@ struct SpeedPoint: Identifiable {
     private var quotaFetch: Task<Void, Never>?
     private var localScan: DispatchWorkItem?
     private var localScanRunning = false
+    private let localScanQueue = DispatchQueue(label: "TokenStatMenu.localCodexScan", qos: .utility)
+    private var localCache = LocalCodexUsageReader.Cache()
+    private var localRefreshScheduler = LocalRefreshScheduler()
     private var proxyWasStarted = false
     private var isShuttingDown = false
     private var generation = 0
@@ -87,7 +90,7 @@ struct SpeedPoint: Identifiable {
             }
         }
     }
-    func shutdown() { isShuttingDown = true; generation += 1; timer?.invalidate(); quotaLoop?.cancel(); quotaFetch?.cancel(); localScan?.cancel(); if proxyWasStarted { proxy.stop() } }
+    func shutdown() { isShuttingDown = true; generation += 1; _ = localRefreshScheduler.invalidate(); timer?.invalidate(); quotaLoop?.cancel(); quotaFetch?.cancel(); localScan?.cancel(); if proxyWasStarted { proxy.stop() } }
     func tick() {
         stats = engine.snapshot()
         let now = Date()
@@ -113,11 +116,31 @@ struct SpeedPoint: Identifiable {
         return hasRequestData ? "本次启动 · 仅统计经过本机代理的请求" : "未采集到请求数据 · 尚未观测到客户端流量"
     }
     var title: String {
-        if config.dataSource == "localCodex" { return (isTestFixture ? "测试 " : "") + "T:—" }
+        if config.dataSource == "localCodex" {
+            let rate = localSnapshot.lastTurn.map { String(format: "%.1ftok/s", $0.outputTPS) } ?? "—"
+            let total = localSnapshot.sessionCount > 0 ? formatCompactCount(localSnapshot.total) : "—"
+            return (isTestFixture ? "测试 " : "") + "上轮均:\(rate) · Σ\(total) · \(localSnapshot.sessionCount)会话"
+        }
         let value = !hasRequestData ? "T:—" : stats.active > 0
             ? String(format: "T:≈%.1ftok/s", stats.outputTPS) : "T:0.0tok/s"
-        return (isTestFixture ? "测试 " : "") + value
+        let total = stats.requests > 0 ? formatCompactCount(stats.total) : "—"
+        return (isTestFixture ? "测试 " : "") + "\(value) · Σ\(total) · 请求\(stats.requests)"
     }
+    var menuTooltip: String {
+        guard config.dataSource == "localCodex" else { return "\(dataNotice) · \(proxyStatus)" }
+        let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
+        let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
+        let coverage = "扫描上限：最多32个会话文件、每文件尾部256KiB、总计8MiB；" + (localSnapshot.isLimited ? "本次达到上限，记录可能不完整" : "本次已检查 \(localSnapshot.filesScanned) 个会话文件，\(localSnapshot.sessionCount) 个含有效累计用量")
+        return "本地 Codex 历史累计：\(formatCount(localSnapshot.total)) tokens · \(localSnapshot.sessionCount)会话\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n5 小时额度：\(quotaDescription(fiveHourQuota))\n7 天额度：\(quotaDescription(sevenDayQuota))"
+    }
+    private func quotaDescription(_ quota: WindowQuota?) -> String {
+        guard let quota else { return "未提供" }
+        let status = WindowQuotaCard.presentation(for: quota, refreshSeconds: config.refreshSeconds).statusLabel
+        let reset = quota.resetsAt.map { "，原重置时间 \($0.formatted())" } ?? "，重置时间未知"
+        return "\(status)，上游已用 \(String(format: "%.1f", quota.usedPercent))%\(reset)"
+    }
+    private func formatCount(_ value: Int) -> String { value.formatted(.number) }
+    private func formatCompactCount(_ value: Int) -> String { value.formatted(.number.notation(.compactName)) }
     var alertColor: NSColor {
         let windows = [fiveHourQuota, sevenDayQuota].compactMap { $0 }
             .filter { $0.isFresh(refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
@@ -163,6 +186,8 @@ struct SpeedPoint: Identifiable {
     }
     private func startServices() {
         generation += 1; quotaLoop?.cancel(); quotaFetch?.cancel(); quotaFetch = nil; quotaLoading = false
+        _ = localRefreshScheduler.invalidate()
+        localCache = LocalCodexUsageReader.Cache()
         localScan?.cancel(); localScan = nil
         quota = nil; quotaError = config.usageURL.isEmpty ? "未配置企业用量接口，已用量未知" : "等待企业接口"
         fiveHourQuota = nil; sevenDayQuota = nil
@@ -193,15 +218,20 @@ struct SpeedPoint: Identifiable {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             Task { @MainActor in
-                guard !self.isShuttingDown, self.generation == version, !self.localScanRunning,
+                guard !self.isShuttingDown, self.generation == version,
                       self.config.dataSource == "localCodex" else { return }
+                guard !self.localScanRunning else { return }
+                guard let scanGeneration = self.localRefreshScheduler.begin(now: Date()) else {
+                    self.scheduleLocalScan(immediate: false); return
+                }
                 self.localScanRunning = true
                 let directory = LocalCodexUsageReader.defaultSessionsDirectory()
-                DispatchQueue.global(qos: .utility).async {
-                    let result = try? LocalCodexUsageReader.scan(directory: directory)
+                let cache = self.localCache
+                self.localScanQueue.async {
+                    let result = try? LocalCodexUsageReader.scan(directory: directory, now: Date(), cache: cache)
                     Task { @MainActor in
-                        guard self.generation == version else {
-                            self.localScanRunning = false
+                        self.localScanRunning = false
+                        guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
                             if self.config.dataSource == "localCodex", !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
                             return
                         }
@@ -214,14 +244,13 @@ struct SpeedPoint: Identifiable {
                                 self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
                             }
                         }
-                        self.localScanRunning = false
                         if self.config.dataSource == "localCodex" { self.scheduleLocalScan() }
                     }
                 }
             }
         }
         localScan = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0 : 30), execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0 : 5), execute: work)
     }
     func refreshQuota() {
         guard config.dataSource == "proxy", !config.usageURL.isEmpty, !quotaLoading else { return }

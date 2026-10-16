@@ -1,10 +1,34 @@
 import CoreFoundation
 import Foundation
-import TokenStatCore
+@testable import TokenStatCore
 
 extension CoreChecks {
     static func localCodexUsageChecks() throws {
         let now = Date(timeIntervalSince1970: 1_797_000_000)
+
+        var refresh = LocalRefreshScheduler()
+        let firstGeneration = refresh.begin(now: now)
+        check(firstGeneration != nil && refresh.begin(now: now.addingTimeInterval(1)) == nil,
+            "local scheduler allows one startup scan and never overlaps an in-flight scan")
+        if let generation = firstGeneration {
+            check(refresh.complete(generation: generation, now: now.addingTimeInterval(3)),
+                "local scheduler accepts completion for the active generation")
+            check(refresh.begin(now: now.addingTimeInterval(7.9)) == nil
+                && refresh.begin(now: now.addingTimeInterval(8)) != nil,
+                "next local scan is due five seconds after the prior scan completes")
+        } else {
+            check(false, "local scheduler accepts completion for the active generation")
+            check(false, "next local scan is due five seconds after the prior scan completes")
+        }
+        var cancelledRefresh = LocalRefreshScheduler()
+        let staleGeneration = cancelledRefresh.begin(now: now)
+        _ = cancelledRefresh.invalidate()
+        if let staleGeneration {
+            check(!cancelledRefresh.complete(generation: staleGeneration, now: now.addingTimeInterval(10)),
+                "mode/root invalidation rejects a late local scan result")
+        } else {
+            check(false, "mode/root invalidation rejects a late local scan result")
+        }
 
         let aggregateRoot = try fixtureDirectory("aggregate")
         defer { try? FileManager.default.removeItem(at: aggregateRoot.deletingLastPathComponent()) }
@@ -31,8 +55,338 @@ extension CoreChecks {
             "repeated local Codex scans replace the snapshot instead of accumulating it")
         let reflectedFields = Set(Mirror(reflecting: aggregate).children.compactMap(\.label))
         check(reflectedFields == Set(["input", "output", "total", "sessionCount", "filesScanned",
-            "isLimited", "latestEventAt", "fiveHour", "sevenDay"]),
-            "local Codex snapshot contains only numeric, timestamp, quota and scan metadata")
+            "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn"]),
+            "local Codex snapshot exposes only bounded numeric turn and aggregate metadata")
+
+        let turnRoot = try fixtureDirectory("completed-turn")
+        let turnID = "abababab-abab-4bab-8bab-aaaaaaaaaaaa"
+        try writeSession(in: turnRoot, uuid: turnID, events: [
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 100),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "turn-1"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 140),
+            turnBoundary(at: now, type: "task_complete", id: "turn-1", durationMS: 1000)
+        ], modified: now)
+        let completedTurn = try LocalCodexUsageReader.scan(directory: turnRoot, now: now)
+        check(completedTurn.lastTurn?.outputTokens == 40
+            && completedTurn.lastTurn?.durationSeconds == 1
+            && completedTurn.lastTurn?.outputTPS == 40,
+            "completed local turn speed uses last in-turn cumulative output delta over whole turn duration")
+        if let turn = completedTurn.lastTurn {
+            let fields = Mirror(reflecting: turn).children
+            let turnFields = Set(fields.compactMap(\.label))
+            check(turnFields == Set(["outputTokens", "durationSeconds", "completedAt"])
+                && fields.allSatisfy { !($0.value is String) && !($0.value is URL) && !($0.value is Data) },
+                "turn reflection exposes only narrow numeric and timestamp fields, with no identifier or path")
+        } else {
+            check(false, "turn reflection exposes only narrow numeric and timestamp fields, with no identifier or path")
+        }
+        try? FileManager.default.removeItem(at: turnRoot.deletingLastPathComponent())
+
+        let equalTimestampRoot = try fixtureDirectory("equal-turn-timestamps")
+        try writeSession(in: equalTimestampRoot, uuid: "acacacac-acac-4cac-8cac-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 3),
+            turnBoundary(at: now, type: "task_started", id: "turn-equal"),
+            turnTokenEvent(at: now, output: 8),
+            turnBoundary(at: now, type: "task_complete", id: "turn-equal", durationMS: 100)
+        ], modified: now)
+        let equalTimestamps = try LocalCodexUsageReader.scan(directory: equalTimestampRoot, now: now)
+        check(equalTimestamps.lastTurn?.outputTokens == 5
+            && equalTimestamps.lastTurn?.durationSeconds == 0.1,
+            "equal adjacent timestamps are valid in JSONL order when duration_ms establishes a valid turn")
+        try? FileManager.default.removeItem(at: equalTimestampRoot.deletingLastPathComponent())
+
+        let invalidDurationRoot = try fixtureDirectory("invalid-turn-duration")
+        try writeSession(in: invalidDurationRoot, uuid: "adadadad-adad-4dad-8dad-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 3),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "turn-bad"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 8),
+            turnBoundary(at: now, type: "task_complete", id: "turn-bad", durationLiteral: "true")
+        ], modified: now)
+        let invalidDuration = try LocalCodexUsageReader.scan(directory: invalidDurationRoot, now: now)
+        check(invalidDuration.lastTurn == nil,
+            "present invalid duration_ms rejects a turn instead of falling back to timestamps")
+        try? FileManager.default.removeItem(at: invalidDurationRoot.deletingLastPathComponent())
+
+        let laterBaselineRoot = try fixtureDirectory("late-timestamp-baseline")
+        try writeSession(in: laterBaselineRoot, uuid: "bebebebe-bebe-4ebe-8ebe-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-3), output: 1),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "late-baseline"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.25), output: 3),
+            turnBoundary(at: now, type: "task_complete", id: "late-baseline", durationMS: 1000)
+        ], modified: now)
+        let lateBaseline = try LocalCodexUsageReader.scan(directory: laterBaselineRoot, now: now)
+        check(lateBaseline.lastTurn == nil,
+            "reader cannot skip a later-recorded baseline whose timestamp is after start to use an earlier baseline")
+        try? FileManager.default.removeItem(at: laterBaselineRoot.deletingLastPathComponent())
+
+        let nestedTurnsRoot = try fixtureDirectory("outer-incomplete-inner-complete")
+        try writeSession(in: nestedTurnsRoot, uuid: "bebebebe-bebe-4ebe-8ebe-bbbbbbbbbbbb", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-4), output: 1),
+            turnBoundary(at: now.addingTimeInterval(-3), type: "task_started", id: "outer"),
+            turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "inner"),
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 4),
+            turnBoundary(at: now, type: "task_complete", id: "inner", durationMS: 1000)
+        ], modified: now)
+        let nestedTurns = try LocalCodexUsageReader.scan(directory: nestedTurnsRoot, now: now)
+        check(nestedTurns.lastTurn == nil,
+            "an inner complete turn cannot be accepted while an outer overlapping turn remains open")
+        try? FileManager.default.removeItem(at: nestedTurnsRoot.deletingLastPathComponent())
+
+        let malformedExplicitRoot = try fixtureDirectory("malformed-explicit-usage")
+        try writeSession(in: malformedExplicitRoot, uuid: "bfbfbfbf-bfbf-4bfb-8bfb-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 1),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "bad-usage"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2),
+            rawTokenEvent(at: now.addingTimeInterval(-0.25), inputLiteral: "null", outputLiteral: "3"),
+            turnBoundary(at: now, type: "task_complete", id: "bad-usage", durationMS: 1000)
+        ], modified: now)
+        let malformedExplicit = try LocalCodexUsageReader.scan(directory: malformedExplicitRoot, now: now)
+        check(malformedExplicit.lastTurn == nil,
+            "explicit null or malformed cumulative usage cannot be ignored after valid in-turn usage")
+        try? FileManager.default.removeItem(at: malformedExplicitRoot.deletingLastPathComponent())
+
+        var oversizedPrefix = Data(repeating: 0x78, count: 256 * 1024 + 32)
+        oversizedPrefix.append(10)
+        let tailCompleteRoot = try fixtureDirectory("tail-complete-turn")
+        try writeSession(in: tailCompleteRoot, uuid: "babababa-baba-4bab-8bab-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 2),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "tail"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 5),
+            turnBoundary(at: now, type: "task_complete", id: "tail", durationMS: 1000)
+        ], modified: now, prefix: oversizedPrefix)
+        let tailComplete = try LocalCodexUsageReader.scan(directory: tailCompleteRoot, now: now)
+        check(tailComplete.lastTurn?.outputTokens == 3,
+            "a complete turn retained within the bounded tail remains eligible")
+        try? FileManager.default.removeItem(at: tailCompleteRoot.deletingLastPathComponent())
+
+        let tailMissingBaselineRoot = try fixtureDirectory("tail-missing-baseline")
+        try writeSession(in: tailMissingBaselineRoot, uuid: "bcbabcbc-bcbc-4bcb-8bcb-aaaaaaaaaaaa", events: [
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "tail"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 5),
+            turnBoundary(at: now, type: "task_complete", id: "tail", durationMS: 1000)
+        ], modified: now, prefix: oversizedPrefix)
+        let tailMissingBaseline = try LocalCodexUsageReader.scan(directory: tailMissingBaselineRoot, now: now)
+        check(tailMissingBaseline.lastTurn == nil,
+            "a truncated tail missing the cumulative baseline cannot produce turn speed")
+        try? FileManager.default.removeItem(at: tailMissingBaselineRoot.deletingLastPathComponent())
+
+        let fallbackRoot = try fixtureDirectory("turn-duration-fallback")
+        try writeSession(in: fallbackRoot, uuid: "afafafaf-afaf-4faf-8faf-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 10),
+            turnBoundary(at: now.addingTimeInterval(-0.5), type: "task_started", id: "turn-fallback"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.25), output: 30),
+            turnBoundary(at: now, type: "task_complete", id: "turn-fallback")
+        ], modified: now)
+        let fallback = try LocalCodexUsageReader.scan(directory: fallbackRoot, now: now)
+        check(fallback.lastTurn?.outputTokens == 20 && fallback.lastTurn?.durationSeconds == 0.5,
+            "absent duration_ms falls back to start-to-completion event timestamp duration")
+        try? FileManager.default.removeItem(at: fallbackRoot.deletingLastPathComponent())
+
+        let activeAfterCompletionRoot = try fixtureDirectory("completed-before-active")
+        try writeSession(in: activeAfterCompletionRoot, uuid: "baababaa-baba-4bab-8bab-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-4), output: 10),
+            turnBoundary(at: now.addingTimeInterval(-3), type: "task_started", id: "completed"),
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 30),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_complete", id: "completed", durationMS: 2000),
+            turnTokenEvent(at: now.addingTimeInterval(-0.9), output: 30),
+            turnBoundary(at: now.addingTimeInterval(-0.8), type: "task_started", id: "latest"),
+            turnTokenEvent(at: now.addingTimeInterval(-0.6), output: 50),
+            turnBoundary(at: now.addingTimeInterval(-0.3), type: "task_complete", id: "latest", durationMS: 500),
+            turnBoundary(at: now.addingTimeInterval(-0.2), type: "task_started", id: "still-active"),
+            turnTokenEvent(at: now, output: 80)
+        ], modified: now)
+        let retainedCompleted = try LocalCodexUsageReader.scan(directory: activeAfterCompletionRoot, now: now)
+        check(retainedCompleted.lastTurn?.outputTokens == 20 && retainedCompleted.lastTurn?.durationSeconds == 0.5,
+            "the most recent completed turn wins, and a still-active turn does not replace it")
+        try? FileManager.default.removeItem(at: activeAfterCompletionRoot.deletingLastPathComponent())
+
+        let rejectedTurnCases: [(String, [Data])] = try [
+            ("missing-baseline", [turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now, output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("invalid-explicit-baseline", [rawTokenEvent(at: now.addingTimeInterval(-2), inputLiteral: "0", outputLiteral: "-1"), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("invalid-later-in-turn-usage", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.75), output: 2), rawTokenEvent(at: now.addingTimeInterval(-0.5), inputLiteral: "0", outputLiteral: "-1"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("missing-start", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("missing-complete", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now, output: 2)]),
+            ("missing-in-turn-usage", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("overlap", [turnTokenEvent(at: now.addingTimeInterval(-4), output: 1), turnBoundary(at: now.addingTimeInterval(-3), type: "task_started", id: "x"), turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "y"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now.addingTimeInterval(-0.5), type: "task_complete", id: "x", durationMS: 2000), turnBoundary(at: now, type: "task_complete", id: "y", durationMS: 1000)]),
+            ("reused-id", [turnTokenEvent(at: now.addingTimeInterval(-5), output: 1), turnBoundary(at: now.addingTimeInterval(-4), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-3), output: 2), turnBoundary(at: now.addingTimeInterval(-2), type: "task_complete", id: "x", durationMS: 1000), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now, output: 3), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("post-complete-usage", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000), turnTokenEvent(at: now, output: 4)]),
+            ("mismatched-id", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "y", durationMS: 1000)]),
+            ("aborted", [turnTokenEvent(at: now.addingTimeInterval(-3), output: 1), turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now.addingTimeInterval(-0.5), type: "turn_aborted", id: "x"), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("future-complete", [turnTokenEvent(at: now.addingTimeInterval(-3), output: 1), turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 2), turnBoundary(at: now.addingTimeInterval(1), type: "task_complete", id: "x", durationMS: 1000)]),
+            ("timestamp-regression", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)]),
+            ("null-duration", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationLiteral: "null")]),
+            ("negative-duration", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: -1)]),
+            ("too-short-duration", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 1), turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 2), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 99)]),
+            ("rollback", [turnTokenEvent(at: now.addingTimeInterval(-2), output: 10), turnBoundary(at: now.addingTimeInterval(-1.5), type: "task_started", id: "x"), turnTokenEvent(at: now.addingTimeInterval(-1), output: 15), turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 12), turnTokenEvent(at: now.addingTimeInterval(-0.25), output: 18), turnBoundary(at: now, type: "task_complete", id: "x", durationMS: 1000)])
+        ]
+        for (label, events) in rejectedTurnCases {
+            let root = try fixtureDirectory("turn-reject-\(label)")
+            let uuid = UUID().uuidString.lowercased()
+            try writeSession(in: root, uuid: uuid, events: events, modified: now)
+            let result = try LocalCodexUsageReader.scan(directory: root, now: now)
+            check(result.lastTurn == nil, "invalid turn evidence is rejected: \(label)")
+            try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
+        }
+        let duplicateCompletionRoot = try fixtureDirectory("duplicate-turn-completion")
+        try writeSession(in: duplicateCompletionRoot, uuid: "bbabbbab-babb-4bab-8bab-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-3), output: 1),
+            turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "once"),
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 2),
+            turnBoundary(at: now.addingTimeInterval(-0.5), type: "task_complete", id: "once", durationMS: 1000),
+            turnBoundary(at: now, type: "task_complete", id: "once", durationMS: 1000)
+        ], modified: now)
+        let duplicateCompletion = try LocalCodexUsageReader.scan(directory: duplicateCompletionRoot, now: now)
+        check(duplicateCompletion.lastTurn?.outputTokens == 1,
+            "duplicate completion does not double-count the same completed turn")
+        try? FileManager.default.removeItem(at: duplicateCompletionRoot.deletingLastPathComponent())
+
+        let cacheRoot = try fixtureDirectory("warm-cache")
+        try writeSession(in: cacheRoot, uuid: "aeaeaeae-aeae-4eae-8eae-aaaaaaaaaaaa",
+            events: [tokenEvent(at: now, input: 2, output: 3)], modified: now)
+        let cache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        _ = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        let diagnostics = cache.diagnostics
+        check(diagnostics.cacheHits == 1 && diagnostics.bytesRead == 0
+            && diagnostics.parsedFiles == 0 && diagnostics.safeOpens == 1,
+            "unchanged local session is safely reopened and served from numeric cache without reading or parsing bytes")
+        let freshnessRoot = try fixtureDirectory("cache-quota-freshness")
+        try writeSession(in: freshnessRoot, uuid: "c3c3c3c3-c3c3-4c3c-8c3c-aaaaaaaaaaaa", events: [
+            tokenEvent(at: now, input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 20, sevenDay: nil, reset: now.addingTimeInterval(3600)))
+        ], modified: now)
+        let freshnessCache = LocalCodexUsageReader.Cache()
+        let freshSnapshot = try LocalCodexUsageReader.scan(directory: freshnessRoot, now: now, cache: freshnessCache)
+        let staleSnapshot = try LocalCodexUsageReader.scan(directory: freshnessRoot, now: now.addingTimeInterval(180), cache: freshnessCache)
+        check(freshSnapshot.fiveHour?.isFresh(at: now, refreshSeconds: 60) == true
+            && staleSnapshot.fiveHour?.isFresh(at: now.addingTimeInterval(180), refreshSeconds: 60) == false
+            && freshnessCache.diagnostics.cacheHits == 1,
+            "cache hit reevaluates quota freshness against the current scan time")
+        try? FileManager.default.removeItem(at: freshnessRoot.deletingLastPathComponent())
+
+        let futureOnRollbackRoot = try fixtureDirectory("cache-now-rollback")
+        let futureCompletion = now.addingTimeInterval(10)
+        try writeSession(in: futureOnRollbackRoot, uuid: "c5c5c5c5-c5c5-4c5c-8c5c-aaaaaaaaaaaa", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 1),
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_started", id: "future"),
+            turnTokenEvent(at: now, output: 2),
+            turnBoundary(at: futureCompletion, type: "task_complete", id: "future", durationMS: 1000)
+        ], modified: now)
+        let rollbackCache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: futureOnRollbackRoot, now: futureCompletion.addingTimeInterval(1), cache: rollbackCache)
+        let afterRollback = try LocalCodexUsageReader.scan(directory: futureOnRollbackRoot, now: now, cache: rollbackCache)
+        check(afterRollback.lastTurn == nil && rollbackCache.diagnostics.cacheHits == 1,
+            "warm numeric cache revalidates completion time when the scan clock moves backward")
+        try? FileManager.default.removeItem(at: futureOnRollbackRoot.deletingLastPathComponent())
+        let cachedPath = sessionURL(in: cacheRoot, uuid: "aeaeaeae-aeae-4eae-8eae-aaaaaaaaaaaa")
+        var appended = try Data(contentsOf: cachedPath)
+        appended.append(try tokenEvent(at: now, input: 3, output: 4)); appended.append(10)
+        try appended.write(to: cachedPath)
+        let changedCache = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        check(changedCache.input == 3 && changedCache.output == 4
+            && cache.diagnostics.cacheHits == 0 && cache.diagnostics.bytesRead > 0,
+            "appending to a cached local session invalidates its prior numeric summary")
+        var sameSizeRewrite = try Data(contentsOf: cachedPath)
+        // Keep the JSONL byte count stable while changing its numeric payload.
+        let originalBytes = Data("\"input_tokens\":3".utf8)
+        let rewrittenBytes = Data("\"input_tokens\":4".utf8)
+        if let range = sameSizeRewrite.range(of: originalBytes) {
+            sameSizeRewrite.replaceSubrange(range, with: rewrittenBytes)
+        } else {
+            check(false, "same-size cache rewrite fixture locates the input count")
+        }
+        let originalFileSize = try Data(contentsOf: cachedPath).count
+        check(sameSizeRewrite.count == originalFileSize,
+            "same-size cache rewrite fixture preserves byte count")
+        try sameSizeRewrite.write(to: cachedPath)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(2)], ofItemAtPath: cachedPath.path)
+        let rewrittenCache = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        check(rewrittenCache.input == 4 && rewrittenCache.output == 4 && cache.diagnostics.cacheHits == 0,
+            "same-size rewrite with changed file metadata invalidates cached summary")
+        var truncatedBytes = try Data(contentsOf: cachedPath)
+        truncatedBytes.removeLast(min(10, truncatedBytes.count))
+        try truncatedBytes.write(to: cachedPath)
+        let truncatedCache = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        check(truncatedCache.input == 2 && truncatedCache.output == 3
+            && cache.diagnostics.cacheHits == 0 && cache.diagnostics.bytesRead > 0,
+            "truncating a cached file reparses and falls back to its remaining valid line")
+        let otherRoot = try fixtureDirectory("cache-other-root")
+        try writeSession(in: otherRoot, uuid: "aeaeaeae-aeae-4eae-8eae-aaaaaaaaaaaa",
+            events: [tokenEvent(at: now, input: 9, output: 9)], modified: now)
+        let rootIsolated = try LocalCodexUsageReader.scan(directory: otherRoot, now: now, cache: cache)
+        check(rootIsolated.input == 9 && rootIsolated.output == 9
+            && cache.diagnostics.cacheHits == 0 && cache.entryCount <= 32,
+            "same UUID, size and mtime under another root do not hit prior root's cache")
+        try? FileManager.default.removeItem(at: otherRoot.deletingLastPathComponent())
+        let sameRootA = try fixtureDirectory("same-identity-root-a")
+        let sameRootB = try fixtureDirectory("same-identity-root-b")
+        let sharedUUID = "c1c1c1c1-c1c1-4c1c-8c1c-aaaaaaaaaaaa"
+        try writeSession(in: sameRootA, uuid: sharedUUID,
+            events: [tokenEvent(at: now, input: 5, output: 6)], modified: now)
+        try writeSession(in: sameRootB, uuid: sharedUUID,
+            events: [tokenEvent(at: now, input: 7, output: 8)], modified: now)
+        let rootProofCache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: sameRootA, now: now, cache: rootProofCache)
+        let rootProofResult = try LocalCodexUsageReader.scan(directory: sameRootB, now: now, cache: rootProofCache)
+        check(rootProofResult.input == 7 && rootProofResult.output == 8
+            && rootProofCache.diagnostics.cacheHits == 0,
+            "identical UUID, byte size and modification time remain isolated by root identity")
+        try? FileManager.default.removeItem(at: sameRootA.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: sameRootB.deletingLastPathComponent())
+        let inodeRoot = try fixtureDirectory("inode-replacement")
+        let inodeUUID = "c2c2c2c2-c2c2-4c2c-8c2c-aaaaaaaaaaaa"
+        try writeSession(in: inodeRoot, uuid: inodeUUID,
+            events: [tokenEvent(at: now, input: 1, output: 2)], modified: now)
+        let inodeCache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: inodeRoot, now: now, cache: inodeCache)
+        try Data("replacement".utf8).write(to: sessionURL(in: inodeRoot, uuid: inodeUUID), options: .atomic)
+        let inodeReplaced = try LocalCodexUsageReader.scan(directory: inodeRoot, now: now, cache: inodeCache)
+        check(inodeReplaced.input == 0 && inodeCache.diagnostics.cacheHits == 0,
+            "atomic same-path replacement invalidates cached descriptor identity")
+        try? FileManager.default.removeItem(at: inodeRoot.deletingLastPathComponent())
+        let isolatedCache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: isolatedCache)
+        check(isolatedCache.entryCount == 1 && cache.entryCount == 1,
+            "reader cache instances isolate roots and retain only bounded numeric summaries")
+        _ = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        try FileManager.default.removeItem(at: cachedPath)
+        let outside = FileManager.default.temporaryDirectory.appendingPathComponent("tokenstat-cache-outside-\(UUID().uuidString).jsonl")
+        try Data("secret".utf8).write(to: outside)
+        try FileManager.default.createSymbolicLink(at: cachedPath, withDestinationURL: outside)
+        let replacedBySymlink = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
+        check(replacedBySymlink.input == 0 && replacedBySymlink.output == 0,
+            "deleted cached file replaced by symlink is not served from stale cache")
+        try? FileManager.default.removeItem(at: outside)
+        try? FileManager.default.removeItem(at: cacheRoot.deletingLastPathComponent())
+
+        let cappedCacheRoot = try fixtureDirectory("cache-cap")
+        for index in 0..<33 {
+            let uuid = String(format: "bcbcbcbc-bcbc-4bcb-8bcb-%012d", index + 1)
+            try writeSession(in: cappedCacheRoot, uuid: uuid,
+                events: [tokenEvent(at: now, input: 1, output: 1)], modified: now.addingTimeInterval(Double(index)))
+        }
+        let cappedCache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: cappedCacheRoot, now: now, cache: cappedCache)
+        check(cappedCache.entryCount <= 32, "per-reader numeric cache retains at most 32 summaries")
+        try? FileManager.default.removeItem(at: cappedCacheRoot.deletingLastPathComponent())
+
+        let raceRoot = try fixtureDirectory("metadata-race")
+        let racedURL = sessionURL(in: raceRoot, uuid: "bdcdbdcd-bdcd-4bcd-8bcd-aaaaaaaaaaaa")
+        try writeSession(in: raceRoot, uuid: "bdcdbdcd-bdcd-4bcd-8bcd-aaaaaaaaaaaa",
+            events: [tokenEvent(at: now, input: 100, output: 100)], modified: now)
+        try writeSession(in: raceRoot, uuid: "bebdbebd-bebd-4beb-8beb-aaaaaaaaaaaa",
+            events: [tokenEvent(at: now, input: 7, output: 8)], modified: now)
+        var raced = false
+        let raceCache = LocalCodexUsageReader.Cache(beforePostReadValidation: {
+            guard !raced else { return }
+            raced = true
+            try? Data("replacement".utf8).write(to: racedURL)
+        })
+        let raceResult = try LocalCodexUsageReader.scan(directory: raceRoot, now: now, cache: raceCache)
+        check(raceResult.input == 7 && raceResult.output == 8,
+            "metadata change during read drops only that file while retaining other safe file results")
+        try? FileManager.default.removeItem(at: raceRoot.deletingLastPathComponent())
 
         let duplicateRoot = try fixtureDirectory("duplicate")
         let duplicateID = "abc33333-3333-4333-8333-333333333333"
@@ -103,6 +457,30 @@ extension CoreChecks {
         check(quotaSnapshot.fiveHour?.fetchedAt == latestTime && quotaSnapshot.sevenDay?.fetchedAt == latestTime,
             "local quota freshness preserves the source event timestamp")
         try? FileManager.default.removeItem(at: quotaRoot.deletingLastPathComponent())
+
+        let reverseQuotaRoot = try fixtureDirectory("quota-event-timestamps")
+        try writeSession(in: reverseQuotaRoot, uuid: "c4c4c4c4-c4c4-4c4c-8c4c-aaaaaaaaaaaa", events: [
+            tokenEvent(at: now.addingTimeInterval(-10), input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 61, sevenDay: 71, reset: now.addingTimeInterval(3600))),
+            tokenEvent(at: now.addingTimeInterval(-20), input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 11, sevenDay: 21, reset: now.addingTimeInterval(3600)))
+        ], modified: now)
+        let reverseQuota = try LocalCodexUsageReader.scan(directory: reverseQuotaRoot, now: now)
+        check(reverseQuota.fiveHour?.usedPercent == 61 && reverseQuota.sevenDay?.usedPercent == 71,
+            "older timestamp appearing later in the file cannot replace the newest quota snapshot")
+        try? FileManager.default.removeItem(at: reverseQuotaRoot.deletingLastPathComponent())
+
+        let equalQuotaRoot = try fixtureDirectory("quota-equal-timestamp-clear")
+        let equalQuotaTime = now.addingTimeInterval(-10)
+        try writeSession(in: equalQuotaRoot, uuid: "c6c6c6c6-c6c6-4c6c-8c6c-aaaaaaaaaaaa", events: [
+            tokenEvent(at: equalQuotaTime, input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 61, sevenDay: 71, reset: now.addingTimeInterval(3600))),
+            tokenEvent(at: equalQuotaTime, input: 1, output: 1, rateLimits: [:])
+        ], modified: now)
+        let equalQuota = try LocalCodexUsageReader.scan(directory: equalQuotaRoot, now: now)
+        check(equalQuota.fiveHour == nil && equalQuota.sevenDay == nil,
+            "same-timestamp later snapshot with missing windows clears older quota data")
+        try? FileManager.default.removeItem(at: equalQuotaRoot.deletingLastPathComponent())
 
         let missingWindowRoot = try fixtureDirectory("missing-window")
         try writeSession(in: missingWindowRoot, uuid: "99999999-9999-4999-8999-999999999999",
@@ -195,9 +573,14 @@ extension CoreChecks {
                 events: [tokenEvent(at: now, input: 1, output: 1)],
                 modified: now.addingTimeInterval(Double(index)), prefix: pad)
         }
-        let bounded = try LocalCodexUsageReader.scan(directory: boundedRoot, now: now)
+        let boundedCache = LocalCodexUsageReader.Cache()
+        let bounded = try LocalCodexUsageReader.scan(directory: boundedRoot, now: now, cache: boundedCache)
         check(bounded.sessionCount == 32 && bounded.isLimited,
             "scan selects at most 32 sessions, reads only each bounded tail, and marks omitted history")
+        let warmBounded = try LocalCodexUsageReader.scan(directory: boundedRoot, now: now, cache: boundedCache)
+        check(boundedCache.diagnostics.cacheHits == 32 && boundedCache.diagnostics.bytesRead == 0
+            && boundedCache.entryCount == 32 && warmBounded.isLimited,
+            "warm cache hits all 32 retained sessions without content reads and preserves tail limitation")
         try? FileManager.default.removeItem(at: boundedRoot.deletingLastPathComponent())
 
         let entryRoot = try fixtureDirectory("bounded-entries")
@@ -261,6 +644,24 @@ extension CoreChecks {
     private static func rawTokenEvent(at timestamp: Date, inputLiteral: String, outputLiteral: String) -> Data {
         let time = iso(timestamp)
         return Data("{\"timestamp\":\"\(time)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\(inputLiteral),\"output_tokens\":\(outputLiteral),\"total_tokens\":1}}}}".utf8)
+    }
+
+    private static func turnTokenEvent(at timestamp: Date, output: Int) throws -> Data {
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
+            "payload": ["type": "token_count", "info": ["total_token_usage": [
+                "input_tokens": 0, "output_tokens": output, "total_tokens": output]]]]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func turnBoundary(at timestamp: Date, type: String, id: String,
+                                     durationMS: Int? = nil, durationLiteral: String? = nil) throws -> Data {
+        var payload: [String: Any] = ["type": type, "turn_id": id]
+        if let durationMS { payload["duration_ms"] = durationMS }
+        if durationLiteral == "true" { payload["duration_ms"] = true }
+        else if durationLiteral == "null" { payload["duration_ms"] = NSNull() }
+        else if let durationLiteral { payload["duration_ms"] = durationLiteral }
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg", "payload": payload]
+        return try JSONSerialization.data(withJSONObject: event)
     }
 
     private static func rateLimits(fiveHour: Int?, sevenDay: Int?, reset: Date) -> [String: Any] {

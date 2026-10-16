@@ -113,10 +113,16 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             VStack(alignment: .leading, spacing: 10) {
                 metric("历史输入 Token", localCount(model.localSnapshot.input))
                 metric("历史输出 Token", localCount(model.localSnapshot.output))
-                metric("历史总 Token", localCount(model.localSnapshot.total))
+                metric("历史总 Token", model.localSnapshot.sessionCount > 0 ? localCount(model.localSnapshot.total) : "未知")
                 metric("包含会话", "\(model.localSnapshot.sessionCount)")
                 metric("最近用量事件", model.localSnapshot.latestEventAt?.formatted(date: .abbreviated, time: .shortened) ?? "未发现")
-                Text("本地 Codex 会话记录中的历史累计值；不是实时速率、企业总量或账单。扫描最多纳入 32 个最新修改会话，每文件尾部最多 256 KiB（单轮总计 8 MiB）。\(model.localSnapshot.isLimited ? "已达到扫描范围限制，较旧记录可能未包含。" : "")")
+                if let turn = model.localSnapshot.lastTurn {
+                    metric("上轮记录均速", String(format: "%.1f tok/s", turn.outputTPS))
+                    metric("上轮完成时间", turn.completedAt.formatted(date: .abbreviated, time: .shortened))
+                } else {
+                    metric("上轮记录均速", "未知")
+                }
+                Text("上轮均速包含工具、网络和等待，只统计会话记录的 output；不是模型瞬时生成速度。缺少可信边界或累计基线时显示未知。本地 Codex 会话记录是历史累计值，不是实时速率、企业总量或账单。扫描最多纳入 32 个最新修改会话，每文件尾部最多 256 KiB（总计 8 MiB）。\(model.localSnapshot.isLimited ? "已达到扫描范围限制，较旧记录可能未包含。" : "")")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
         } label: { Label("本地记录用量", systemImage: "doc.text.magnifyingglass") }
@@ -124,13 +130,19 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private var localQuotaCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
-                metric("5 小时额度", model.fiveHourQuota.map { String(format: "%.0f%% 已用", $0.usedPercent) } ?? "未知")
-                metric("7 天额度", model.sevenDayQuota.map { String(format: "%.0f%% 已用", $0.usedPercent) } ?? "未知")
+                metric("5 小时额度", localQuotaDescription(model.fiveHourQuota))
+                metric("7 天额度", localQuotaDescription(model.sevenDayQuota))
                 Text("额度来自最近的本地 rate_limits 事件；仅作历史快照，过期或未来时间不会作为当前额度。")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
             }
         } label: { Label("本地额度快照", systemImage: "chart.bar") }
+    }
+    private func localQuotaDescription(_ quota: WindowQuota?) -> String {
+        let state = WindowQuotaCard.presentation(for: quota, refreshSeconds: model.config.refreshSeconds)
+        guard let percent = state.usedPercent else { return state.statusLabel }
+        let reset = state.resetsAt.map { " · \($0.formatted(date: .abbreviated, time: .shortened))重置" } ?? " · 重置时间未知"
+        return "\(state.statusLabel) · 上游已用 \(String(format: "%.1f", percent))%\(reset)"
     }
     private var sessionCard: some View {
         GroupBox {

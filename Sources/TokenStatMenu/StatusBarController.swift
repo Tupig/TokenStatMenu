@@ -33,8 +33,7 @@ import SwiftUI
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: color
             ])
         }
-        let measurement = model.config.dataSource == "localCodex" ? "本地历史快照 · 速度缺少可靠计时" : "输出估算速度（5 秒窗口）"
-        item.button?.toolTip = "\(model.dataNotice) · \(measurement) · \(model.proxyStatus)"
+        item.button?.toolTip = model.menuTooltip
         writeDiagnosticsIfRequested()
     }
     @objc func toggle() {
