@@ -1,6 +1,7 @@
 import Foundation
 
 public struct AppConfiguration: Codable, Equatable {
+    public var dataSource = "localCodex"
     public var endpoint = "http://127.0.0.1:11434/v1/chat/completions"
     public var model = ""
     public var port = 18765
@@ -23,8 +24,28 @@ public struct AppConfiguration: Codable, Equatable {
     public var loggingEnabled = false
     public var historyEnabled = true
     public init() {}
+    private enum CodingKeys: String, CodingKey { case dataSource, endpoint, model, port, includeUsage, allowInsecureHTTP, inputPrice, outputPrice, currency, usdToCNY, monthlyLimit, usageURL, usedPath, limitPath, periodPath, fiveHourUsedPercentPath, fiveHourResetPath, sevenDayUsedPercentPath, sevenDayResetPath, refreshSeconds, loggingEnabled, historyEnabled }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        dataSource = try c.decodeIfPresent(String.self, forKey: .dataSource) ?? ((c.contains(.endpoint) || c.contains(.usageURL)) ? "proxy" : "localCodex")
+        endpoint = try c.decodeIfPresent(String.self, forKey: .endpoint) ?? "http://127.0.0.1:11434/v1/chat/completions"
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""; port = try c.decodeIfPresent(Int.self, forKey: .port) ?? 18765
+        includeUsage = try c.decodeIfPresent(Bool.self, forKey: .includeUsage) ?? true; allowInsecureHTTP = try c.decodeIfPresent(Bool.self, forKey: .allowInsecureHTTP) ?? false
+        inputPrice = try c.decodeIfPresent(Double.self, forKey: .inputPrice) ?? 0; outputPrice = try c.decodeIfPresent(Double.self, forKey: .outputPrice) ?? 0
+        currency = try c.decodeIfPresent(String.self, forKey: .currency) ?? "USD"; usdToCNY = try c.decodeIfPresent(Double.self, forKey: .usdToCNY) ?? 7
+        monthlyLimit = try c.decodeIfPresent(Double.self, forKey: .monthlyLimit) ?? 0; usageURL = try c.decodeIfPresent(String.self, forKey: .usageURL) ?? ""
+        usedPath = try c.decodeIfPresent(String.self, forKey: .usedPath) ?? "data.used_tokens"; limitPath = try c.decodeIfPresent(String.self, forKey: .limitPath) ?? "data.total_tokens"
+        periodPath = try c.decodeIfPresent(String.self, forKey: .periodPath) ?? "data.month"
+        fiveHourUsedPercentPath = try c.decodeIfPresent(String.self, forKey: .fiveHourUsedPercentPath) ?? "data.five_hour.used_percent"
+        fiveHourResetPath = try c.decodeIfPresent(String.self, forKey: .fiveHourResetPath) ?? "data.five_hour.resets_at"
+        sevenDayUsedPercentPath = try c.decodeIfPresent(String.self, forKey: .sevenDayUsedPercentPath) ?? "data.seven_day.used_percent"
+        sevenDayResetPath = try c.decodeIfPresent(String.self, forKey: .sevenDayResetPath) ?? "data.seven_day.resets_at"
+        refreshSeconds = try c.decodeIfPresent(Double.self, forKey: .refreshSeconds) ?? 60
+        loggingEnabled = try c.decodeIfPresent(Bool.self, forKey: .loggingEnabled) ?? false; historyEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyEnabled) ?? true
+    }
 
     public func validated() throws -> AppConfiguration {
+        guard ["localCodex", "proxy"].contains(dataSource) else { throw StatError.message("无效数据来源") }
         guard (1024...65535).contains(port) else { throw StatError.message("代理端口必须为 1024–65535") }
         let url = try checkedURL(endpoint)
         let paths = ["/chat/completions", "/responses", "/api/chat", "/api/generate"]

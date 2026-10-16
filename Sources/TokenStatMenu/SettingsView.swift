@@ -17,10 +17,19 @@ import TokenStatCore
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 14) {
-                discoverySection
-                upstreamSection
-                priceSection
-                quotaSection
+                Picker("用量来源", selection: $draft.dataSource) {
+                    Text("本地 Codex 记录").tag("localCodex")
+                    Text("本机代理与企业接口").tag("proxy")
+                }.pickerStyle(.segmented)
+                if draft.dataSource == "proxy" {
+                    discoverySection
+                    upstreamSection
+                    priceSection
+                    quotaSection
+                } else {
+                    Text("从 ~/.codex/sessions 读取有限范围的历史用量统计，不连接本机代理，不读取密钥。切换到代理模式可恢复企业接口配置。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 otherSection
                 HStack {
                     Button("保存并应用") { _ = model.apply(draft, upstreamKey: apiKey, quotaKey: quotaKey) }.buttonStyle(.borderedProminent)
@@ -30,6 +39,8 @@ import TokenStatCore
             }.padding(16)
         }
         .textFieldStyle(.roundedBorder)
+        .onChange(of: draft.endpoint) { _ in apiKey = "" }
+        .onChange(of: draft.usageURL) { _ in quotaKey = "" }
     }
     private var discoverySection: some View {
         GroupBox("本机网关 · 自动发现") {

@@ -16,6 +16,7 @@ struct SpeedPoint: Identifiable {
     let isTestFixture = CommandLine.arguments.contains("--test-fixture")
     @Published var config = AppConfiguration()
     @Published var stats = MetricsSnapshot()
+    @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil)
     @Published var quota: QuotaSnapshot?
     @Published var fiveHourQuota: WindowQuota?
     @Published var sevenDayQuota: WindowQuota?
@@ -34,6 +35,10 @@ struct SpeedPoint: Identifiable {
     private var timer: Timer?
     private var quotaLoop: Task<Void, Never>?
     private var quotaFetch: Task<Void, Never>?
+    private var localScan: DispatchWorkItem?
+    private var localScanRunning = false
+    private var proxyWasStarted = false
+    private var isShuttingDown = false
     private var generation = 0
     private var lastHistory = Date.distantPast
     private(set) var localKey = ""
@@ -44,23 +49,21 @@ struct SpeedPoint: Identifiable {
     init(preview: Bool = false) {
         // Offline view rendering must never touch local configuration or credentials.
         if preview { proxyStatus = "模拟预览 · 无网络、无本机配置"; discoveryStatus = "离线预览"; return }
-        proxy.onStatus = { [weak self] status in Task { @MainActor in self?.proxyStatus = status } }
-        proxy.onRecord = { [weak self] record in
-            Task { @MainActor in if self?.config.loggingEnabled == true { self?.logger.append(record) } }
-        }
         logger.onError = { [weak self] error in Task { @MainActor in self?.message = error } }
         do {
             config = try ConfigStore.load()
-            localKey = try KeychainStore.localToken()
-            apiKey = try KeychainStore.resolve("upstream", environment: "TOKENSTAT_API_KEY")
-            usageKey = try KeychainStore.resolve("usage", environment: "TOKENSTAT_USAGE_KEY")
+            if config.dataSource == "proxy" {
+                localKey = try KeychainStore.localToken()
+                apiKey = try KeychainStore.resolve("upstream", environment: "TOKENSTAT_API_KEY", validatedURL: config.endpoint)
+                usageKey = config.usageURL.isEmpty ? "" : try KeychainStore.resolve("usage", environment: "TOKENSTAT_USAGE_KEY", validatedURL: config.usageURL)
+            }
             startServices()
         } catch { message = error.localizedDescription; proxyStatus = "未启动：检查设置" }
         // A single 2Hz main timer updates menu text. Network callbacks never redraw the UI.
         timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
         timer?.tolerance = 0.1
         RunLoop.main.add(timer!, forMode: .common)
-        discoverGateways()
+        if config.dataSource == "proxy" { discoverGateways() }
     }
     /// One bounded scan at startup or on explicit refresh. Never polls the filesystem.
     func discoverGateways() {
@@ -84,11 +87,11 @@ struct SpeedPoint: Identifiable {
             }
         }
     }
-    func shutdown() { timer?.invalidate(); quotaLoop?.cancel(); quotaFetch?.cancel(); proxy.stop() }
+    func shutdown() { isShuttingDown = true; generation += 1; timer?.invalidate(); quotaLoop?.cancel(); quotaFetch?.cancel(); localScan?.cancel(); if proxyWasStarted { proxy.stop() } }
     func tick() {
         stats = engine.snapshot()
         let now = Date()
-        if config.historyEnabled, now.timeIntervalSince(lastHistory) >= 1 {
+        if config.dataSource == "proxy", config.historyEnabled, now.timeIntervalSince(lastHistory) >= 1 {
             history.append(SpeedPoint(date: now, value: stats.outputTPS))
             history.removeAll { now.timeIntervalSince($0.date) > 600 }
             if history.count > 600 { history.removeFirst(history.count - 600) }
@@ -103,12 +106,14 @@ struct SpeedPoint: Identifiable {
     }
     var currencyFactor: Double { config.currency == "CNY" ? config.usdToCNY : 1 }
     var currencySymbol: String { config.currency == "CNY" ? "¥" : "$" }
-    var hasRequestData: Bool { stats.requests > 0 }
+    var hasRequestData: Bool { config.dataSource == "localCodex" ? localSnapshot.sessionCount > 0 : stats.requests > 0 }
     var dataNotice: String {
         if isTestFixture { return "模拟测试 · 以下速度、Token、费用和配额均非企业真实数据" }
+        if config.dataSource == "localCodex" { return "本地 Codex 会话记录 · 历史累计用量，不代表企业总量或实时用量；账号与组织归属未核验" }
         return hasRequestData ? "本次启动 · 仅统计经过本机代理的请求" : "未采集到请求数据 · 尚未观测到客户端流量"
     }
     var title: String {
+        if config.dataSource == "localCodex" { return (isTestFixture ? "测试 " : "") + "T:—" }
         let value = !hasRequestData ? "T:—" : stats.active > 0
             ? String(format: "T:≈%.1ftok/s", stats.outputTPS) : "T:0.0tok/s"
         return (isTestFixture ? "测试 " : "") + value
@@ -123,26 +128,54 @@ struct SpeedPoint: Identifiable {
     func apply(_ newConfig: AppConfiguration, upstreamKey: String, quotaKey: String) -> Bool {
         guard stats.active == 0 else { message = "请求进行中，请等待完成后再修改代理配置"; return false }
         do {
-            _ = try newConfig.validated()
-            try KeychainStore.write("upstream", value: upstreamKey)
-            try KeychainStore.write("usage", value: quotaKey)
-            if localKey.isEmpty { localKey = try KeychainStore.localToken() }
-            try ConfigStore.save(newConfig)
-            config = newConfig; apiKey = upstreamKey; usageKey = quotaKey
+            var savedConfig = newConfig
+            if newConfig.dataSource == "localCodex" {
+                savedConfig.endpoint = config.endpoint; savedConfig.usageURL = config.usageURL
+            }
+            _ = try savedConfig.validated()
+            if savedConfig.dataSource == "proxy" {
+                let old = config
+                let resolvedAPI = upstreamKey.isEmpty ? (savedConfig.endpoint == old.endpoint && !apiKey.isEmpty ? apiKey : try KeychainStore.read("upstream", validatedURL: savedConfig.endpoint)) : upstreamKey
+                let resolvedUsage = quotaKey.isEmpty && !savedConfig.usageURL.isEmpty ? (savedConfig.usageURL == old.usageURL && !usageKey.isEmpty ? usageKey : try KeychainStore.read("usage", validatedURL: savedConfig.usageURL)) : quotaKey
+                try KeychainStore.write("upstream", validatedURL: savedConfig.endpoint, value: resolvedAPI)
+                if !savedConfig.usageURL.isEmpty { try KeychainStore.write("usage", validatedURL: savedConfig.usageURL, value: resolvedUsage) }
+                if localKey.isEmpty { localKey = try KeychainStore.localToken() }
+                apiKey = resolvedAPI; usageKey = resolvedUsage
+            }
+            try ConfigStore.save(savedConfig)
+            config = savedConfig
             if !config.historyEnabled { history.removeAll() }
             message = "设置已保存"; startServices(); return true
         } catch { message = error.localizedDescription; return false }
     }
     func reload() {
         guard stats.active == 0 else { message = "请求进行中，暂不能重新加载"; return }
-        do { config = try ConfigStore.load(); message = "配置已重新加载"; startServices() }
+        do {
+            let loaded = try ConfigStore.load()
+            if loaded.dataSource == "proxy" {
+                localKey = try KeychainStore.localToken()
+                apiKey = try KeychainStore.resolve("upstream", environment: "TOKENSTAT_API_KEY", validatedURL: loaded.endpoint)
+                usageKey = loaded.usageURL.isEmpty ? "" : try KeychainStore.resolve("usage", environment: "TOKENSTAT_USAGE_KEY", validatedURL: loaded.usageURL)
+            } else { apiKey = ""; usageKey = ""; localKey = "" }
+            config = loaded; message = "配置已重新加载"; startServices()
+        }
         catch { message = error.localizedDescription }
     }
     private func startServices() {
         generation += 1; quotaLoop?.cancel(); quotaFetch?.cancel(); quotaFetch = nil; quotaLoading = false
+        localScan?.cancel(); localScan = nil
         quota = nil; quotaError = config.usageURL.isEmpty ? "未配置企业用量接口，已用量未知" : "等待企业接口"
         fiveHourQuota = nil; sevenDayQuota = nil
+        if config.dataSource == "localCodex" {
+            if proxyWasStarted { proxy.stop(); proxyWasStarted = false }
+            proxyStatus = "本地模式 · 未启动代理"
+            quota = nil; quotaError = "本地会话记录不提供月度企业配额"
+            scheduleLocalScan(immediate: true); return
+        }
+        proxy.onStatus = { [weak self] status in Task { @MainActor in self?.proxyStatus = status } }
+        proxy.onRecord = { [weak self] record in Task { @MainActor in if self?.config.loggingEnabled == true { self?.logger.append(record) } } }
         proxy.start(config: config, apiKey: apiKey, localKey: localKey)
+        proxyWasStarted = true
         if !config.usageURL.isEmpty {
             quotaLoop = Task { [weak self] in
                 while !Task.isCancelled {
@@ -154,8 +187,44 @@ struct SpeedPoint: Identifiable {
             }
         }
     }
+    private func scheduleLocalScan(immediate: Bool = false) {
+        localScan?.cancel()
+        let version = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                guard !self.isShuttingDown, self.generation == version, !self.localScanRunning,
+                      self.config.dataSource == "localCodex" else { return }
+                self.localScanRunning = true
+                let directory = LocalCodexUsageReader.defaultSessionsDirectory()
+                DispatchQueue.global(qos: .utility).async {
+                    let result = try? LocalCodexUsageReader.scan(directory: directory)
+                    Task { @MainActor in
+                        guard self.generation == version else {
+                            self.localScanRunning = false
+                            if self.config.dataSource == "localCodex", !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
+                            return
+                        }
+                        if self.config.dataSource == "localCodex" {
+                            if let result {
+                                self.localSnapshot = result; self.fiveHourQuota = result.fiveHour; self.sevenDayQuota = result.sevenDay
+                                self.quotaError = result.latestEventAt == nil ? "未发现有效本地用量记录" : "额度来自 Codex 会话事件，可能已过期"
+                            } else {
+                                self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil)
+                                self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
+                            }
+                        }
+                        self.localScanRunning = false
+                        if self.config.dataSource == "localCodex" { self.scheduleLocalScan() }
+                    }
+                }
+            }
+        }
+        localScan = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0 : 30), execute: work)
+    }
     func refreshQuota() {
-        guard !config.usageURL.isEmpty, !quotaLoading else { return }
+        guard config.dataSource == "proxy", !config.usageURL.isEmpty, !quotaLoading else { return }
         quotaLoading = true
         let config = config, key = usageKey, version = generation
         quotaFetch = Task { [weak self] in

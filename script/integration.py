@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import plistlib
+import socket
 import subprocess
 import sys
 import tempfile
@@ -58,7 +59,7 @@ def main():
     WORK.mkdir(exist_ok=True)
     WORK = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=WORK))
     (ROOT / ".integration/last-run.txt").write_text(str(WORK))
-    config = {"endpoint": "http://127.0.0.1:19877/v1/chat/completions", "port": 19876,
+    config = {"dataSource": "proxy", "endpoint": "http://127.0.0.1:19877/v1/chat/completions", "port": 19876,
         "usageURL": "http://127.0.0.1:19877/usage", "refreshSeconds": 15.0,
         "inputPrice": 1.0, "outputPrice": 2.0, "loggingEnabled": True}
     with (WORK / "config.plist").open("wb") as handle:
@@ -145,7 +146,7 @@ def main():
             subprocess.run(["pkill", "-x", "TokenStatMenu"], capture_output=True)
             normal_config = WORK / "normal.plist"
             with normal_config.open("wb") as handle:
-                plistlib.dump({"port": 19876}, handle)
+                plistlib.dump({"port": 19876, "dataSource": "proxy"}, handle)
             normal_diagnostic = WORK / "normal-ui.json"
             normal_command = command.copy()
             normal_command.remove("--test-fixture")
@@ -158,6 +159,33 @@ def main():
             assert normal.get("fiveHourUsedPercent") is None and normal.get("sevenDayUsedPercent") is None, normal
             assert normal.get("quotaUsed") is None and normal["alert"] == "normal", normal
             print("PASS: fixture clearly labeled; normal startup has no inherited usage or quota", flush=True)
+
+            # Local-source startup uses an isolated CODEX_HOME fixture and never resolves proxy credentials.
+            subprocess.run(["pkill", "-x", "TokenStatMenu"], capture_output=True)
+            local_home = WORK / "local-codex"
+            session_dir = local_home / "sessions" / "2026" / "10" / "17"
+            session_dir.mkdir(parents=True)
+            event = {"timestamp": "2026-10-17T03:00:00Z", "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 23, "output_tokens": 7, "total_tokens": 30}}, "rate_limits": {}}}
+            (session_dir / "rollout-fixture-12345678-1234-4234-8234-123456789abc.jsonl").write_text(json.dumps(event) + "\n")
+            local_config = WORK / "local.plist"
+            with local_config.open("wb") as handle:
+                plistlib.dump({"port": 19879, "dataSource": "localCodex"}, handle)
+            local_diagnostic = WORK / "local-ui.json"
+            local_command = ["open", "-n", str(ROOT / "dist/TokenStatMenu.app"),
+                "--env", "CODEX_HOME=" + str(local_home), "--args", "--config", str(local_config),
+                "--test-fixture", "--disable-discovery", "--diagnostics-output", str(local_diagnostic)]
+            subprocess.run(local_command, check=True)
+            local = wait_for(lambda: (r if (r := json.loads(local_diagnostic.read_text())).get("hasRequestData") else None))
+            assert local["title"] == "测试 T:—" and local["isTestFixture"], local
+            assert "模拟测试" in local["dataNotice"], local
+            assert (local.get("quotaUsed") is None and local.get("fiveHourUsedPercent") is None
+                and local.get("sevenDayUsedPercent") is None), local
+            with socket.socket() as probe:
+                probe.settimeout(0.5)
+                assert probe.connect_ex(("127.0.0.1", 19879)) != 0, "local source must not start the proxy listener"
+            print("PASS: synthetic nested local Codex startup is ready without proxy listener or inherited quota", flush=True)
         (WORK / "result.json").write_text(json.dumps(cancelled, indent=2))
         if "--keep-running" in sys.argv:
             print("Fixture running for UI inspection. PID", server.pid, flush=True)

@@ -5,11 +5,12 @@
 启动参数 `--config /absolute/path/config.plist` 可选择独立配置；它的日志也放在同级 `Logs` 目录。
 缺少字段会采用默认值；类型错误或非法 URL/端口会明确报错，不会静默覆盖旧配置。
 
-密钥不写 plist：菜单设置中的推理 Key、企业用量 Key、本机访问令牌存入专用 Keychain service `com.tupig.TokenStatMenu`。
+密钥不写 plist：菜单设置中的推理 Key、企业用量 Key 存入专用 Keychain service `com.tupig.TokenStatMenu`，Keychain account 按用途和准确 URL 的 SHA-256 分别绑定；更换 URL 不会复用原密钥；返回原 URL 时可继续使用原绑定密钥。本机访问令牌单独保存。旧版未绑定 URL 的通用推理/用量 Key 不自动迁移，切换至代理后请重新填写。
 自动化环境可以使用 `TOKENSTAT_API_KEY`、`TOKENSTAT_USAGE_KEY`、`TOKENSTAT_LOCAL_KEY` 覆盖启动时读取值；不要把真实密钥提交到源码或测试脚本。
 
 | 字段 | 默认值/单位 | 说明 |
 |---|---|---|
+| dataSource | localCodex | `localCodex` 读取本地 Codex 会话统计；`proxy` 启用本机转发与可选企业用量接口。旧 plist 若未含该字段但显式含代理配置，按 `proxy` 迁移。 |
 | endpoint | Ollama 本机 Chat 完整 URL | 支持额外路径前缀 |
 | model | 空 | 空则保留客户端模型；非空统一覆盖 |
 | port | 18765 | 监听 127.0.0.1，范围 1024–65535 |
@@ -69,3 +70,10 @@
 例如 Codex 中 `base_url = "https://gateway.example/airoute"` 与 `wire_api = "responses"` 会生成 `https://gateway.example/airoute/responses`，不会额外插入 `/v1`。使用 `https://gateway.example/v1` 则保留 `/v1`。对活动 profile 的 model/provider 覆盖优先于根配置。复杂 TOML 形式或重复值会被跳过；仍可手动填写。
 
 `--disable-discovery` 可在本次启动禁用发现。不使用定时文件扫描，不发网络探测，不上报发现结果。发现与手动录入一样，都无法在没有认证信息的情况下访问受保护的接口。
+
+
+## 本地 Codex 会话来源
+
+全新安装默认选择 `localCodex`。它读取绝对路径 `CODEX_HOME/sessions`（仅当环境变量为绝对路径），否则读取 `~/.codex/sessions`。不读取 Codex 认证数据，不调用 Keychain，不启动本机代理或企业用量接口。扫描每 30 秒在后台运行且不重叠；最多枚举 5,000 个目录项、选择最新修改的 32 个会话，每个仅读取尾部 256 KiB，单次总字节上限 8 MiB。会话 JSONL 内容只在内存中短暂解析，输出只包含汇总数字、会话数、扫描限制状态和事件时间。界面将其标为历史记录，不生成实时速率、请求数、成本或延迟。
+
+切换到 `proxy` 后，旧的 Endpoint、用量 URL 和密钥保留供代理使用。保存时密钥留空且对应 URL 未变化，会沿用已保存密钥；URL 改变时要求为新地址重新输入密钥；留空则只解析此前已绑定到该新 URL 的密钥。旧密钥仍绑定原 URL，切换回原地址时可继续使用。

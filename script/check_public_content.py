@@ -10,6 +10,13 @@ import subprocess
 from pathlib import Path
 from package_source import PUBLIC_FILES, ROOT
 
+SYNTHETIC_PNG_SHA256 = {
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "e03aa7d784ce5d11b8994b99fa781e560e68c51764ab80396c6bfa91c9f848d0",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "0713582fbfbeafd295fec11f9f062d929b03aa24ece2c625fb6213af51e3eb79",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "ead37da0bb4717d1cd62c040218cf82a0aef02147874ebce0865d325194b32a3",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "49dad314d7714198f49031f9c47714f5ad7a87bd88595edea1713d0003ee372a",
+}
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -42,6 +49,13 @@ def main():
             if path.is_symlink() or not path.is_file():
                 failures.append((name, 0, "missing or symbolic-link file")); continue
             data = path.read_bytes()
+        if name in SYNTHETIC_PNG_SHA256:
+            import hashlib
+            if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                failures.append((name, 0, "reviewed synthetic PNG signature mismatch")); continue
+            if hashlib.sha256(data).hexdigest() != SYNTHETIC_PNG_SHA256[name]:
+                failures.append((name, 0, "reviewed synthetic PNG hash mismatch")); continue
+            continue
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:

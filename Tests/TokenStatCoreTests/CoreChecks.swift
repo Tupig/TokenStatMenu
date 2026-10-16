@@ -96,6 +96,7 @@ import TokenStatCore
         check(totals.active == 0 && totals.failures == 0, "all concurrent requests finalized once")
         try gatewayChecks()
         try windowQuotaChecks()
+        try localCodexUsageChecks()
         print("\(checks - failures)/\(checks) checks passed")
         if failures > 0 { exit(1) }
     }

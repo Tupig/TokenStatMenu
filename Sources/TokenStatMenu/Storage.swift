@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import CryptoKit
 #if SWIFT_PACKAGE
 import TokenStatCore
 #endif
@@ -17,12 +18,9 @@ enum AppPaths {
 enum ConfigStore {
     static func load() throws -> AppConfiguration {
         guard FileManager.default.fileExists(atPath: AppPaths.configURL.path) else { return AppConfiguration() }
-        let defaults = try PropertyListEncoder().encode(AppConfiguration())
-        var base = try PropertyListSerialization.propertyList(from: defaults, format: nil) as! [String: Any]
         let loaded = try PropertyListSerialization.propertyList(from: Data(contentsOf: AppPaths.configURL), format: nil)
         guard let values = loaded as? [String: Any] else { throw StatError.message("配置必须是 plist 字典") }
-        base.merge(values) { _, new in new }
-        let data = try PropertyListSerialization.data(fromPropertyList: base, format: .xml, options: 0)
+        let data = try PropertyListSerialization.data(fromPropertyList: values, format: .xml, options: 0)
         return try PropertyListDecoder().decode(AppConfiguration.self, from: data).validated()
     }
     static func save(_ config: AppConfiguration) throws {
@@ -35,6 +33,14 @@ enum ConfigStore {
 
 enum KeychainStore {
     private static let service = "com.tupig.TokenStatMenu"
+    static func accountName(_ purpose: String, validatedURL: String) throws -> String {
+        guard ["upstream", "usage"].contains(purpose),
+              let url = URL(string: validatedURL), let host = url.host, !host.isEmpty,
+              url.user == nil, url.password == nil, url.fragment == nil,
+              ["https", "http"].contains(url.scheme ?? "") else { throw StatError.message("无效密钥绑定 URL") }
+        let digest = SHA256.hash(data: Data(validatedURL.utf8)).map { String(format: "%02x", $0) }.joined()
+        return "\(purpose)-\(digest)"
+    }
     static func read(_ name: String) throws -> String {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
             kSecAttrAccount as String: name, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
@@ -57,9 +63,15 @@ enum KeychainStore {
         }
         guard status == errSecSuccess else { throw StatError.message("无法保存 TokenStatMenu 钥匙串（\(status)）") }
     }
-    static func resolve(_ name: String, environment: String) throws -> String {
+    static func read(_ purpose: String, validatedURL: String) throws -> String {
+        try read(try accountName(purpose, validatedURL: validatedURL))
+    }
+    static func write(_ purpose: String, validatedURL: String, value: String) throws {
+        try write(try accountName(purpose, validatedURL: validatedURL), value: value)
+    }
+    static func resolve(_ purpose: String, environment: String, validatedURL: String) throws -> String {
         if let value = ProcessInfo.processInfo.environment[environment] { return value }
-        return try read(name)
+        return try read(purpose, validatedURL: validatedURL)
     }
     static func localToken() throws -> String {
         if let value = ProcessInfo.processInfo.environment["TOKENSTAT_LOCAL_KEY"], !value.isEmpty { return value }

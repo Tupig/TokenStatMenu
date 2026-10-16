@@ -17,7 +17,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     var body: some View {
         VStack(spacing: 0) {
             header
-            if model.isTestFixture || !model.hasRequestData {
+            if model.isTestFixture || model.config.dataSource == "localCodex" || !model.hasRequestData {
                 HStack(spacing: 7) {
                     Image(systemName: model.isTestFixture ? "testtube.2" : "info.circle")
                     Text(model.dataNotice).fixedSize(horizontal: false, vertical: true)
@@ -31,19 +31,16 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             else {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 12) {
-                        liveCard
+                        if model.config.dataSource == "localCodex" { localUsageCard } else { liveCard }
                         HStack(alignment: .top, spacing: 10) {
                             WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
                                 color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds)
                             WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
                                 color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds)
                         }
-                        sessionCard
-                        quotaCard
-                        if model.config.historyEnabled, model.panelVisible { historyCard }
-                        costCard
-                        requestCard
-                        connectionCard
+                        if model.config.dataSource == "localCodex" { localQuotaCard } else { sessionCard; quotaCard }
+                        if model.config.dataSource == "proxy", model.config.historyEnabled, model.panelVisible { historyCard }
+                        if model.config.dataSource == "proxy" { costCard; requestCard; connectionCard }
                     }.padding(.horizontal, 16).padding(.bottom, 14)
                 }
             }
@@ -63,18 +60,18 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 .background(PanelPalette.gradient, in: RoundedRectangle(cornerRadius: 10))
             VStack(alignment: .leading, spacing: 3) {
                 Text("TokenStatMenu").font(.system(size: 16, weight: .bold, design: .rounded))
-                Text(settings ? "本机网关与偏好设置" : "实时用量 · 本次启动")
+                Text(settings ? "本机网关与偏好设置" : (model.config.dataSource == "localCodex" ? "本地 Codex · 历史记录" : "实时用量 · 本次启动"))
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Spacer()
             Button { settings.toggle() } label: {
                 Image(systemName: settings ? "chart.bar.xaxis" : "slider.horizontal.3")
                     .frame(width: 28, height: 28)
-            }.buttonStyle(.plain).foregroundStyle(.secondary).help(settings ? "返回概览" : "连接与设置")
+            }.buttonStyle(.borderless).foregroundStyle(.secondary).help(settings ? "返回概览" : "连接与设置")
                 .accessibilityLabel(settings ? "返回概览" : "连接与设置")
             Button { NSApp.terminate(nil) } label: {
                 Image(systemName: "power").frame(width: 24, height: 28)
-            }.buttonStyle(.borderless).help("退出 TokenStatMenu").accessibilityLabel("退出")
+            }.buttonStyle(.borderless).foregroundStyle(.secondary).help("退出 TokenStatMenu").accessibilityLabel("退出")
         }.padding(16)
     }
     private var liveCard: some View {
@@ -110,6 +107,30 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         .padding(16)
         .background(PanelPalette.gradient.opacity(0.10), in: RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(PanelPalette.blue.opacity(0.22)))
+    }
+    private var localUsageCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                metric("历史输入 Token", localCount(model.localSnapshot.input))
+                metric("历史输出 Token", localCount(model.localSnapshot.output))
+                metric("历史总 Token", localCount(model.localSnapshot.total))
+                metric("包含会话", "\(model.localSnapshot.sessionCount)")
+                metric("最近用量事件", model.localSnapshot.latestEventAt?.formatted(date: .abbreviated, time: .shortened) ?? "未发现")
+                Text("本地 Codex 会话记录中的历史累计值；不是实时速率、企业总量或账单。扫描最多纳入 32 个最新修改会话，每文件尾部最多 256 KiB（单轮总计 8 MiB）。\(model.localSnapshot.isLimited ? "已达到扫描范围限制，较旧记录可能未包含。" : "")")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        } label: { Label("本地记录用量", systemImage: "doc.text.magnifyingglass") }
+    }
+    private var localQuotaCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                metric("5 小时额度", model.fiveHourQuota.map { String(format: "%.0f%% 已用", $0.usedPercent) } ?? "未知")
+                metric("7 天额度", model.sevenDayQuota.map { String(format: "%.0f%% 已用", $0.usedPercent) } ?? "未知")
+                Text("额度来自最近的本地 rate_limits 事件；仅作历史快照，过期或未来时间不会作为当前额度。")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
+            }
+        } label: { Label("本地额度快照", systemImage: "chart.bar") }
     }
     private var sessionCard: some View {
         GroupBox {
@@ -227,6 +248,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         HStack { Text(label).foregroundStyle(.secondary); Spacer(); Text(value).fontWeight(.medium).monospacedDigit().textSelection(.enabled) }.font(.system(size: 11))
     }
     private func count(_ n: Int) -> String { n.formatted() }
+    private func localCount(_ n: Int) -> String { model.localSnapshot.sessionCount == 0 ? "—" : count(n) }
     private func count(_ n: Double) -> String { n.formatted(.number.precision(.fractionLength(0))) }
     private func measuredCount(_ n: Int) -> String {
         guard model.hasRequestData else { return "—" }

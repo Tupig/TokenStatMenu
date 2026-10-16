@@ -33,7 +33,8 @@ import SwiftUI
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: color
             ])
         }
-        item.button?.toolTip = "\(model.dataNotice) · 输出估算速度（5 秒窗口）· \(model.proxyStatus)"
+        let measurement = model.config.dataSource == "localCodex" ? "本地历史快照 · 速度缺少可靠计时" : "输出估算速度（5 秒窗口）"
+        item.button?.toolTip = "\(model.dataNotice) · \(measurement) · \(model.proxyStatus)"
         writeDiagnosticsIfRequested()
     }
     @objc func toggle() {
@@ -44,7 +45,12 @@ import SwiftUI
         model.panelVisible = true
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
+        if let window = popover.contentViewController?.view.window {
+            window.makeKey()
+            // Avoid a green default-button focus ring on open. Native keyboard
+            // traversal still establishes and displays focus when the user tabs.
+            window.makeFirstResponder(nil)
+        }
     }
     func popoverDidClose(_ notification: Notification) { model.panelVisible = false }
     /// Opt-in local diagnostic output for integration tests; no credentials or content.

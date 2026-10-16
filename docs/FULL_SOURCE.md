@@ -4,6 +4,9 @@
 
 ```mermaid
 flowchart LR
+    Local[本机 Codex 有界会话记录] --> Reader[LocalCodexUsageReader 数字快照]
+    Reader --> Menu
+    Reader --> Panel
     Client[Codex / SDK / 其他客户端] -->|HTTP + 本机令牌| Proxy[127.0.0.1 本机代理]
     Proxy -->|企业 Key / HTTPS| API[企业网关 / OpenAI 兼容 API / Ollama]
     API -->|SSE / NDJSON / JSON 原样转发| Proxy
@@ -15,7 +18,7 @@ flowchart LR
     Quota --> Menu
 ```
 
-选择本机转发代理是因为应用无法凭空读取其他进程的 TLS 流。它不修改系统代理，也不自动修改 Codex 或企业客户端配置。所有已存在、未经过代理的会话不计入统计。
+本机记录模式与代理模式分别显示数据，不混合累计。代理模式用于观测实际流式请求，因为应用无法凭空读取其他进程的 TLS 流；它不修改系统代理，也不自动修改 Codex 或企业客户端配置。代理统计只覆盖启动后经过它的请求。
 
 
 ## 分文件完整源码
@@ -41,6 +44,10 @@ jobs:
         run: python3 script/check_public_content.py --git-index
       - name: Core and gateway discovery checks
         run: swift run --build-system native TokenStatCoreChecks
+      - name: Compile UI test target and run OS-independent checks
+        run: |
+          swift test --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
+          swift test --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
       - name: Native Xcode build
         run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build
 ```
@@ -55,10 +62,12 @@ let package = Package(
     name: "TokenStatMenu",
     platforms: [.macOS(.v13)],
     products: [.executable(name: "TokenStatMenu", targets: ["TokenStatMenu"])],
+    dependencies: [.package(url: "https://github.com/pointfreeco/swift-snapshot-testing", exact: "1.19.6")],
     targets: [
         .target(name: "TokenStatCore"),
         .executableTarget(name: "TokenStatMenu", dependencies: ["TokenStatCore"]),
-        .executableTarget(name: "TokenStatCoreChecks", dependencies: ["TokenStatCore"], path: "Tests/TokenStatCoreTests")
+        .executableTarget(name: "TokenStatCoreChecks", dependencies: ["TokenStatCore"], path: "Tests/TokenStatCoreTests"),
+        .testTarget(name: "TokenStatUITests", dependencies: ["TokenStatMenu", .product(name: "SnapshotTesting", package: "swift-snapshot-testing")], path: "Tests/TokenStatUITests", exclude: ["__Snapshots__"])
     ]
 )
 ```
@@ -69,6 +78,7 @@ let package = Package(
 import Foundation
 
 public struct AppConfiguration: Codable, Equatable {
+    public var dataSource = "localCodex"
     public var endpoint = "http://127.0.0.1:11434/v1/chat/completions"
     public var model = ""
     public var port = 18765
@@ -91,8 +101,28 @@ public struct AppConfiguration: Codable, Equatable {
     public var loggingEnabled = false
     public var historyEnabled = true
     public init() {}
+    private enum CodingKeys: String, CodingKey { case dataSource, endpoint, model, port, includeUsage, allowInsecureHTTP, inputPrice, outputPrice, currency, usdToCNY, monthlyLimit, usageURL, usedPath, limitPath, periodPath, fiveHourUsedPercentPath, fiveHourResetPath, sevenDayUsedPercentPath, sevenDayResetPath, refreshSeconds, loggingEnabled, historyEnabled }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        dataSource = try c.decodeIfPresent(String.self, forKey: .dataSource) ?? ((c.contains(.endpoint) || c.contains(.usageURL)) ? "proxy" : "localCodex")
+        endpoint = try c.decodeIfPresent(String.self, forKey: .endpoint) ?? "http://127.0.0.1:11434/v1/chat/completions"
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""; port = try c.decodeIfPresent(Int.self, forKey: .port) ?? 18765
+        includeUsage = try c.decodeIfPresent(Bool.self, forKey: .includeUsage) ?? true; allowInsecureHTTP = try c.decodeIfPresent(Bool.self, forKey: .allowInsecureHTTP) ?? false
+        inputPrice = try c.decodeIfPresent(Double.self, forKey: .inputPrice) ?? 0; outputPrice = try c.decodeIfPresent(Double.self, forKey: .outputPrice) ?? 0
+        currency = try c.decodeIfPresent(String.self, forKey: .currency) ?? "USD"; usdToCNY = try c.decodeIfPresent(Double.self, forKey: .usdToCNY) ?? 7
+        monthlyLimit = try c.decodeIfPresent(Double.self, forKey: .monthlyLimit) ?? 0; usageURL = try c.decodeIfPresent(String.self, forKey: .usageURL) ?? ""
+        usedPath = try c.decodeIfPresent(String.self, forKey: .usedPath) ?? "data.used_tokens"; limitPath = try c.decodeIfPresent(String.self, forKey: .limitPath) ?? "data.total_tokens"
+        periodPath = try c.decodeIfPresent(String.self, forKey: .periodPath) ?? "data.month"
+        fiveHourUsedPercentPath = try c.decodeIfPresent(String.self, forKey: .fiveHourUsedPercentPath) ?? "data.five_hour.used_percent"
+        fiveHourResetPath = try c.decodeIfPresent(String.self, forKey: .fiveHourResetPath) ?? "data.five_hour.resets_at"
+        sevenDayUsedPercentPath = try c.decodeIfPresent(String.self, forKey: .sevenDayUsedPercentPath) ?? "data.seven_day.used_percent"
+        sevenDayResetPath = try c.decodeIfPresent(String.self, forKey: .sevenDayResetPath) ?? "data.seven_day.resets_at"
+        refreshSeconds = try c.decodeIfPresent(Double.self, forKey: .refreshSeconds) ?? 60
+        loggingEnabled = try c.decodeIfPresent(Bool.self, forKey: .loggingEnabled) ?? false; historyEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyEnabled) ?? true
+    }
 
     public func validated() throws -> AppConfiguration {
+        guard ["localCodex", "proxy"].contains(dataSource) else { throw StatError.message("无效数据来源") }
         guard (1024...65535).contains(port) else { throw StatError.message("代理端口必须为 1024–65535") }
         let url = try checkedURL(endpoint)
         let paths = ["/chat/completions", "/responses", "/api/chat", "/api/generate"]
@@ -371,6 +401,221 @@ public struct HTTPDecoder {
         guard let length = Int(rawLength), length >= 0, length <= 8_388_608 else { throw StatError.message("无效 Content-Length") }
         guard buffer.count >= length else { return nil }
         return LocalRequest(method: method, path: path, headers: headers, body: Data(buffer.prefix(length)))
+    }
+}
+```
+
+### Sources/TokenStatCore/LocalCodexUsageReader.swift
+
+```swift
+import Foundation
+import CoreFoundation
+import Darwin
+
+public struct LocalCodexSnapshot: Equatable {
+    public let input: Int
+    public let output: Int
+    public let total: Int
+    public let sessionCount: Int
+    public let filesScanned: Int
+    public let isLimited: Bool
+    public let latestEventAt: Date?
+    public let fiveHour: WindowQuota?
+    public let sevenDay: WindowQuota?
+    public init(input: Int, output: Int, total: Int, sessionCount: Int, filesScanned: Int, isLimited: Bool, latestEventAt: Date?, fiveHour: WindowQuota?, sevenDay: WindowQuota?) {
+        self.input = input; self.output = output; self.total = total; self.sessionCount = sessionCount
+        self.filesScanned = filesScanned; self.isLimited = isLimited; self.latestEventAt = latestEventAt
+        self.fiveHour = fiveHour; self.sevenDay = sevenDay
+    }
+}
+
+/// Reads only bounded numeric usage metadata from Codex session JSONL files.
+public enum LocalCodexUsageReader {
+    private static let maxEntries = 5_000
+    private static let maxSessions = 32
+    private static let tailLimit = 256 * 1024
+    private static let byteLimit = 8 * 1024 * 1024
+    private static let uuidPattern = try! NSRegularExpression(pattern: "([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\\.jsonl$")
+
+    private struct Candidate { let name: String; let uuid: String; let modified: Date }
+    private struct Record { let date: Date; let input: Int; let output: Int; let total: Int; let five: WindowQuota?; let seven: WindowQuota?; let isRate: Bool }
+
+    public static func defaultSessionsDirectory(environment: [String: String] = ProcessInfo.processInfo.environment, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
+        if let configured = environment["CODEX_HOME"], configured.hasPrefix("/") {
+            return URL(fileURLWithPath: configured).appendingPathComponent("sessions")
+        }
+        return home.appendingPathComponent(".codex").appendingPathComponent("sessions")
+    }
+
+    public static func scan(directory: URL, now: Date = Date()) throws -> LocalCodexSnapshot {
+        let empty = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil)
+        var st = stat()
+        guard lstat(directory.path, &st) == 0 else { if errno == ENOENT { return empty }; return empty }
+        guard (st.st_mode & S_IFMT) == S_IFDIR else { return empty }
+        let rootFD = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard rootFD >= 0 else { return empty }
+        defer { close(rootFD) }
+        var opened = stat()
+        guard fstat(rootFD, &opened) == 0, (opened.st_mode & S_IFMT) == S_IFDIR else { return empty }
+        var candidates: [Candidate] = [], entries = 0, limited = false
+        var directories = [""]
+        while let relative = directories.first, entries < maxEntries {
+            directories.removeFirst()
+            let dfd = relative.isEmpty ? dup(rootFD) : openDirectoryRelative(rootFD, relative)
+            guard dfd >= 0, let listing = fdopendir(dfd) else { if dfd >= 0 { close(dfd) }; continue }
+            while entries < maxEntries, let item = readdir(listing) {
+                let leaf = withUnsafePointer(to: &item.pointee.d_name) { ptr -> String in
+                    ptr.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) }
+                }
+                if leaf == "." || leaf == ".." { continue }
+                entries += 1
+                let name = relative.isEmpty ? leaf : relative + "/" + leaf
+                var fst = stat()
+                guard fstatat(dfd, leaf, &fst, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
+                if (fst.st_mode & S_IFMT) == S_IFDIR { directories.append(name); continue }
+                guard (fst.st_mode & S_IFMT) == S_IFREG else { continue }
+                let ns = name as NSString, range = NSRange(location: 0, length: ns.length)
+                guard let match = uuidPattern.firstMatch(in: name, range: range), let r = Range(match.range(at: 1), in: name) else { continue }
+                candidates.append(Candidate(name: name, uuid: String(name[r]).lowercased(), modified: Date(timeIntervalSince1970: Double(fst.st_mtimespec.tv_sec))))
+                if entries >= maxEntries { break }
+            }
+            closedir(listing)
+        }
+        if entries >= maxEntries { limited = true }
+        var newestByUUID: [String: Candidate] = [:]
+        for candidate in candidates where newestByUUID[candidate.uuid].map({ $0.modified < candidate.modified }) ?? true { newestByUUID[candidate.uuid] = candidate }
+        candidates = Array(newestByUUID.values)
+        candidates.sort { $0.modified == $1.modified ? $0.uuid < $1.uuid : $0.modified > $1.modified }
+        if candidates.count > maxSessions { candidates = Array(candidates.prefix(maxSessions)); limited = true }
+        var usedBytes = 0, filesScanned = 0, input = 0, output = 0, total = 0, sessionCount = 0
+        var latestEvent: Date?, latestRate: Record?
+        for candidate in candidates {
+            guard usedBytes < byteLimit else { limited = true; break }
+            let fd = openRelative(rootFD, candidate.name)
+            guard fd >= 0 else { continue }
+            defer { close(fd) }
+            var fst = stat()
+            guard fstat(fd, &fst) == 0, (fst.st_mode & S_IFMT) == S_IFREG, fst.st_size >= 0 else { continue }
+            let contained = isContained(fd: fd, rootFD: rootFD)
+            guard contained else { continue }
+            let remaining = byteLimit - usedBytes
+            let amount = min(Int(fst.st_size), tailLimit, remaining)
+            if amount <= 0 { limited = true; continue }
+            var data = Data(count: amount)
+            let offset = max(0, fst.st_size - off_t(amount))
+            let readCount = data.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return pread(fd, base, amount, offset)
+            }
+            guard readCount > 0 else { continue }
+            data.count = readCount
+            usedBytes += readCount; filesScanned += 1
+            if fst.st_size > off_t(amount) { limited = true }
+            var lines = data.split(separator: 10, omittingEmptySubsequences: false)
+            if offset > 0, !data.isEmpty { lines.removeFirst() }
+            if data.last != 10 { lines.removeLast() }
+            var lastToken: Record?
+            for line in lines where !line.isEmpty {
+                guard let object = try? JSONSerialization.jsonObject(with: Data(line)), let root = object as? [String: Any],
+                      root["type"] as? String == "event_msg", let payload = root["payload"] as? [String: Any] else { continue }
+                guard let date = parseDate(root["timestamp"]) else { continue }
+                let payloadType = payload["type"] as? String
+                if payloadType == "token_count", let info = payload["info"] as? [String: Any],
+                   let usage = info["total_token_usage"] as? [String: Any],
+                   let i = integer(usage["input_tokens"]), let o = integer(usage["output_tokens"]), let t = integer(usage["total_tokens"]) {
+                    lastToken = Record(date: date, input: i, output: o, total: t, five: nil, seven: nil, isRate: false)
+                }
+                if payloadType == "token_count" {
+                    let limits = payload["rate_limits"] as? [String: Any]
+                    let windows = [limits?["primary"], limits?["secondary"]]
+                    let fiveCandidates = windows.compactMap { window($0, minutes: 300, now: now, at: date) }
+                    let sevenCandidates = windows.compactMap { window($0, minutes: 10080, now: now, at: date) }
+                    let record = Record(date: date, input: 0, output: 0, total: 0,
+                        five: fiveCandidates.count == 1 ? fiveCandidates[0] : nil,
+                        seven: sevenCandidates.count == 1 ? sevenCandidates[0] : nil, isRate: true)
+                    if latestRate == nil || latestRate!.date <= date { latestRate = record }
+                }
+            }
+            if let record = lastToken {
+                let (ni, oi) = input.addingReportingOverflow(record.input), (no, oo) = output.addingReportingOverflow(record.output), (nt, ot) = total.addingReportingOverflow(record.total)
+                guard !oi, !oo, !ot else { throw StatError.message("本地用量汇总超出可表示范围") }
+                input = ni; output = no; total = nt; sessionCount += 1
+                if latestEvent == nil || latestEvent! < record.date { latestEvent = record.date }
+            }
+        }
+        return LocalCodexSnapshot(input: input, output: output, total: total, sessionCount: sessionCount, filesScanned: filesScanned, isLimited: limited, latestEventAt: latestEvent,
+            fiveHour: latestRate?.five, sevenDay: latestRate?.seven)
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+        guard n.doubleValue.isFinite, n.doubleValue >= 0 else { return nil }
+        var decimal = n.decimalValue
+        var rounded = Decimal()
+        NSDecimalRound(&rounded, &decimal, 0, .plain)
+        guard rounded == decimal else { return nil }
+        let text = NSDecimalNumber(decimal: rounded).stringValue
+        guard let exact = Int(text), exact >= 0 else { return nil }
+        return exact
+    }
+    private static func openRelative(_ rootFD: Int32, _ path: String) -> Int32 {
+        let parts = path.split(separator: "/").map(String.init)
+        guard let leaf = parts.last else { return -1 }
+        var current = dup(rootFD)
+        guard current >= 0 else { return -1 }
+        for component in parts.dropLast() {
+            let next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            close(current)
+            guard next >= 0 else { return -1 }
+            current = next
+        }
+        let result = openat(current, leaf, O_RDONLY | O_NOFOLLOW)
+        close(current)
+        return result
+    }
+    private static func openDirectoryRelative(_ rootFD: Int32, _ path: String) -> Int32 {
+        let parts = path.split(separator: "/").map(String.init)
+        var current = dup(rootFD)
+        guard current >= 0 else { return -1 }
+        for component in parts {
+            let next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            close(current)
+            guard next >= 0 else { return -1 }
+            current = next
+        }
+        return current
+    }
+    private static func isContained(fd: Int32, rootFD: Int32) -> Bool {
+        func path(_ descriptor: Int32) -> String? {
+            var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+            guard fcntl(descriptor, F_GETPATH, &buffer) == 0 else { return nil }
+            let raw = String(cString: buffer)
+            return raw.withCString { pointer in
+                guard let resolved = realpath(pointer, nil) else { return nil }
+                defer { free(resolved) }
+                return String(cString: resolved)
+            }
+        }
+        guard let root = path(rootFD), let file = path(fd) else { return false }
+        return file.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+    }
+    private static func parseDate(_ value: Any?) -> Date? {
+        guard let s = value as? String else { return nil }
+        let formatter = ISO8601DateFormatter()
+        if let date = formatter.date(from: s) { return date }
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: s)
+    }
+    private static func window(_ value: Any?, minutes: Int, now: Date, at date: Date) -> WindowQuota? {
+        guard let v = value as? [String: Any], let raw = v["used_percent"] as? NSNumber,
+              CFGetTypeID(raw) != CFBooleanGetTypeID(), raw.doubleValue.isFinite, (0...100).contains(raw.doubleValue),
+              let duration = integer(v["window_minutes"]), duration == minutes else { return nil }
+        var reset: Date?
+        if let n = v["resets_at"] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(),
+           n.doubleValue.isFinite, n.doubleValue > 0, n.doubleValue < 100_000_000_000 {
+            reset = Date(timeIntervalSince1970: n.doubleValue)
+        }
+        return WindowQuota(minutes: minutes, usedPercent: raw.doubleValue, resetsAt: reset, fetchedAt: date)
     }
 }
 ```
@@ -819,7 +1064,7 @@ public struct WindowQuota: Codable, Equatable {
     public let fetchedAt: Date
     public var remainingPercent: Double { max(0, 100 - usedPercent) }
     public func isFresh(at now: Date = Date(), refreshSeconds: Double) -> Bool {
-        now.timeIntervalSince(fetchedAt) < max(120, refreshSeconds * 2)
+        fetchedAt <= now && now.timeIntervalSince(fetchedAt) < max(120, refreshSeconds * 2)
             && (resetsAt.map { $0 > now } ?? true)
     }
 }
@@ -1095,6 +1340,7 @@ struct SpeedPoint: Identifiable {
     let isTestFixture = CommandLine.arguments.contains("--test-fixture")
     @Published var config = AppConfiguration()
     @Published var stats = MetricsSnapshot()
+    @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil)
     @Published var quota: QuotaSnapshot?
     @Published var fiveHourQuota: WindowQuota?
     @Published var sevenDayQuota: WindowQuota?
@@ -1113,6 +1359,10 @@ struct SpeedPoint: Identifiable {
     private var timer: Timer?
     private var quotaLoop: Task<Void, Never>?
     private var quotaFetch: Task<Void, Never>?
+    private var localScan: DispatchWorkItem?
+    private var localScanRunning = false
+    private var proxyWasStarted = false
+    private var isShuttingDown = false
     private var generation = 0
     private var lastHistory = Date.distantPast
     private(set) var localKey = ""
@@ -1123,23 +1373,21 @@ struct SpeedPoint: Identifiable {
     init(preview: Bool = false) {
         // Offline view rendering must never touch local configuration or credentials.
         if preview { proxyStatus = "模拟预览 · 无网络、无本机配置"; discoveryStatus = "离线预览"; return }
-        proxy.onStatus = { [weak self] status in Task { @MainActor in self?.proxyStatus = status } }
-        proxy.onRecord = { [weak self] record in
-            Task { @MainActor in if self?.config.loggingEnabled == true { self?.logger.append(record) } }
-        }
         logger.onError = { [weak self] error in Task { @MainActor in self?.message = error } }
         do {
             config = try ConfigStore.load()
-            localKey = try KeychainStore.localToken()
-            apiKey = try KeychainStore.resolve("upstream", environment: "TOKENSTAT_API_KEY")
-            usageKey = try KeychainStore.resolve("usage", environment: "TOKENSTAT_USAGE_KEY")
+            if config.dataSource == "proxy" {
+                localKey = try KeychainStore.localToken()
+                apiKey = try KeychainStore.resolve("upstream", environment: "TOKENSTAT_API_KEY", validatedURL: config.endpoint)
+                usageKey = config.usageURL.isEmpty ? "" : try KeychainStore.resolve("usage", environment: "TOKENSTAT_USAGE_KEY", validatedURL: config.usageURL)
+            }
             startServices()
         } catch { message = error.localizedDescription; proxyStatus = "未启动：检查设置" }
         // A single 2Hz main timer updates menu text. Network callbacks never redraw the UI.
         timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
         timer?.tolerance = 0.1
         RunLoop.main.add(timer!, forMode: .common)
-        discoverGateways()
+        if config.dataSource == "proxy" { discoverGateways() }
     }
     /// One bounded scan at startup or on explicit refresh. Never polls the filesystem.
     func discoverGateways() {
@@ -1163,11 +1411,11 @@ struct SpeedPoint: Identifiable {
             }
         }
     }
-    func shutdown() { timer?.invalidate(); quotaLoop?.cancel(); quotaFetch?.cancel(); proxy.stop() }
+    func shutdown() { isShuttingDown = true; generation += 1; timer?.invalidate(); quotaLoop?.cancel(); quotaFetch?.cancel(); localScan?.cancel(); if proxyWasStarted { proxy.stop() } }
     func tick() {
         stats = engine.snapshot()
         let now = Date()
-        if config.historyEnabled, now.timeIntervalSince(lastHistory) >= 1 {
+        if config.dataSource == "proxy", config.historyEnabled, now.timeIntervalSince(lastHistory) >= 1 {
             history.append(SpeedPoint(date: now, value: stats.outputTPS))
             history.removeAll { now.timeIntervalSince($0.date) > 600 }
             if history.count > 600 { history.removeFirst(history.count - 600) }
@@ -1182,12 +1430,14 @@ struct SpeedPoint: Identifiable {
     }
     var currencyFactor: Double { config.currency == "CNY" ? config.usdToCNY : 1 }
     var currencySymbol: String { config.currency == "CNY" ? "¥" : "$" }
-    var hasRequestData: Bool { stats.requests > 0 }
+    var hasRequestData: Bool { config.dataSource == "localCodex" ? localSnapshot.sessionCount > 0 : stats.requests > 0 }
     var dataNotice: String {
         if isTestFixture { return "模拟测试 · 以下速度、Token、费用和配额均非企业真实数据" }
+        if config.dataSource == "localCodex" { return "本地 Codex 会话记录 · 历史累计用量，不代表企业总量或实时用量；账号与组织归属未核验" }
         return hasRequestData ? "本次启动 · 仅统计经过本机代理的请求" : "未采集到请求数据 · 尚未观测到客户端流量"
     }
     var title: String {
+        if config.dataSource == "localCodex" { return (isTestFixture ? "测试 " : "") + "T:—" }
         let value = !hasRequestData ? "T:—" : stats.active > 0
             ? String(format: "T:≈%.1ftok/s", stats.outputTPS) : "T:0.0tok/s"
         return (isTestFixture ? "测试 " : "") + value
@@ -1202,26 +1452,54 @@ struct SpeedPoint: Identifiable {
     func apply(_ newConfig: AppConfiguration, upstreamKey: String, quotaKey: String) -> Bool {
         guard stats.active == 0 else { message = "请求进行中，请等待完成后再修改代理配置"; return false }
         do {
-            _ = try newConfig.validated()
-            try KeychainStore.write("upstream", value: upstreamKey)
-            try KeychainStore.write("usage", value: quotaKey)
-            if localKey.isEmpty { localKey = try KeychainStore.localToken() }
-            try ConfigStore.save(newConfig)
-            config = newConfig; apiKey = upstreamKey; usageKey = quotaKey
+            var savedConfig = newConfig
+            if newConfig.dataSource == "localCodex" {
+                savedConfig.endpoint = config.endpoint; savedConfig.usageURL = config.usageURL
+            }
+            _ = try savedConfig.validated()
+            if savedConfig.dataSource == "proxy" {
+                let old = config
+                let resolvedAPI = upstreamKey.isEmpty ? (savedConfig.endpoint == old.endpoint && !apiKey.isEmpty ? apiKey : try KeychainStore.read("upstream", validatedURL: savedConfig.endpoint)) : upstreamKey
+                let resolvedUsage = quotaKey.isEmpty && !savedConfig.usageURL.isEmpty ? (savedConfig.usageURL == old.usageURL && !usageKey.isEmpty ? usageKey : try KeychainStore.read("usage", validatedURL: savedConfig.usageURL)) : quotaKey
+                try KeychainStore.write("upstream", validatedURL: savedConfig.endpoint, value: resolvedAPI)
+                if !savedConfig.usageURL.isEmpty { try KeychainStore.write("usage", validatedURL: savedConfig.usageURL, value: resolvedUsage) }
+                if localKey.isEmpty { localKey = try KeychainStore.localToken() }
+                apiKey = resolvedAPI; usageKey = resolvedUsage
+            }
+            try ConfigStore.save(savedConfig)
+            config = savedConfig
             if !config.historyEnabled { history.removeAll() }
             message = "设置已保存"; startServices(); return true
         } catch { message = error.localizedDescription; return false }
     }
     func reload() {
         guard stats.active == 0 else { message = "请求进行中，暂不能重新加载"; return }
-        do { config = try ConfigStore.load(); message = "配置已重新加载"; startServices() }
+        do {
+            let loaded = try ConfigStore.load()
+            if loaded.dataSource == "proxy" {
+                localKey = try KeychainStore.localToken()
+                apiKey = try KeychainStore.resolve("upstream", environment: "TOKENSTAT_API_KEY", validatedURL: loaded.endpoint)
+                usageKey = loaded.usageURL.isEmpty ? "" : try KeychainStore.resolve("usage", environment: "TOKENSTAT_USAGE_KEY", validatedURL: loaded.usageURL)
+            } else { apiKey = ""; usageKey = ""; localKey = "" }
+            config = loaded; message = "配置已重新加载"; startServices()
+        }
         catch { message = error.localizedDescription }
     }
     private func startServices() {
         generation += 1; quotaLoop?.cancel(); quotaFetch?.cancel(); quotaFetch = nil; quotaLoading = false
+        localScan?.cancel(); localScan = nil
         quota = nil; quotaError = config.usageURL.isEmpty ? "未配置企业用量接口，已用量未知" : "等待企业接口"
         fiveHourQuota = nil; sevenDayQuota = nil
+        if config.dataSource == "localCodex" {
+            if proxyWasStarted { proxy.stop(); proxyWasStarted = false }
+            proxyStatus = "本地模式 · 未启动代理"
+            quota = nil; quotaError = "本地会话记录不提供月度企业配额"
+            scheduleLocalScan(immediate: true); return
+        }
+        proxy.onStatus = { [weak self] status in Task { @MainActor in self?.proxyStatus = status } }
+        proxy.onRecord = { [weak self] record in Task { @MainActor in if self?.config.loggingEnabled == true { self?.logger.append(record) } } }
         proxy.start(config: config, apiKey: apiKey, localKey: localKey)
+        proxyWasStarted = true
         if !config.usageURL.isEmpty {
             quotaLoop = Task { [weak self] in
                 while !Task.isCancelled {
@@ -1233,8 +1511,44 @@ struct SpeedPoint: Identifiable {
             }
         }
     }
+    private func scheduleLocalScan(immediate: Bool = false) {
+        localScan?.cancel()
+        let version = generation
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                guard !self.isShuttingDown, self.generation == version, !self.localScanRunning,
+                      self.config.dataSource == "localCodex" else { return }
+                self.localScanRunning = true
+                let directory = LocalCodexUsageReader.defaultSessionsDirectory()
+                DispatchQueue.global(qos: .utility).async {
+                    let result = try? LocalCodexUsageReader.scan(directory: directory)
+                    Task { @MainActor in
+                        guard self.generation == version else {
+                            self.localScanRunning = false
+                            if self.config.dataSource == "localCodex", !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
+                            return
+                        }
+                        if self.config.dataSource == "localCodex" {
+                            if let result {
+                                self.localSnapshot = result; self.fiveHourQuota = result.fiveHour; self.sevenDayQuota = result.sevenDay
+                                self.quotaError = result.latestEventAt == nil ? "未发现有效本地用量记录" : "额度来自 Codex 会话事件，可能已过期"
+                            } else {
+                                self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil)
+                                self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
+                            }
+                        }
+                        self.localScanRunning = false
+                        if self.config.dataSource == "localCodex" { self.scheduleLocalScan() }
+                    }
+                }
+            }
+        }
+        localScan = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0 : 30), execute: work)
+    }
     func refreshQuota() {
-        guard !config.usageURL.isEmpty, !quotaLoading else { return }
+        guard config.dataSource == "proxy", !config.usageURL.isEmpty, !quotaLoading else { return }
         quotaLoading = true
         let config = config, key = usageKey, version = generation
         quotaFetch = Task { [weak self] in
@@ -1294,7 +1608,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     var body: some View {
         VStack(spacing: 0) {
             header
-            if model.isTestFixture || !model.hasRequestData {
+            if model.isTestFixture || model.config.dataSource == "localCodex" || !model.hasRequestData {
                 HStack(spacing: 7) {
                     Image(systemName: model.isTestFixture ? "testtube.2" : "info.circle")
                     Text(model.dataNotice).fixedSize(horizontal: false, vertical: true)
@@ -1308,19 +1622,16 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             else {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 12) {
-                        liveCard
+                        if model.config.dataSource == "localCodex" { localUsageCard } else { liveCard }
                         HStack(alignment: .top, spacing: 10) {
                             WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
                                 color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds)
                             WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
                                 color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds)
                         }
-                        sessionCard
-                        quotaCard
-                        if model.config.historyEnabled, model.panelVisible { historyCard }
-                        costCard
-                        requestCard
-                        connectionCard
+                        if model.config.dataSource == "localCodex" { localQuotaCard } else { sessionCard; quotaCard }
+                        if model.config.dataSource == "proxy", model.config.historyEnabled, model.panelVisible { historyCard }
+                        if model.config.dataSource == "proxy" { costCard; requestCard; connectionCard }
                     }.padding(.horizontal, 16).padding(.bottom, 14)
                 }
             }
@@ -1340,18 +1651,18 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 .background(PanelPalette.gradient, in: RoundedRectangle(cornerRadius: 10))
             VStack(alignment: .leading, spacing: 3) {
                 Text("TokenStatMenu").font(.system(size: 16, weight: .bold, design: .rounded))
-                Text(settings ? "本机网关与偏好设置" : "实时用量 · 本次启动")
+                Text(settings ? "本机网关与偏好设置" : (model.config.dataSource == "localCodex" ? "本地 Codex · 历史记录" : "实时用量 · 本次启动"))
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Spacer()
             Button { settings.toggle() } label: {
                 Image(systemName: settings ? "chart.bar.xaxis" : "slider.horizontal.3")
                     .frame(width: 28, height: 28)
-            }.buttonStyle(.plain).foregroundStyle(.secondary).help(settings ? "返回概览" : "连接与设置")
+            }.buttonStyle(.borderless).foregroundStyle(.secondary).help(settings ? "返回概览" : "连接与设置")
                 .accessibilityLabel(settings ? "返回概览" : "连接与设置")
             Button { NSApp.terminate(nil) } label: {
                 Image(systemName: "power").frame(width: 24, height: 28)
-            }.buttonStyle(.borderless).help("退出 TokenStatMenu").accessibilityLabel("退出")
+            }.buttonStyle(.borderless).foregroundStyle(.secondary).help("退出 TokenStatMenu").accessibilityLabel("退出")
         }.padding(16)
     }
     private var liveCard: some View {
@@ -1387,6 +1698,30 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         .padding(16)
         .background(PanelPalette.gradient.opacity(0.10), in: RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(PanelPalette.blue.opacity(0.22)))
+    }
+    private var localUsageCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                metric("历史输入 Token", localCount(model.localSnapshot.input))
+                metric("历史输出 Token", localCount(model.localSnapshot.output))
+                metric("历史总 Token", localCount(model.localSnapshot.total))
+                metric("包含会话", "\(model.localSnapshot.sessionCount)")
+                metric("最近用量事件", model.localSnapshot.latestEventAt?.formatted(date: .abbreviated, time: .shortened) ?? "未发现")
+                Text("本地 Codex 会话记录中的历史累计值；不是实时速率、企业总量或账单。扫描最多纳入 32 个最新修改会话，每文件尾部最多 256 KiB（单轮总计 8 MiB）。\(model.localSnapshot.isLimited ? "已达到扫描范围限制，较旧记录可能未包含。" : "")")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        } label: { Label("本地记录用量", systemImage: "doc.text.magnifyingglass") }
+    }
+    private var localQuotaCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                metric("5 小时额度", model.fiveHourQuota.map { String(format: "%.0f%% 已用", $0.usedPercent) } ?? "未知")
+                metric("7 天额度", model.sevenDayQuota.map { String(format: "%.0f%% 已用", $0.usedPercent) } ?? "未知")
+                Text("额度来自最近的本地 rate_limits 事件；仅作历史快照，过期或未来时间不会作为当前额度。")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
+            }
+        } label: { Label("本地额度快照", systemImage: "chart.bar") }
     }
     private var sessionCard: some View {
         GroupBox {
@@ -1504,6 +1839,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         HStack { Text(label).foregroundStyle(.secondary); Spacer(); Text(value).fontWeight(.medium).monospacedDigit().textSelection(.enabled) }.font(.system(size: 11))
     }
     private func count(_ n: Int) -> String { n.formatted() }
+    private func localCount(_ n: Int) -> String { model.localSnapshot.sessionCount == 0 ? "—" : count(n) }
     private func count(_ n: Double) -> String { n.formatted(.number.precision(.fractionLength(0))) }
     private func measuredCount(_ n: Int) -> String {
         guard model.hasRequestData else { return "—" }
@@ -1573,10 +1909,19 @@ import TokenStatCore
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 14) {
-                discoverySection
-                upstreamSection
-                priceSection
-                quotaSection
+                Picker("用量来源", selection: $draft.dataSource) {
+                    Text("本地 Codex 记录").tag("localCodex")
+                    Text("本机代理与企业接口").tag("proxy")
+                }.pickerStyle(.segmented)
+                if draft.dataSource == "proxy" {
+                    discoverySection
+                    upstreamSection
+                    priceSection
+                    quotaSection
+                } else {
+                    Text("从 ~/.codex/sessions 读取有限范围的历史用量统计，不连接本机代理，不读取密钥。切换到代理模式可恢复企业接口配置。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 otherSection
                 HStack {
                     Button("保存并应用") { _ = model.apply(draft, upstreamKey: apiKey, quotaKey: quotaKey) }.buttonStyle(.borderedProminent)
@@ -1586,6 +1931,8 @@ import TokenStatCore
             }.padding(16)
         }
         .textFieldStyle(.roundedBorder)
+        .onChange(of: draft.endpoint) { _ in apiKey = "" }
+        .onChange(of: draft.usageURL) { _ in quotaKey = "" }
     }
     private var discoverySection: some View {
         GroupBox("本机网关 · 自动发现") {
@@ -1724,7 +2071,8 @@ import SwiftUI
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: color
             ])
         }
-        item.button?.toolTip = "\(model.dataNotice) · 输出估算速度（5 秒窗口）· \(model.proxyStatus)"
+        let measurement = model.config.dataSource == "localCodex" ? "本地历史快照 · 速度缺少可靠计时" : "输出估算速度（5 秒窗口）"
+        item.button?.toolTip = "\(model.dataNotice) · \(measurement) · \(model.proxyStatus)"
         writeDiagnosticsIfRequested()
     }
     @objc func toggle() {
@@ -1735,7 +2083,12 @@ import SwiftUI
         model.panelVisible = true
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
+        if let window = popover.contentViewController?.view.window {
+            window.makeKey()
+            // Avoid a green default-button focus ring on open. Native keyboard
+            // traversal still establishes and displays focus when the user tabs.
+            window.makeFirstResponder(nil)
+        }
     }
     func popoverDidClose(_ notification: Notification) { model.panelVisible = false }
     /// Opt-in local diagnostic output for integration tests; no credentials or content.
@@ -1785,6 +2138,7 @@ import SwiftUI
 ```swift
 import Foundation
 import Security
+import CryptoKit
 #if SWIFT_PACKAGE
 import TokenStatCore
 #endif
@@ -1802,12 +2156,9 @@ enum AppPaths {
 enum ConfigStore {
     static func load() throws -> AppConfiguration {
         guard FileManager.default.fileExists(atPath: AppPaths.configURL.path) else { return AppConfiguration() }
-        let defaults = try PropertyListEncoder().encode(AppConfiguration())
-        var base = try PropertyListSerialization.propertyList(from: defaults, format: nil) as! [String: Any]
         let loaded = try PropertyListSerialization.propertyList(from: Data(contentsOf: AppPaths.configURL), format: nil)
         guard let values = loaded as? [String: Any] else { throw StatError.message("配置必须是 plist 字典") }
-        base.merge(values) { _, new in new }
-        let data = try PropertyListSerialization.data(fromPropertyList: base, format: .xml, options: 0)
+        let data = try PropertyListSerialization.data(fromPropertyList: values, format: .xml, options: 0)
         return try PropertyListDecoder().decode(AppConfiguration.self, from: data).validated()
     }
     static func save(_ config: AppConfiguration) throws {
@@ -1820,6 +2171,14 @@ enum ConfigStore {
 
 enum KeychainStore {
     private static let service = "com.tupig.TokenStatMenu"
+    static func accountName(_ purpose: String, validatedURL: String) throws -> String {
+        guard ["upstream", "usage"].contains(purpose),
+              let url = URL(string: validatedURL), let host = url.host, !host.isEmpty,
+              url.user == nil, url.password == nil, url.fragment == nil,
+              ["https", "http"].contains(url.scheme ?? "") else { throw StatError.message("无效密钥绑定 URL") }
+        let digest = SHA256.hash(data: Data(validatedURL.utf8)).map { String(format: "%02x", $0) }.joined()
+        return "\(purpose)-\(digest)"
+    }
     static func read(_ name: String) throws -> String {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
             kSecAttrAccount as String: name, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
@@ -1842,9 +2201,15 @@ enum KeychainStore {
         }
         guard status == errSecSuccess else { throw StatError.message("无法保存 TokenStatMenu 钥匙串（\(status)）") }
     }
-    static func resolve(_ name: String, environment: String) throws -> String {
+    static func read(_ purpose: String, validatedURL: String) throws -> String {
+        try read(try accountName(purpose, validatedURL: validatedURL))
+    }
+    static func write(_ purpose: String, validatedURL: String, value: String) throws {
+        try write(try accountName(purpose, validatedURL: validatedURL), value: value)
+    }
+    static func resolve(_ purpose: String, environment: String, validatedURL: String) throws -> String {
         if let value = ProcessInfo.processInfo.environment[environment] { return value }
-        return try read(name)
+        return try read(purpose, validatedURL: validatedURL)
     }
     static func localToken() throws -> String {
         if let value = ProcessInfo.processInfo.environment["TOKENSTAT_LOCAL_KEY"], !value.isEmpty { return value }
@@ -2123,6 +2488,8 @@ struct WindowQuotaCard: View {
 08BC9043587CC788D01C24E7 = { isa = PBXBuildFile; fileRef = 6060CB36BD32E4DE62121D71; };
 25DB8EC2672FE7C810B75A38 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HTTPDecoder.swift"; sourceTree = "<group>"; };
 C6D71C6FAB45AC1E6B57A569 = { isa = PBXBuildFile; fileRef = 25DB8EC2672FE7C810B75A38; };
+967CB92DBAF3C5042457AF3F = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LocalCodexUsageReader.swift"; sourceTree = "<group>"; };
+2D299820E6AC3A52FFC40FC8 = { isa = PBXBuildFile; fileRef = 967CB92DBAF3C5042457AF3F; };
 4C87C1C697E481BB11B23261 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "MetricsEngine.swift"; sourceTree = "<group>"; };
 BACF14F65A3D26C56E4559AC = { isa = PBXBuildFile; fileRef = 4C87C1C697E481BB11B23261; };
 99081DE7CEB5C9C7DAFEADA1 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ProxyServer.swift"; sourceTree = "<group>"; };
@@ -2135,7 +2502,7 @@ E51281927C6E41F6B2F2A59B = { isa = PBXBuildFile; fileRef = A1B8AA05224B907A20995
 06CC516465ECBFB9656FCFE3 = { isa = PBXBuildFile; fileRef = 951D8E55C70DA883B1E10A70; };
 52C5DE96C0BE6977037C956F = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "WindowQuota.swift"; sourceTree = "<group>"; };
 D495B366C1D0E1A6672A9637 = { isa = PBXBuildFile; fileRef = 52C5DE96C0BE6977037C956F; };
-AF7F4C7B765701F258FB7F4D = { isa = PBXGroup; children = (8E4403D07D4E24DF01F86E5D, 6060CB36BD32E4DE62121D71, 25DB8EC2672FE7C810B75A38, 4C87C1C697E481BB11B23261, 99081DE7CEB5C9C7DAFEADA1, 4B0A93085460A2D4B5B2F8C2, A1B8AA05224B907A20995624, 951D8E55C70DA883B1E10A70, 52C5DE96C0BE6977037C956F,); path = "Sources/TokenStatCore"; sourceTree = "<group>"; };
+AF7F4C7B765701F258FB7F4D = { isa = PBXGroup; children = (8E4403D07D4E24DF01F86E5D, 6060CB36BD32E4DE62121D71, 25DB8EC2672FE7C810B75A38, 967CB92DBAF3C5042457AF3F, 4C87C1C697E481BB11B23261, 99081DE7CEB5C9C7DAFEADA1, 4B0A93085460A2D4B5B2F8C2, A1B8AA05224B907A20995624, 951D8E55C70DA883B1E10A70, 52C5DE96C0BE6977037C956F,); path = "Sources/TokenStatCore"; sourceTree = "<group>"; };
 11043337019FA9BE53E5DEA5 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppModel.swift"; sourceTree = "<group>"; };
 60476D6C0F010F89CDCF9332 = { isa = PBXBuildFile; fileRef = 11043337019FA9BE53E5DEA5; };
 B3117F547294E09EFEF92409 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DashboardView.swift"; sourceTree = "<group>"; };
@@ -2160,7 +2527,7 @@ A8792157CB4F27FB949C035F = { isa = PBXFileReference; explicitFileType = wrapper.
 9B987D631012EC23CDD96B6A = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Resources/Info.plist"; sourceTree = "<group>"; };
 652E7FD0652728D9B3EF13DF = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Resources/config.example.plist"; sourceTree = "<group>"; };
 0D6E4079E36703EBD37C0072 = { isa = PBXGroup; children = (AF7F4C7B765701F258FB7F4D, 96BD6B98AF8DAF812B21484D, 9B987D631012EC23CDD96B6A, 652E7FD0652728D9B3EF13DF, 0A3E27B8CA818264D75C8D81,); sourceTree = "<group>"; };
-878A52FC5FF6A57D50B7B870 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (6A3864C6E6DB561D02F46C35, 08BC9043587CC788D01C24E7, C6D71C6FAB45AC1E6B57A569, BACF14F65A3D26C56E4559AC, DDA47B3DEE61C34C2F297CF7, 49E56DE5EE1D3357BC99E0B5, E51281927C6E41F6B2F2A59B, 06CC516465ECBFB9656FCFE3, D495B366C1D0E1A6672A9637, 60476D6C0F010F89CDCF9332, BBE06DCD34D248AEC63DEFB1, 1C6C1E79E7D0D3008EFA0C51, 29DBAC87E7D2D08969C25259, DF47DB83567E12D94C90C186, 775730CD86C47FBDC9419E49, F2E25F94650242E3A64878B7, B71BD30B9E5D41A06B13B456, 164B1DA057D49AA2DDF2EB36,); runOnlyForDeploymentPostprocessing = 0; };
+878A52FC5FF6A57D50B7B870 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (6A3864C6E6DB561D02F46C35, 08BC9043587CC788D01C24E7, C6D71C6FAB45AC1E6B57A569, 2D299820E6AC3A52FFC40FC8, BACF14F65A3D26C56E4559AC, DDA47B3DEE61C34C2F297CF7, 49E56DE5EE1D3357BC99E0B5, E51281927C6E41F6B2F2A59B, 06CC516465ECBFB9656FCFE3, D495B366C1D0E1A6672A9637, 60476D6C0F010F89CDCF9332, BBE06DCD34D248AEC63DEFB1, 1C6C1E79E7D0D3008EFA0C51, 29DBAC87E7D2D08969C25259, DF47DB83567E12D94C90C186, 775730CD86C47FBDC9419E49, F2E25F94650242E3A64878B7, B71BD30B9E5D41A06B13B456, 164B1DA057D49AA2DDF2EB36,); runOnlyForDeploymentPostprocessing = 0; };
 E2AA269EB967A8853A258BFA = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 41D311A605520FC7B8B9A980 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 5DF0EAF287A59303D4EFEAF3 = { isa = XCBuildConfiguration; name = Debug; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 5.0; }; };
@@ -2302,6 +2669,7 @@ import TokenStatCore
         check(totals.active == 0 && totals.failures == 0, "all concurrent requests finalized once")
         try gatewayChecks()
         try windowQuotaChecks()
+        try localCodexUsageChecks()
         print("\(checks - failures)/\(checks) checks passed")
         if failures > 0 { exit(1) }
     }
@@ -2423,9 +2791,9 @@ extension CoreChecks {
         } catch { check(true, "invalid percentage string rejected") }
         let invalidReset = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":20,\"resets_at\":\"not-an-ISO-date\"}}}"), config: config, now: now)
         check(invalidReset.fiveHour?.usedPercent == 20 && invalidReset.fiveHour?.resetsAt == nil, "invalid reset format preserves usage with unknown reset")
-        let resetNow = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":20,\"resets_at\":1800000000}}}"), config: config, now: now)
-        check(resetNow.fiveHour?.isFresh(at: now, refreshSeconds: 3600) == false, "reset time equal to now is expired")
+        let resetNow = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":20,\"resets_at\":1800000000}}}"), config: config, now: now.addingTimeInterval(-1))
         check(resetNow.fiveHour?.isFresh(at: now.addingTimeInterval(-1), refreshSeconds: 3600) == true, "window remains fresh immediately before reset time")
+        check(resetNow.fiveHour?.isFresh(at: now, refreshSeconds: 3600) == false, "reset time equal to now is expired")
         let milliseconds = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":10,\"resets_at\":1800003600000}}}"), config: config, now: now)
         check(milliseconds.fiveHour?.resetsAt == nil, "milliseconds must not silently become a far-future seconds timestamp")
         var customPaths = config
@@ -2436,6 +2804,367 @@ extension CoreChecks {
         let month = QuotaSnapshot.currentMonth(at: now)
         let monthly = try QuotaReport.parse(json("{\"data\":{\"used_tokens\":800,\"total_tokens\":1000,\"month\":\"\(month)\"}}"), config: config, now: now)
         check(monthly.monthly?.fraction == 0.8 && monthly.fiveHour == nil && monthly.sevenDay == nil, "monthly-only APIs remain supported without manufacturing windows")
+    }
+}
+```
+
+### Tests/TokenStatCoreTests/LocalCodexUsageChecks.swift
+
+```swift
+import CoreFoundation
+import Foundation
+import TokenStatCore
+
+extension CoreChecks {
+    static func localCodexUsageChecks() throws {
+        let now = Date(timeIntervalSince1970: 1_797_000_000)
+
+        let aggregateRoot = try fixtureDirectory("aggregate")
+        defer { try? FileManager.default.removeItem(at: aggregateRoot.deletingLastPathComponent()) }
+        let firstID = "11111111-1111-4111-8111-111111111111"
+        let secondID = "22222222-2222-4222-8222-222222222222"
+        let firstEvents = try [
+            tokenEvent(at: now.addingTimeInterval(-300), input: 20, output: 10, cached: 7, reasoning: 4),
+            tokenEvent(at: now.addingTimeInterval(-200), input: 50, output: 20),
+            tokenEvent(at: now.addingTimeInterval(-120), input: 2, output: 3, cached: 1, reasoning: 1)
+        ]
+        try writeSession(in: aggregateRoot, uuid: firstID, events: firstEvents, modified: now.addingTimeInterval(-100))
+        try writeSession(in: aggregateRoot, uuid: secondID,
+            events: [tokenEvent(at: now.addingTimeInterval(-60), input: 4, output: 6)], modified: now)
+        let aggregate = try LocalCodexUsageReader.scan(directory: aggregateRoot, now: now)
+        check(aggregate.input == 6 && aggregate.output == 9 && aggregate.total == 15,
+            "local Codex totals use each session's last cumulative counter, including a lower reset value")
+        check(aggregate.sessionCount == 2 && aggregate.latestEventAt == now.addingTimeInterval(-60),
+            "local Codex reports unique session count and latest event timestamp")
+        check(aggregate.input == 6 && aggregate.output == 9,
+            "cached input and reasoning output subfields are not added twice")
+        let rescanned = try LocalCodexUsageReader.scan(directory: aggregateRoot, now: now)
+        check(rescanned.input == aggregate.input && rescanned.output == aggregate.output
+            && rescanned.total == aggregate.total && rescanned.sessionCount == aggregate.sessionCount,
+            "repeated local Codex scans replace the snapshot instead of accumulating it")
+        let reflectedFields = Set(Mirror(reflecting: aggregate).children.compactMap(\.label))
+        check(reflectedFields == Set(["input", "output", "total", "sessionCount", "filesScanned",
+            "isLimited", "latestEventAt", "fiveHour", "sevenDay"]),
+            "local Codex snapshot contains only numeric, timestamp, quota and scan metadata")
+
+        let duplicateRoot = try fixtureDirectory("duplicate")
+        let duplicateID = "abc33333-3333-4333-8333-333333333333"
+        try writeSession(in: duplicateRoot, uuid: duplicateID,
+            events: [tokenEvent(at: now.addingTimeInterval(-30), input: 1, output: 1)], modified: now.addingTimeInterval(-20))
+        let lowercaseFixture = sessionURL(in: duplicateRoot, uuid: duplicateID)
+        try FileManager.default.moveItem(at: lowercaseFixture,
+            to: duplicateRoot.appendingPathComponent("rollout-primary-\(duplicateID).jsonl"))
+        try writeSession(in: duplicateRoot, uuid: duplicateID.uppercased(),
+            events: [tokenEvent(at: now.addingTimeInterval(-10), input: 8, output: 9)], modified: now)
+        let uppercaseFixture = sessionURL(in: duplicateRoot, uuid: duplicateID.uppercased())
+        try FileManager.default.moveItem(at: uppercaseFixture,
+            to: duplicateRoot.appendingPathComponent("rollout-alias-\(duplicateID.uppercased()).jsonl"))
+        let duplicate = try LocalCodexUsageReader.scan(directory: duplicateRoot, now: now)
+        check(duplicate.sessionCount == 1 && duplicate.input == 8 && duplicate.output == 9,
+            "UUID suffix aliases canonicalize and newest modified duplicate contributes once")
+        try? FileManager.default.removeItem(at: duplicateRoot.deletingLastPathComponent())
+
+        let invalidRoot = try fixtureDirectory("invalid-counts")
+        let validID = "44444444-4444-4444-8444-444444444444"
+        try writeSession(in: invalidRoot, uuid: validID,
+            events: [tokenEvent(at: now, input: 5, output: 7)], modified: now)
+        let invalidLiterals = ["-1", "1.5", "true", "9223372036854775808", "1e999"]
+        for (index, literal) in invalidLiterals.enumerated() {
+            let uuid = String(format: "55555555-5555-4555-8555-%012d", index + 1)
+            try writeSession(in: invalidRoot, uuid: uuid,
+                events: [rawTokenEvent(at: now, inputLiteral: literal, outputLiteral: "1")], modified: now)
+        }
+        let invalid = try LocalCodexUsageReader.scan(directory: invalidRoot, now: now)
+        check(invalid.input == 5 && invalid.output == 7 && invalid.sessionCount == 1,
+            "negative, fractional, boolean, overflowing and non-finite counters are rejected")
+        try? FileManager.default.removeItem(at: invalidRoot.deletingLastPathComponent())
+
+        let exactRoot = try fixtureDirectory("exact-large-integer")
+        try writeSession(in: exactRoot, uuid: "14141414-1414-4414-8414-141414141414",
+            events: [rawTokenEvent(at: now, inputLiteral: "9007199254740993", outputLiteral: "0")], modified: now)
+        let exactLarge = try LocalCodexUsageReader.scan(directory: exactRoot, now: now)
+        check(exactLarge.input == 9_007_199_254_740_993,
+            "large JSON integer above 2^53 is parsed without floating point rounding")
+        try? FileManager.default.removeItem(at: exactRoot.deletingLastPathComponent())
+
+        let truncatedRoot = try fixtureDirectory("truncated-tail")
+        let longPrefix = Data(repeating: 0x78, count: 256 * 1024 + 32)
+        let complete = try tokenEvent(at: now, input: 12, output: 13)
+        var paddedPrefix = longPrefix
+        paddedPrefix.append(10)
+        try writeSession(in: truncatedRoot, uuid: "66666666-6666-4666-8666-666666666666",
+            events: [complete], modified: now, prefix: paddedPrefix, suffix: Data("{\"partial\":".utf8))
+        let truncated = try LocalCodexUsageReader.scan(directory: truncatedRoot, now: now)
+        check(truncated.input == 12 && truncated.output == 13,
+            "tail scan ignores the truncated first fragment and incomplete final JSON line")
+        try? FileManager.default.removeItem(at: truncatedRoot.deletingLastPathComponent())
+
+        let quotaRoot = try fixtureDirectory("quota-snapshots")
+        let oldTime = now.addingTimeInterval(-600), latestTime = now.addingTimeInterval(-60)
+        try writeSession(in: quotaRoot, uuid: "77777777-7777-4777-8777-777777777777",
+            events: [tokenEvent(at: oldTime, input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 10, sevenDay: 20, reset: now.addingTimeInterval(3600)))],
+            modified: now)
+        try writeSession(in: quotaRoot, uuid: "88888888-8888-4888-8888-888888888888",
+            events: [tokenEvent(at: latestTime, input: 2, output: 2,
+                rateLimits: rateLimits(fiveHour: 30, sevenDay: 40, reset: now.addingTimeInterval(7200)))],
+            modified: now.addingTimeInterval(-500))
+        let quotaSnapshot = try LocalCodexUsageReader.scan(directory: quotaRoot, now: now)
+        check(quotaSnapshot.latestEventAt == latestTime && quotaSnapshot.fiveHour?.usedPercent == 30
+            && quotaSnapshot.sevenDay?.usedPercent == 40,
+            "quota windows come from one latest event timestamp, not file modification order")
+        check(quotaSnapshot.fiveHour?.fetchedAt == latestTime && quotaSnapshot.sevenDay?.fetchedAt == latestTime,
+            "local quota freshness preserves the source event timestamp")
+        try? FileManager.default.removeItem(at: quotaRoot.deletingLastPathComponent())
+
+        let missingWindowRoot = try fixtureDirectory("missing-window")
+        try writeSession(in: missingWindowRoot, uuid: "99999999-9999-4999-8999-999999999999",
+            events: [tokenEvent(at: now.addingTimeInterval(-40), input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 25, sevenDay: nil, reset: now.addingTimeInterval(3600)))],
+            modified: now)
+        try writeSession(in: missingWindowRoot, uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+            events: [tokenEvent(at: now.addingTimeInterval(-20), input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: nil, sevenDay: 55, reset: now.addingTimeInterval(3600)))], modified: now)
+        let missingWindow = try LocalCodexUsageReader.scan(directory: missingWindowRoot, now: now)
+        check(missingWindow.fiveHour == nil && missingWindow.sevenDay?.usedPercent == 55,
+            "missing 5-hour quota stays unknown without combining another event")
+        try? FileManager.default.removeItem(at: missingWindowRoot.deletingLastPathComponent())
+
+        let clearedWindowRoot = try fixtureDirectory("cleared-window")
+        try writeSession(in: clearedWindowRoot, uuid: "12121212-1212-4212-8212-121212121212",
+            events: [tokenEvent(at: now.addingTimeInterval(-60), input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 45, sevenDay: 65, reset: now.addingTimeInterval(3600)))], modified: now)
+        try writeSession(in: clearedWindowRoot, uuid: "13131313-1313-4313-8313-131313131313",
+            events: [tokenEvent(at: now.addingTimeInterval(-10), input: 1, output: 1, rateLimits: [:])], modified: now)
+        let clearedWindow = try LocalCodexUsageReader.scan(directory: clearedWindowRoot, now: now)
+        check(clearedWindow.fiveHour == nil && clearedWindow.sevenDay == nil,
+            "newest event with empty rate_limits clears older quota snapshot")
+        try? FileManager.default.removeItem(at: clearedWindowRoot.deletingLastPathComponent())
+
+        let futureRoot = try fixtureDirectory("future-event")
+        let future = now.addingTimeInterval(3600)
+        try writeSession(in: futureRoot, uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            events: [tokenEvent(at: future, input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 25, sevenDay: 35, reset: future.addingTimeInterval(3600)))], modified: now)
+        let futureSnapshot = try LocalCodexUsageReader.scan(directory: futureRoot, now: now)
+        check(futureSnapshot.latestEventAt == future
+            && futureSnapshot.fiveHour?.isFresh(at: now, refreshSeconds: 60) == false,
+            "future-dated local quota retains its timestamp but is not treated as current")
+        try? FileManager.default.removeItem(at: futureRoot.deletingLastPathComponent())
+
+        let symlinkRoot = try fixtureDirectory("symlink-root")
+        let outsideRoot = try fixtureDirectory("symlink-outside")
+        try writeSession(in: outsideRoot, uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            events: [tokenEvent(at: now, input: 100, output: 200)], modified: now)
+        let target = sessionURL(in: outsideRoot, uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        try FileManager.default.createSymbolicLink(at: sessionURL(in: symlinkRoot, uuid: "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+            withDestinationURL: target)
+        try FileManager.default.createSymbolicLink(at: symlinkRoot.appendingPathComponent("linked-directory"),
+            withDestinationURL: outsideRoot)
+        let symlink = try LocalCodexUsageReader.scan(directory: symlinkRoot, now: now)
+        check(symlink.input == 0 && symlink.output == 0 && symlink.sessionCount == 0,
+            "file and directory symlinks outside the sessions root are not followed")
+        try? FileManager.default.removeItem(at: symlinkRoot.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: outsideRoot.deletingLastPathComponent())
+
+        let missingRoot = FileManager.default.temporaryDirectory.appendingPathComponent("tokenstat-missing-\(UUID().uuidString)")
+        let empty = try LocalCodexUsageReader.scan(directory: missingRoot, now: now)
+        check(empty.input == 0 && empty.output == 0 && empty.total == 0 && empty.sessionCount == 0
+            && empty.latestEventAt == nil,
+            "missing sessions root returns an empty snapshot")
+
+        let nestedRoot = try fixtureDirectory("nested-sessions")
+        let nestedID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        try writeSession(in: nestedRoot, uuid: nestedID,
+            events: [tokenEvent(at: now, input: 17, output: 19)], modified: now)
+        let nestedDirectory = nestedRoot.appendingPathComponent("2026/10/17", isDirectory: true)
+        try FileManager.default.createDirectory(at: nestedDirectory, withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: sessionURL(in: nestedRoot, uuid: nestedID),
+            to: nestedDirectory.appendingPathComponent("rollout-fixture-\(nestedID).jsonl"))
+        let nested = try LocalCodexUsageReader.scan(directory: nestedRoot, now: now)
+        check(nested.input == 17 && nested.output == 19 && nested.sessionCount == 1,
+            "nested Codex YYYY/MM/DD session files are discovered")
+        try? FileManager.default.removeItem(at: nestedRoot.deletingLastPathComponent())
+
+        let overflowRoot = try fixtureDirectory("aggregate-overflow")
+        try writeSession(in: overflowRoot, uuid: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            events: [rawTokenEvent(at: now, inputLiteral: String(Int.max), outputLiteral: "0")], modified: now)
+        try writeSession(in: overflowRoot, uuid: "abababab-abab-4bab-8bab-abababababab",
+            events: [rawTokenEvent(at: now, inputLiteral: "1", outputLiteral: "0")], modified: now)
+        do {
+            _ = try LocalCodexUsageReader.scan(directory: overflowRoot, now: now)
+            check(false, "aggregate Int overflow is rejected")
+        } catch {
+            check(true, "aggregate Int overflow is rejected")
+        }
+        try? FileManager.default.removeItem(at: overflowRoot.deletingLastPathComponent())
+
+        let boundedRoot = try fixtureDirectory("bounded-sessions")
+        var pad = Data(repeating: 0x78, count: 256 * 1024 + 8)
+        pad.append(10)
+        for index in 0..<33 {
+            let uuid = String(format: "dddddddd-dddd-4ddd-8ddd-%012d", index + 1)
+            try writeSession(in: boundedRoot, uuid: uuid,
+                events: [tokenEvent(at: now, input: 1, output: 1)],
+                modified: now.addingTimeInterval(Double(index)), prefix: pad)
+        }
+        let bounded = try LocalCodexUsageReader.scan(directory: boundedRoot, now: now)
+        check(bounded.sessionCount == 32 && bounded.isLimited,
+            "scan selects at most 32 sessions, reads only each bounded tail, and marks omitted history")
+        try? FileManager.default.removeItem(at: boundedRoot.deletingLastPathComponent())
+
+        let entryRoot = try fixtureDirectory("bounded-entries")
+        for _ in 0..<5001 {
+            let name = "rollout-fixture-\(UUID().uuidString).jsonl"
+            try Data().write(to: entryRoot.appendingPathComponent(name))
+        }
+        let entryBound = try LocalCodexUsageReader.scan(directory: entryRoot, now: now)
+        check(entryBound.isLimited && entryBound.filesScanned <= 5000,
+            "directory enumeration beyond 5000 entries is bounded and reported")
+        try? FileManager.default.removeItem(at: entryRoot.deletingLastPathComponent())
+
+        let defaultConfiguration = AppConfiguration()
+        check(defaultConfiguration.dataSource == "localCodex", "fresh desktop configuration defaults to local Codex data")
+        let syntheticHome = FileManager.default.temporaryDirectory.appendingPathComponent("tokenstat-home-\(UUID().uuidString)")
+        let syntheticCodex = FileManager.default.temporaryDirectory.appendingPathComponent("tokenstat-codex-\(UUID().uuidString)")
+        let defaultLocalDirectory = LocalCodexUsageReader.defaultSessionsDirectory(environment: [:], home: syntheticHome)
+        let overrideLocalDirectory = LocalCodexUsageReader.defaultSessionsDirectory(environment: ["CODEX_HOME": syntheticCodex.path], home: syntheticHome)
+        check(defaultLocalDirectory.standardizedFileURL.path == syntheticHome.appendingPathComponent(".codex/sessions").standardizedFileURL.path
+            && overrideLocalDirectory.standardizedFileURL.path == syntheticCodex.appendingPathComponent("sessions").standardizedFileURL.path,
+            "local source resolves only the synthetic home or explicit absolute CODEX_HOME sessions path")
+        let legacyPlist: [String: Any] = ["endpoint": "https://gateway.example/v1/chat/completions",
+            "usageURL": "https://gateway.example/usage", "port": 18888]
+        let legacyData = try PropertyListSerialization.data(fromPropertyList: legacyPlist, format: .xml, options: 0)
+        let legacy = try PropertyListDecoder().decode(AppConfiguration.self, from: legacyData)
+        check(legacy.dataSource == "proxy", "legacy explicit proxy configuration without source preserves proxy mode")
+    }
+
+    private static func fixtureDirectory(_ label: String) throws -> URL {
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent("tokenstat-\(label)-\(UUID().uuidString)", isDirectory: true)
+        let directory = parent.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    private static func sessionURL(in directory: URL, uuid: String) -> URL {
+        directory.appendingPathComponent("rollout-fixture-\(uuid).jsonl")
+    }
+
+    private static func writeSession(in directory: URL, uuid: String, events: [Data], modified: Date,
+                                     prefix: Data = Data(), suffix: Data = Data()) throws {
+        var data = prefix
+        for event in events { data.append(event); data.append(10) }
+        data.append(suffix)
+        let url = sessionURL(in: directory, uuid: uuid)
+        try data.write(to: url)
+        try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: url.path)
+    }
+
+    private static func tokenEvent(at timestamp: Date, input: Int, output: Int, cached: Int = 0,
+                                   reasoning: Int = 0, rateLimits: [String: Any]? = nil) throws -> Data {
+        var usage: [String: Any] = ["input_tokens": input, "output_tokens": output, "total_tokens": input + output]
+        if cached > 0 { usage["cached_input_tokens"] = cached }
+        if reasoning > 0 { usage["reasoning_output_tokens"] = reasoning }
+        let info: [String: Any] = ["total_token_usage": usage]
+        let event: [String: Any] = ["timestamp": iso(timestamp), "type": "event_msg",
+            "payload": ["type": "token_count", "info": info, "rate_limits": rateLimits ?? [:]]]
+        return try JSONSerialization.data(withJSONObject: event)
+    }
+
+    private static func rawTokenEvent(at timestamp: Date, inputLiteral: String, outputLiteral: String) -> Data {
+        let time = iso(timestamp)
+        return Data("{\"timestamp\":\"\(time)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\(inputLiteral),\"output_tokens\":\(outputLiteral),\"total_tokens\":1}}}}".utf8)
+    }
+
+    private static func rateLimits(fiveHour: Int?, sevenDay: Int?, reset: Date) -> [String: Any] {
+        var value: [String: Any] = [:]
+        if let fiveHour { value["primary"] = ["used_percent": fiveHour, "window_minutes": 300, "resets_at": reset.timeIntervalSince1970] }
+        if let sevenDay { value["secondary"] = ["used_percent": sevenDay, "window_minutes": 10080, "resets_at": reset.timeIntervalSince1970] }
+        return value
+    }
+
+    private static func iso(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+}
+```
+
+### Tests/TokenStatUITests/TokenStatUISnapshotTests.swift
+
+```swift
+import AppKit
+import SnapshotTesting
+import SwiftUI
+import XCTest
+@testable import TokenStatMenu
+
+@MainActor
+final class TokenStatUISnapshotTests: XCTestCase {
+    func testDashboardLightAndDark() {
+        assertDashboard(_appearance: .aqua, name: "dashboard-light")
+        assertDashboard(_appearance: .darkAqua, name: "dashboard-dark")
+    }
+
+    func testSettingsLightAndDark() {
+        assertDashboard(_appearance: .aqua, settings: true, name: "settings-light")
+        assertDashboard(_appearance: .darkAqua, settings: true, name: "settings-dark")
+    }
+
+    func testImageMatcherDetectsDeliberateMismatchWithoutRecording() {
+        let reference = solidImage(.white)
+        let unchanged = solidImage(.white)
+        let changed = solidImage(.black)
+        XCTAssertNil(Snapshotting<NSImage, NSImage>.image.diffing.diffV2(reference, unchanged))
+        XCTAssertNotNil(Snapshotting<NSImage, NSImage>.image.diffing.diffV2(reference, changed))
+    }
+
+    func testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO() throws {
+        let urlA = "https://gateway-a.example/v1/chat/completions"
+        let urlB = "https://gateway-b.example/v1/chat/completions"
+        let stableA = try KeychainStore.accountName("upstream", validatedURL: urlA)
+        XCTAssertEqual(stableA, try KeychainStore.accountName("upstream", validatedURL: urlA))
+        XCTAssertNotEqual(stableA, try KeychainStore.accountName("upstream", validatedURL: urlB))
+        XCTAssertNotEqual(stableA, try KeychainStore.accountName("usage", validatedURL: urlA))
+    }
+
+    private func solidImage(_ color: NSColor) -> NSImage {
+        let image = NSImage(size: NSSize(width: 24, height: 24))
+        image.lockFocus()
+        color.setFill()
+        NSBezierPath(rect: NSRect(x: 0, y: 0, width: 24, height: 24)).fill()
+        image.unlockFocus()
+        return image
+    }
+
+    private func assertDashboard(_appearance appearance: NSAppearance.Name, settings: Bool = false, name: String,
+                                 file: StaticString = #filePath, testName: String = #function, line: UInt = #line) {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let root = DashboardView(model: model, settings: settings)
+        let hostingView = NSHostingView(rootView: root)
+        hostingView.frame = NSRect(x: 0, y: 0, width: 460, height: 700)
+        hostingView.appearance = NSAppearance(named: appearance)
+        let toolbarCrop = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 66))
+        toolbarCrop.wantsLayer = true
+        hostingView.frame.origin.y = -634
+        toolbarCrop.addSubview(hostingView)
+        NSApplication.shared.setActivationPolicy(.accessory)
+        let window = NSWindow(contentRect: toolbarCrop.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        window.contentView = toolbarCrop
+        window.appearance = NSAppearance(named: appearance)
+        window.displayIfNeeded()
+        toolbarCrop.layoutSubtreeIfNeeded()
+        let recordMode: SnapshotTestingConfiguration.Record =
+            ProcessInfo.processInfo.environment["TOKENSTAT_RECORD_SNAPSHOTS"] == "1" ? .all : .never
+        withSnapshotTesting(record: recordMode) {
+            assertSnapshot(of: toolbarCrop, as: .image, named: name, record: recordMode,
+                           file: file, testName: testName, line: line)
+        }
+        window.orderOut(nil)
     }
 }
 ```
@@ -2601,6 +3330,7 @@ import json
 import os
 import pathlib
 import plistlib
+import socket
 import subprocess
 import sys
 import tempfile
@@ -2653,7 +3383,7 @@ def main():
     WORK.mkdir(exist_ok=True)
     WORK = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=WORK))
     (ROOT / ".integration/last-run.txt").write_text(str(WORK))
-    config = {"endpoint": "http://127.0.0.1:19877/v1/chat/completions", "port": 19876,
+    config = {"dataSource": "proxy", "endpoint": "http://127.0.0.1:19877/v1/chat/completions", "port": 19876,
         "usageURL": "http://127.0.0.1:19877/usage", "refreshSeconds": 15.0,
         "inputPrice": 1.0, "outputPrice": 2.0, "loggingEnabled": True}
     with (WORK / "config.plist").open("wb") as handle:
@@ -2740,7 +3470,7 @@ def main():
             subprocess.run(["pkill", "-x", "TokenStatMenu"], capture_output=True)
             normal_config = WORK / "normal.plist"
             with normal_config.open("wb") as handle:
-                plistlib.dump({"port": 19876}, handle)
+                plistlib.dump({"port": 19876, "dataSource": "proxy"}, handle)
             normal_diagnostic = WORK / "normal-ui.json"
             normal_command = command.copy()
             normal_command.remove("--test-fixture")
@@ -2753,6 +3483,33 @@ def main():
             assert normal.get("fiveHourUsedPercent") is None and normal.get("sevenDayUsedPercent") is None, normal
             assert normal.get("quotaUsed") is None and normal["alert"] == "normal", normal
             print("PASS: fixture clearly labeled; normal startup has no inherited usage or quota", flush=True)
+
+            # Local-source startup uses an isolated CODEX_HOME fixture and never resolves proxy credentials.
+            subprocess.run(["pkill", "-x", "TokenStatMenu"], capture_output=True)
+            local_home = WORK / "local-codex"
+            session_dir = local_home / "sessions" / "2026" / "10" / "17"
+            session_dir.mkdir(parents=True)
+            event = {"timestamp": "2026-10-17T03:00:00Z", "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": 23, "output_tokens": 7, "total_tokens": 30}}, "rate_limits": {}}}
+            (session_dir / "rollout-fixture-12345678-1234-4234-8234-123456789abc.jsonl").write_text(json.dumps(event) + "\n")
+            local_config = WORK / "local.plist"
+            with local_config.open("wb") as handle:
+                plistlib.dump({"port": 19879, "dataSource": "localCodex"}, handle)
+            local_diagnostic = WORK / "local-ui.json"
+            local_command = ["open", "-n", str(ROOT / "dist/TokenStatMenu.app"),
+                "--env", "CODEX_HOME=" + str(local_home), "--args", "--config", str(local_config),
+                "--test-fixture", "--disable-discovery", "--diagnostics-output", str(local_diagnostic)]
+            subprocess.run(local_command, check=True)
+            local = wait_for(lambda: (r if (r := json.loads(local_diagnostic.read_text())).get("hasRequestData") else None))
+            assert local["title"] == "测试 T:—" and local["isTestFixture"], local
+            assert "模拟测试" in local["dataNotice"], local
+            assert (local.get("quotaUsed") is None and local.get("fiveHourUsedPercent") is None
+                and local.get("sevenDayUsedPercent") is None), local
+            with socket.socket() as probe:
+                probe.settimeout(0.5)
+                assert probe.connect_ex(("127.0.0.1", 19879)) != 0, "local source must not start the proxy listener"
+            print("PASS: synthetic nested local Codex startup is ready without proxy listener or inherited quota", flush=True)
         (WORK / "result.json").write_text(json.dumps(cancelled, indent=2))
         if "--keep-running" in sys.argv:
             print("Fixture running for UI inspection. PID", server.pid, flush=True)
@@ -2850,6 +3607,7 @@ print(directory)
 """Render fixture-only light/dark dashboards and settings using actual SwiftUI code."""
 from pathlib import Path
 import subprocess
+import sys
 
 root = Path(__file__).resolve().parents[1]
 sources = sorted((root / "Sources").rglob("*.swift"))
@@ -2857,7 +3615,10 @@ sources = [str(p) for p in sources if p.name != "TokenStatMenuApp.swift"]
 binary = root / ".build/preview-renderer"
 binary.parent.mkdir(exist_ok=True)
 subprocess.run(["xcrun", "swiftc", "-parse-as-library", "-swift-version", "5", "-module-name", "TokenStatMenuPreview", *sources, str(root / "script/RenderPreview.swift"), "-o", str(binary)], check=True)
-subprocess.run([str(binary), str(root / "dist/previews"), "--test-fixture"], check=True)
+if "--focus-diagnostic" in sys.argv:
+    subprocess.run([str(binary), str(root / "dist/focus-previews"), "--test-fixture", "--focus-diagnostic"], check=True)
+else:
+    subprocess.run([str(binary), str(root / "dist/previews"), "--test-fixture"], check=True)
 ```
 
 ### script/RenderPreview.swift
@@ -2874,6 +3635,7 @@ import SwiftUI
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
         _ = NSApplication.shared
         let model = AppModel(preview: true)
+        model.config.dataSource = "proxy"
         model.panelVisible = true
         model.stats.requests = 12; model.stats.input = 64000; model.stats.output = 12000
         model.stats.active = 1; model.stats.outputTPS = 24.5; model.stats.inputWaitTPS = 3800
@@ -2891,6 +3653,10 @@ import SwiftUI
         model.gateways = [GatewayDiscovery.candidate(baseURL: "https://gateway.example/route", provider: "示例网关", source: "虚构本机配置", model: "example-model", isActive: true)!]
         model.discoveryStatus = "模拟候选 · 不读取实际配置"
         model.history = (0..<60).map { i in SpeedPoint(date: Date().addingTimeInterval(Double(i - 60)), value: 20 + sin(Double(i) * 0.3) * 6) }
+        if CommandLine.arguments.contains("--focus-diagnostic") {
+            try renderFocusedPopovers(model, to: output)
+            return
+        }
         let normalWindows = (model.fiveHourQuota, model.sevenDayQuota)
         for (name, scheme, appearance) in [("light", ColorScheme.light, NSAppearance.Name.aqua), ("dark", .dark, .darkAqua)] {
             NSApp.appearance = NSAppearance(named: appearance)
@@ -2913,7 +3679,16 @@ import SwiftUI
             try render(model, settings: false, scheme: scheme, appearance: appearance,
                 name: "\(name)-dashboard-quota-expired", to: output)
         }
-        print("Rendered light/dark dashboard and settings plus missing/expired quota states from offline simulated fixtures; no configuration, credentials or network accessed")
+        model.config.dataSource = "localCodex"
+        model.localSnapshot = LocalCodexSnapshot(input: 12_345, output: 6_789, total: 19_134,
+            sessionCount: 3, filesScanned: 3, isLimited: false, latestEventAt: Date(),
+            fiveHour: normalWindows.0, sevenDay: normalWindows.1)
+        for (name, scheme, appearance) in [("light", ColorScheme.light, NSAppearance.Name.aqua), ("dark", .dark, .darkAqua)] {
+            NSApp.appearance = NSAppearance(named: appearance)
+            try render(model, settings: false, scheme: scheme, appearance: appearance,
+                name: "local-codex-\(name)-dashboard", to: output)
+        }
+        print("Rendered proxy and populated local Codex views from offline synthetic fixtures; no configuration, credentials or network accessed")
     }
 
     @MainActor private static func render(_ model: AppModel, settings: Bool, scheme: ColorScheme,
@@ -2990,6 +3765,64 @@ import SwiftUI
             fatalError("Settings scroll did not reach the bottom and restore its original position")
         }
     }
+
+    @MainActor private static func renderFocusedPopovers(_ model: AppModel, to output: URL) throws {
+        NSApp.setActivationPolicy(.accessory)
+        NSApp.activate(ignoringOtherApps: true)
+        for (name, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+            NSApp.appearance = NSAppearance(named: appearance)
+            let anchorWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 48, height: 32),
+                styleMask: [.titled], backing: .buffered, defer: false)
+            anchorWindow.isReleasedWhenClosed = false
+            anchorWindow.setFrameOrigin(NSPoint(x: -10000, y: -10000))
+            let anchor = NSButton(frame: NSRect(x: 8, y: 6, width: 32, height: 20))
+            anchor.title = "Fixture"
+            anchorWindow.contentView = anchor
+            anchorWindow.makeKeyAndOrderFront(nil)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+
+            let popover = NSPopover()
+            popover.behavior = .transient
+            popover.animates = false
+            popover.contentSize = NSSize(width: 460, height: 700)
+            popover.contentViewController = NSHostingController(rootView:
+                DashboardView(model: model).environment(\.colorScheme, name == "dark" ? .dark : .light))
+            popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+
+            guard let popoverWindow = popover.contentViewController?.view.window,
+                  let contentView = popover.contentViewController?.view else {
+                print("UNVERIFIED \(name) popover focus: no NSPopover window was exposed")
+                anchorWindow.close()
+                continue
+            }
+            let views = descendants(of: contentView)
+            let settingsButton = views.compactMap { $0 as? NSButton }.first {
+                $0.accessibilityLabel()?.contains("连接与设置") == true
+            }
+            let responder = popoverWindow.firstResponder
+            let responderLabel = (responder as? NSView)?.accessibilityLabel() ?? "<unavailable>"
+            let settingsFocused = settingsButton.map { responder === $0 } ?? false
+            let focusRing = settingsButton.map { String(describing: $0.focusRingType) } ?? "unavailable"
+            print("Focus diagnostic \(name): appActive=\(NSApp.isActive), anchorKey=\(anchorWindow.isKeyWindow), keyWindow=\(popoverWindow.isKeyWindow), firstResponder=\(String(describing: type(of: responder))), responderLabel=\(responderLabel), settingsButtonFound=\(settingsButton != nil), settingsButtonFirstResponder=\(settingsFocused), focusRing=\(focusRing)")
+
+            let bounds = contentView.bounds
+            contentView.layoutSubtreeIfNeeded()
+            guard let bitmap = contentView.bitmapImageRepForCachingDisplay(in: bounds) else { throw NSError(domain: "FocusPreview", code: 1) }
+            contentView.cacheDisplay(in: bounds, to: bitmap)
+            guard let png = bitmap.representation(using: .png, properties: [:]) else { throw NSError(domain: "FocusPreview", code: 2) }
+            try png.write(to: output.appendingPathComponent("\(name)-focused-popover.png"))
+            popover.performClose(nil)
+            anchorWindow.close()
+        }
+        print("Rendered natural key-window NSPopover focus diagnostics from simulated fixtures only; first responder was not forced")
+    }
+
+    @MainActor private static func descendants(of view: NSView) -> [NSView] {
+        [view] + view.subviews.flatMap { descendants(of: $0) }
+    }
 }
 ```
 
@@ -3005,9 +3838,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = [
-    ".gitignore", ".github/workflows/build.yml", "Package.swift", "README.md", "LICENSE", "PRIVACY.md",
+    ".gitignore", ".github/workflows/build.yml", "Package.swift", "Package.resolved", "README.md", "LICENSE", "PRIVACY.md",
     "Sources/TokenStatCore/Configuration.swift", "Sources/TokenStatCore/GatewayDiscovery.swift",
-    "Sources/TokenStatCore/HTTPDecoder.swift", "Sources/TokenStatCore/MetricsEngine.swift",
+    "Sources/TokenStatCore/HTTPDecoder.swift", "Sources/TokenStatCore/LocalCodexUsageReader.swift", "Sources/TokenStatCore/MetricsEngine.swift",
     "Sources/TokenStatCore/ProxyServer.swift", "Sources/TokenStatCore/Quota.swift",
     "Sources/TokenStatCore/WindowQuota.swift", "Sources/TokenStatCore/RateWindow.swift", "Sources/TokenStatCore/StreamParser.swift",
     "Sources/TokenStatMenu/AppModel.swift", "Sources/TokenStatMenu/DashboardView.swift",
@@ -3015,10 +3848,15 @@ PUBLIC_FILES = [
     "Sources/TokenStatMenu/StatusBarController.swift", "Sources/TokenStatMenu/Storage.swift",
     "Sources/TokenStatMenu/TokenStatMenuApp.swift", "Sources/TokenStatMenu/PanelStyle.swift", "Sources/TokenStatMenu/WindowQuotaCard.swift",
     "Resources/Info.plist", "Resources/config.example.plist", "TokenStatMenu.xcodeproj/project.pbxproj",
-    "Tests/TokenStatCoreTests/CoreChecks.swift", "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/WindowQuotaChecks.swift",
+    "Tests/TokenStatCoreTests/CoreChecks.swift", "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/WindowQuotaChecks.swift", "Tests/TokenStatCoreTests/LocalCodexUsageChecks.swift",
+    "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png",
     "script/build_and_run.sh", "script/test.sh", "script/mock_server.py", "script/integration.py",
     "script/generate_xcode_project.py", "script/render_preview.py", "script/RenderPreview.swift", "script/package_source.py", "script/check_public_content.py",
-    "docs/DESIGN.md", "docs/IMPLEMENTATION.md", "docs/CONFIGURATION.md", "docs/VALIDATION.md", "docs/FULL_SOURCE.md",
+    "docs/DESIGN.md", "docs/IMPLEMENTATION.md", "docs/CONFIGURATION.md", "docs/VALIDATION.md", "docs/UI_TESTING.md", "docs/FULL_SOURCE.md",
 ]
 
 
@@ -3079,6 +3917,13 @@ import subprocess
 from pathlib import Path
 from package_source import PUBLIC_FILES, ROOT
 
+SYNTHETIC_PNG_SHA256 = {
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "e03aa7d784ce5d11b8994b99fa781e560e68c51764ab80396c6bfa91c9f848d0",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "0713582fbfbeafd295fec11f9f062d929b03aa24ece2c625fb6213af51e3eb79",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "ead37da0bb4717d1cd62c040218cf82a0aef02147874ebce0865d325194b32a3",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "49dad314d7714198f49031f9c47714f5ad7a87bd88595edea1713d0003ee372a",
+}
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -3111,6 +3956,13 @@ def main():
             if path.is_symlink() or not path.is_file():
                 failures.append((name, 0, "missing or symbolic-link file")); continue
             data = path.read_bytes()
+        if name in SYNTHETIC_PNG_SHA256:
+            import hashlib
+            if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                failures.append((name, 0, "reviewed synthetic PNG signature mismatch")); continue
+            if hashlib.sha256(data).hexdigest() != SYNTHETIC_PNG_SHA256[name]:
+                failures.append((name, 0, "reviewed synthetic PNG hash mismatch")); continue
+            continue
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
@@ -3161,6 +4013,10 @@ cd TokenStatMenu
 当前 Swift 6.4 对 `--build-system native` 有弃用提示；采用它是为了兼容这台机器已经可用的 Command Line Tools。项目不依赖该构建系统，Xcode 项目仍可独立编译。
 
 ## 首次配置与接入
+
+首次启动默认使用本机 Codex 记录：每约 30 秒在后台扫描一次，读取已知 sessions 目录内最近最多 32 个会话、每个文件尾部最多 256 KiB。没有有效计量事件时显示未知，不把缺失当作零。未配置的新安装使用本机来源；已有明确代理配置保持代理模式。
+
+以下步骤用于需要流式速度估算的**代理模式**，先在设置中切换数据来源：
 
 1. 点击菜单栏 `T:—` → **设置**。
 2. 设置页会自动发现本机 Codex 配置中的网关；核对来源后点“填入”。也可手动填写上游完整 Endpoint，例如 `https://你的网关/v1/chat/completions`；填写企业推理 API Key。Ollama 本机无需 Key。
@@ -3225,13 +4081,15 @@ OpenAI 兼容网关可能拒绝 `stream_options.include_usage`；可在设置关
 
 ## 本机网关自动发现与隐私
 
-启动时及点击“重新扫描”时读取 `$CODEX_HOME/config.toml`（未设置则 `~/.codex/config.toml`），只提取 `model`、`model_provider`、`profile` 以及 provider 的 `base_url`、`wire_api`。支持常见的单行字符串 TOML 与活动 profile；不支持的复杂形式不猜测、不导入。配置文件限制 1MB，不做目录递归扫描。
+本机记录模式仅扫描 `$CODEX_HOME/sessions`（未设置则 `~/.codex/sessions`）。扫描有文件数、枚举数和字节上限，拒绝符号链接；只保留计量数值、时间及扫描状态。会话文件可能含有正文，因此读取文件尾部会短暂接触这些字节，但不会保留、导出或上传正文。本机模式不读取认证文件或钥匙串，也不启动代理或访问配额接口。
+
+代理模式的网关发现会在启动时及点击“重新扫描”时读取 `$CODEX_HOME/config.toml`（未设置则 `~/.codex/config.toml`），只提取 `model`、`model_provider`、`profile` 以及 provider 的 `base_url`、`wire_api`。支持常见的单行字符串 TOML 与活动 profile；不支持的复杂形式不猜测、不导入。配置文件限制 1MB，不做目录递归扫描。
 
 也识别当前进程中的 `OPENAI_BASE_URL`、`OPENAI_MODEL`、`OLLAMA_HOST`；从 Finder 启动时不一定继承终端环境。不会执行 shell 配置文件。企业客户端只要把自定义 provider 写入上述 Codex 配置，就能通过同一机制被发现；不需要硬编码公司名称或网关域名。
 
 发现结果仅在本机内存和设置页展示，不联网验证，不写入统计日志。点击“填入”后仍需保存；更换 Endpoint 会清空表单中的旧推理/配额密钥及旧用量 URL，避免将旧凭据发给新上游。带 URL 用户名、密码、查询参数或 fragment 的候选整条拒绝导入。认证文件、浏览器数据、其他应用钥匙串和企业后台数据库均不属于发现范围。
 
-发现网关地址不等于认证成功，也不自动接管 Codex 流量。需要认证时，用户仍须通过设置提供自己有权使用的 API Key。项目自己的密钥保存在专用 Keychain 中。完整数据处理说明见 [PRIVACY.md](PRIVACY.md)。
+发现网关地址不等于认证成功，也不自动接管 Codex 流量。需要认证时，用户仍须通过设置提供自己有权使用的 API Key。项目自己的密钥保存在专用 Keychain 中，并按用途与完整接口 URL 分别绑定；更换接口不会自动复用其他地址的密钥。旧版未绑定地址的密钥不会自动迁移，代理模式需要重新填写；本机记录模式不需要密钥。完整数据处理说明见 [PRIVACY.md](PRIVACY.md)。
 
 企业月度接口通常与推理接口不同；本项目不会猜测计费 URL 或把金额/积分当作 Token。需配置企业文档确认的接口与字段，详见 [配置说明](docs/CONFIGURATION.md)。
 
@@ -3245,12 +4103,22 @@ swift run --build-system native TokenStatCoreChecks
 
 测试会关闭当前 TokenStatMenu，运行隔离本地配置，使用纯测试令牌；不会访问企业网关。测试通过 `--test-fixture` 参数显式启动，菜单栏加“测试”前缀，面板常显橙色“模拟测试”标记。正常启动尚无流量时显示“未采集”，累计量为 `—`；存在估算请求时累计量带 `≈`。默认结束后关闭测试 App 和 mock 服务。可用 `python3 script/integration.py --keep-running` 保留测试面板作检查，注意面板里都是模拟数据。
 
-测试报告见 `docs/VALIDATION.md`。核心测试是可执行程序，避免这台 CLT 缺少 XCTest 模块导致无法执行。
+测试报告见 `docs/VALIDATION.md`。核心测试是可执行程序，保留仅使用 Command Line Tools 的运行方式。
+
+### UI 视觉回归
+
+已接入 [SnapshotTesting](https://github.com/pointfreeco/swift-snapshot-testing) 1.19.6（MIT），版本和传递依赖记录在 `Package.resolved`。它只属于 SwiftPM 测试目标，正式菜单栏 App 不链接测试库。使用完整 Xcode 运行：
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter TokenStatUISnapshotTests
+```
+
+测试比较真实 SwiftUI 工具栏的浅色、深色及设置状态，共四张已审查的合成参考图。正常测试禁止录制，缺图或图像变化即失败；参考图更新命令见 [UI 测试说明](docs/UI_TESTING.md)。像素参考图要求一致的 macOS 与显示缩放环境；CI 运行不依赖系统外观的校验，桌面视觉比较单独执行。图像快照不等于实际弹出面板的键盘焦点、点击或辅助功能验收。
 
 常见情况：
 
-- **标题一直 — 或 0**：先确认客户端请求确实发往本机代理，并使用本机令牌；没有请求不能显示吞吐量。
-- **企业配额未知**：检查 URL、独立用量 Key、字段路径和月份；推理 API 的 Key 不一定能访问企业计费接口。
+- **标题一直 — 或 0**：本机记录模式没有可靠实时生成耗时，速度为 `—` 是明确的能力边界。代理模式需确认请求确实经过本机代理并使用本机令牌；没有请求不能显示吞吐量。
+- **企业配额未知**：本机来源只显示记录中已有的额度快照，可能缺失或过期，且账户未经核验。代理来源需检查用量 URL、独立 Key、字段路径和月份；推理 API 的 Key 不一定能访问计费接口。
 - **图标不见**：macOS 可能关闭菜单栏项目或因刘海/其他图标拥挤而隐藏，任何 App 都不能保证绕过系统布局。检查“系统设置 → 菜单栏”。从 Finder 再次打开应用会主动打开面板。
 - **关闭面板即退出**：本项目持有 status item 和 app delegate，并显式禁止最后窗口关闭时退出。
 - **内存/CPU**：使用原生框架、有限缓冲与低频刷新，不会无限保存回答文本；SwiftUI/Charts 仍有系统开销，不承诺所有机器固定内存值。

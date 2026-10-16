@@ -16,5 +16,9 @@ jobs:
         run: python3 script/check_public_content.py --git-index
       - name: Core and gateway discovery checks
         run: swift run --build-system native TokenStatCoreChecks
+      - name: Compile UI test target and run OS-independent checks
+        run: |
+          swift test --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
+          swift test --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
       - name: Native Xcode build
         run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build

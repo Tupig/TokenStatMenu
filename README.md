@@ -1,13 +1,18 @@
 # TokenStatMenu
 
-原生 macOS 菜单栏 Token 监控器。Swift + SwiftUI / AppKit；macOS 13+；Apple Silicon 与 Intel；无第三方库、无 Electron、无主窗口。
+原生 macOS 菜单栏 Token 监控器。Swift + SwiftUI / AppKit；macOS 13+；Apple Silicon 与 Intel；正式 App 无第三方运行时依赖、无 Electron、无主窗口。开发侧 UI 测试单独使用 SnapshotTesting。
 
-菜单栏尚未采集请求时显示 `T:—`，采集过请求且当前空闲时显示 `T:0.0tok/s`，请求进行中显示例如 `T:≈24.5tok/s`。`≈` 明确表示实时文本估算；最后收到权威 `usage` 后，启动以来的累计用量与估算费用会校正。没有请求经过代理时不会产生速度数字。
+默认读取本机 Codex 最近最多 32 个会话的计量记录，显示已记录的 Token 和会话数量，不需要 API Key、不修改 Codex 配置。本机记录没有可靠生成计时，因此速度显示 `T:—`；记录额度标明来源和时效，不能当作当前账户已核验额度。
+
+切换到可选的代理模式后，菜单栏尚未采集请求时显示 `T:—`，采集过请求且当前空闲时显示 `T:0.0tok/s`，请求进行中显示例如 `T:≈24.5tok/s`。`≈` 明确表示实时文本估算；最后收到权威 `usage` 后，启动以来的累计用量与估算费用会校正。没有请求经过代理时不会产生速度数字。
 
 ## 整体架构
 
 ```mermaid
 flowchart LR
+    Local[本机 Codex 有界会话记录] --> Reader[LocalCodexUsageReader 数字快照]
+    Reader --> Menu
+    Reader --> Panel
     Client[Codex / SDK / 其他客户端] -->|HTTP + 本机令牌| Proxy[127.0.0.1 本机代理]
     Proxy -->|企业 Key / HTTPS| API[企业网关 / OpenAI 兼容 API / Ollama]
     API -->|SSE / NDJSON / JSON 原样转发| Proxy
@@ -19,12 +24,13 @@ flowchart LR
     Quota --> Menu
 ```
 
-选择本机转发代理是因为应用无法凭空读取其他进程的 TLS 流。它不修改系统代理，也不自动修改 Codex 或企业客户端配置。所有已存在、未经过代理的会话不计入统计。
+本机记录模式与代理模式分别显示数据，不混合累计。代理模式用于观测实际流式请求，因为应用无法凭空读取其他进程的 TLS 流；它不修改系统代理，也不自动修改 Codex 或企业客户端配置。代理统计只覆盖启动后经过它的请求。
 
 ## 文件与职责
 
 | 文件 | 职责 |
 |---|---|
+| `Sources/TokenStatCore/LocalCodexUsageReader.swift` | 有界只读本机计量记录、会话去重、独立额度快照 |
 | `Sources/TokenStatCore/GatewayDiscovery.swift` | 本机配置白名单读取、网关候选、凭据 URL 拒绝 |
 | `Sources/TokenStatCore/Configuration.swift` | Endpoint、价格、配额、URL 校验、上游路径映射 |
 | `Sources/TokenStatCore/HTTPDecoder.swift` | HTTP Content-Length/chunked 请求解码与边界校验 |
@@ -75,6 +81,10 @@ cd TokenStatMenu
 当前 Swift 6.4 对 `--build-system native` 有弃用提示；采用它是为了兼容这台机器已经可用的 Command Line Tools。项目不依赖该构建系统，Xcode 项目仍可独立编译。
 
 ## 首次配置与接入
+
+首次启动默认使用本机 Codex 记录：每约 30 秒在后台扫描一次，读取已知 sessions 目录内最近最多 32 个会话、每个文件尾部最多 256 KiB。没有有效计量事件时显示未知，不把缺失当作零。未配置的新安装使用本机来源；已有明确代理配置保持代理模式。
+
+以下步骤用于需要流式速度估算的**代理模式**，先在设置中切换数据来源：
 
 1. 点击菜单栏 `T:—` → **设置**。
 2. 设置页会自动发现本机 Codex 配置中的网关；核对来源后点“填入”。也可手动填写上游完整 Endpoint，例如 `https://你的网关/v1/chat/completions`；填写企业推理 API Key。Ollama 本机无需 Key。
@@ -139,13 +149,15 @@ OpenAI 兼容网关可能拒绝 `stream_options.include_usage`；可在设置关
 
 ## 本机网关自动发现与隐私
 
-启动时及点击“重新扫描”时读取 `$CODEX_HOME/config.toml`（未设置则 `~/.codex/config.toml`），只提取 `model`、`model_provider`、`profile` 以及 provider 的 `base_url`、`wire_api`。支持常见的单行字符串 TOML 与活动 profile；不支持的复杂形式不猜测、不导入。配置文件限制 1MB，不做目录递归扫描。
+本机记录模式仅扫描 `$CODEX_HOME/sessions`（未设置则 `~/.codex/sessions`）。扫描有文件数、枚举数和字节上限，拒绝符号链接；只保留计量数值、时间及扫描状态。会话文件可能含有正文，因此读取文件尾部会短暂接触这些字节，但不会保留、导出或上传正文。本机模式不读取认证文件或钥匙串，也不启动代理或访问配额接口。
+
+代理模式的网关发现会在启动时及点击“重新扫描”时读取 `$CODEX_HOME/config.toml`（未设置则 `~/.codex/config.toml`），只提取 `model`、`model_provider`、`profile` 以及 provider 的 `base_url`、`wire_api`。支持常见的单行字符串 TOML 与活动 profile；不支持的复杂形式不猜测、不导入。配置文件限制 1MB，不做目录递归扫描。
 
 也识别当前进程中的 `OPENAI_BASE_URL`、`OPENAI_MODEL`、`OLLAMA_HOST`；从 Finder 启动时不一定继承终端环境。不会执行 shell 配置文件。企业客户端只要把自定义 provider 写入上述 Codex 配置，就能通过同一机制被发现；不需要硬编码公司名称或网关域名。
 
 发现结果仅在本机内存和设置页展示，不联网验证，不写入统计日志。点击“填入”后仍需保存；更换 Endpoint 会清空表单中的旧推理/配额密钥及旧用量 URL，避免将旧凭据发给新上游。带 URL 用户名、密码、查询参数或 fragment 的候选整条拒绝导入。认证文件、浏览器数据、其他应用钥匙串和企业后台数据库均不属于发现范围。
 
-发现网关地址不等于认证成功，也不自动接管 Codex 流量。需要认证时，用户仍须通过设置提供自己有权使用的 API Key。项目自己的密钥保存在专用 Keychain 中。完整数据处理说明见 [PRIVACY.md](PRIVACY.md)。
+发现网关地址不等于认证成功，也不自动接管 Codex 流量。需要认证时，用户仍须通过设置提供自己有权使用的 API Key。项目自己的密钥保存在专用 Keychain 中，并按用途与完整接口 URL 分别绑定；更换接口不会自动复用其他地址的密钥。旧版未绑定地址的密钥不会自动迁移，代理模式需要重新填写；本机记录模式不需要密钥。完整数据处理说明见 [PRIVACY.md](PRIVACY.md)。
 
 企业月度接口通常与推理接口不同；本项目不会猜测计费 URL 或把金额/积分当作 Token。需配置企业文档确认的接口与字段，详见 [配置说明](docs/CONFIGURATION.md)。
 
@@ -159,12 +171,22 @@ swift run --build-system native TokenStatCoreChecks
 
 测试会关闭当前 TokenStatMenu，运行隔离本地配置，使用纯测试令牌；不会访问企业网关。测试通过 `--test-fixture` 参数显式启动，菜单栏加“测试”前缀，面板常显橙色“模拟测试”标记。正常启动尚无流量时显示“未采集”，累计量为 `—`；存在估算请求时累计量带 `≈`。默认结束后关闭测试 App 和 mock 服务。可用 `python3 script/integration.py --keep-running` 保留测试面板作检查，注意面板里都是模拟数据。
 
-测试报告见 `docs/VALIDATION.md`。核心测试是可执行程序，避免这台 CLT 缺少 XCTest 模块导致无法执行。
+测试报告见 `docs/VALIDATION.md`。核心测试是可执行程序，保留仅使用 Command Line Tools 的运行方式。
+
+### UI 视觉回归
+
+已接入 [SnapshotTesting](https://github.com/pointfreeco/swift-snapshot-testing) 1.19.6（MIT），版本和传递依赖记录在 `Package.resolved`。它只属于 SwiftPM 测试目标，正式菜单栏 App 不链接测试库。使用完整 Xcode 运行：
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter TokenStatUISnapshotTests
+```
+
+测试比较真实 SwiftUI 工具栏的浅色、深色及设置状态，共四张已审查的合成参考图。正常测试禁止录制，缺图或图像变化即失败；参考图更新命令见 [UI 测试说明](docs/UI_TESTING.md)。像素参考图要求一致的 macOS 与显示缩放环境；CI 运行不依赖系统外观的校验，桌面视觉比较单独执行。图像快照不等于实际弹出面板的键盘焦点、点击或辅助功能验收。
 
 常见情况：
 
-- **标题一直 — 或 0**：先确认客户端请求确实发往本机代理，并使用本机令牌；没有请求不能显示吞吐量。
-- **企业配额未知**：检查 URL、独立用量 Key、字段路径和月份；推理 API 的 Key 不一定能访问企业计费接口。
+- **标题一直 — 或 0**：本机记录模式没有可靠实时生成耗时，速度为 `—` 是明确的能力边界。代理模式需确认请求确实经过本机代理并使用本机令牌；没有请求不能显示吞吐量。
+- **企业配额未知**：本机来源只显示记录中已有的额度快照，可能缺失或过期，且账户未经核验。代理来源需检查用量 URL、独立 Key、字段路径和月份；推理 API 的 Key 不一定能访问计费接口。
 - **图标不见**：macOS 可能关闭菜单栏项目或因刘海/其他图标拥挤而隐藏，任何 App 都不能保证绕过系统布局。检查“系统设置 → 菜单栏”。从 Finder 再次打开应用会主动打开面板。
 - **关闭面板即退出**：本项目持有 status item 和 app delegate，并显式禁止最后窗口关闭时退出。
 - **内存/CPU**：使用原生框架、有限缓冲与低频刷新，不会无限保存回答文本；SwiftUI/Charts 仍有系统开销，不承诺所有机器固定内存值。

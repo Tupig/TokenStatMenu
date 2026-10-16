@@ -8,7 +8,7 @@ public struct WindowQuota: Codable, Equatable {
     public let fetchedAt: Date
     public var remainingPercent: Double { max(0, 100 - usedPercent) }
     public func isFresh(at now: Date = Date(), refreshSeconds: Double) -> Bool {
-        now.timeIntervalSince(fetchedAt) < max(120, refreshSeconds * 2)
+        fetchedAt <= now && now.timeIntervalSince(fetchedAt) < max(120, refreshSeconds * 2)
             && (resetsAt.map { $0 > now } ?? true)
     }
 }

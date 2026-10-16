@@ -1,9 +1,9 @@
 # TokenStatMenu 设计
 
-macOS 13+；Swift、AppKit、SwiftUI、Network、Foundation、Security、Charts；零第三方依赖。
+macOS 13+；Swift、AppKit、SwiftUI、Network、Foundation、Security、Charts。SnapshotTesting 仅作为测试依赖。
 NSStatusItem 常驻标题；NSPopover 承载仪表盘和设置，无默认主窗口、无 Dock 图标、无自动弹窗。
 
-数据流：调用方 → 127.0.0.1 本机代理 → 固定配置的上游 Endpoint。
+数据来源由配置选择：`localCodex`（新安装默认）有限读取本地 Codex 会话记录；`proxy` 为调用方 → 127.0.0.1 本机代理 → 固定配置的上游 Endpoint。
 独立 URLSession 请求企业月度接口，支持点分字段路径；月度数据不与启动后累计混用。
 仅统计经过代理的请求，通过白名单读取 Codex 网关非认证字段，不改写 Codex 配置，也不对其他应用做全局 TLS 拦截。
 
@@ -30,3 +30,6 @@ HTTP 入口严格限制在回环，需本机随机访问令牌，拒绝非 JSON�
 构建 arm64 和 x86_64；本机启动并核对标题和面板；真实企业 API 未配置时不宣称联调完成。
 
 网关发现：启动或手动刷新时做一次有界本地扫描。与网络、计量、日志解耦；候选仅包含来源、provider、Endpoint、模型和是否活动，不携带认证值。导入不同 Endpoint 时清空旧凭据表单，需用户保存才改变网络服务。
+
+
+本地 Codex 来源：只扫描绝对 `CODEX_HOME/sessions` 或 `~/.codex/sessions`，每 30 秒后台替换一次汇总。最多枚举 5,000 个目录项、读取最新修改的 32 个 UUID 会话，每文件尾部 256 KiB、单轮总量 8 MiB；符号链接和非普通文件跳过。会话内容短暂在内存解析，仅数字、会话数、事件时间及 quota 窗口快照进入模型。此模式不调用 Keychain、不启动代理、不访问企业用量接口。UI 明确标记其为历史记录，不显示实时速度、请求数、费用或延迟。

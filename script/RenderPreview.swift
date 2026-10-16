@@ -9,6 +9,7 @@ import SwiftUI
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
         _ = NSApplication.shared
         let model = AppModel(preview: true)
+        model.config.dataSource = "proxy"
         model.panelVisible = true
         model.stats.requests = 12; model.stats.input = 64000; model.stats.output = 12000
         model.stats.active = 1; model.stats.outputTPS = 24.5; model.stats.inputWaitTPS = 3800
@@ -26,6 +27,10 @@ import SwiftUI
         model.gateways = [GatewayDiscovery.candidate(baseURL: "https://gateway.example/route", provider: "示例网关", source: "虚构本机配置", model: "example-model", isActive: true)!]
         model.discoveryStatus = "模拟候选 · 不读取实际配置"
         model.history = (0..<60).map { i in SpeedPoint(date: Date().addingTimeInterval(Double(i - 60)), value: 20 + sin(Double(i) * 0.3) * 6) }
+        if CommandLine.arguments.contains("--focus-diagnostic") {
+            try renderFocusedPopovers(model, to: output)
+            return
+        }
         let normalWindows = (model.fiveHourQuota, model.sevenDayQuota)
         for (name, scheme, appearance) in [("light", ColorScheme.light, NSAppearance.Name.aqua), ("dark", .dark, .darkAqua)] {
             NSApp.appearance = NSAppearance(named: appearance)
@@ -48,7 +53,16 @@ import SwiftUI
             try render(model, settings: false, scheme: scheme, appearance: appearance,
                 name: "\(name)-dashboard-quota-expired", to: output)
         }
-        print("Rendered light/dark dashboard and settings plus missing/expired quota states from offline simulated fixtures; no configuration, credentials or network accessed")
+        model.config.dataSource = "localCodex"
+        model.localSnapshot = LocalCodexSnapshot(input: 12_345, output: 6_789, total: 19_134,
+            sessionCount: 3, filesScanned: 3, isLimited: false, latestEventAt: Date(),
+            fiveHour: normalWindows.0, sevenDay: normalWindows.1)
+        for (name, scheme, appearance) in [("light", ColorScheme.light, NSAppearance.Name.aqua), ("dark", .dark, .darkAqua)] {
+            NSApp.appearance = NSAppearance(named: appearance)
+            try render(model, settings: false, scheme: scheme, appearance: appearance,
+                name: "local-codex-\(name)-dashboard", to: output)
+        }
+        print("Rendered proxy and populated local Codex views from offline synthetic fixtures; no configuration, credentials or network accessed")
     }
 
     @MainActor private static func render(_ model: AppModel, settings: Bool, scheme: ColorScheme,
@@ -124,5 +138,63 @@ import SwiftUI
         guard moved && reachedBottom && restored else {
             fatalError("Settings scroll did not reach the bottom and restore its original position")
         }
+    }
+
+    @MainActor private static func renderFocusedPopovers(_ model: AppModel, to output: URL) throws {
+        NSApp.setActivationPolicy(.accessory)
+        NSApp.activate(ignoringOtherApps: true)
+        for (name, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {
+            NSApp.appearance = NSAppearance(named: appearance)
+            let anchorWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 48, height: 32),
+                styleMask: [.titled], backing: .buffered, defer: false)
+            anchorWindow.isReleasedWhenClosed = false
+            anchorWindow.setFrameOrigin(NSPoint(x: -10000, y: -10000))
+            let anchor = NSButton(frame: NSRect(x: 8, y: 6, width: 32, height: 20))
+            anchor.title = "Fixture"
+            anchorWindow.contentView = anchor
+            anchorWindow.makeKeyAndOrderFront(nil)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+
+            let popover = NSPopover()
+            popover.behavior = .transient
+            popover.animates = false
+            popover.contentSize = NSSize(width: 460, height: 700)
+            popover.contentViewController = NSHostingController(rootView:
+                DashboardView(model: model).environment(\.colorScheme, name == "dark" ? .dark : .light))
+            popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            popover.contentViewController?.view.window?.makeKeyAndOrderFront(nil)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+
+            guard let popoverWindow = popover.contentViewController?.view.window,
+                  let contentView = popover.contentViewController?.view else {
+                print("UNVERIFIED \(name) popover focus: no NSPopover window was exposed")
+                anchorWindow.close()
+                continue
+            }
+            let views = descendants(of: contentView)
+            let settingsButton = views.compactMap { $0 as? NSButton }.first {
+                $0.accessibilityLabel()?.contains("连接与设置") == true
+            }
+            let responder = popoverWindow.firstResponder
+            let responderLabel = (responder as? NSView)?.accessibilityLabel() ?? "<unavailable>"
+            let settingsFocused = settingsButton.map { responder === $0 } ?? false
+            let focusRing = settingsButton.map { String(describing: $0.focusRingType) } ?? "unavailable"
+            print("Focus diagnostic \(name): appActive=\(NSApp.isActive), anchorKey=\(anchorWindow.isKeyWindow), keyWindow=\(popoverWindow.isKeyWindow), firstResponder=\(String(describing: type(of: responder))), responderLabel=\(responderLabel), settingsButtonFound=\(settingsButton != nil), settingsButtonFirstResponder=\(settingsFocused), focusRing=\(focusRing)")
+
+            let bounds = contentView.bounds
+            contentView.layoutSubtreeIfNeeded()
+            guard let bitmap = contentView.bitmapImageRepForCachingDisplay(in: bounds) else { throw NSError(domain: "FocusPreview", code: 1) }
+            contentView.cacheDisplay(in: bounds, to: bitmap)
+            guard let png = bitmap.representation(using: .png, properties: [:]) else { throw NSError(domain: "FocusPreview", code: 2) }
+            try png.write(to: output.appendingPathComponent("\(name)-focused-popover.png"))
+            popover.performClose(nil)
+            anchorWindow.close()
+        }
+        print("Rendered natural key-window NSPopover focus diagnostics from simulated fixtures only; first responder was not forced")
+    }
+
+    @MainActor private static func descendants(of view: NSView) -> [NSView] {
+        [view] + view.subviews.flatMap { descendants(of: $0) }
     }
 }
