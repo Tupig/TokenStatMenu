@@ -1,0 +1,20 @@
+name: macOS build
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Public content guardrail
+        run: python3 script/check_public_content.py --git-index
+      - name: Core and gateway discovery checks
+        run: swift run --build-system native TokenStatCoreChecks
+      - name: Native Xcode build
+        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build

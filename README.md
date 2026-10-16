@@ -1,0 +1,191 @@
+# TokenStatMenu
+
+原生 macOS 菜单栏 Token 监控器。Swift + SwiftUI / AppKit；macOS 13+；Apple Silicon 与 Intel；无第三方库、无 Electron、无主窗口。
+
+菜单栏尚未采集请求时显示 `T:—`，采集过请求且当前空闲时显示 `T:0.0tok/s`，请求进行中显示例如 `T:≈24.5tok/s`。`≈` 明确表示实时文本估算；最后收到权威 `usage` 后，启动以来的累计用量与估算费用会校正。没有请求经过代理时不会产生速度数字。
+
+## 整体架构
+
+```mermaid
+flowchart LR
+    Client[Codex / SDK / 其他客户端] -->|HTTP + 本机令牌| Proxy[127.0.0.1 本机代理]
+    Proxy -->|企业 Key / HTTPS| API[企业网关 / OpenAI 兼容 API / Ollama]
+    API -->|SSE / NDJSON / JSON 原样转发| Proxy
+    Proxy --> Parser[StreamParser + UsageDecoder]
+    Parser --> Engine[MetricsEngine + 5 秒滑动窗口]
+    Engine --> Menu[NSStatusItem 顶部实时标题]
+    Engine --> Panel[SwiftUI 弹出面板 + 10 分钟曲线]
+    Quota[企业用量接口 + 独立 Key] --> Panel
+    Quota --> Menu
+```
+
+选择本机转发代理是因为应用无法凭空读取其他进程的 TLS 流。它不修改系统代理，也不自动修改 Codex 或企业客户端配置。所有已存在、未经过代理的会话不计入统计。
+
+## 文件与职责
+
+| 文件 | 职责 |
+|---|---|
+| `Sources/TokenStatCore/GatewayDiscovery.swift` | 本机配置白名单读取、网关候选、凭据 URL 拒绝 |
+| `Sources/TokenStatCore/Configuration.swift` | Endpoint、价格、配额、URL 校验、上游路径映射 |
+| `Sources/TokenStatCore/HTTPDecoder.swift` | HTTP Content-Length/chunked 请求解码与边界校验 |
+| `Sources/TokenStatCore/ProxyServer.swift` | 回环监听、认证、URLSession 增量转发、取消、背压 |
+| `Sources/TokenStatCore/StreamParser.swift` | SSE/NDJSON 分帧、Chat/Responses/Ollama usage、文本估算 |
+| `Sources/TokenStatCore/RateWindow.swift` | 单调时钟下的 5 秒窗口、100ms 分桶 |
+| `Sources/TokenStatCore/MetricsEngine.swift` | 并发隔离、累计校正、费用、请求成功/失败与延迟 |
+| `Sources/TokenStatCore/Quota.swift` | 企业 JSON 字段路径、月份、配额计算 |
+| `Sources/TokenStatMenu/TokenStatMenuApp.swift` | App 生命周期、LSUIElement 菜单栏启动 |
+| `Sources/TokenStatMenu/StatusBarController.swift` | 持有 NSStatusItem、2Hz 标题刷新、颜色告警与 NSPopover |
+| `Sources/TokenStatMenu/AppModel.swift` | UI 状态、限频刷新、服务管理、日志导出 |
+| `Sources/TokenStatMenu/DashboardView.swift` | 中文实时/累计/费用/配额/请求/历史图面板 |
+| `Sources/TokenStatMenu/SettingsView.swift` | 内嵌设置面板，无独立主窗口 |
+| `Sources/TokenStatMenu/Storage.swift` | plist、专用 Keychain、脱敏 JSONL 日志与轮转 |
+| `Sources/TokenStatMenu/QuotaClient.swift` | 独立 GET 用量请求、超时、重定向拒绝 |
+| `Resources/Info.plist` | 菜单栏 App 元数据 |
+| `Resources/config.example.plist` | 无需改代码的配置样例 |
+| `Tests/TokenStatCoreTests/CoreChecks.swift` | 无 XCTest 依赖的核心测试 |
+| `script/integration.py`、`mock_server.py` | 实际 `.app` 与本地模拟上游联测 |
+
+所有源码均为完整文件。另见 `docs/FULL_SOURCE.md`：按“架构 → 分文件完整源码 → 构建与使用”排列的单文件交付版。
+
+## 构建与运行
+
+### Xcode
+
+1. 完成 Xcode 首次启动、许可与组件安装。
+2. 打开 `TokenStatMenu.xcodeproj`，选择 **TokenStatMenu → My Mac**。
+3. 按 ⌘B 编译，⌘R 运行。程序只出现于菜单栏，不会打开主窗口或 Dock 图标。
+4. 项目默认本机 ad hoc 签名；向其他电脑正式分发时，使用你的 Developer ID 签名与公证。
+
+`.xcodeproj` 和 Swift Package 编译同一份源码。新增源码后执行 `python3 script/generate_xcode_project.py` 可更新 Xcode 项目文件。
+
+### 命令行（Command Line Tools 即可）
+
+```bash
+git clone https://github.com/Tupig/TokenStatMenu.git
+cd TokenStatMenu
+./script/build_and_run.sh                 # 构建 .app 并启动
+./script/build_and_run.sh --build-only    # 仅生成 dist/TokenStatMenu.app
+./script/build_and_run.sh --release       # 本机架构优化构建并启动
+./script/build_and_run.sh --universal     # arm64 + x86_64 Release；只构建不启动
+```
+
+可将 `dist/TokenStatMenu.app` 拖到“应用程序”。开发脚本会先关闭同名进程再更新构建产物，避免覆盖正在执行的二进制。不会自动设置开机启动。
+
+当前 Swift 6.4 对 `--build-system native` 有弃用提示；采用它是为了兼容这台机器已经可用的 Command Line Tools。项目不依赖该构建系统，Xcode 项目仍可独立编译。
+
+## 首次配置与接入
+
+1. 点击菜单栏 `T:—` → **设置**。
+2. 设置页会自动发现本机 Codex 配置中的网关；核对来源后点“填入”。也可手动填写上游完整 Endpoint，例如 `https://你的网关/v1/chat/completions`；填写企业推理 API Key。Ollama 本机无需 Key。
+3. 模型覆盖留空时使用客户端请求的 `model`；填写时会覆盖所有经过代理请求的模型。
+4. 保存设置，回到面板，分别复制 **Base URL** 与 **本机令牌**。
+5. 将调用方 Base URL 改成 `http://127.0.0.1:18765/v1`，调用方 API Key 使用本机令牌。企业真实 Key 保存在本 App 的钥匙串中。
+6. 发起流式请求；菜单栏显示输出估算速度。请求结束后立即回到 `0.0`，累计数量以末尾 usage 校正。
+
+示例（把 `本机令牌` 和 `模型名` 换成实际值）：
+
+```bash
+curl -N http://127.0.0.1:18765/v1/chat/completions \
+  -H 'Authorization: Bearer 本机令牌' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"模型名","stream":true,"messages":[{"role":"user","content":"请介绍一下你自己"}]}'
+```
+
+支持的本机请求路径：
+
+- `POST /v1/chat/completions`：OpenAI Chat SSE 或非流式 JSON。
+- `POST /v1/responses`：Responses 文本、推理摘要、工具参数 delta 与嵌套 usage。
+- `POST /api/chat`、`POST /api/generate`：Ollama 原生 NDJSON / JSON。
+- `GET /health`：仅返回进程健康，不需要令牌。
+- `GET /tokenstat/status`：需要本机令牌；返回累计与实时统计 JSON。
+
+上游 URL 会保留 Endpoint 的前缀，再替换以上路由后缀。例如设置 `https://gateway.example/gateway/v1/chat/completions`，Responses 请求发往 `https://gateway.example/gateway/v1/responses`。不支持通用 CONNECT、WebSocket、未知路径、自动 SDK 模型枚举或 TLS 透明拦截。
+
+Codex 如使用 Responses，需要通过其受支持的自定义 provider 配置将请求接入本机 `/v1`。企业客户端可能自行覆盖配置或使用额外认证，必须按该客户端接入方式处理。本项目没有更改你现在的 Codex 或企业网关配置。
+
+## 关键计算口径
+
+### SSE 与 Token 计数
+
+HTTP 网络 chunk 与模型 token 不一一对应。`StreamParser` 保存未完整行的原始字节，按 LF/CRLF 提取行，多行 `data:` 合并，空行结束事件，忽略注释。中文 UTF-8 拆到不同网络回调也不会破坏字符。单事件限制约 2MB。
+
+`UsageDecoder` 读取文本、推理文本和工具参数增量。无模型 tokenizer 时，ASCII 标量暂按 0.25 token、非 ASCII 按 1 token 估算；这是明确的启发式估算，不是精确 BPE。累计原始权重后再取整，避免“每个 chunk 至少算一个 token”的偏差。图像/音频等非文本输入不能靠文本准确估算。
+
+Chat 的 `usage.prompt_tokens/completion_tokens`、Responses 的 `response.usage.input_tokens/output_tokens`、Ollama 的 `prompt_eval_count/eval_count` 到达后替换该请求累计值。重复 usage 不重复累加，reasoning 已含在上游输出 token 中时也不重复相加。没有 usage 的完成/失败请求保留估算标记。
+
+OpenAI 兼容网关可能拒绝 `stream_options.include_usage`；可在设置关闭该开关。这会降低最终统计准确度，除非上游仍返回用量。
+
+### token/s 滑动窗口
+
+使用 `ProcessInfo.systemUptime` 避免系统时间回拨影响。输出估算增量进入 100ms 分桶，保留最近 5 秒：
+
+`输出估算 tok/s = 最近 5 秒输出估算增量总和 ÷ 5`
+
+启动最初不足 5 秒仍除以 5，因此读数渐进升高；这是固定窗口平均，非瞬时 token 间隔测速。并发请求的输出合计显示。末尾 usage 的校正差值不进入滑动窗口，避免结算时出现假峰值；没有活跃请求时标题归零。
+
+输入没有逐块生成事件，面板显示 `输入 Token ÷ 从请求开始到首个输出片段的时间`，明确标记“推算”。等待首输出时使用已等待时间，实时显示的分母最低取 0.5 秒以避免启动瞬间产生极大值。它包含网络和排队，不能当作模型实际 prefill 速度。Ollama 返回 `prompt_eval_duration/eval_duration` 时，另显示上次服务端平均输入/输出速度（纳秒换算为秒）。
+
+### 刷新、成本与配额
+
+- 菜单栏 2Hz，只有标题或颜色变化时改 attributedTitle；网络回调不直接绘制 UI。
+- 曲线 1Hz、最多 600 点；仅弹出面板可见时构建图表，不使用高频动画。
+- 请求、网络、日志使用后台串行队列；统计引擎短锁保护并发，没有锁内 I/O。
+- 输入/输出单价按 **USD/百万 Token** 保存；CNY 只是用手填汇率换算显示。每请求记录开始时单价，之后改价不会改写历史费用。
+- 费用不是企业账单；缓存输入按普通输入价，失败请求缺失 usage 时也可能有估算费用。
+- 企业配额来自独立接口；手填总量仅定义上限，没有接口就显示已用/剩余/使用率未知。
+- 配额达到 80% 标题黄色、95% 红色，不发通知或弹窗；过期数据不驱动新告警。
+
+## 本机网关自动发现与隐私
+
+启动时及点击“重新扫描”时读取 `$CODEX_HOME/config.toml`（未设置则 `~/.codex/config.toml`），只提取 `model`、`model_provider`、`profile` 以及 provider 的 `base_url`、`wire_api`。支持常见的单行字符串 TOML 与活动 profile；不支持的复杂形式不猜测、不导入。配置文件限制 1MB，不做目录递归扫描。
+
+也识别当前进程中的 `OPENAI_BASE_URL`、`OPENAI_MODEL`、`OLLAMA_HOST`；从 Finder 启动时不一定继承终端环境。不会执行 shell 配置文件。企业客户端只要把自定义 provider 写入上述 Codex 配置，就能通过同一机制被发现；不需要硬编码公司名称或网关域名。
+
+发现结果仅在本机内存和设置页展示，不联网验证，不写入统计日志。点击“填入”后仍需保存；更换 Endpoint 会清空表单中的旧推理/配额密钥及旧用量 URL，避免将旧凭据发给新上游。带 URL 用户名、密码、查询参数或 fragment 的候选整条拒绝导入。认证文件、浏览器数据、其他应用钥匙串和企业后台数据库均不属于发现范围。
+
+发现网关地址不等于认证成功，也不自动接管 Codex 流量。需要认证时，用户仍须通过设置提供自己有权使用的 API Key。项目自己的密钥保存在专用 Keychain 中。完整数据处理说明见 [PRIVACY.md](PRIVACY.md)。
+
+企业月度接口通常与推理接口不同；本项目不会猜测计费 URL 或把金额/积分当作 Token。需配置企业文档确认的接口与字段，详见 [配置说明](docs/CONFIGURATION.md)。
+
+## 验证与限制
+
+```bash
+./script/test.sh
+# 只运行核心检查：
+swift run --build-system native TokenStatCoreChecks
+```
+
+测试会关闭当前 TokenStatMenu，运行隔离本地配置，使用纯测试令牌；不会访问企业网关。测试通过 `--test-fixture` 参数显式启动，菜单栏加“测试”前缀，面板常显橙色“模拟测试”标记。正常启动尚无流量时显示“未采集”，累计量为 `—`；存在估算请求时累计量带 `≈`。默认结束后关闭测试 App 和 mock 服务。可用 `python3 script/integration.py --keep-running` 保留测试面板作检查，注意面板里都是模拟数据。
+
+测试报告见 `docs/VALIDATION.md`。核心测试是可执行程序，避免这台 CLT 缺少 XCTest 模块导致无法执行。
+
+常见情况：
+
+- **标题一直 — 或 0**：先确认客户端请求确实发往本机代理，并使用本机令牌；没有请求不能显示吞吐量。
+- **企业配额未知**：检查 URL、独立用量 Key、字段路径和月份；推理 API 的 Key 不一定能访问企业计费接口。
+- **图标不见**：macOS 可能关闭菜单栏项目或因刘海/其他图标拥挤而隐藏，任何 App 都不能保证绕过系统布局。检查“系统设置 → 菜单栏”。从 Finder 再次打开应用会主动打开面板。
+- **关闭面板即退出**：本项目持有 status item 和 app delegate，并显式禁止最后窗口关闭时退出。
+- **内存/CPU**：使用原生框架、有限缓冲与低频刷新，不会无限保存回答文本；SwiftUI/Charts 仍有系统开销，不承诺所有机器固定内存值。
+- **代理断开**：App 退出后代理端口停止，调用方需恢复原 Endpoint 才能直接访问上游。
+- **Xcode 报许可错误**：手动首次打开 Xcode 完成其许可流程。本项目脚本不代替用户接受协议。
+
+纯测试数据必须显式附加 `--test-fixture`，此参数仅标记来源，不会自行生成数据。调试可显式附加 `--show-panel` 和 `--diagnostics-output /tmp/tokenstat-status.json`，后者每秒输出实际 AppKit 标题、popover 状态和用量摘要，不含密钥/请求正文。正常运行没有诊断文件写入。
+
+## 上游格式参考
+
+- [OpenAI Chat API](https://developers.openai.com/api/reference/resources/chat)
+- [OpenAI Responses 流事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)
+- [Ollama Chat API](https://docs.ollama.com/api/chat)
+- [Apple NWListener](https://developer.apple.com/documentation/network/nwlistener)
+
+## 开源
+
+[MIT License](LICENSE)。欢迎提交 Issue 或 Pull Request；请使用虚构域名、模型名与脱敏数据重现问题，不提交真实企业配置或日志。
+
+发布前执行 `python3 script/package_source.py` 重新生成完整源码与源码包，再执行 `python3 script/check_public_content.py` 检查发布清单。Git 提交前使用 `--git-index` 检查实际暂存内容，并人工审查差异；检查脚本不会连接外部服务。
+
+## 界面设计参考
+
+视觉布局参考 [codexU](https://github.com/shanggqm/codexU) 的紧凑圆角卡片、半透明材质与蓝紫色强调。TokenStatMenu 的界面组件独立用 SwiftUI 实现，未复制其源码、图标、截图或配色资源。
+
+离线界面预览：`python3 script/render_preview.py`，在 `dist/previews` 生成浅色/深色概览与设置页图片。预览明确标记模拟数据，使用独立内存模型，不读取本机配置或 Keychain、不发网络请求。
