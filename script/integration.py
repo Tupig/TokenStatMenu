@@ -82,6 +82,7 @@ def main():
         ui = wait_for(lambda: (r if (r := json.loads(diagnostic.read_text())).get("quotaFraction") == 0.85 else None))
         assert ui["discoveredGateways"] == 1, ui
         assert "fixture-auth" not in diagnostic.read_text(), ui
+        assert ui["fiveHourUsedPercent"] == 25 and ui["sevenDayUsedPercent"] == 70, ui
         assert ui["quotaUsed"] == 850000 and ui["alert"] == "yellow", ui
         assert ui["title"] == "测试 T:—" and ui["statusItemVisible"], ui
         assert ui["isTestFixture"] and not ui["hasRequestData"], ui
@@ -154,6 +155,7 @@ def main():
             normal = wait_for(lambda: json.loads(normal_diagnostic.read_text()))
             assert normal["title"] == "T:—" and not normal["isTestFixture"], normal
             assert not normal["hasRequestData"] and "未采集" in normal["dataNotice"], normal
+            assert normal.get("fiveHourUsedPercent") is None and normal.get("sevenDayUsedPercent") is None, normal
             assert normal.get("quotaUsed") is None and normal["alert"] == "normal", normal
             print("PASS: fixture clearly labeled; normal startup has no inherited usage or quota", flush=True)
         (WORK / "result.json").write_text(json.dumps(cancelled, indent=2))

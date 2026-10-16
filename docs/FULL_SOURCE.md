@@ -83,6 +83,10 @@ public struct AppConfiguration: Codable, Equatable {
     public var usedPath = "data.used_tokens"
     public var limitPath = "data.total_tokens"
     public var periodPath = "data.month"
+    public var fiveHourUsedPercentPath = "data.five_hour.used_percent"
+    public var fiveHourResetPath = "data.five_hour.resets_at"
+    public var sevenDayUsedPercentPath = "data.seven_day.used_percent"
+    public var sevenDayResetPath = "data.seven_day.resets_at"
     public var refreshSeconds = 60.0
     public var loggingEnabled = false
     public var historyEnabled = true
@@ -802,6 +806,92 @@ public struct QuotaSnapshot: Codable {
 }
 ```
 
+### Sources/TokenStatCore/WindowQuota.swift
+
+```swift
+import Foundation
+import CoreFoundation
+
+public struct WindowQuota: Codable, Equatable {
+    public let minutes: Int
+    public let usedPercent: Double
+    public let resetsAt: Date?
+    public let fetchedAt: Date
+    public var remainingPercent: Double { max(0, 100 - usedPercent) }
+    public func isFresh(at now: Date = Date(), refreshSeconds: Double) -> Bool {
+        now.timeIntervalSince(fetchedAt) < max(120, refreshSeconds * 2)
+            && (resetsAt.map { $0 > now } ?? true)
+    }
+}
+
+/// Monthly and rolling-window quotas are independent facts; missing one must not
+/// erase the others. No quota is inferred from local token/request counters.
+public struct QuotaReport {
+    public let monthly: QuotaSnapshot?
+    public let monthlyMessage: String
+    public let fiveHour: WindowQuota?
+    public let sevenDay: WindowQuota?
+
+    public static func parse(_ data: Data, config: AppConfiguration, now: Date = Date()) throws -> QuotaReport {
+        let object = try JSONSerialization.jsonObject(with: data)
+        var monthly: QuotaSnapshot?, monthlyMessage = ""
+        do { monthly = try QuotaSnapshot.parse(data, config: config, now: now) }
+        catch { monthlyMessage = "月度用量未提供，或月度字段 / 月份未匹配" }
+        func value(_ path: String) -> Any? {
+            guard !path.isEmpty else { return nil }
+            return path.split(separator: ".").reduce(Optional(object)) { node, key in
+                if let dict = node as? [String: Any] { return dict[String(key)] }
+                if let array = node as? [Any], let i = Int(key), array.indices.contains(i) { return array[i] }
+                return nil
+            }
+        }
+        func configured(_ minutes: Int, percentPath: String, resetPath: String) -> WindowQuota? {
+            if let raw = value(percentPath), !(raw is NSNull) {
+                guard let percent = number(raw), (0...100).contains(percent) else { return nil }
+                return WindowQuota(minutes: minutes, usedPercent: percent,
+                    resetsAt: resetDate(value(resetPath)), fetchedAt: now)
+            }
+            // Also accept the published Codex rateLimits shape from this same configured
+            // endpoint. Duration, not primary/secondary order, determines the window.
+            let root = object as? [String: Any] ?? [:]
+            let payload = root["result"] as? [String: Any] ?? root
+            guard let limits = payload["rateLimits"] as? [String: Any] else { return nil }
+            let matches = ["primary", "secondary"].compactMap { limits[$0] as? [String: Any] }
+                .filter { number($0["windowDurationMins"]) == Double(minutes) }
+            guard matches.count == 1, let window = matches.first,
+                  let percent = number(window["usedPercent"]), (0...100).contains(percent) else { return nil }
+            return WindowQuota(minutes: minutes, usedPercent: percent,
+                resetsAt: resetDate(window["resetsAt"]), fetchedAt: now)
+        }
+        let five = configured(300, percentPath: config.fiveHourUsedPercentPath, resetPath: config.fiveHourResetPath)
+        let seven = configured(10080, percentPath: config.sevenDayUsedPercentPath, resetPath: config.sevenDayResetPath)
+        guard monthly != nil || five != nil || seven != nil else {
+            throw StatError.message("接口未返回有效月度、5 小时或 7 天额度；请检查字段映射和单位")
+        }
+        return QuotaReport(monthly: monthly, monthlyMessage: monthlyMessage, fiveHour: five, sevenDay: seven)
+    }
+    private static func number(_ value: Any?) -> Double? {
+        let result: Double?
+        if let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() { result = n.doubleValue }
+        else if let text = value as? String { result = Double(text) }
+        else { return nil }
+        guard let result, result.isFinite else { return nil }
+        return result
+    }
+    private static func resetDate(_ value: Any?) -> Date? {
+        // Numeric timestamps are Unix seconds, never guessed as milliseconds.
+        if let seconds = number(value), seconds > 0, seconds < 100_000_000_000 {
+            return Date(timeIntervalSince1970: seconds)
+        }
+        guard let text = value as? String else { return nil }
+        let formatter = ISO8601DateFormatter()
+        if let date = formatter.date(from: text) { return date }
+        formatter.formatOptions.insert(.withFractionalSeconds)
+        return formatter.date(from: text)
+    }
+}
+```
+
 ### Sources/TokenStatCore/RateWindow.swift
 
 ```swift
@@ -1006,6 +1096,8 @@ struct SpeedPoint: Identifiable {
     @Published var config = AppConfiguration()
     @Published var stats = MetricsSnapshot()
     @Published var quota: QuotaSnapshot?
+    @Published var fiveHourQuota: WindowQuota?
+    @Published var sevenDayQuota: WindowQuota?
     @Published var quotaError = "未配置企业用量接口"
     @Published var proxyStatus = "启动中"
     @Published var message = ""
@@ -1101,7 +1193,9 @@ struct SpeedPoint: Identifiable {
         return (isTestFixture ? "测试 " : "") + value
     }
     var alertColor: NSColor {
-        guard let ratio = freshQuota?.fraction else { return .labelColor }
+        let windows = [fiveHourQuota, sevenDayQuota].compactMap { $0 }
+            .filter { $0.isFresh(refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
+        guard let ratio = (windows + [freshQuota?.fraction].compactMap { $0 }).max() else { return .labelColor }
         return ratio >= 0.95 ? .systemRed : ratio >= 0.8 ? .systemYellow : .labelColor
     }
     func credentials() -> (String, String) { (apiKey, usageKey) }
@@ -1126,6 +1220,7 @@ struct SpeedPoint: Identifiable {
     private func startServices() {
         generation += 1; quotaLoop?.cancel(); quotaFetch?.cancel(); quotaFetch = nil; quotaLoading = false
         quota = nil; quotaError = config.usageURL.isEmpty ? "未配置企业用量接口，已用量未知" : "等待企业接口"
+        fiveHourQuota = nil; sevenDayQuota = nil
         proxy.start(config: config, apiKey: apiKey, localKey: localKey)
         if !config.usageURL.isEmpty {
             quotaLoop = Task { [weak self] in
@@ -1147,7 +1242,8 @@ struct SpeedPoint: Identifiable {
             do {
                 let result = try await QuotaClient.fetch(config: config, key: key)
                 guard !Task.isCancelled, self?.generation == version else { return }
-                self?.quota = result; self?.quotaError = ""
+                self?.quota = result.monthly; self?.quotaError = result.monthlyMessage
+                self?.fiveHourQuota = result.fiveHour; self?.sevenDayQuota = result.sevenDay
             } catch {
                 guard !Task.isCancelled, self?.generation == version else { return }
                 self?.quotaError = (error as? StatError)?.localizedDescription ?? "企业用量请求失败：检查网络、URL 和认证"
@@ -1210,9 +1306,15 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             }
             if settings { SettingsView(model: model) }
             else {
-                ScrollView {
+                ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 12) {
                         liveCard
+                        HStack(alignment: .top, spacing: 10) {
+                            WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
+                                color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds)
+                            WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
+                                color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds)
+                        }
                         sessionCard
                         quotaCard
                         if model.config.historyEnabled, model.panelVisible { historyCard }
@@ -1245,7 +1347,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             Button { settings.toggle() } label: {
                 Image(systemName: settings ? "chart.bar.xaxis" : "slider.horizontal.3")
                     .frame(width: 28, height: 28)
-            }.buttonStyle(.borderless).help(settings ? "返回概览" : "连接与设置")
+            }.buttonStyle(.plain).foregroundStyle(.secondary).help(settings ? "返回概览" : "连接与设置")
                 .accessibilityLabel(settings ? "返回概览" : "连接与设置")
             Button { NSApp.terminate(nil) } label: {
                 Image(systemName: "power").frame(width: 24, height: 28)
@@ -1425,7 +1527,7 @@ private final class NoRedirect: NSObject, URLSessionTaskDelegate {
 }
 
 enum QuotaClient {
-    static func fetch(config: AppConfiguration, key: String) async throws -> QuotaSnapshot {
+    static func fetch(config: AppConfiguration, key: String) async throws -> QuotaReport {
         let url = try config.checkedURL(config.usageURL)
         var request = URLRequest(url: url); request.timeoutInterval = 15
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -1444,7 +1546,7 @@ enum QuotaClient {
             guard data.count < 1_048_576 else { throw StatError.message("企业用量响应超过 1MB") }
             data.append(byte)
         }
-        return try QuotaSnapshot.parse(data, config: config)
+        return try QuotaReport.parse(data, config: config)
     }
 }
 ```
@@ -1469,7 +1571,7 @@ import TokenStatCore
         _apiKey = State(initialValue: keys.0); _quotaKey = State(initialValue: keys.1)
     }
     var body: some View {
-        ScrollView {
+        ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 14) {
                 discoverySection
                 upstreamSection
@@ -1542,7 +1644,7 @@ import TokenStatCore
         }
     }
     private var quotaSection: some View {
-        GroupBox("企业月度 Token 接口") {
+        GroupBox("企业额度接口 · 月度 / 5 小时 / 7 天") {
             VStack(alignment: .leading, spacing: 8) {
                 field("用量 GET URL（可留空）", text: $draft.usageURL)
                 Text("用量接口 Bearer Key（独立于推理 Key）").font(.caption)
@@ -1552,7 +1654,14 @@ import TokenStatCore
                 field("月份字段路径（yyyy-MM；留空信任接口本月语义）", text: $draft.periodPath)
                 number("手动月度 Token 上限（0 = 接口值）", value: $draft.monthlyLimit)
                 number("刷新秒数（15–3600）", value: $draft.refreshSeconds)
-                Text("字段必须是 Token 数量，不能填金额或积分。手动配额不会推算全企业已用量。达到 80% 黄色、95% 红色，仅改变菜单栏颜色。")
+                Divider()
+                field("5 小时已用百分比字段（0–100）", text: $draft.fiveHourUsedPercentPath)
+                field("5 小时重置时间字段", text: $draft.fiveHourResetPath)
+                field("7 天已用百分比字段（0–100）", text: $draft.sevenDayUsedPercentPath)
+                field("7 天重置时间字段", text: $draft.sevenDayResetPath)
+                Text("重置时间支持 Unix 秒或 ISO 8601。缺少窗口时显示未提供；不会从月度配额或本机 Token 推算。也可接收带明确窗口时长的 Codex rateLimits 格式。")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Text("月度已用量、总配额和手动月度上限必须使用 Token 数量，不能填金额或积分；窗口字段使用 0–100 的百分比。手动配额不会推算全企业已用量。达到 80% 黄色、95% 红色，仅改变菜单栏颜色。")
                     .font(.caption2).foregroundStyle(.secondary)
             }.padding(6)
         }
@@ -1647,6 +1756,8 @@ import SwiftUI
             let active: Int
             let quotaUsed: Double?
             let quotaFraction: Double?
+            let fiveHourUsedPercent: Double?
+            let sevenDayUsedPercent: Double?
             let quotaError: String
             let alert: String
         }
@@ -1657,7 +1768,9 @@ import SwiftUI
             dataNotice: model.dataNotice, discoveredGateways: model.gateways.count,
             title: item.button?.attributedTitle.string ?? "", popoverShown: popover.isShown,
             statusItemVisible: item.isVisible, active: model.stats.active,
-            quotaUsed: model.quota?.used, quotaFraction: model.quota?.fraction, quotaError: model.quotaError,
+            quotaUsed: model.quota?.used, quotaFraction: model.quota?.fraction,
+            fiveHourUsedPercent: model.fiveHourQuota?.usedPercent, sevenDayUsedPercent: model.sevenDayQuota?.usedPercent,
+            quotaError: model.quotaError,
             alert: appliedColor == .systemRed ? "red" : appliedColor == .systemYellow ? "yellow" : "normal")
         if let data = try? JSONEncoder().encode(report) {
             let url = URL(fileURLWithPath: args[index + 1])
@@ -1874,6 +1987,55 @@ struct QuotaRing: View {
 }
 ```
 
+### Sources/TokenStatMenu/WindowQuotaCard.swift
+
+```swift
+import SwiftUI
+#if SWIFT_PACKAGE
+import TokenStatCore
+#endif
+
+struct WindowQuotaCard: View {
+    let title: String
+    let quota: WindowQuota?
+    let color: Color
+    let refreshSeconds: Double
+    var body: some View {
+        let fresh = quota?.isFresh(refreshSeconds: refreshSeconds) == true
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    Text(fresh ? String(format: "%.1f%%", quota!.remainingPercent) : "—")
+                        .font(.system(size: 27, weight: .semibold, design: .rounded))
+                        .monospacedDigit().foregroundStyle(fresh ? color : .secondary)
+                        .lineLimit(1).minimumScaleFactor(0.75)
+                    if fresh { Text("剩余").font(.system(size: 10)).foregroundStyle(.secondary) }
+                }
+                GeometryReader { geometry in
+                    Capsule().fill(color.opacity(0.12))
+                    if fresh, let quota {
+                        Capsule().fill(color).frame(width: geometry.size.width * quota.remainingPercent / 100)
+                    }
+                }.frame(height: 5)
+                if let quota {
+                    Text(String(format: "上游已用 %.1f%%", quota.usedPercent))
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                    if !fresh {
+                        Text("已过期 · 等待刷新").foregroundStyle(.orange)
+                    } else if let reset = quota.resetsAt {
+                        Text(reset.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute()) + " 重置")
+                            .foregroundStyle(.secondary)
+                    } else { Text("重置时间未提供").foregroundStyle(.secondary) }
+                } else {
+                    Text("接口未提供 / 字段未匹配").foregroundStyle(.secondary)
+                    Text("重置时间未知").foregroundStyle(.secondary)
+                }
+            }.font(.system(size: 9)).frame(maxWidth: .infinity, alignment: .leading)
+        } label: { Label(title, systemImage: "clock") }
+    }
+}
+```
+
 ### Resources/Info.plist
 
 ```xml
@@ -1902,25 +2064,52 @@ struct QuotaRing: View {
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>endpoint</key><string>http://127.0.0.1:11434/v1/chat/completions</string>
-<key>model</key><string></string>
-<key>port</key><integer>18765</integer>
-<key>includeUsage</key><true/>
-<key>allowInsecureHTTP</key><false/>
-<key>inputPrice</key><real>0</real>
-<key>outputPrice</key><real>0</real>
-<key>currency</key><string>USD</string>
-<key>usdToCNY</key><real>7.0</real>
-<key>monthlyLimit</key><real>0</real>
-<key>usageURL</key><string></string>
-<key>usedPath</key><string>data.used_tokens</string>
-<key>limitPath</key><string>data.total_tokens</string>
-<key>periodPath</key><string>data.month</string>
-<key>refreshSeconds</key><real>60</real>
-<key>loggingEnabled</key><false/>
-<key>historyEnabled</key><true/>
-</dict></plist>
+<plist version="1.0">
+<dict>
+	<key>endpoint</key>
+	<string>http://127.0.0.1:11434/v1/chat/completions</string>
+	<key>model</key>
+	<string></string>
+	<key>port</key>
+	<integer>18765</integer>
+	<key>includeUsage</key>
+	<true/>
+	<key>allowInsecureHTTP</key>
+	<false/>
+	<key>inputPrice</key>
+	<real>0.0</real>
+	<key>outputPrice</key>
+	<real>0.0</real>
+	<key>currency</key>
+	<string>USD</string>
+	<key>usdToCNY</key>
+	<real>7.0</real>
+	<key>monthlyLimit</key>
+	<real>0.0</real>
+	<key>usageURL</key>
+	<string></string>
+	<key>usedPath</key>
+	<string>data.used_tokens</string>
+	<key>limitPath</key>
+	<string>data.total_tokens</string>
+	<key>periodPath</key>
+	<string>data.month</string>
+	<key>refreshSeconds</key>
+	<real>60.0</real>
+	<key>loggingEnabled</key>
+	<false/>
+	<key>historyEnabled</key>
+	<true/>
+	<key>fiveHourUsedPercentPath</key>
+	<string>data.five_hour.used_percent</string>
+	<key>fiveHourResetPath</key>
+	<string>data.five_hour.resets_at</string>
+	<key>sevenDayUsedPercentPath</key>
+	<string>data.seven_day.used_percent</string>
+	<key>sevenDayResetPath</key>
+	<string>data.seven_day.resets_at</string>
+</dict>
+</plist>
 ```
 
 ### TokenStatMenu.xcodeproj/project.pbxproj
@@ -1944,7 +2133,9 @@ A1B8AA05224B907A20995624 = { isa = PBXFileReference; lastKnownFileType = sourcec
 E51281927C6E41F6B2F2A59B = { isa = PBXBuildFile; fileRef = A1B8AA05224B907A20995624; };
 951D8E55C70DA883B1E10A70 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "StreamParser.swift"; sourceTree = "<group>"; };
 06CC516465ECBFB9656FCFE3 = { isa = PBXBuildFile; fileRef = 951D8E55C70DA883B1E10A70; };
-AF7F4C7B765701F258FB7F4D = { isa = PBXGroup; children = (8E4403D07D4E24DF01F86E5D, 6060CB36BD32E4DE62121D71, 25DB8EC2672FE7C810B75A38, 4C87C1C697E481BB11B23261, 99081DE7CEB5C9C7DAFEADA1, 4B0A93085460A2D4B5B2F8C2, A1B8AA05224B907A20995624, 951D8E55C70DA883B1E10A70,); path = "Sources/TokenStatCore"; sourceTree = "<group>"; };
+52C5DE96C0BE6977037C956F = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "WindowQuota.swift"; sourceTree = "<group>"; };
+D495B366C1D0E1A6672A9637 = { isa = PBXBuildFile; fileRef = 52C5DE96C0BE6977037C956F; };
+AF7F4C7B765701F258FB7F4D = { isa = PBXGroup; children = (8E4403D07D4E24DF01F86E5D, 6060CB36BD32E4DE62121D71, 25DB8EC2672FE7C810B75A38, 4C87C1C697E481BB11B23261, 99081DE7CEB5C9C7DAFEADA1, 4B0A93085460A2D4B5B2F8C2, A1B8AA05224B907A20995624, 951D8E55C70DA883B1E10A70, 52C5DE96C0BE6977037C956F,); path = "Sources/TokenStatCore"; sourceTree = "<group>"; };
 11043337019FA9BE53E5DEA5 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppModel.swift"; sourceTree = "<group>"; };
 60476D6C0F010F89CDCF9332 = { isa = PBXBuildFile; fileRef = 11043337019FA9BE53E5DEA5; };
 B3117F547294E09EFEF92409 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DashboardView.swift"; sourceTree = "<group>"; };
@@ -1961,13 +2152,15 @@ DF47DB83567E12D94C90C186 = { isa = PBXBuildFile; fileRef = 7DBBE1964667520E74C4B
 F2E25F94650242E3A64878B7 = { isa = PBXBuildFile; fileRef = 3D39E548358F39784FDEFE9F; };
 9215CF293A4FF1D70E77EC32 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TokenStatMenuApp.swift"; sourceTree = "<group>"; };
 B71BD30B9E5D41A06B13B456 = { isa = PBXBuildFile; fileRef = 9215CF293A4FF1D70E77EC32; };
-96BD6B98AF8DAF812B21484D = { isa = PBXGroup; children = (11043337019FA9BE53E5DEA5, B3117F547294E09EFEF92409, 1568C8A45BC98EBCCE9A8EA4, 54DC60746B43C432B61ADBD4, 7DBBE1964667520E74C4B575, 262E8C516B62E763FA6537BF, 3D39E548358F39784FDEFE9F, 9215CF293A4FF1D70E77EC32,); path = "Sources/TokenStatMenu"; sourceTree = "<group>"; };
+414355FEF7F80FBFD58C7086 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "WindowQuotaCard.swift"; sourceTree = "<group>"; };
+164B1DA057D49AA2DDF2EB36 = { isa = PBXBuildFile; fileRef = 414355FEF7F80FBFD58C7086; };
+96BD6B98AF8DAF812B21484D = { isa = PBXGroup; children = (11043337019FA9BE53E5DEA5, B3117F547294E09EFEF92409, 1568C8A45BC98EBCCE9A8EA4, 54DC60746B43C432B61ADBD4, 7DBBE1964667520E74C4B575, 262E8C516B62E763FA6537BF, 3D39E548358F39784FDEFE9F, 9215CF293A4FF1D70E77EC32, 414355FEF7F80FBFD58C7086,); path = "Sources/TokenStatMenu"; sourceTree = "<group>"; };
 A8792157CB4F27FB949C035F = { isa = PBXFileReference; explicitFileType = wrapper.application; path = TokenStatMenu.app; sourceTree = BUILT_PRODUCTS_DIR; };
 0A3E27B8CA818264D75C8D81 = { isa = PBXGroup; children = (A8792157CB4F27FB949C035F,); name = Products; sourceTree = "<group>"; };
 9B987D631012EC23CDD96B6A = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Resources/Info.plist"; sourceTree = "<group>"; };
 652E7FD0652728D9B3EF13DF = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Resources/config.example.plist"; sourceTree = "<group>"; };
 0D6E4079E36703EBD37C0072 = { isa = PBXGroup; children = (AF7F4C7B765701F258FB7F4D, 96BD6B98AF8DAF812B21484D, 9B987D631012EC23CDD96B6A, 652E7FD0652728D9B3EF13DF, 0A3E27B8CA818264D75C8D81,); sourceTree = "<group>"; };
-878A52FC5FF6A57D50B7B870 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (6A3864C6E6DB561D02F46C35, 08BC9043587CC788D01C24E7, C6D71C6FAB45AC1E6B57A569, BACF14F65A3D26C56E4559AC, DDA47B3DEE61C34C2F297CF7, 49E56DE5EE1D3357BC99E0B5, E51281927C6E41F6B2F2A59B, 06CC516465ECBFB9656FCFE3, 60476D6C0F010F89CDCF9332, BBE06DCD34D248AEC63DEFB1, 1C6C1E79E7D0D3008EFA0C51, 29DBAC87E7D2D08969C25259, DF47DB83567E12D94C90C186, 775730CD86C47FBDC9419E49, F2E25F94650242E3A64878B7, B71BD30B9E5D41A06B13B456,); runOnlyForDeploymentPostprocessing = 0; };
+878A52FC5FF6A57D50B7B870 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (6A3864C6E6DB561D02F46C35, 08BC9043587CC788D01C24E7, C6D71C6FAB45AC1E6B57A569, BACF14F65A3D26C56E4559AC, DDA47B3DEE61C34C2F297CF7, 49E56DE5EE1D3357BC99E0B5, E51281927C6E41F6B2F2A59B, 06CC516465ECBFB9656FCFE3, D495B366C1D0E1A6672A9637, 60476D6C0F010F89CDCF9332, BBE06DCD34D248AEC63DEFB1, 1C6C1E79E7D0D3008EFA0C51, 29DBAC87E7D2D08969C25259, DF47DB83567E12D94C90C186, 775730CD86C47FBDC9419E49, F2E25F94650242E3A64878B7, B71BD30B9E5D41A06B13B456, 164B1DA057D49AA2DDF2EB36,); runOnlyForDeploymentPostprocessing = 0; };
 E2AA269EB967A8853A258BFA = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 41D311A605520FC7B8B9A980 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 5DF0EAF287A59303D4EFEAF3 = { isa = XCBuildConfiguration; name = Debug; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 5.0; }; };
@@ -2108,6 +2301,7 @@ import TokenStatCore
         check(totals.requests == 100 && totals.input == 700 && totals.output == 300, "100 concurrent completions never lose counts")
         check(totals.active == 0 && totals.failures == 0, "all concurrent requests finalized once")
         try gatewayChecks()
+        try windowQuotaChecks()
         print("\(checks - failures)/\(checks) checks passed")
         if failures > 0 { exit(1) }
     }
@@ -2170,6 +2364,78 @@ extension CoreChecks {
         check(disk.count == 2, "bounded local file discovery")
         try String(repeating: "a", count: 1_048_577).write(to: file, atomically: true, encoding: .utf8)
         check(GatewayDiscovery.readCodexConfig(at: file, source: "fixture").isEmpty, "oversized discovery file refused")
+    }
+}
+```
+
+### Tests/TokenStatCoreTests/WindowQuotaChecks.swift
+
+```swift
+import Foundation
+import TokenStatCore
+
+extension CoreChecks {
+    static func windowQuotaChecks() throws {
+        let config = AppConfiguration(), now = Date(timeIntervalSince1970: 1_800_000_000)
+        let response = json("""
+        {"data":{"five_hour":{"used_percent":25,"resets_at":1800003600},"seven_day":{"used_percent":70,"resets_at":"2027-01-17T08:00:00Z"}}}
+        """)
+        let report = try QuotaReport.parse(response, config: config, now: now)
+        check(report.monthly == nil && report.fiveHour?.remainingPercent == 75, "5-hour quota independent of missing monthly fields")
+        check(report.sevenDay?.usedPercent == 70 && report.sevenDay?.resetsAt != nil, "7-day quota and ISO reset timestamp")
+        check(report.fiveHour?.isFresh(at: now.addingTimeInterval(30), refreshSeconds: 60) == true, "window fresh before reset")
+        check(report.fiveHour?.isFresh(at: now.addingTimeInterval(121), refreshSeconds: 60) == false, "stale quota never drives current alerts")
+        check(report.fiveHour?.isFresh(at: now.addingTimeInterval(4000), refreshSeconds: 3600) == false, "reset time expires quota even with long refresh interval")
+        let codex = json("""
+        {"rateLimits":{"primary":{"usedPercent":45,"windowDurationMins":10080,"resetsAt":1800007200},"secondary":{"usedPercent":10,"windowDurationMins":300,"resetsAt":1800003600}}}
+        """)
+        let normalized = try QuotaReport.parse(codex, config: config, now: now)
+        check(normalized.fiveHour?.usedPercent == 10 && normalized.sevenDay?.usedPercent == 45, "classify Codex windows by duration, not primary/secondary position")
+        let wrappedCodex = json("""
+        {"result":{"rateLimits":{"primary":{"usedPercent":20,"windowDurationMins":300},"secondary":{"usedPercent":60,"windowDurationMins":10080}}}}
+        """)
+        let wrapped = try QuotaReport.parse(wrappedCodex, config: config, now: now)
+        check(wrapped.fiveHour?.usedPercent == 20 && wrapped.sevenDay?.usedPercent == 60, "classify duration-based windows under the result wrapper")
+        let unknown = json("{\"rateLimits\":{\"primary\":{\"usedPercent\":10,\"windowDurationMins\":null}}}")
+        do { _ = try QuotaReport.parse(unknown, config: config, now: now); check(false, "unknown duration must not become 5-hour quota") } catch { check(true, "unknown duration is not guessed") }
+        var ambiguousConfig = config
+        ambiguousConfig.sevenDayUsedPercentPath = "data.seven_day.used_percent"
+        let ambiguous = json("""
+        {"data":{"seven_day":{"used_percent":65}},"rateLimits":{"primary":{"usedPercent":20,"windowDurationMins":300},"secondary":{"usedPercent":30,"windowDurationMins":300}}}
+        """)
+        let ambiguousReport = try QuotaReport.parse(ambiguous, config: ambiguousConfig, now: now)
+        check(ambiguousReport.fiveHour == nil && ambiguousReport.sevenDay?.usedPercent == 65, "duplicate 5-hour duration stays unknown without discarding configured 7-day sibling")
+        let partial = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":0}}}"), config: config, now: now)
+        check(partial.fiveHour?.remainingPercent == 100 && partial.fiveHour?.resetsAt == nil && partial.sevenDay == nil, "zero is valid, unknown reset and missing window stay unknown")
+        let full = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":100,\"resets_at\":1800003600}}}"), config: config, now: now)
+        check(full.fiveHour?.usedPercent == 100 && full.fiveHour?.remainingPercent == 0, "100 percent is valid and means zero remaining")
+        let percentage = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":0.85}}}"), config: config, now: now)
+        check(percentage.fiveHour?.remainingPercent == 99.15, "percentage fields never guessed as fractional ratios")
+        for value in ["true", "-1", "101"] {
+            do { _ = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":\(value)}}}"), config: config, now: now); check(false, "invalid percent should fail") }
+            catch { check(true, "invalid percent rejected") }
+        }
+        let invalidStringSibling = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":\"not-a-number\"},\"seven_day\":{\"used_percent\":40}}}"), config: config, now: now)
+        check(invalidStringSibling.fiveHour == nil && invalidStringSibling.sevenDay?.usedPercent == 40, "invalid string percentage does not erase valid sibling window")
+        do {
+            _ = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":\"not-a-number\"}}}"), config: config, now: now)
+            check(false, "invalid percentage string alone must not create a quota report")
+        } catch { check(true, "invalid percentage string rejected") }
+        let invalidReset = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":20,\"resets_at\":\"not-an-ISO-date\"}}}"), config: config, now: now)
+        check(invalidReset.fiveHour?.usedPercent == 20 && invalidReset.fiveHour?.resetsAt == nil, "invalid reset format preserves usage with unknown reset")
+        let resetNow = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":20,\"resets_at\":1800000000}}}"), config: config, now: now)
+        check(resetNow.fiveHour?.isFresh(at: now, refreshSeconds: 3600) == false, "reset time equal to now is expired")
+        check(resetNow.fiveHour?.isFresh(at: now.addingTimeInterval(-1), refreshSeconds: 3600) == true, "window remains fresh immediately before reset time")
+        let milliseconds = try QuotaReport.parse(json("{\"data\":{\"five_hour\":{\"used_percent\":10,\"resets_at\":1800003600000}}}"), config: config, now: now)
+        check(milliseconds.fiveHour?.resetsAt == nil, "milliseconds must not silently become a far-future seconds timestamp")
+        var customPaths = config
+        customPaths.fiveHourUsedPercentPath = "payload.windows.0.used"
+        customPaths.fiveHourResetPath = "payload.windows.0.reset"
+        let customPathReport = try QuotaReport.parse(json("{\"payload\":{\"windows\":[{\"used\":35,\"reset\":\"2027-01-15T08:00:00Z\"}]}}"), config: customPaths, now: now)
+        check(customPathReport.fiveHour?.usedPercent == 35 && customPathReport.fiveHour?.resetsAt != nil, "configured paths support nested objects and array indices")
+        let month = QuotaSnapshot.currentMonth(at: now)
+        let monthly = try QuotaReport.parse(json("{\"data\":{\"used_tokens\":800,\"total_tokens\":1000,\"month\":\"\(month)\"}}"), config: config, now: now)
+        check(monthly.monthly?.fraction == 0.8 && monthly.fiveHour == nil && monthly.sevenDay == nil, "monthly-only APIs remain supported without manufacturing windows")
     }
 }
 ```
@@ -2259,7 +2525,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("Authorization") != "Bearer integration-quota-key":
                 return self.send_json(401, {"error": "wrong quota key"})
             return self.send_json(200, {"data": {"used_tokens": Handler.quota_used, "total_tokens": 1000000,
-                "month": datetime.datetime.now().strftime("%Y-%m")}})
+                "month": datetime.datetime.now().strftime("%Y-%m"),
+                "five_hour": {"used_percent": 25, "resets_at": int(time.time()) + 3600},
+                "seven_day": {"used_percent": 70, "resets_at": int(time.time()) + 86400}}})
         self.send_json(404, {})
 
     def do_POST(self):
@@ -2409,6 +2677,7 @@ def main():
         ui = wait_for(lambda: (r if (r := json.loads(diagnostic.read_text())).get("quotaFraction") == 0.85 else None))
         assert ui["discoveredGateways"] == 1, ui
         assert "fixture-auth" not in diagnostic.read_text(), ui
+        assert ui["fiveHourUsedPercent"] == 25 and ui["sevenDayUsedPercent"] == 70, ui
         assert ui["quotaUsed"] == 850000 and ui["alert"] == "yellow", ui
         assert ui["title"] == "测试 T:—" and ui["statusItemVisible"], ui
         assert ui["isTestFixture"] and not ui["hasRequestData"], ui
@@ -2481,6 +2750,7 @@ def main():
             normal = wait_for(lambda: json.loads(normal_diagnostic.read_text()))
             assert normal["title"] == "T:—" and not normal["isTestFixture"], normal
             assert not normal["hasRequestData"] and "未采集" in normal["dataNotice"], normal
+            assert normal.get("fiveHourUsedPercent") is None and normal.get("sevenDayUsedPercent") is None, normal
             assert normal.get("quotaUsed") is None and normal["alert"] == "normal", normal
             print("PASS: fixture clearly labeled; normal startup has no inherited usage or quota", flush=True)
         (WORK / "result.json").write_text(json.dumps(cancelled, indent=2))
@@ -2613,36 +2883,112 @@ import SwiftUI
         let month = QuotaSnapshot.currentMonth()
         model.quota = try QuotaSnapshot.parse(Data("{\"data\":{\"used_tokens\":640000,\"total_tokens\":1000000,\"month\":\"\(month)\"}}".utf8), config: model.config)
         model.quotaError = ""
+        let windows = try QuotaReport.parse(JSONSerialization.data(withJSONObject: ["data": [
+            "five_hour": ["used_percent": 25, "resets_at": Date().addingTimeInterval(7200).timeIntervalSince1970],
+            "seven_day": ["used_percent": 70, "resets_at": Date().addingTimeInterval(172800).timeIntervalSince1970]
+        ]]), config: model.config)
+        model.fiveHourQuota = windows.fiveHour; model.sevenDayQuota = windows.sevenDay
         model.gateways = [GatewayDiscovery.candidate(baseURL: "https://gateway.example/route", provider: "示例网关", source: "虚构本机配置", model: "example-model", isActive: true)!]
         model.discoveryStatus = "模拟候选 · 不读取实际配置"
         model.history = (0..<60).map { i in SpeedPoint(date: Date().addingTimeInterval(Double(i - 60)), value: 20 + sin(Double(i) * 0.3) * 6) }
+        let normalWindows = (model.fiveHourQuota, model.sevenDayQuota)
         for (name, scheme, appearance) in [("light", ColorScheme.light, NSAppearance.Name.aqua), ("dark", .dark, .darkAqua)] {
             NSApp.appearance = NSAppearance(named: appearance)
+            model.fiveHourQuota = normalWindows.0; model.sevenDayQuota = normalWindows.1
             for settings in [false, true] {
-                let content = DashboardView(model: model, settings: settings)
-                    .environment(\.colorScheme, scheme)
-                    .background(scheme == .dark ? Color(red: 0.13, green: 0.14, blue: 0.17) : Color(red: 0.96, green: 0.97, blue: 0.99))
-                // NSHostingView also renders AppKit-backed ScrollView/TextField/Button,
-                // which ImageRenderer intentionally omits. This window stays off screen.
-                let bounds = NSRect(x: 0, y: 0, width: 460, height: 700)
-                let host = NSHostingView(rootView: content)
-                let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
-                window.isReleasedWhenClosed = false
-                window.appearance = NSAppearance(named: appearance)
-                window.contentView = host
-                window.setFrameOrigin(NSPoint(x: -10000, y: -10000))
-                host.frame = bounds
-                host.layoutSubtreeIfNeeded()
-                RunLoop.current.run(until: Date().addingTimeInterval(0.2))
-                host.layoutSubtreeIfNeeded()
-                guard let bitmap = host.bitmapImageRepForCachingDisplay(in: bounds) else { throw NSError(domain: "Preview", code: 1) }
-                host.cacheDisplay(in: bounds, to: bitmap)
-                guard let png = bitmap.representation(using: .png, properties: [:]) else { throw NSError(domain: "Preview", code: 2) }
-                window.close()
-                try png.write(to: output.appendingPathComponent("\(name)-\(settings ? "settings" : "dashboard").png"))
+                try render(model, settings: settings, scheme: scheme, appearance: appearance,
+                    name: "\(name)-\(settings ? "settings" : "dashboard")", to: output)
             }
+
+            model.fiveHourQuota = nil; model.sevenDayQuota = nil
+            try render(model, settings: false, scheme: scheme, appearance: appearance,
+                name: "\(name)-dashboard-quota-missing", to: output)
+
+            let staleNow = Date().addingTimeInterval(-1000)
+            let staleWindows = try QuotaReport.parse(JSONSerialization.data(withJSONObject: ["data": [
+                "five_hour": ["used_percent": 25, "resets_at": Date().addingTimeInterval(3600).timeIntervalSince1970],
+                "seven_day": ["used_percent": 70, "resets_at": Date().addingTimeInterval(86400).timeIntervalSince1970]
+            ]]), config: model.config, now: staleNow)
+            model.fiveHourQuota = staleWindows.fiveHour; model.sevenDayQuota = staleWindows.sevenDay
+            try render(model, settings: false, scheme: scheme, appearance: appearance,
+                name: "\(name)-dashboard-quota-expired", to: output)
         }
-        print("Rendered four offline fixture previews; no configuration, credentials or network accessed")
+        print("Rendered light/dark dashboard and settings plus missing/expired quota states from offline simulated fixtures; no configuration, credentials or network accessed")
+    }
+
+    @MainActor private static func render(_ model: AppModel, settings: Bool, scheme: ColorScheme,
+                                          appearance: NSAppearance.Name, name: String, to output: URL) throws {
+        let content = DashboardView(model: model, settings: settings)
+            .environment(\.colorScheme, scheme)
+            .background(scheme == .dark ? Color(red: 0.13, green: 0.14, blue: 0.17) : Color(red: 0.96, green: 0.97, blue: 0.99))
+        // NSHostingView also renders AppKit-backed ScrollView/TextField/Button,
+        // which ImageRenderer intentionally omits. This window stays off screen.
+        let bounds = NSRect(x: 0, y: 0, width: 460, height: 700)
+        let host = NSHostingView(rootView: content)
+        let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.appearance = NSAppearance(named: appearance)
+        window.contentView = host
+        window.setFrameOrigin(NSPoint(x: -10000, y: -10000))
+        host.frame = bounds
+        host.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        host.layoutSubtreeIfNeeded()
+        if settings { verifySettingsScroll(in: host, panelWidth: bounds.width) }
+        guard let bitmap = host.bitmapImageRepForCachingDisplay(in: bounds) else { throw NSError(domain: "Preview", code: 1) }
+        host.cacheDisplay(in: bounds, to: bitmap)
+        guard let png = bitmap.representation(using: .png, properties: [:]) else { throw NSError(domain: "Preview", code: 2) }
+        window.close()
+        try png.write(to: output.appendingPathComponent("\(name).png"))
+    }
+
+    @MainActor private static func verifySettingsScroll(in host: NSView, panelWidth: CGFloat) {
+        func descendants(_ view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap(descendants)
+        }
+        let candidates = descendants(host).compactMap { $0 as? NSScrollView }.filter { scroll in
+            guard let document = scroll.documentView else { return false }
+            return scroll.frame.width >= panelWidth * 0.8
+                && document.bounds.height > scroll.contentView.bounds.height + 1
+        }
+        guard let scroll = candidates.max(by: { $0.frame.width < $1.frame.width }),
+              let document = scroll.documentView else {
+            print("UNVERIFIED settings scroll: no wide native NSScrollView with vertical overflow was exposed")
+            return
+        }
+
+        let clip = scroll.contentView
+        let originalOrigin = clip.bounds.origin
+        let originalVisible = scroll.documentVisibleRect
+        let viewportSize = clip.bounds.size
+        let documentSize = document.bounds.size
+        let targetY: CGFloat = document.isFlipped
+            ? max(document.bounds.minY, document.bounds.maxY - viewportSize.height)
+            : document.bounds.minY
+        clip.scroll(to: NSPoint(x: originalOrigin.x, y: targetY))
+        scroll.reflectScrolledClipView(clip)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+        host.layoutSubtreeIfNeeded()
+
+        let bottomVisible = scroll.documentVisibleRect
+        let reachedBottom = document.isFlipped
+            ? bottomVisible.maxY >= document.bounds.maxY - 1
+            : bottomVisible.minY <= document.bounds.minY + 1
+        let moved = abs(bottomVisible.origin.y - originalVisible.origin.y) > 1
+
+        clip.scroll(to: originalOrigin)
+        scroll.reflectScrolledClipView(clip)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        host.layoutSubtreeIfNeeded()
+        let restoredVisible = scroll.documentVisibleRect
+        let restored = abs(restoredVisible.origin.y - originalVisible.origin.y) <= 1
+            && abs(restoredVisible.origin.x - originalVisible.origin.x) <= 1
+        print(String(format: "Settings scroll: viewport %.1f×%.1f, document %.1f×%.1f, moved=%@, bottomReached=%@, restoredTop=%@",
+            viewportSize.width, viewportSize.height, documentSize.width, documentSize.height,
+            moved ? "yes" : "no", reachedBottom ? "yes" : "no", restored ? "yes" : "no"))
+        guard moved && reachedBottom && restored else {
+            fatalError("Settings scroll did not reach the bottom and restore its original position")
+        }
     }
 }
 ```
@@ -2663,13 +3009,13 @@ PUBLIC_FILES = [
     "Sources/TokenStatCore/Configuration.swift", "Sources/TokenStatCore/GatewayDiscovery.swift",
     "Sources/TokenStatCore/HTTPDecoder.swift", "Sources/TokenStatCore/MetricsEngine.swift",
     "Sources/TokenStatCore/ProxyServer.swift", "Sources/TokenStatCore/Quota.swift",
-    "Sources/TokenStatCore/RateWindow.swift", "Sources/TokenStatCore/StreamParser.swift",
+    "Sources/TokenStatCore/WindowQuota.swift", "Sources/TokenStatCore/RateWindow.swift", "Sources/TokenStatCore/StreamParser.swift",
     "Sources/TokenStatMenu/AppModel.swift", "Sources/TokenStatMenu/DashboardView.swift",
     "Sources/TokenStatMenu/QuotaClient.swift", "Sources/TokenStatMenu/SettingsView.swift",
     "Sources/TokenStatMenu/StatusBarController.swift", "Sources/TokenStatMenu/Storage.swift",
-    "Sources/TokenStatMenu/TokenStatMenuApp.swift", "Sources/TokenStatMenu/PanelStyle.swift",
+    "Sources/TokenStatMenu/TokenStatMenuApp.swift", "Sources/TokenStatMenu/PanelStyle.swift", "Sources/TokenStatMenu/WindowQuotaCard.swift",
     "Resources/Info.plist", "Resources/config.example.plist", "TokenStatMenu.xcodeproj/project.pbxproj",
-    "Tests/TokenStatCoreTests/CoreChecks.swift", "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift",
+    "Tests/TokenStatCoreTests/CoreChecks.swift", "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/WindowQuotaChecks.swift",
     "script/build_and_run.sh", "script/test.sh", "script/mock_server.py", "script/integration.py",
     "script/generate_xcode_project.py", "script/render_preview.py", "script/RenderPreview.swift", "script/package_source.py", "script/check_public_content.py",
     "docs/DESIGN.md", "docs/IMPLEMENTATION.md", "docs/CONFIGURATION.md", "docs/VALIDATION.md", "docs/FULL_SOURCE.md",
@@ -2874,6 +3220,7 @@ OpenAI 兼容网关可能拒绝 `stream_options.include_usage`；可在设置关
 - 输入/输出单价按 **USD/百万 Token** 保存；CNY 只是用手填汇率换算显示。每请求记录开始时单价，之后改价不会改写历史费用。
 - 费用不是企业账单；缓存输入按普通输入价，失败请求缺失 usage 时也可能有估算费用。
 - 企业配额来自独立接口；手填总量仅定义上限，没有接口就显示已用/剩余/使用率未知。
+- 月度映射字段 `usedPath` / `limitPath` 是 Token 数量；5 小时与 7 天映射字段分别是 0–100 的 `used_percent`，重置时间可用 Unix 秒或 ISO 8601。也接受同一接口中的 Codex `rateLimits` 格式，并按 300 / 10080 分钟识别窗口；窗口缺失或过期时显示未提供/过期，不从月度配额或本机 Token 推算。详见 [配置说明](docs/CONFIGURATION.md)。
 - 配额达到 80% 标题黄色、95% 红色，不发通知或弹窗；过期数据不驱动新告警。
 
 ## 本机网关自动发现与隐私
@@ -2921,7 +3268,7 @@ swift run --build-system native TokenStatCoreChecks
 
 ## 开源
 
-[MIT License](LICENSE)。欢迎提交 Issue 或 Pull Request；请使用虚构域名、模型名与脱敏数据重现问题，不提交真实企业配置或日志。
+[MIT License](LICENSE)。发现的问题应建立 GitHub Issue，并用虚构域名、模型名与脱敏数据描述复现步骤；Issue 应链接对应修复与验证结果。请勿提交真实企业配置、凭据或日志。欢迎提交 Pull Request。
 
 发布前执行 `python3 script/package_source.py` 重新生成完整源码与源码包，再执行 `python3 script/check_public_content.py` 检查发布清单。Git 提交前使用 `--git-index` 检查实际暂存内容，并人工审查差异；检查脚本不会连接外部服务。
 

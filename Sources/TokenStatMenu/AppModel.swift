@@ -17,6 +17,8 @@ struct SpeedPoint: Identifiable {
     @Published var config = AppConfiguration()
     @Published var stats = MetricsSnapshot()
     @Published var quota: QuotaSnapshot?
+    @Published var fiveHourQuota: WindowQuota?
+    @Published var sevenDayQuota: WindowQuota?
     @Published var quotaError = "未配置企业用量接口"
     @Published var proxyStatus = "启动中"
     @Published var message = ""
@@ -112,7 +114,9 @@ struct SpeedPoint: Identifiable {
         return (isTestFixture ? "测试 " : "") + value
     }
     var alertColor: NSColor {
-        guard let ratio = freshQuota?.fraction else { return .labelColor }
+        let windows = [fiveHourQuota, sevenDayQuota].compactMap { $0 }
+            .filter { $0.isFresh(refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
+        guard let ratio = (windows + [freshQuota?.fraction].compactMap { $0 }).max() else { return .labelColor }
         return ratio >= 0.95 ? .systemRed : ratio >= 0.8 ? .systemYellow : .labelColor
     }
     func credentials() -> (String, String) { (apiKey, usageKey) }
@@ -137,6 +141,7 @@ struct SpeedPoint: Identifiable {
     private func startServices() {
         generation += 1; quotaLoop?.cancel(); quotaFetch?.cancel(); quotaFetch = nil; quotaLoading = false
         quota = nil; quotaError = config.usageURL.isEmpty ? "未配置企业用量接口，已用量未知" : "等待企业接口"
+        fiveHourQuota = nil; sevenDayQuota = nil
         proxy.start(config: config, apiKey: apiKey, localKey: localKey)
         if !config.usageURL.isEmpty {
             quotaLoop = Task { [weak self] in
@@ -158,7 +163,8 @@ struct SpeedPoint: Identifiable {
             do {
                 let result = try await QuotaClient.fetch(config: config, key: key)
                 guard !Task.isCancelled, self?.generation == version else { return }
-                self?.quota = result; self?.quotaError = ""
+                self?.quota = result.monthly; self?.quotaError = result.monthlyMessage
+                self?.fiveHourQuota = result.fiveHour; self?.sevenDayQuota = result.sevenDay
             } catch {
                 guard !Task.isCancelled, self?.generation == version else { return }
                 self?.quotaError = (error as? StatError)?.localizedDescription ?? "企业用量请求失败：检查网络、URL 和认证"

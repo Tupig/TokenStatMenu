@@ -15,7 +15,7 @@ import TokenStatCore
         _apiKey = State(initialValue: keys.0); _quotaKey = State(initialValue: keys.1)
     }
     var body: some View {
-        ScrollView {
+        ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 14) {
                 discoverySection
                 upstreamSection
@@ -88,7 +88,7 @@ import TokenStatCore
         }
     }
     private var quotaSection: some View {
-        GroupBox("企业月度 Token 接口") {
+        GroupBox("企业额度接口 · 月度 / 5 小时 / 7 天") {
             VStack(alignment: .leading, spacing: 8) {
                 field("用量 GET URL（可留空）", text: $draft.usageURL)
                 Text("用量接口 Bearer Key（独立于推理 Key）").font(.caption)
@@ -98,7 +98,14 @@ import TokenStatCore
                 field("月份字段路径（yyyy-MM；留空信任接口本月语义）", text: $draft.periodPath)
                 number("手动月度 Token 上限（0 = 接口值）", value: $draft.monthlyLimit)
                 number("刷新秒数（15–3600）", value: $draft.refreshSeconds)
-                Text("字段必须是 Token 数量，不能填金额或积分。手动配额不会推算全企业已用量。达到 80% 黄色、95% 红色，仅改变菜单栏颜色。")
+                Divider()
+                field("5 小时已用百分比字段（0–100）", text: $draft.fiveHourUsedPercentPath)
+                field("5 小时重置时间字段", text: $draft.fiveHourResetPath)
+                field("7 天已用百分比字段（0–100）", text: $draft.sevenDayUsedPercentPath)
+                field("7 天重置时间字段", text: $draft.sevenDayResetPath)
+                Text("重置时间支持 Unix 秒或 ISO 8601。缺少窗口时显示未提供；不会从月度配额或本机 Token 推算。也可接收带明确窗口时长的 Codex rateLimits 格式。")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Text("月度已用量、总配额和手动月度上限必须使用 Token 数量，不能填金额或积分；窗口字段使用 0–100 的百分比。手动配额不会推算全企业已用量。达到 80% 黄色、95% 红色，仅改变菜单栏颜色。")
                     .font(.caption2).foregroundStyle(.secondary)
             }.padding(6)
         }

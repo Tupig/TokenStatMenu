@@ -9,7 +9,7 @@ private final class NoRedirect: NSObject, URLSessionTaskDelegate {
 }
 
 enum QuotaClient {
-    static func fetch(config: AppConfiguration, key: String) async throws -> QuotaSnapshot {
+    static func fetch(config: AppConfiguration, key: String) async throws -> QuotaReport {
         let url = try config.checkedURL(config.usageURL)
         var request = URLRequest(url: url); request.timeoutInterval = 15
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -28,6 +28,6 @@ enum QuotaClient {
             guard data.count < 1_048_576 else { throw StatError.message("企业用量响应超过 1MB") }
             data.append(byte)
         }
-        return try QuotaSnapshot.parse(data, config: config)
+        return try QuotaReport.parse(data, config: config)
     }
 }

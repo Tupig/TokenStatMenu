@@ -65,6 +65,8 @@ import SwiftUI
             let active: Int
             let quotaUsed: Double?
             let quotaFraction: Double?
+            let fiveHourUsedPercent: Double?
+            let sevenDayUsedPercent: Double?
             let quotaError: String
             let alert: String
         }
@@ -75,7 +77,9 @@ import SwiftUI
             dataNotice: model.dataNotice, discoveredGateways: model.gateways.count,
             title: item.button?.attributedTitle.string ?? "", popoverShown: popover.isShown,
             statusItemVisible: item.isVisible, active: model.stats.active,
-            quotaUsed: model.quota?.used, quotaFraction: model.quota?.fraction, quotaError: model.quotaError,
+            quotaUsed: model.quota?.used, quotaFraction: model.quota?.fraction,
+            fiveHourUsedPercent: model.fiveHourQuota?.usedPercent, sevenDayUsedPercent: model.sevenDayQuota?.usedPercent,
+            quotaError: model.quotaError,
             alert: appliedColor == .systemRed ? "red" : appliedColor == .systemYellow ? "yellow" : "normal")
         if let data = try? JSONEncoder().encode(report) {
             let url = URL(fileURLWithPath: args[index + 1])

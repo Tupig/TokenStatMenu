@@ -19,10 +19,14 @@
 | currency | USD | USD 或 CNY |
 | usdToCNY | 7.0 | 手填参考汇率，不是实时汇率 |
 | monthlyLimit | 0 token | 大于 0 覆盖接口总量；0 使用接口总量 |
-| usageURL | 空 | 企业月度 Token 接口 GET URL |
+| usageURL | 空 | 企业月度与可选 5 小时 / 7 天窗口用量接口 GET URL |
 | usedPath | data.used_tokens | 数值或可解析数值字符串 |
 | limitPath | data.total_tokens | 可留空配合手动上限 |
 | periodPath | data.month | 需等于本地本月 yyyy-MM；留空信任接口的本月定义 |
+| fiveHourUsedPercentPath | data.five_hour.used_percent | 5 小时窗口已用百分比，0–100 |
+| fiveHourResetPath | data.five_hour.resets_at | 5 小时窗口重置时间，可留空 |
+| sevenDayUsedPercentPath | data.seven_day.used_percent | 7 天窗口已用百分比，0–100 |
+| sevenDayResetPath | data.seven_day.resets_at | 7 天窗口重置时间，可留空 |
 | refreshSeconds | 60 秒 | 15–3600；禁止重叠请求 |
 | loggingEnabled | false | 脱敏 JSONL 请求统计 |
 | historyEnabled | true | 10 分钟内存曲线 |
@@ -34,13 +38,18 @@
   "data": {
     "used_tokens": 850000,
     "total_tokens": 1000000,
-    "month": "2026-10"
+    "month": "2026-10",
+    "five_hour": { "used_percent": 25, "resets_at": 1792246800 },
+    "seven_day": { "used_percent": 70, "resets_at": "2026-10-19T12:00:00Z" }
   }
 }
 ```
 
 月份必须改为实际当前月份。该示例得到剩余 150000 Token、使用率 85%，触发黄色标题。
 点分路径也支持数组下标，例如 `data.projects.0.used_tokens`。
+月度字段 `usedPath`、`limitPath` 和 `monthlyLimit` 的单位是 Token 数量；窗口字段是接口报告的已用百分比（0–100），不能填 Token 数或金额。例如数值 `85` 表示 85%，`0.85` 表示 0.85%，不是 85%。5 小时和 7 天字段分别独立映射，缺少或无效的某个窗口只会让该窗口显示未提供，不会从月度用量或本机请求推算。重置字段可为 Unix 秒或 ISO 8601；省略时仍显示百分比，但没有重置时间。窗口在重置时间已过或数据超过 `max(120 秒, 2 × 刷新间隔)` 后显示过期。
+
+如果配置的同一个用量接口返回 Codex `rateLimits` 对象，也可省略窗口映射路径：应用按 `windowDurationMins` 精确匹配 300（5 小时）和 10080（7 天），读取相应对象的 `usedPercent` 与可选 `resetsAt`。该格式不会改变月度字段映射；两个窗口仍分别判断，无法唯一匹配或百分比不在 0–100 时视为未提供。
 设置中的 Key 会以 `Authorization: Bearer ...` 发出。需要 Cookie、SSO 签名或自定义请求头的企业接口不属于自动适配范围：应先由企业侧提供一个返回上述 Token 字段的授权适配接口，不能在此冒充已接入。
 
 每次请求超时上限约 20 秒，响应上限 1MB；不跟随重定向。接口失败时保留上次成功值并显示错误；超过 `max(120 秒, 2 × 刷新间隔)` 标记过期；跨月清空旧月数据等待重取。配额统计以系统本地月为界，如企业采用 UTC，应由接口适配返回明确的当前周期。

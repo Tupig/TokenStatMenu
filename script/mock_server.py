@@ -29,7 +29,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("Authorization") != "Bearer integration-quota-key":
                 return self.send_json(401, {"error": "wrong quota key"})
             return self.send_json(200, {"data": {"used_tokens": Handler.quota_used, "total_tokens": 1000000,
-                "month": datetime.datetime.now().strftime("%Y-%m")}})
+                "month": datetime.datetime.now().strftime("%Y-%m"),
+                "five_hour": {"used_percent": 25, "resets_at": int(time.time()) + 3600},
+                "seven_day": {"used_percent": 70, "resets_at": int(time.time()) + 86400}}})
         self.send_json(404, {})
 
     def do_POST(self):

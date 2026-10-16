@@ -95,6 +95,7 @@ import TokenStatCore
         check(totals.requests == 100 && totals.input == 700 && totals.output == 300, "100 concurrent completions never lose counts")
         check(totals.active == 0 && totals.failures == 0, "all concurrent requests finalized once")
         try gatewayChecks()
+        try windowQuotaChecks()
         print("\(checks - failures)/\(checks) checks passed")
         if failures > 0 { exit(1) }
     }

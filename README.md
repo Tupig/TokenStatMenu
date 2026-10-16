@@ -33,6 +33,7 @@ flowchart LR
 | `Sources/TokenStatCore/RateWindow.swift` | 单调时钟下的 5 秒窗口、100ms 分桶 |
 | `Sources/TokenStatCore/MetricsEngine.swift` | 并发隔离、累计校正、费用、请求成功/失败与延迟 |
 | `Sources/TokenStatCore/Quota.swift` | 企业 JSON 字段路径、月份、配额计算 |
+| `Sources/TokenStatCore/WindowQuota.swift` | 独立的月度、5 小时与 7 天额度解析和过期状态 |
 | `Sources/TokenStatMenu/TokenStatMenuApp.swift` | App 生命周期、LSUIElement 菜单栏启动 |
 | `Sources/TokenStatMenu/StatusBarController.swift` | 持有 NSStatusItem、2Hz 标题刷新、颜色告警与 NSPopover |
 | `Sources/TokenStatMenu/AppModel.swift` | UI 状态、限频刷新、服务管理、日志导出 |
@@ -133,6 +134,7 @@ OpenAI 兼容网关可能拒绝 `stream_options.include_usage`；可在设置关
 - 输入/输出单价按 **USD/百万 Token** 保存；CNY 只是用手填汇率换算显示。每请求记录开始时单价，之后改价不会改写历史费用。
 - 费用不是企业账单；缓存输入按普通输入价，失败请求缺失 usage 时也可能有估算费用。
 - 企业配额来自独立接口；手填总量仅定义上限，没有接口就显示已用/剩余/使用率未知。
+- 月度映射字段 `usedPath` / `limitPath` 是 Token 数量；5 小时与 7 天映射字段分别是 0–100 的 `used_percent`，重置时间可用 Unix 秒或 ISO 8601。也接受同一接口中的 Codex `rateLimits` 格式，并按 300 / 10080 分钟识别窗口；窗口缺失或过期时显示未提供/过期，不从月度配额或本机 Token 推算。详见 [配置说明](docs/CONFIGURATION.md)。
 - 配额达到 80% 标题黄色、95% 红色，不发通知或弹窗；过期数据不驱动新告警。
 
 ## 本机网关自动发现与隐私
@@ -180,7 +182,7 @@ swift run --build-system native TokenStatCoreChecks
 
 ## 开源
 
-[MIT License](LICENSE)。欢迎提交 Issue 或 Pull Request；请使用虚构域名、模型名与脱敏数据重现问题，不提交真实企业配置或日志。
+[MIT License](LICENSE)。发现的问题应建立 GitHub Issue，并用虚构域名、模型名与脱敏数据描述复现步骤；Issue 应链接对应修复与验证结果。请勿提交真实企业配置、凭据或日志。欢迎提交 Pull Request。
 
 发布前执行 `python3 script/package_source.py` 重新生成完整源码与源码包，再执行 `python3 script/check_public_content.py` 检查发布清单。Git 提交前使用 `--git-index` 检查实际暂存内容，并人工审查差异；检查脚本不会连接外部服务。
 

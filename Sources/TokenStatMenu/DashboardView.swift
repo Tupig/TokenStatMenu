@@ -29,9 +29,15 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             }
             if settings { SettingsView(model: model) }
             else {
-                ScrollView {
+                ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 12) {
                         liveCard
+                        HStack(alignment: .top, spacing: 10) {
+                            WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
+                                color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds)
+                            WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
+                                color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds)
+                        }
                         sessionCard
                         quotaCard
                         if model.config.historyEnabled, model.panelVisible { historyCard }
@@ -64,7 +70,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             Button { settings.toggle() } label: {
                 Image(systemName: settings ? "chart.bar.xaxis" : "slider.horizontal.3")
                     .frame(width: 28, height: 28)
-            }.buttonStyle(.borderless).help(settings ? "返回概览" : "连接与设置")
+            }.buttonStyle(.plain).foregroundStyle(.secondary).help(settings ? "返回概览" : "连接与设置")
                 .accessibilityLabel(settings ? "返回概览" : "连接与设置")
             Button { NSApp.terminate(nil) } label: {
                 Image(systemName: "power").frame(width: 24, height: 28)

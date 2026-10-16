@@ -15,6 +15,10 @@ public struct AppConfiguration: Codable, Equatable {
     public var usedPath = "data.used_tokens"
     public var limitPath = "data.total_tokens"
     public var periodPath = "data.month"
+    public var fiveHourUsedPercentPath = "data.five_hour.used_percent"
+    public var fiveHourResetPath = "data.five_hour.resets_at"
+    public var sevenDayUsedPercentPath = "data.seven_day.used_percent"
+    public var sevenDayResetPath = "data.seven_day.resets_at"
     public var refreshSeconds = 60.0
     public var loggingEnabled = false
     public var historyEnabled = true
