@@ -1635,6 +1635,7 @@ struct SpeedPoint: Identifiable {
     }
     var currencyFactor: Double { config.currency == "CNY" ? config.usdToCNY : 1 }
     var currencySymbol: String { config.currency == "CNY" ? "¥" : "$" }
+    var quotaSource: QuotaSource { config.dataSource == "localCodex" ? .localCodex : .enterprise }
     var hasRequestData: Bool { config.dataSource == "localCodex" ? localSnapshot.sessionCount > 0 : stats.requests > 0 }
     var dataNotice: String {
         if isTestFixture { return "模拟测试 · 以下速度、Token、费用和配额均非企业真实数据" }
@@ -1653,22 +1654,27 @@ struct SpeedPoint: Identifiable {
         return (isTestFixture ? "测试 " : "") + "\(value) · Σ\(total) · 请求\(stats.requests)"
     }
     var menuTooltip: String {
-        guard config.dataSource == "localCodex" else { return "\(dataNotice) · \(proxyStatus)" }
+        guard config.dataSource == "localCodex" else {
+            return "\(dataNotice) · \(proxyStatus)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .enterprise))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .enterprise))"
+        }
         let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
         let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
         let coverage = "扫描上限：最多32个会话文件、每文件尾部256KiB、总计8MiB；" + (localSnapshot.isLimited ? "本次达到上限，记录可能不完整" : "本次已检查 \(localSnapshot.filesScanned) 个会话文件，\(localSnapshot.sessionCount) 个含有效累计用量")
-        return "本地 Codex 历史累计：\(formatCount(localSnapshot.total)) tokens · \(localSnapshot.sessionCount)会话\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n5 小时额度：\(quotaDescription(fiveHourQuota))\n7 天额度：\(quotaDescription(sevenDayQuota))"
+        return "本地 Codex 历史累计：\(formatCount(localSnapshot.total)) tokens · \(localSnapshot.sessionCount)会话\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
     }
-    private func quotaDescription(_ quota: WindowQuota?) -> String {
-        guard let quota else { return "未提供" }
-        let status = WindowQuotaCard.presentation(for: quota, refreshSeconds: config.refreshSeconds).statusLabel
-        let reset = quota.resetsAt.map { "，原重置时间 \($0.formatted())" } ?? "，重置时间未知"
-        return "\(status)，上游已用 \(String(format: "%.1f", quota.usedPercent))%\(reset)"
+    private func quotaDescription(_ quota: WindowQuota?, source: QuotaSource) -> String {
+        let presentation = WindowQuotaCard.presentation(for: quota, refreshSeconds: config.refreshSeconds, source: source)
+        guard let usedPercent = presentation.usedPercent else { return "\(presentation.sourceLabel) · \(presentation.statusLabel)" }
+        let resetLabel = source == .localCodex || !presentation.isFresh ? "原重置时间" : "重置时间"
+        let reset = presentation.resetsAt.map { "，\(resetLabel) \($0.formatted())" } ?? "，重置时间未知"
+        let recorded = presentation.recordedAt.map { "，记录于 \($0.formatted())" } ?? ""
+        return "\(presentation.sourceLabel) · \(presentation.statusLabel)，上游已用 \(String(format: "%.1f", usedPercent))%\(reset)\(recorded)"
     }
     private func formatCount(_ value: Int) -> String { value.formatted(.number) }
     private func formatCompactCount(_ value: Int) -> String { value.formatted(.number.notation(.compactName)) }
     var alertColor: NSColor {
-        let windows = [fiveHourQuota, sevenDayQuota].compactMap { $0 }
+        guard quotaSource == .enterprise else { return .labelColor }
+        let windows = (quotaSource == .enterprise ? [fiveHourQuota, sevenDayQuota].compactMap { $0 } : [])
             .filter { $0.isFresh(refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
         guard let ratio = (windows + [freshQuota?.fraction].compactMap { $0 }).max() else { return .labelColor }
         return ratio >= 0.95 ? .systemRed : ratio >= 0.8 ? .systemYellow : .labelColor
@@ -1715,12 +1721,10 @@ struct SpeedPoint: Identifiable {
         _ = localRefreshScheduler.invalidate()
         localCache = LocalCodexUsageReader.Cache()
         localScan?.cancel(); localScan = nil
-        quota = nil; quotaError = config.usageURL.isEmpty ? "未配置企业用量接口，已用量未知" : "等待企业接口"
-        fiveHourQuota = nil; sevenDayQuota = nil
+        resetQuotaState()
         if config.dataSource == "localCodex" {
             if proxyWasStarted { proxy.stop(); proxyWasStarted = false }
             proxyStatus = "本地模式 · 未启动代理"
-            quota = nil; quotaError = "本地会话记录不提供月度企业配额"
             scheduleLocalScan(immediate: true); return
         }
         proxy.onStatus = { [weak self] status in Task { @MainActor in self?.proxyStatus = status } }
@@ -1737,6 +1741,15 @@ struct SpeedPoint: Identifiable {
                 }
             }
         }
+    }
+    /// Clears quota values at a source transition without performing I/O.
+    func resetQuotaState() {
+        quota = nil
+        fiveHourQuota = nil
+        sevenDayQuota = nil
+        quotaLoading = false
+        quotaError = quotaSource == .localCodex ? "本地会话记录不提供月度企业配额"
+            : (config.usageURL.isEmpty ? "未配置企业用量接口，已用量未知" : "等待企业接口")
     }
     private func scheduleLocalScan(immediate: Bool = false) {
         localScan?.cancel()
@@ -1856,9 +1869,9 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                         if model.config.dataSource == "localCodex" { localUsageCard } else { liveCard }
                         HStack(alignment: .top, spacing: 10) {
                             WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
-                                color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds)
+                                color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
                             WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
-                                color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds)
+                                color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
                         }
                         if model.config.dataSource == "localCodex" { localQuotaCard } else { sessionCard; quotaCard }
                         if model.config.dataSource == "proxy", model.config.historyEnabled, model.panelVisible { historyCard }
@@ -1954,17 +1967,18 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             VStack(alignment: .leading, spacing: 8) {
                 metric("5 小时额度", localQuotaDescription(model.fiveHourQuota))
                 metric("7 天额度", localQuotaDescription(model.sevenDayQuota))
-                Text("额度来自最近的本地 rate_limits 事件；仅作历史快照，过期或未来时间不会作为当前额度。")
+                Text("本地 rate_limits 始终只是历史参考，不论事件是否新鲜；不代表当前企业剩余额度，也不触发企业额度告警。保留源记录的已用比例、记录时间和原重置时间。")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
             }
         } label: { Label("本地额度快照", systemImage: "chart.bar") }
     }
     private func localQuotaDescription(_ quota: WindowQuota?) -> String {
-        let state = WindowQuotaCard.presentation(for: quota, refreshSeconds: model.config.refreshSeconds)
+        let state = WindowQuotaCard.presentation(for: quota, refreshSeconds: model.config.refreshSeconds, source: .localCodex)
         guard let percent = state.usedPercent else { return state.statusLabel }
         let reset = state.resetsAt.map { " · \($0.formatted(date: .abbreviated, time: .shortened))重置" } ?? " · 重置时间未知"
-        return "\(state.statusLabel) · 上游已用 \(String(format: "%.1f", percent))%\(reset)"
+        let recorded = state.recordedAt.map { " · 记录于 \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
+        return "\(state.sourceLabel) · \(state.statusLabel) · 上游已用 \(String(format: "%.1f", percent))%\(recorded)\(reset)"
     }
     private var sessionCard: some View {
         GroupBox {
@@ -2602,10 +2616,17 @@ import SwiftUI
 import TokenStatCore
 #endif
 
+enum QuotaSource: Equatable {
+    case localCodex
+    case enterprise
+}
+
 struct WindowQuotaPresentation: Equatable {
+    let sourceLabel: String
     let isFresh: Bool
     let usedPercent: Double?
     let resetsAt: Date?
+    let recordedAt: Date?
     let statusLabel: String
 }
 
@@ -2614,36 +2635,69 @@ struct WindowQuotaCard: View {
     let quota: WindowQuota?
     let color: Color
     let refreshSeconds: Double
-    static func presentation(for quota: WindowQuota?, at now: Date = Date(), refreshSeconds: Double) -> WindowQuotaPresentation {
-        guard let quota else { return WindowQuotaPresentation(isFresh: false, usedPercent: nil, resetsAt: nil, statusLabel: "未提供") }
-        if quota.fetchedAt > now { return WindowQuotaPresentation(isFresh: false, usedPercent: quota.usedPercent, resetsAt: quota.resetsAt, statusLabel: "异常时间戳") }
+    let source: QuotaSource
+    static func presentation(for quota: WindowQuota?, at now: Date = Date(), refreshSeconds: Double,
+                             source: QuotaSource = .enterprise) -> WindowQuotaPresentation {
+        let sourceLabel = source == .localCodex ? "本地 Codex 历史快照 · 账号/组织未核验" : "已配置企业用量接口数据"
+        guard let quota else {
+            return WindowQuotaPresentation(sourceLabel: sourceLabel, isFresh: false, usedPercent: nil,
+                resetsAt: nil, recordedAt: nil, statusLabel: source == .localCodex ? "本地历史额度未提供" : "企业额度未提供")
+        }
+        if source == .localCodex {
+            let resetStatus: String
+            if let reset = quota.resetsAt { resetStatus = reset <= now ? " · 重置已过期" : "" }
+            else { resetStatus = " · 重置时间未知" }
+            return WindowQuotaPresentation(sourceLabel: sourceLabel, isFresh: false, usedPercent: quota.usedPercent,
+                resetsAt: quota.resetsAt, recordedAt: quota.fetchedAt,
+                statusLabel: quota.fetchedAt > now ? "本地历史参考 · 异常时间戳" : "本地历史参考\(resetStatus)")
+        }
+        if quota.fetchedAt > now {
+            return WindowQuotaPresentation(sourceLabel: sourceLabel, isFresh: false, usedPercent: quota.usedPercent,
+                resetsAt: quota.resetsAt, recordedAt: quota.fetchedAt, statusLabel: "企业额度异常时间戳")
+        }
         let fresh = quota.isFresh(at: now, refreshSeconds: refreshSeconds)
-        let staleLabel = quota.resetsAt.map { $0 <= now } == true ? "历史额度 · 已过期" : "历史额度"
-        return WindowQuotaPresentation(isFresh: fresh, usedPercent: quota.usedPercent, resetsAt: quota.resetsAt,
-            statusLabel: fresh ? "当前额度" : staleLabel)
+        let staleLabel: String
+        if quota.resetsAt.map({ $0 <= now }) == true { staleLabel = "企业历史额度 · 已过期" }
+        else { staleLabel = "企业历史额度" }
+        return WindowQuotaPresentation(sourceLabel: sourceLabel, isFresh: fresh, usedPercent: quota.usedPercent,
+            resetsAt: quota.resetsAt, recordedAt: quota.fetchedAt, statusLabel: fresh ? "企业当前额度" : staleLabel)
     }
     var body: some View {
-        let presentation = Self.presentation(for: quota, refreshSeconds: refreshSeconds)
+        let presentation = Self.presentation(for: quota, refreshSeconds: refreshSeconds, source: source)
         let fresh = presentation.isFresh
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text(fresh ? String(format: "%.1f%%", quota!.remainingPercent) : "—")
+                    Text(source == .localCodex ? presentation.usedPercent.map { String(format: "%.1f%%", $0) } ?? "—"
+                        : fresh ? String(format: "%.1f%%", quota!.remainingPercent) : "—")
                         .font(.system(size: 27, weight: .semibold, design: .rounded))
                         .monospacedDigit().foregroundStyle(fresh ? color : .secondary)
                         .lineLimit(1).minimumScaleFactor(0.75)
-                    if fresh { Text("剩余").font(.system(size: 10)).foregroundStyle(.secondary) }
+                    if source == .localCodex, presentation.usedPercent != nil {
+                        Text("历史已用").font(.system(size: 10)).foregroundStyle(.secondary)
+                    } else if fresh { Text("剩余").font(.system(size: 10)).foregroundStyle(.secondary) }
                 }
-                GeometryReader { geometry in
-                    Capsule().fill(color.opacity(0.12))
-                    if fresh, let quota {
-                        Capsule().fill(color).frame(width: geometry.size.width * quota.remainingPercent / 100)
-                    }
-                }.frame(height: 5)
+                Text(presentation.sourceLabel)
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+                if source == .enterprise {
+                    GeometryReader { geometry in
+                        Capsule().fill(color.opacity(0.12))
+                        if fresh, let quota {
+                            Capsule().fill(color).frame(width: geometry.size.width * quota.remainingPercent / 100)
+                        }
+                    }.frame(height: 5)
+                }
                 if let used = presentation.usedPercent {
                     Text(String(format: "上游已用 %.1f%%", used))
                         .font(.system(size: 10)).foregroundStyle(.secondary)
-                    if !fresh { Text(presentation.statusLabel + " · 等待刷新").foregroundStyle(.orange) }
+                    if !fresh {
+                        Text(presentation.statusLabel + (source == .enterprise ? " · 等待刷新" : ""))
+                            .foregroundStyle(source == .enterprise ? .orange : .secondary)
+                    }
+                    if let recordedAt = presentation.recordedAt {
+                        Text("记录于 " + recordedAt.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute()))
+                            .foregroundStyle(.secondary)
+                    }
                     if let reset = presentation.resetsAt {
                         Text((fresh ? "重置于 " : "原重置时间 ") + reset.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute()))
                             .foregroundStyle(.secondary)
@@ -3806,10 +3860,11 @@ final class TokenStatUISnapshotTests: XCTestCase {
         XCTAssertTrue(model.menuTooltip.contains("异常时间戳"), "tooltip should label future quota data anomalous")
     }
 
-    func testLocalQuotaAlertsUseOnlyFreshIndependentWindows() throws {
+    func testEnterpriseQuotaAlertsUseOnlyFreshIndependentWindows() throws {
         let now = Date()
         let model = AppModel(preview: true)
         defer { model.shutdown() }
+        model.config.dataSource = "proxy"
         func quota(five: Double?, seven: Double?, fetchedAt: Date, reset: Date) throws -> QuotaReport {
             var limits: [String: Any] = [:]
             if let five { limits["primary"] = ["usedPercent": five, "windowDurationMins": 300, "resetsAt": reset.timeIntervalSince1970] }
@@ -3841,6 +3896,203 @@ final class TokenStatUISnapshotTests: XCTestCase {
         model.fiveHourQuota = resetExpired.fiveHour
         model.sevenDayQuota = nil
         XCTAssertEqual(model.alertColor, .labelColor, "reset-expired quota must not contribute to current alerts")
+    }
+
+    func testC11LocalQuotaSnapshotsNeverBecomeEnterpriseCurrentOrAlerts() throws {
+        let now = Date()
+        let monthlyData = try JSONSerialization.data(withJSONObject: ["data": [
+            "used_tokens": 123, "total_tokens": 1234
+        ]])
+        var monthlyConfig = AppConfiguration()
+        monthlyConfig.periodPath = ""
+        let monthlyFixture = try QuotaSnapshot.parse(monthlyData, config: monthlyConfig, now: now)
+        func quota(five: Double?, seven: Double?, fetchedAt: Date, reset: Date) throws -> QuotaReport {
+            var limits: [String: Any] = [:]
+            if let five { limits["primary"] = ["usedPercent": five, "windowDurationMins": 300, "resetsAt": reset.timeIntervalSince1970] }
+            if let seven { limits["secondary"] = ["usedPercent": seven, "windowDurationMins": 10080, "resetsAt": reset.timeIntervalSince1970] }
+            return try QuotaReport.parse(JSONSerialization.data(withJSONObject: ["result": ["rateLimits": limits]]),
+                config: AppConfiguration(), now: fetchedAt)
+        }
+
+        let local = AppModel(preview: true)
+        defer { local.shutdown() }
+        local.config.dataSource = "localCodex"
+        let recentLocal = try quota(five: 99, seven: 98, fetchedAt: now, reset: now.addingTimeInterval(3600))
+        local.fiveHourQuota = recentLocal.fiveHour
+        local.sevenDayQuota = recentLocal.sevenDay
+        let highMonthlyData = try JSONSerialization.data(withJSONObject: ["data": [
+            "used_tokens": 1234, "total_tokens": 1234
+        ]])
+        local.quota = try QuotaSnapshot.parse(highMonthlyData, config: monthlyConfig, now: now)
+        XCTAssertEqual(local.quotaSource, .localCodex)
+        for value in [recentLocal.fiveHour, recentLocal.sevenDay].compactMap({ $0 }) {
+            let card = WindowQuotaCard.presentation(for: value, at: now, refreshSeconds: 60, source: .localCodex)
+            XCTAssertFalse(card.isFresh, "a recent local snapshot is never an enterprise-current allowance")
+            XCTAssertTrue(card.sourceLabel.contains("本地"))
+            XCTAssertTrue(card.statusLabel.contains("本地"))
+            XCTAssertFalse(card.statusLabel.contains("当前企业"))
+            XCTAssertEqual(card.usedPercent, value.usedPercent)
+            XCTAssertEqual(card.resetsAt, value.resetsAt)
+            XCTAssertEqual(card.recordedAt, value.fetchedAt)
+        }
+        XCTAssertEqual(local.alertColor, .labelColor, "local rolling snapshots and a high monthly quota never drive enterprise alerts")
+        XCTAssertTrue(local.menuTooltip.contains("5 小时额度：本地"))
+        XCTAssertTrue(local.menuTooltip.contains("7 天额度：本地"))
+        XCTAssertFalse(local.menuTooltip.contains("当前企业"))
+        XCTAssertTrue(local.menuTooltip.contains("99.0%"), "local tooltip retains the original percentage")
+        XCTAssertTrue(local.menuTooltip.contains("重置"), "local tooltip includes the reset time when present")
+
+        for (window, percent) in [(300, 77.0), (10080, 78.0)] {
+            let stale = try quota(five: window == 300 ? percent : nil, seven: window == 10080 ? percent : nil,
+                fetchedAt: now.addingTimeInterval(-3600), reset: now.addingTimeInterval(3600))
+            let value = window == 300 ? stale.fiveHour : stale.sevenDay
+            let card = WindowQuotaCard.presentation(for: value, at: now, refreshSeconds: 60, source: .localCodex)
+            XCTAssertFalse(card.isFresh, "stale local \(window)-minute window is never current")
+            XCTAssertEqual(card.usedPercent, percent)
+            XCTAssertEqual(card.resetsAt, value?.resetsAt)
+            XCTAssertTrue(card.statusLabel.contains("本地"))
+            XCTAssertTrue(card.statusLabel.contains("历史"))
+            XCTAssertEqual(card.recordedAt, value?.fetchedAt)
+
+            let future = try quota(five: window == 300 ? percent : nil, seven: window == 10080 ? percent : nil,
+                fetchedAt: now.addingTimeInterval(600), reset: now.addingTimeInterval(3600))
+            let futureValue = window == 300 ? future.fiveHour : future.sevenDay
+            let futureCard = WindowQuotaCard.presentation(for: futureValue, at: now, refreshSeconds: 60, source: .localCodex)
+            XCTAssertTrue(futureCard.statusLabel.contains("本地"))
+            XCTAssertTrue(futureCard.statusLabel.contains("异常"))
+            XCTAssertEqual(futureCard.usedPercent, percent)
+
+            let expired = try quota(five: window == 300 ? percent : nil, seven: window == 10080 ? percent : nil,
+                fetchedAt: now, reset: now.addingTimeInterval(-1))
+            let expiredValue = window == 300 ? expired.fiveHour : expired.sevenDay
+            let expiredCard = WindowQuotaCard.presentation(for: expiredValue, at: now, refreshSeconds: 60, source: .localCodex)
+            XCTAssertTrue(expiredCard.statusLabel.contains("本地"))
+            XCTAssertTrue(expiredCard.statusLabel.contains("重置已过"))
+            XCTAssertEqual(expiredCard.usedPercent, percent)
+            XCTAssertEqual(expiredCard.resetsAt, expiredValue?.resetsAt)
+
+            let missingResetData = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": [
+                "primary": ["usedPercent": percent, "windowDurationMins": 300],
+                "secondary": ["usedPercent": percent, "windowDurationMins": 10080]
+            ]]])
+            let missingReset = try QuotaReport.parse(missingResetData, config: AppConfiguration(), now: now)
+            let missingResetValue = window == 300 ? missingReset.fiveHour : missingReset.sevenDay
+            let missingResetCard = WindowQuotaCard.presentation(for: missingResetValue, at: now,
+                refreshSeconds: 60, source: .localCodex)
+            XCTAssertEqual(missingResetCard.usedPercent, percent)
+            XCTAssertNil(missingResetCard.resetsAt)
+            XCTAssertTrue(missingResetCard.statusLabel.contains("本地"))
+            XCTAssertTrue(missingResetCard.statusLabel.contains("未知"))
+
+            let missingCard = WindowQuotaCard.presentation(for: nil, at: now, refreshSeconds: 60, source: .localCodex)
+            XCTAssertTrue(missingCard.statusLabel.contains("本地"))
+            XCTAssertTrue(missingCard.statusLabel.contains("未提供"))
+        }
+
+        let enterprise = AppModel(preview: true)
+        defer { enterprise.shutdown() }
+        enterprise.config.dataSource = "proxy"
+        let currentEnterprise = try quota(five: 96, seven: 20, fetchedAt: now, reset: now.addingTimeInterval(3600))
+        enterprise.fiveHourQuota = currentEnterprise.fiveHour
+        enterprise.sevenDayQuota = currentEnterprise.sevenDay
+        XCTAssertTrue(enterprise.menuTooltip.contains("企业"), "proxy tooltip identifies its quota source")
+        XCTAssertTrue(enterprise.menuTooltip.contains("96.0%"), "proxy tooltip retains the original percentage")
+        XCTAssertTrue(enterprise.menuTooltip.contains("重置"), "proxy tooltip includes the reset time")
+        XCTAssertEqual(enterprise.quotaSource, .enterprise)
+        let enterpriseCard = WindowQuotaCard.presentation(for: try XCTUnwrap(currentEnterprise.fiveHour), at: now,
+            refreshSeconds: 60, source: .enterprise)
+        XCTAssertTrue(enterpriseCard.isFresh)
+        XCTAssertTrue(enterpriseCard.sourceLabel.contains("企业"))
+        XCTAssertTrue(enterpriseCard.statusLabel.contains("企业"))
+        XCTAssertEqual(enterprise.alertColor, .systemRed, "configured enterprise fresh-window alerts remain unchanged")
+
+        let staleEnterprise = try quota(five: 99, seven: 20, fetchedAt: now.addingTimeInterval(-3600), reset: now.addingTimeInterval(3600))
+        enterprise.fiveHourQuota = staleEnterprise.fiveHour
+        enterprise.sevenDayQuota = currentEnterprise.sevenDay
+        let staleEnterpriseCard = WindowQuotaCard.presentation(for: try XCTUnwrap(staleEnterprise.fiveHour), at: now,
+            refreshSeconds: 60, source: .enterprise)
+        XCTAssertFalse(staleEnterpriseCard.isFresh)
+        XCTAssertTrue(staleEnterpriseCard.statusLabel.contains("企业"))
+        XCTAssertEqual(staleEnterpriseCard.usedPercent, 99)
+        XCTAssertEqual(enterprise.alertColor, .labelColor, "stale enterprise 5-hour data remains excluded beside fresh 7-day data")
+
+        enterprise.fiveHourQuota = nil
+        enterprise.sevenDayQuota = nil
+        enterprise.quota = monthlyFixture
+        enterprise.quotaLoading = true
+        enterprise.resetQuotaState()
+        XCTAssertNil(enterprise.quota)
+        XCTAssertNil(enterprise.fiveHourQuota)
+        XCTAssertNil(enterprise.sevenDayQuota)
+        XCTAssertFalse(enterprise.quotaLoading)
+
+        let switching = AppModel(preview: true)
+        defer { switching.shutdown() }
+        switching.config.dataSource = "localCodex"
+        switching.quota = monthlyFixture
+        switching.quotaLoading = true
+        switching.fiveHourQuota = recentLocal.fiveHour
+        switching.sevenDayQuota = recentLocal.sevenDay
+        switching.resetQuotaState()
+        XCTAssertNil(switching.fiveHourQuota)
+        XCTAssertNil(switching.sevenDayQuota)
+        XCTAssertNil(switching.quota)
+        switching.config.dataSource = "proxy"
+        switching.quota = monthlyFixture
+        switching.quotaLoading = true
+        switching.fiveHourQuota = currentEnterprise.fiveHour
+        switching.sevenDayQuota = currentEnterprise.sevenDay
+        switching.resetQuotaState()
+        XCTAssertNil(switching.fiveHourQuota)
+        XCTAssertNil(switching.sevenDayQuota)
+        XCTAssertNil(switching.quota)
+        XCTAssertFalse(switching.quotaLoading)
+        XCTAssertEqual(switching.alertColor, .labelColor)
+        XCTAssertFalse(switching.menuTooltip.contains("本地额度快照"))
+        switching.sevenDayQuota = currentEnterprise.sevenDay
+        XCTAssertNil(switching.fiveHourQuota, "injecting only the new 7-day source window leaves its missing 5-hour sibling missing")
+        XCTAssertNotNil(switching.sevenDayQuota)
+        switching.quota = monthlyFixture
+        switching.quotaLoading = true
+        switching.config.dataSource = "localCodex"
+        switching.resetQuotaState()
+        XCTAssertNil(switching.fiveHourQuota)
+        XCTAssertNil(switching.sevenDayQuota)
+        XCTAssertNil(switching.quota)
+        XCTAssertFalse(switching.quotaLoading)
+        switching.fiveHourQuota = recentLocal.fiveHour
+        XCTAssertNotNil(switching.fiveHourQuota)
+        XCTAssertNil(switching.sevenDayQuota, "injecting only the new 5-hour source window leaves its missing 7-day sibling missing")
+        XCTAssertEqual(switching.alertColor, .labelColor)
+    }
+
+    func testC11QuotaCardRenderExportsLocalAndEnterpriseSyntheticExamples() throws {
+        let now = Date()
+        func quota(_ minutes: Int, _ percent: Double, hasReset: Bool = true) throws -> WindowQuota {
+            var limit: [String: Any] = ["usedPercent": percent, "windowDurationMins": minutes]
+            if hasReset { limit["resetsAt"] = now.addingTimeInterval(3600).timeIntervalSince1970 }
+            let key = minutes == 300 ? "primary" : "secondary"
+            let data = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": [key: limit]]])
+            let report = try QuotaReport.parse(data, config: AppConfiguration(), now: now)
+            return try XCTUnwrap(minutes == 300 ? report.fiveHour : report.sevenDay)
+        }
+        let artifactDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("TokenStatMenu-C11-review", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactDirectory, withIntermediateDirectories: true)
+        var paths: [String] = []
+        for (source, sourceName) in [(QuotaSource.localCodex, "local-codex"), (.enterprise, "enterprise")] {
+            for (appearance, appearanceName) in [(NSAppearance.Name.aqua, "aqua"), (.darkAqua, "dark-aqua")] {
+                let url = artifactDirectory.appendingPathComponent("\(sourceName)-\(appearanceName).png")
+                try renderQuotaCard(try quota(300, 97), source: source, appearance: appearance).write(to: url)
+                XCTAssertGreaterThan(try Data(contentsOf: url).count, 0)
+                paths.append(url.path)
+            }
+        }
+        let pairedURL = artifactDirectory.appendingPathComponent("local-5h-missing-7d-present.png")
+        try renderQuotaCard(try quota(10080, 42, hasReset: false), source: .localCodex, appearance: .aqua,
+            missingFiveHour: true).write(to: pairedURL)
+        XCTAssertGreaterThan(try Data(contentsOf: pairedURL).count, 0)
+        paths.append(pairedURL.path)
+        print("C11 synthetic quota card renders: \(paths.joined(separator: ", "))")
     }
 
     func testHistoricalQuotaPresentationPreservesOriginalSourceValues() throws {
@@ -3907,6 +4159,52 @@ final class TokenStatUISnapshotTests: XCTestCase {
         NSBezierPath(rect: NSRect(x: 0, y: 0, width: 24, height: 24)).fill()
         image.unlockFocus()
         return image
+    }
+
+    private func renderQuotaCard(_ quota: WindowQuota, source: QuotaSource, appearance: NSAppearance.Name,
+                                 missingFiveHour: Bool = false) throws -> Data {
+        let card = Group {
+            if missingFiveHour {
+                VStack {
+                    WindowQuotaCard(title: "5 小时额度", quota: nil, color: .blue, refreshSeconds: 60, source: source)
+                    WindowQuotaCard(title: "7 天额度", quota: quota, color: .blue, refreshSeconds: 60, source: source)
+                }
+            } else {
+                WindowQuotaCard(title: quota.minutes == 300 ? "5 小时额度" : "7 天额度", quota: quota,
+                    color: .blue, refreshSeconds: 60, source: source)
+            }
+        }
+        let dark = appearance == .darkAqua
+        let root = card
+            .environment(\.colorScheme, dark ? .dark : .light)
+            .padding(16)
+            .frame(width: 300, height: 300, alignment: .topLeading)
+            .background(dark ? Color(red: 0.13, green: 0.14, blue: 0.17) : Color(red: 0.96, green: 0.97, blue: 0.99))
+        let bounds = NSRect(x: 0, y: 0, width: 300, height: 300)
+        let hostingView = NSHostingView(rootView: root)
+        hostingView.frame = bounds
+        hostingView.appearance = NSAppearance(named: appearance)
+        let window = NSWindow(contentRect: bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.appearance = NSAppearance(named: appearance)
+        window.contentView = hostingView
+        window.setFrameOrigin(NSPoint(x: -10000, y: -10000))
+        defer { window.close() }
+        window.makeKeyAndOrderFront(nil)
+        window.displayIfNeeded()
+        hostingView.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        window.displayIfNeeded()
+        hostingView.needsDisplay = true
+        hostingView.layoutSubtreeIfNeeded()
+        guard let bitmap = hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds) else {
+            throw NSError(domain: "C11QuotaCardRender", code: 1)
+        }
+        hostingView.cacheDisplay(in: hostingView.bounds, to: bitmap)
+        guard let png = bitmap.representation(using: .png, properties: [:]) else {
+            throw NSError(domain: "C11QuotaCardRender", code: 2)
+        }
+        return png
     }
 
     private func assertDashboard(_appearance appearance: NSAppearance.Name, settings: Bool = false, name: String,
@@ -4857,7 +5155,7 @@ OpenAI 兼容网关可能拒绝 `stream_options.include_usage`；可在设置关
 - 费用不是企业账单；缓存输入按普通输入价，失败请求缺失 usage 时也可能有估算费用。
 - 企业配额来自独立接口；手填总量仅定义上限，没有接口就显示已用/剩余/使用率未知。
 - 月度映射字段 `usedPath` / `limitPath` 是 Token 数量；5 小时与 7 天映射字段分别是 0–100 的 `used_percent`，重置时间可用 Unix 秒或 ISO 8601。也接受同一接口中的 Codex `rateLimits` 格式，并按 300 / 10080 分钟识别窗口；窗口缺失或过期时显示未提供/过期，不从月度配额或本机 Token 推算。详见 [配置说明](docs/CONFIGURATION.md)。
-- 配额达到 80% 标题黄色、95% 红色，不发通知或弹窗；过期数据不驱动新告警。
+- 仅配置接口提供且仍有效的配额达到 80% 时标题黄色、95% 红色，不发通知或弹窗；本地历史快照、过期或异常时间数据不驱动企业额度告警。
 
 ## 本机网关自动发现与隐私
 
@@ -4899,7 +5197,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter Tok
 
 - **均速一直 —**：本机模式需要在同一有界尾部中找到开始前累计、匹配的轮次开始、轮内用量更新与正常完成。缺少其中任何一项时不计算；历史导入量和扫描间隔不会用来伪造速度。代理模式需确认请求确实经过本机代理并使用本机令牌。
 - **5 小时没有数据**：只有来源确实提供 300 分钟窗口才能显示。7 天窗口不能换算成 5 小时，企业网关也未必具有官方订阅额度。面板区分来源未提供、历史快照、时间异常和重置时间已过；历史原值不会触发当前额度告警。
-- **企业配额未知**：本机来源只显示记录中已有的额度快照，可能缺失或过期，且账户未经核验。代理来源需检查用量 URL、独立 Key、字段路径和月份；推理 API 的 Key 不一定能访问计费接口。
+- **企业配额未知**：本机来源只显示历史额度参考，记录新鲜也不能证明它属于当前企业账号或限额池。代理来源需检查用量 URL、独立 Key、字段路径和月份；推理 API 的 Key 不一定能访问计费接口。自动发现推理网关地址不等于接通企业额度接口。本项目当前月度字段按 Token 解释，不能直接填写金额字段。
 - **图标不见**：macOS 可能关闭菜单栏项目或因刘海/其他图标拥挤而隐藏，任何 App 都不能保证绕过系统布局。检查“系统设置 → 菜单栏”。从 Finder 再次打开应用会主动打开面板。
 - **关闭面板即退出**：本项目持有 status item 和 app delegate，并显式禁止最后窗口关闭时退出。
 - **内存/CPU**：使用原生框架、有限缓冲与低频刷新，不会无限保存回答文本；SwiftUI/Charts 仍有系统开销，不承诺所有机器固定内存值。

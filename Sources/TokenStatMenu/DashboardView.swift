@@ -34,9 +34,9 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                         if model.config.dataSource == "localCodex" { localUsageCard } else { liveCard }
                         HStack(alignment: .top, spacing: 10) {
                             WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
-                                color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds)
+                                color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
                             WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
-                                color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds)
+                                color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
                         }
                         if model.config.dataSource == "localCodex" { localQuotaCard } else { sessionCard; quotaCard }
                         if model.config.dataSource == "proxy", model.config.historyEnabled, model.panelVisible { historyCard }
@@ -132,17 +132,18 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             VStack(alignment: .leading, spacing: 8) {
                 metric("5 小时额度", localQuotaDescription(model.fiveHourQuota))
                 metric("7 天额度", localQuotaDescription(model.sevenDayQuota))
-                Text("额度来自最近的本地 rate_limits 事件；仅作历史快照，过期或未来时间不会作为当前额度。")
+                Text("本地 rate_limits 始终只是历史参考，不论事件是否新鲜；不代表当前企业剩余额度，也不触发企业额度告警。保留源记录的已用比例、记录时间和原重置时间。")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
             }
         } label: { Label("本地额度快照", systemImage: "chart.bar") }
     }
     private func localQuotaDescription(_ quota: WindowQuota?) -> String {
-        let state = WindowQuotaCard.presentation(for: quota, refreshSeconds: model.config.refreshSeconds)
+        let state = WindowQuotaCard.presentation(for: quota, refreshSeconds: model.config.refreshSeconds, source: .localCodex)
         guard let percent = state.usedPercent else { return state.statusLabel }
         let reset = state.resetsAt.map { " · \($0.formatted(date: .abbreviated, time: .shortened))重置" } ?? " · 重置时间未知"
-        return "\(state.statusLabel) · 上游已用 \(String(format: "%.1f", percent))%\(reset)"
+        let recorded = state.recordedAt.map { " · 记录于 \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
+        return "\(state.sourceLabel) · \(state.statusLabel) · 上游已用 \(String(format: "%.1f", percent))%\(recorded)\(reset)"
     }
     private var sessionCard: some View {
         GroupBox {

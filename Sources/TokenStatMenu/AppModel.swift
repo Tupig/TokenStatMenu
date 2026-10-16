@@ -109,6 +109,7 @@ struct SpeedPoint: Identifiable {
     }
     var currencyFactor: Double { config.currency == "CNY" ? config.usdToCNY : 1 }
     var currencySymbol: String { config.currency == "CNY" ? "¥" : "$" }
+    var quotaSource: QuotaSource { config.dataSource == "localCodex" ? .localCodex : .enterprise }
     var hasRequestData: Bool { config.dataSource == "localCodex" ? localSnapshot.sessionCount > 0 : stats.requests > 0 }
     var dataNotice: String {
         if isTestFixture { return "模拟测试 · 以下速度、Token、费用和配额均非企业真实数据" }
@@ -127,22 +128,27 @@ struct SpeedPoint: Identifiable {
         return (isTestFixture ? "测试 " : "") + "\(value) · Σ\(total) · 请求\(stats.requests)"
     }
     var menuTooltip: String {
-        guard config.dataSource == "localCodex" else { return "\(dataNotice) · \(proxyStatus)" }
+        guard config.dataSource == "localCodex" else {
+            return "\(dataNotice) · \(proxyStatus)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .enterprise))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .enterprise))"
+        }
         let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
         let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
         let coverage = "扫描上限：最多32个会话文件、每文件尾部256KiB、总计8MiB；" + (localSnapshot.isLimited ? "本次达到上限，记录可能不完整" : "本次已检查 \(localSnapshot.filesScanned) 个会话文件，\(localSnapshot.sessionCount) 个含有效累计用量")
-        return "本地 Codex 历史累计：\(formatCount(localSnapshot.total)) tokens · \(localSnapshot.sessionCount)会话\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n5 小时额度：\(quotaDescription(fiveHourQuota))\n7 天额度：\(quotaDescription(sevenDayQuota))"
+        return "本地 Codex 历史累计：\(formatCount(localSnapshot.total)) tokens · \(localSnapshot.sessionCount)会话\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
     }
-    private func quotaDescription(_ quota: WindowQuota?) -> String {
-        guard let quota else { return "未提供" }
-        let status = WindowQuotaCard.presentation(for: quota, refreshSeconds: config.refreshSeconds).statusLabel
-        let reset = quota.resetsAt.map { "，原重置时间 \($0.formatted())" } ?? "，重置时间未知"
-        return "\(status)，上游已用 \(String(format: "%.1f", quota.usedPercent))%\(reset)"
+    private func quotaDescription(_ quota: WindowQuota?, source: QuotaSource) -> String {
+        let presentation = WindowQuotaCard.presentation(for: quota, refreshSeconds: config.refreshSeconds, source: source)
+        guard let usedPercent = presentation.usedPercent else { return "\(presentation.sourceLabel) · \(presentation.statusLabel)" }
+        let resetLabel = source == .localCodex || !presentation.isFresh ? "原重置时间" : "重置时间"
+        let reset = presentation.resetsAt.map { "，\(resetLabel) \($0.formatted())" } ?? "，重置时间未知"
+        let recorded = presentation.recordedAt.map { "，记录于 \($0.formatted())" } ?? ""
+        return "\(presentation.sourceLabel) · \(presentation.statusLabel)，上游已用 \(String(format: "%.1f", usedPercent))%\(reset)\(recorded)"
     }
     private func formatCount(_ value: Int) -> String { value.formatted(.number) }
     private func formatCompactCount(_ value: Int) -> String { value.formatted(.number.notation(.compactName)) }
     var alertColor: NSColor {
-        let windows = [fiveHourQuota, sevenDayQuota].compactMap { $0 }
+        guard quotaSource == .enterprise else { return .labelColor }
+        let windows = (quotaSource == .enterprise ? [fiveHourQuota, sevenDayQuota].compactMap { $0 } : [])
             .filter { $0.isFresh(refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
         guard let ratio = (windows + [freshQuota?.fraction].compactMap { $0 }).max() else { return .labelColor }
         return ratio >= 0.95 ? .systemRed : ratio >= 0.8 ? .systemYellow : .labelColor
@@ -189,12 +195,10 @@ struct SpeedPoint: Identifiable {
         _ = localRefreshScheduler.invalidate()
         localCache = LocalCodexUsageReader.Cache()
         localScan?.cancel(); localScan = nil
-        quota = nil; quotaError = config.usageURL.isEmpty ? "未配置企业用量接口，已用量未知" : "等待企业接口"
-        fiveHourQuota = nil; sevenDayQuota = nil
+        resetQuotaState()
         if config.dataSource == "localCodex" {
             if proxyWasStarted { proxy.stop(); proxyWasStarted = false }
             proxyStatus = "本地模式 · 未启动代理"
-            quota = nil; quotaError = "本地会话记录不提供月度企业配额"
             scheduleLocalScan(immediate: true); return
         }
         proxy.onStatus = { [weak self] status in Task { @MainActor in self?.proxyStatus = status } }
@@ -211,6 +215,15 @@ struct SpeedPoint: Identifiable {
                 }
             }
         }
+    }
+    /// Clears quota values at a source transition without performing I/O.
+    func resetQuotaState() {
+        quota = nil
+        fiveHourQuota = nil
+        sevenDayQuota = nil
+        quotaLoading = false
+        quotaError = quotaSource == .localCodex ? "本地会话记录不提供月度企业配额"
+            : (config.usageURL.isEmpty ? "未配置企业用量接口，已用量未知" : "等待企业接口")
     }
     private func scheduleLocalScan(immediate: Bool = false) {
         localScan?.cancel()
