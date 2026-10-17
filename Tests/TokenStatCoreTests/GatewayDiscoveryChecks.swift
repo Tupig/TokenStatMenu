@@ -19,6 +19,10 @@ extension CoreChecks {
         check(found.count == 2 && found.first?.isActive == true, "discover active provider first")
         check(found.first?.endpoint == "https://gateway.example/airoute/responses", "preserve enterprise base path without inventing v1")
         check(found.first?.model == "example-model" && found.last?.model == "", "model belongs to selected provider only")
+        check(GatewayDiscovery.originKey(found.first!.endpoint) == "https://gateway.example:443",
+            "route verification reduces a provider endpoint to its credential-free origin")
+        check(GatewayDiscovery.originKey("https://user:password@gateway.example/v1") == nil,
+            "route origin matching rejects embedded credentials")
         var config = AppConfiguration(); config.endpoint = found[0].endpoint
         let mappedResponses = try config.upstreamURL(for: "/v1/responses")
         check(mappedResponses.absoluteString == "https://gateway.example/airoute/responses", "Responses proxy preserves non-v1 upstream")

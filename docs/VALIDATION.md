@@ -1,5 +1,13 @@
 # 验证记录
 
+## BP18 — Seasun 路由归属与活动速度回归（2026-10-18）
+
+- 核心检查：358/358 通过。新增合成 rollout 覆盖当前 `model_provider` 与 Token Hub connection origin 匹配/不匹配两种情况；未验证路由的文件保持未知，不会混入 Token 总量。
+- 活动速度回归覆盖未完成 `task_started` 轮次的两条累计 `token_count` 差分，以及超过 15 秒没有新事件时回到未知。实现只保留输入/输出速率与观测时间，不保留正文、URL 或会话标识。
+- `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`：31/31 通过；`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./script/test.sh`：通过，包含隔离 no-config 启动场景和公开文件检查。
+- 当前本机实际启动当前构建并使用不存在的临时配置文件时，脱敏诊断为 `directQuotaPresent=true`、`monthlyUsagePresent=true`、`resetTimePresent=true`、`permissionPromptRequested=false`、`liveTokenSpeedPresent=true`；临时配置文件保持不存在。
+- 本轮未把实时估算称作网关权威速度；没有新鲜本地事件时菜单栏回退为上轮均速或未知。
+
 ## BP17 — 零配置实机自动读取（2026-10-18）
 
 - 在本机已运行的 Seasun Token Hub 环境中，使用一个不存在的临时配置文件路径启动当前构建；应用没有创建该配置文件，也没有请求辅助功能授权。

@@ -135,6 +135,30 @@ public enum TokenHubConnectionDiscovery {
         return try readAIManagerBaseURL(at: url)
     }
 
+    /// Reads only the credential-free connection origins used to prove that
+    /// the active Codex provider is managed by this Token Hub installation.
+    /// The SSO session row is never touched by this discovery call.
+    public static func readDefaultConnectionBaseURLs(home: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> [URL] {
+        let url = defaultDatabaseURL(home: home)
+        let expected = home.appendingPathComponent(".seasun-token-hub", isDirectory: true).appendingPathComponent("tokenhub.db")
+        guard url.standardizedFileURL == expected.standardizedFileURL,
+              url.resolvingSymlinksInPath() == url.standardizedFileURL else {
+            throw TokenHubDirectQuotaFailure.databaseUnsafe
+        }
+        let db = try openDatabase(at: url)
+        defer { sqlite3_close(db) }
+        guard let connection = try readSetting(db: db, key: "client.connection") else {
+            throw TokenHubDirectQuotaFailure.connectionMalformed
+        }
+        let fields = ["aiManagerBaseUrl", "aitsBaseUrl"]
+        let urls = fields.compactMap { key -> URL? in
+            guard let raw = connection[key] as? String, let value = URL(string: raw) else { return nil }
+            return value
+        }
+        guard urls.count == fields.count else { throw TokenHubDirectQuotaFailure.connectionMalformed }
+        return urls
+    }
+
     fileprivate static func readDefaultStoredSettings(home: URL, now: Date = Date()) throws -> TokenHubStoredSettings {
         let url = defaultDatabaseURL(home: home)
         let expected = home.appendingPathComponent(".seasun-token-hub", isDirectory: true).appendingPathComponent("tokenhub.db")

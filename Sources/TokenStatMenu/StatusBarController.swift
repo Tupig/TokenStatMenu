@@ -85,7 +85,8 @@ import SwiftUI
             directQuotaStatus: model.tokenHubQuotaStatusText,
             resetTimePresent: resetTimePresent,
             monthlyUsagePresent: snapshot?.monthly != nil || model.quota?.used != nil,
-            liveTokenSpeedPresent: model.stats.active > 0,
+            liveTokenSpeedPresent: model.config.dataSource == "localCodex"
+                ? model.localSnapshot.liveTurn != nil : model.stats.active > 0,
             sourceStatus: model.sourceStatus,
             backgroundServiceResources: model.backgroundServiceResources)
         if let data = try? JSONEncoder().encode(report) {

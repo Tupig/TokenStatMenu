@@ -5,10 +5,10 @@
 ```text
 AppKit NSStatusItem + NSPopover
   └─ AppModel：固定专用入口、可选偏好、来源状态与刷新
-      ├─ 本地 Codex 有界记录扫描 → 小计、分类、上轮均速
+      ├─ Seasun origin 路由校验 + 本地 Codex 有界记录扫描 → 小计、分类、实时估算/上轮均速
       ├─ Token Hub 只读会话交换 → 企业 5 小时/7 天/月度额度
       ├─ Token Hub 兼容界面扫描 → 无直连时的可选独立金额/窗口快照
-      └─ 本机 Codex 有界记录 → 记录小计、会话分类、上轮均速
+      └─ 本机 Codex 有界记录 → 记录小计、会话分类、实时估算、上轮均速
 SwiftUI：概览、来源说明、可选偏好
 ```
 
@@ -251,6 +251,30 @@ public enum GatewayDiscovery {
         }.sorted { a, b in a.isActive != b.isActive ? a.isActive : a.provider < b.provider }
     }
 
+    /// Returns the selected Codex provider and the credential-free origin of
+    /// its configured endpoint. Only the origin is used for Seasun route
+    /// verification; paths, query strings, and credentials are discarded.
+    public static func activeCodexProvider(at url: URL) -> (provider: String, origin: String)? {
+        guard let active = readCodexConfig(at: url, source: "local").first(where: \.isActive),
+              let origin = originKey(active.endpoint) else { return nil }
+        return (active.provider, origin)
+    }
+
+    public static func originKey(_ raw: String) -> String? {
+        guard let url = URL(string: raw) else { return nil }
+        return originKey(url)
+    }
+
+    public static func originKey(_ url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = url.host?.lowercased(), !host.isEmpty,
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              !host.contains(":") else { return nil }
+        let port = url.port ?? (scheme == "https" ? 443 : 80)
+        guard (1...65_535).contains(port) else { return nil }
+        return "\(scheme)://\(host):\(port)"
+    }
+
     public static func environmentCandidates(_ environment: [String: String]) -> [GatewayCandidate] {
         var result: [GatewayCandidate] = []
         if let base = environment["OPENAI_BASE_URL"], let c = candidate(baseURL: base,
@@ -421,6 +445,7 @@ public struct LocalCodexSnapshot: Equatable {
     public let fiveHour: WindowQuota?
     public let sevenDay: WindowQuota?
     public let lastTurn: LocalTurnSummary?
+    public let liveTurn: LocalLiveTurnSummary?
     public let knownThreadCount: Int
     public let unknownThreadCount: Int
     public let unidentifiedFileCount: Int
@@ -433,10 +458,11 @@ public struct LocalCodexSnapshot: Equatable {
     public init(input: Int, output: Int, total: Int, sessionCount: Int, filesScanned: Int,
                 isLimited: Bool, latestEventAt: Date?, fiveHour: WindowQuota?, sevenDay: WindowQuota?,
                 knownThreadCount: Int = 0, unknownThreadCount: Int = 0, unidentifiedFileCount: Int = 0,
-                subagentCount: Int = 0, forkCount: Int = 0, lastTurn: LocalTurnSummary? = nil) {
+                subagentCount: Int = 0, forkCount: Int = 0, lastTurn: LocalTurnSummary? = nil,
+                liveTurn: LocalLiveTurnSummary? = nil) {
         self.input = input; self.output = output; self.total = total; self.sessionCount = sessionCount
         self.filesScanned = filesScanned; self.isLimited = isLimited; self.latestEventAt = latestEventAt
-        self.fiveHour = fiveHour; self.sevenDay = sevenDay; self.lastTurn = lastTurn
+        self.fiveHour = fiveHour; self.sevenDay = sevenDay; self.lastTurn = lastTurn; self.liveTurn = liveTurn
         self.knownThreadCount = knownThreadCount; self.unknownThreadCount = unknownThreadCount
         self.unidentifiedFileCount = unidentifiedFileCount; self.subagentCount = subagentCount; self.forkCount = forkCount
     }
@@ -449,6 +475,48 @@ public struct LocalTurnSummary: Equatable {
     public var outputTPS: Double { Double(outputTokens) / durationSeconds }
     public init(outputTokens: Int, durationSeconds: Double, completedAt: Date) {
         self.outputTokens = outputTokens; self.durationSeconds = durationSeconds; self.completedAt = completedAt
+    }
+}
+
+/// A short-lived estimate derived from two recent cumulative `token_count`
+/// events while a Codex task is still active. It expires quickly when the
+/// rollout stops advancing and is kept separate from completed-turn averages.
+public struct LocalLiveTurnSummary: Equatable {
+    public let inputTPS: Double
+    public let outputTPS: Double
+    public let observedAt: Date
+
+    public init(inputTPS: Double, outputTPS: Double, observedAt: Date) {
+        self.inputTPS = inputTPS; self.outputTPS = outputTPS; self.observedAt = observedAt
+    }
+}
+
+/// A verified association between the active Codex provider and Seasun Token
+/// Hub. The origin is proved by the caller and is not retained in public state.
+public struct LocalCodexRouteContext: Equatable, Sendable {
+    public let provider: String?
+    public let isVerified: Bool
+    fileprivate let fingerprint: String
+
+    public static let unverified = LocalCodexRouteContext(provider: nil, isVerified: false,
+        fingerprint: "unverified")
+
+    public static func verified(provider: String, origin: String) -> LocalCodexRouteContext {
+        let normalizedProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedOrigin = origin.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedProvider.isEmpty, !normalizedOrigin.isEmpty,
+              normalizedOrigin.hasPrefix("https://") else { return .unverified }
+        return LocalCodexRouteContext(provider: normalizedProvider, isVerified: true,
+            fingerprint: "verified|\(normalizedProvider)|\(normalizedOrigin)")
+    }
+
+    fileprivate init(provider: String?, isVerified: Bool, fingerprint: String) {
+        self.provider = provider; self.isVerified = isVerified; self.fingerprint = fingerprint
+    }
+
+    fileprivate func accepts(_ modelProvider: String?) -> Bool {
+        guard isVerified, let provider, let modelProvider else { return false }
+        return provider == modelProvider
     }
 }
 
@@ -511,6 +579,7 @@ public enum LocalCodexUsageReader {
     fileprivate struct FileSummary {
         let identity: String?; let lineage: Lineage; let isFork: Bool; let sourceKnownTop: Bool
         let contribution: Record?; let rate: Record?; let quotaDate: Date?; let turn: LocalTurnSummary?
+        let live: LocalLiveTurnSummary?
         let latestEventAt: Date?; let tailLimited: Bool; let headComplete: Bool; let hasFutureTurn: Bool
         let contentHash: String?; let signature: FileSignature
     }
@@ -524,6 +593,7 @@ public enum LocalCodexUsageReader {
         public var entryCount: Int { entries.count }
         fileprivate var entries: [FileSignature: CachedFileSummary] = [:]
         fileprivate var rootIdentity: FileSignature?
+        fileprivate var routeFingerprint: String?
         fileprivate var beforePostReadValidation: (() -> Void)?
         public init() {}
         init(beforePostReadValidation: @escaping () -> Void) { self.beforePostReadValidation = beforePostReadValidation }
@@ -539,11 +609,26 @@ public enum LocalCodexUsageReader {
         if let configured = environment["CODEX_HOME"], configured.hasPrefix("/") { return URL(fileURLWithPath: configured).appendingPathComponent("sessions") }
         return home.appendingPathComponent(".codex").appendingPathComponent("sessions")
     }
+    public static func defaultConfigURL(environment: [String: String] = ProcessInfo.processInfo.environment,
+                                        home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
+        if let configured = environment["CODEX_HOME"], configured.hasPrefix("/") {
+            return URL(fileURLWithPath: configured).appendingPathComponent("config.toml")
+        }
+        return home.appendingPathComponent(".codex").appendingPathComponent("config.toml")
+    }
     public static func scan(directory: URL, now: Date = Date()) throws -> LocalCodexSnapshot { try scan(directory: directory, now: now, cache: nil) }
+    public static func scan(directory: URL, now: Date = Date(),
+                            routeContext: LocalCodexRouteContext?) throws -> LocalCodexSnapshot {
+        try scan(directory: directory, now: now, cache: nil, routeContext: routeContext)
+    }
 
-    public static func scan(directory: URL, now: Date = Date(), cache: Cache?) throws -> LocalCodexSnapshot {
+    public static func scan(directory: URL, now: Date = Date(), cache: Cache?,
+                            routeContext: LocalCodexRouteContext? = nil) throws -> LocalCodexSnapshot {
         cache?.resetDiagnostics()
         func empty() -> LocalCodexSnapshot { LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil) }
+        if let cache, cache.routeFingerprint != routeContext?.fingerprint {
+            cache.entries.removeAll(); cache.routeFingerprint = routeContext?.fingerprint
+        }
         var st = stat()
         guard lstat(directory.path, &st) == 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty() }
         guard (st.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty() }
@@ -592,14 +677,18 @@ public enum LocalCodexUsageReader {
                 if timestampChanged { cache.entries = cache.entries.filter { $0.key.device != signature.device || $0.key.inode != signature.inode } }
             }
             if fst.st_size < 0 { unsafeCandidate = true; continue }
-        if let cached = cache?.entries[signature] {
+            if let cached = cache?.entries[signature] {
                 cache?.hit()
                 let cachedSummary = cached.summary
+                let cachedLive: LocalLiveTurnSummary? = cachedSummary.live.flatMap { live in
+                    guard live.observedAt <= now, now.timeIntervalSince(live.observedAt) <= 15 else { return nil }
+                    return live
+                }
                 let refreshed = FileSummary(identity: cachedSummary.identity, lineage: cachedSummary.lineage,
                     isFork: cachedSummary.isFork,
                     sourceKnownTop: cachedSummary.sourceKnownTop, contribution: cachedSummary.contribution,
                     rate: cachedSummary.rate,
-                    quotaDate: cachedSummary.quotaDate, turn: cachedSummary.hasFutureTurn ? nil : cachedSummary.turn, latestEventAt: cachedSummary.latestEventAt,
+                    quotaDate: cachedSummary.quotaDate, turn: cachedSummary.hasFutureTurn ? nil : cachedSummary.turn, live: cachedLive, latestEventAt: cachedSummary.latestEventAt,
                     tailLimited: cachedSummary.tailLimited, headComplete: cachedSummary.headComplete,
                     hasFutureTurn: cachedSummary.hasFutureTurn, contentHash: cachedSummary.contentHash, signature: cachedSummary.signature)
                 summaries.append(refreshed); filesScanned += 1
@@ -629,7 +718,8 @@ public enum LocalCodexUsageReader {
             cache?.beforePostReadValidation?()
             var after = stat(); guard fstat(fd, &after) == 0, FileSignature(after) == signature else { cache?.entries.removeValue(forKey: signature); unsafeCandidate = true; continue }
             cache?.parsed()
-            let parsed = parseFile(bytes: bytes, size: size, now: now, signature: signature)
+            let parsed = parseFile(bytes: bytes, size: size, now: now, signature: signature,
+                                   routeContext: routeContext)
             filesScanned += 1
             if parsed.identity == nil { unidentified += 1 }
             if parsed.tailLimited || !parsed.headComplete { limited = true; coverageLimited = true }
@@ -658,6 +748,7 @@ public enum LocalCodexUsageReader {
         }
         var known: [Record] = [], unknownThreads = 0, topLevelCount = 0, subagentCount = 0, forkCount = 0
         var latestTurn: LocalTurnSummary?, latestEvent: Date?
+        var liveInputTPS = 0.0, liveOutputTPS = 0.0, latestLiveAt: Date?
         for (_, variants) in grouped {
             let hashes = variants.compactMap(\.contentHash)
             guard variants.count == 1 || hashes.count == variants.count && Set(hashes).count == 1,
@@ -672,6 +763,10 @@ public enum LocalCodexUsageReader {
             }
             if let turn = summary.turn, turn.completedAt <= now, latestTurn == nil || turn.completedAt > latestTurn!.completedAt { latestTurn = turn }
             if let event = summary.latestEventAt, latestEvent == nil || event > latestEvent! { latestEvent = event }
+            if let live = summary.live, live.observedAt <= now {
+                liveInputTPS += live.inputTPS; liveOutputTPS += live.outputTPS
+                if latestLiveAt == nil || live.observedAt > latestLiveAt! { latestLiveAt = live.observedAt }
+            }
         }
         var input = 0, output = 0, total = 0
         for record in known {
@@ -680,14 +775,17 @@ public enum LocalCodexUsageReader {
             input = i; output = o; total = t
         }
         let finalRate = quotaWinner?.1
+        let liveTurn = latestLiveAt.map { LocalLiveTurnSummary(inputTPS: liveInputTPS,
+            outputTPS: liveOutputTPS, observedAt: $0) }
         return LocalCodexSnapshot(input: input, output: output, total: total, sessionCount: topLevelCount,
             filesScanned: filesScanned, isLimited: limited || unsafeCandidate || coverageLimited, latestEventAt: latestEvent,
             fiveHour: finalRate?.five, sevenDay: finalRate?.seven, knownThreadCount: known.count,
             unknownThreadCount: unknownThreads, unidentifiedFileCount: unidentifiedCount,
-            subagentCount: subagentCount, forkCount: forkCount, lastTurn: latestTurn)
+            subagentCount: subagentCount, forkCount: forkCount, lastTurn: latestTurn, liveTurn: liveTurn)
     }
 
-    private static func parseFile(bytes: Data, size: Int, now: Date, signature: FileSignature) -> FileSummary {
+    private static func parseFile(bytes: Data, size: Int, now: Date, signature: FileSignature,
+                                 routeContext: LocalCodexRouteContext?) -> FileSummary {
         let headLength = min(size, headLimit), tailLength = max(0, bytes.count - headLength)
         let head = bytes.prefix(headLength), tail = tailLength > 0 ? bytes.suffix(tailLength) : Data()
         let tailLimited = size > headLimit + tailLimit
@@ -715,7 +813,7 @@ public enum LocalCodexUsageReader {
         else { identity = nil }
         guard let identity else {
             return FileSummary(identity: nil, lineage: .unknown, isFork: false, sourceKnownTop: false, contribution: nil, rate: nil,
-                quotaDate: nil, turn: nil, latestEventAt: nil, tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false,
+                quotaDate: nil, turn: nil, live: nil, latestEventAt: nil, tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false,
                 contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature)
         }
         func remap(_ event: ParsedEvent) -> ParsedEvent {
@@ -728,9 +826,15 @@ public enum LocalCodexUsageReader {
         let mappedHeadSlots = headSlots.map { $0.map(remap) }
         let mappedTailSlots = tailSlots.map { $0.map(remap) }
         decoded = (wholeFileRead ? mappedHeadSlots : mappedHeadSlots + mappedTailSlots).compactMap { $0 }
-        guard let firstMetaLine = firstPhysicalLine else { return FileSummary(identity: nil, lineage: .unknown, isFork: false, sourceKnownTop: false, contribution: nil, rate: nil, quotaDate: nil, turn: nil, latestEventAt: nil, tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false, contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature) }
+        guard let firstMetaLine = firstPhysicalLine else { return FileSummary(identity: nil, lineage: .unknown, isFork: false, sourceKnownTop: false, contribution: nil, rate: nil, quotaDate: nil, turn: nil, live: nil, latestEventAt: nil, tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false, contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature) }
         let metadata = (try? JSONSerialization.jsonObject(with: Data(firstMetaLine))) as? [String: Any]
         let payload = metadata?["payload"] as? [String: Any] ?? [:]
+        if let routeContext, !routeContext.accepts(payload["model_provider"] as? String) {
+            return FileSummary(identity: nil, lineage: .unknown, isFork: false, sourceKnownTop: false,
+                contribution: nil, rate: nil, quotaDate: nil, turn: nil, live: nil, latestEventAt: nil,
+                tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false,
+                contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature)
+        }
         let (source, sourceSubagentKind) = sessionSource(payload["source"])
         let threadSource = payload["thread_source"] as? String
         let sourceIsRootString = payload["source"] as? String == source && isTopRootSource(source)
@@ -774,9 +878,10 @@ public enum LocalCodexUsageReader {
         let rate = resolvedQuota.record
         let turnSegments = observedLineSegments.flatMap { parsedSegments($0) }
         let turn = turnSegments.compactMap { completedTurns(in: $0, now: now) }.max(by: { $0.completedAt < $1.completedAt })
+        let live = liveTurn(in: decoded, now: now)
         let latestUsageDate = validCounters.last?.date
         return FileSummary(identity: identity, lineage: lineage, isFork: isFork, sourceKnownTop: sourceKnownTop,
-            contribution: contribution, rate: rate, quotaDate: resolvedQuota.date, turn: turn, latestEventAt: latestUsageDate,
+            contribution: contribution, rate: rate, quotaDate: resolvedQuota.date, turn: turn, live: live, latestEventAt: latestUsageDate,
             tailLimited: tailLimited, headComplete: headComplete,
             hasFutureTurn: decoded.contains(where: { $0.type == "task_complete" && $0.date > now }),
             contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature)
@@ -856,6 +961,43 @@ public enum LocalCodexUsageReader {
         }
         if !current.isEmpty { segments.append(current) }
         return segments
+    }
+
+    /// Derive a short-lived output/input rate only from a still-open task and
+    /// two monotonic cumulative counters. A missing or stale tail is unknown.
+    private static func liveTurn(in events: [ParsedEvent], now: Date) -> LocalLiveTurnSummary? {
+        let freshnessLimit: TimeInterval = 15
+        var activeStart: Int?
+        var activeID: String?
+        for index in events.indices {
+            let event = events[index]
+            switch event.type {
+            case "task_started":
+                if let id = event.turnID, !id.isEmpty { activeStart = index; activeID = id }
+            case "task_complete", "turn_aborted":
+                if let id = event.turnID, id == activeID { activeStart = nil; activeID = nil }
+                else if event.turnID == nil, event.type == "turn_aborted" { activeStart = nil; activeID = nil }
+            default: break
+            }
+        }
+        guard let start = activeStart, activeID != nil, start + 1 < events.count else { return nil }
+        let counterEvents = events[(start + 1)...].filter {
+            $0.type == "token_count" && $0.hasCumulativePayload && $0.date <= now
+        }
+        guard counterEvents.allSatisfy({ $0.usage != nil && !$0.invalidLifecycleTimestamp }) else { return nil }
+        let counters = counterEvents
+        guard let latest = counters.last, let previous = counters.dropLast().last,
+              let latestUsage = latest.usage, let previousUsage = previous.usage,
+              latest.date >= previous.date,
+              now.timeIntervalSince(latest.date) <= freshnessLimit else { return nil }
+        let elapsed = latest.date.timeIntervalSince(previous.date)
+        guard elapsed > 0,
+              latestUsage.input >= previousUsage.input,
+              latestUsage.output >= previousUsage.output,
+              latestUsage.total >= previousUsage.total else { return nil }
+        return LocalLiveTurnSummary(inputTPS: Double(latestUsage.input - previousUsage.input) / elapsed,
+            outputTPS: Double(latestUsage.output - previousUsage.output) / elapsed,
+            observedAt: latest.date)
     }
 
     private static func quotaUpdate(_ value: Any?, at date: Date) -> QuotaUpdate {
@@ -2543,6 +2685,30 @@ public enum TokenHubConnectionDiscovery {
         return try readAIManagerBaseURL(at: url)
     }
 
+    /// Reads only the credential-free connection origins used to prove that
+    /// the active Codex provider is managed by this Token Hub installation.
+    /// The SSO session row is never touched by this discovery call.
+    public static func readDefaultConnectionBaseURLs(home: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> [URL] {
+        let url = defaultDatabaseURL(home: home)
+        let expected = home.appendingPathComponent(".seasun-token-hub", isDirectory: true).appendingPathComponent("tokenhub.db")
+        guard url.standardizedFileURL == expected.standardizedFileURL,
+              url.resolvingSymlinksInPath() == url.standardizedFileURL else {
+            throw TokenHubDirectQuotaFailure.databaseUnsafe
+        }
+        let db = try openDatabase(at: url)
+        defer { sqlite3_close(db) }
+        guard let connection = try readSetting(db: db, key: "client.connection") else {
+            throw TokenHubDirectQuotaFailure.connectionMalformed
+        }
+        let fields = ["aiManagerBaseUrl", "aitsBaseUrl"]
+        let urls = fields.compactMap { key -> URL? in
+            guard let raw = connection[key] as? String, let value = URL(string: raw) else { return nil }
+            return value
+        }
+        guard urls.count == fields.count else { throw TokenHubDirectQuotaFailure.connectionMalformed }
+        return urls
+    }
+
     fileprivate static func readDefaultStoredSettings(home: URL, now: Date = Date()) throws -> TokenHubStoredSettings {
         let url = defaultDatabaseURL(home: home)
         let expected = home.appendingPathComponent(".seasun-token-hub", isDirectory: true).appendingPathComponent("tokenhub.db")
@@ -3141,12 +3307,19 @@ struct BackgroundServiceResources: Equatable, Encodable {
             }
             return "企业后台直接来源尚未连接；本地 Codex 历史记录与 Token Hub 额度分别展示。"
         }
-        if config.dataSource == "localCodex" { return "本地 Codex 当前扫描范围记录小计 · 不代表账单或实时用量；账号与组织归属未核验" }
+        if config.dataSource == "localCodex" { return "仅统计已证明经 Seasun Token Hub 路由的本地 Codex；当前扫描范围记录小计，实时速度为活动事件短窗口估算" }
         return hasRequestData ? "本次启动 · 仅统计经过本机代理的请求" : "未采集到请求数据 · 尚未观测到客户端流量"
     }
     var title: String {
         if config.dataSource == "localCodex" {
-            let rate = localSnapshot.lastTurn.map { String(format: "%.1ftok/s", $0.outputTPS) } ?? "—"
+            let rate: String
+            if let live = localSnapshot.liveTurn {
+                rate = String(format: "实时≈%.1ftok/s", live.outputTPS)
+            } else if let turn = localSnapshot.lastTurn {
+                rate = String(format: "%.1ftok/s", turn.outputTPS)
+            } else {
+                rate = "上轮均:—"
+            }
             let uncertainty = localSnapshot.unknownThreadCount + localSnapshot.unidentifiedFileCount
             let total = localSnapshot.hasCompleteAccounting ? "Σ\(formatCompactCount(localSnapshot.total))"
                 : localSnapshot.knownThreadCount > 0 ? "小计\(formatCompactCount(localSnapshot.total)) · 未核验\(uncertainty)" : "Σ— · 未核验\(uncertainty)"
@@ -3163,6 +3336,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         if isPreview && config.dataSource != "localCodex" {
             return "\(dataNotice) · \(sourceReadinessText)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .enterprise))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .enterprise))"
         }
+        let live = localSnapshot.liveTurn.map { String(format: "实时估算：输入 %.1f · 输出 %.1f tok/s（观测于 %@）", $0.inputTPS, $0.outputTPS, $0.observedAt.formatted()) } ?? "实时估算：未知（无新鲜活动 token_count）"
         let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
         let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
         let coverage = "扫描范围最多32个物理文件；不是全部对话；每文件头64KiB与尾256KiB，总计10MiB；" + (localSnapshot.isLimited ? "本次达到扫描上限" : "本次安全检查 \(localSnapshot.filesScanned) 个物理文件")
@@ -3171,7 +3345,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "已核验记录小计"
         let total = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.total) : "未知"
         let hub = tokenHubTooltipDetail
-        return "\(userFacingStatus)\n本地 Codex 当前扫描范围记录：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+        return "\(userFacingStatus)\n本地 Seasun 路由 Codex 当前扫描范围记录：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
     }
     private var tokenHubMenuSuffix: String {
         guard let snapshot = freshTokenHubQuota(at: Date()) else { return "" }
@@ -3364,9 +3538,11 @@ struct BackgroundServiceResources: Equatable, Encodable {
                 }
                 self.localScanRunning = true
                 let directory = LocalCodexUsageReader.defaultSessionsDirectory()
+                let routeContext = self.seasunRouteContext()
                 let cache = self.localCache
                 self.localScanQueue.async {
-                    let result = try? LocalCodexUsageReader.scan(directory: directory, now: Date(), cache: cache)
+                    let result = try? LocalCodexUsageReader.scan(directory: directory, now: Date(), cache: cache,
+                        routeContext: routeContext)
                     Task { @MainActor in
                         self.localScanRunning = false
                         guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
@@ -3389,6 +3565,20 @@ struct BackgroundServiceResources: Equatable, Encodable {
         }
         localScan = work
         DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0 : 5), execute: work)
+    }
+
+    /// Proves the active Codex provider is routed through this local Seasun
+    /// Token Hub before any rollout totals are accepted. Failure is represented
+    /// as `.unverified`, which makes the scanner return unknown coverage.
+    private func seasunRouteContext() -> LocalCodexRouteContext {
+        let configURL = LocalCodexUsageReader.defaultConfigURL()
+        guard let active = GatewayDiscovery.activeCodexProvider(at: configURL),
+              let connectionURLs = try? TokenHubConnectionDiscovery.readDefaultConnectionBaseURLs(),
+              let activeOrigin = GatewayDiscovery.originKey(active.origin),
+              connectionURLs.compactMap({ GatewayDiscovery.originKey($0) }).contains(activeOrigin) else {
+            return .unverified
+        }
+        return .verified(provider: active.provider, origin: activeOrigin)
     }
     /// Production refresh first uses Token Hub's own read-only connection and
     /// in-memory SSO exchange. Preview and synthetic tests retain the
@@ -3754,13 +3944,20 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 metric("已识别顶层对话", "\(model.localSnapshot.sessionCount)")
                 metric("已识别子代理 / 分叉", "\(model.localSnapshot.subagentCount) / \(model.localSnapshot.forkCount)")
                 metric("最近用量事件", model.localSnapshot.latestEventAt?.formatted(date: .abbreviated, time: .shortened) ?? "未发现")
+                if let live = model.localSnapshot.liveTurn {
+                    metric("实时估算 · 输入 tok/s", String(format: "%.1f", live.inputTPS))
+                    metric("实时估算 · 输出 tok/s", String(format: "%.1f", live.outputTPS))
+                    metric("实时观测时间", live.observedAt.formatted(date: .abbreviated, time: .shortened))
+                } else {
+                    metric("实时估算 · 输出 tok/s", "未知")
+                }
                 if let turn = model.localSnapshot.lastTurn {
                     metric("上轮记录均速", String(format: "%.1f tok/s", turn.outputTPS))
                     metric("上轮完成时间", turn.completedAt.formatted(date: .abbreviated, time: .shortened))
                 } else {
                     metric("上轮记录均速", "未知")
                 }
-                Text("仅汇总本次扫描中可核算的记录，未核验项不计入小计。顶层对话数不包含子代理和分叉；这里不是完整历史或企业账单。上轮均速含工具、网络和等待，不是模型瞬时生成速度。\(model.localSnapshot.isLimited ? "已达到扫描范围限制。" : "")")
+                Text("仅汇总已证明经 Seasun Token Hub 路由且本次扫描可核算的记录，未核验项不计入小计。实时值来自活动 token_count 的短窗口估算，事件停止推进时会变为未知；上轮均速含工具、网络和等待。\(model.localSnapshot.isLimited ? "已达到扫描范围限制。" : "")")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
         } label: { Label("本地记录用量", systemImage: "doc.text.magnifyingglass") }
@@ -3980,7 +4177,8 @@ import SwiftUI
             directQuotaStatus: model.tokenHubQuotaStatusText,
             resetTimePresent: resetTimePresent,
             monthlyUsagePresent: snapshot?.monthly != nil || model.quota?.used != nil,
-            liveTokenSpeedPresent: model.stats.active > 0,
+            liveTokenSpeedPresent: model.config.dataSource == "localCodex"
+                ? model.localSnapshot.liveTurn != nil : model.stats.active > 0,
             sourceStatus: model.sourceStatus,
             backgroundServiceResources: model.backgroundServiceResources)
         if let data = try? JSONEncoder().encode(report) {
@@ -4788,6 +4986,10 @@ extension CoreChecks {
         check(found.count == 2 && found.first?.isActive == true, "discover active provider first")
         check(found.first?.endpoint == "https://gateway.example/airoute/responses", "preserve enterprise base path without inventing v1")
         check(found.first?.model == "example-model" && found.last?.model == "", "model belongs to selected provider only")
+        check(GatewayDiscovery.originKey(found.first!.endpoint) == "https://gateway.example:443",
+            "route verification reduces a provider endpoint to its credential-free origin")
+        check(GatewayDiscovery.originKey("https://user:password@gateway.example/v1") == nil,
+            "route origin matching rejects embedded credentials")
         var config = AppConfiguration(); config.endpoint = found[0].endpoint
         let mappedResponses = try config.upstreamURL(for: "/v1/responses")
         check(mappedResponses.absoluteString == "https://gateway.example/airoute/responses", "Responses proxy preserves non-v1 upstream")
@@ -4906,6 +5108,61 @@ extension CoreChecks {
     static func localCodexUsageChecks() throws {
         let now = Date(timeIntervalSince1970: 1_797_000_000)
 
+        // Seasun production mode must fail closed when the active Codex route
+        // cannot be tied to Token Hub.  The legacy no-context scan below is
+        // intentionally retained for source-independent fixtures.
+        let routeRoot = try fixtureDirectory("seasun-route-filter")
+        let routeMatchingID = "31313131-3131-4131-8131-313131313131"
+        let routeOtherID = "32323232-3232-4232-8232-323232323232"
+        try writeSession(in: routeRoot, uuid: routeMatchingID,
+            events: [tokenEvent(at: now, input: 10, output: 5)], modified: now,
+            metadataFields: ["model_provider": "seasun"])
+        try writeSession(in: routeRoot, uuid: routeOtherID,
+            events: [tokenEvent(at: now, input: 100, output: 50)], modified: now,
+            metadataFields: ["model_provider": "other"])
+        let verifiedRoute = LocalCodexRouteContext.verified(provider: "seasun", origin: "https://gateway.example")
+        let routeFiltered = try LocalCodexUsageReader.scan(directory: routeRoot, now: now,
+            cache: nil, routeContext: verifiedRoute)
+        check(routeFiltered.input == 10 && routeFiltered.output == 5
+            && routeFiltered.knownThreadCount == 1 && routeFiltered.unidentifiedFileCount == 1,
+            "verified Seasun route includes only the matching Codex provider")
+        let unverifiedRoute = try LocalCodexUsageReader.scan(directory: routeRoot, now: now,
+            cache: nil, routeContext: .unverified)
+        check(unverifiedRoute.total == 0 && unverifiedRoute.knownThreadCount == 0
+            && !unverifiedRoute.hasCompleteAccounting,
+            "unproven Seasun route never mixes local Codex totals")
+        try? FileManager.default.removeItem(at: routeRoot.deletingLastPathComponent())
+
+        let liveRoot = try fixtureDirectory("live-output-speed")
+        try writeSession(in: liveRoot, uuid: "33333333-3333-4333-8333-333333333333", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-5), output: 10),
+            turnBoundary(at: now.addingTimeInterval(-4), type: "task_started", id: "live"),
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 30),
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 50)
+        ], modified: now)
+        let liveCache = LocalCodexUsageReader.Cache()
+        let live = try LocalCodexUsageReader.scan(directory: liveRoot, now: now, cache: liveCache)
+        check(live.liveTurn?.outputTPS == 20 && live.liveTurn?.inputTPS == 0,
+            "active cumulative token_count events produce a live output TPS estimate")
+        let staleLive = try LocalCodexUsageReader.scan(directory: liveRoot,
+            now: now.addingTimeInterval(20), cache: liveCache)
+        check(staleLive.liveTurn == nil,
+            "live output TPS expires when the latest token_count event is stale")
+        try? FileManager.default.removeItem(at: liveRoot.deletingLastPathComponent())
+
+        let malformedLiveRoot = try fixtureDirectory("live-output-malformed")
+        try writeSession(in: malformedLiveRoot, uuid: "34343434-3434-4434-8434-343434343434", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-3), output: 10),
+            turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "malformed-live"),
+            turnTokenEvent(at: now.addingTimeInterval(-1.5), output: 20),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 25),
+            rawTokenEvent(at: now, inputLiteral: "null", outputLiteral: "30")
+        ], modified: now)
+        let malformedLive = try LocalCodexUsageReader.scan(directory: malformedLiveRoot, now: now)
+        check(malformedLive.liveTurn == nil,
+            "malformed cumulative usage in an active turn keeps live speed unknown")
+        try? FileManager.default.removeItem(at: malformedLiveRoot.deletingLastPathComponent())
+
         var refresh = LocalRefreshScheduler()
         let firstGeneration = refresh.begin(now: now)
         check(firstGeneration != nil && refresh.begin(now: now.addingTimeInterval(1)) == nil,
@@ -4958,7 +5215,7 @@ extension CoreChecks {
             "repeated local Codex scans replace the snapshot instead of accumulating it")
         let reflectedFields = Set(Mirror(reflecting: aggregate).children.compactMap(\.label))
         check(reflectedFields == Set(["input", "output", "total", "sessionCount", "filesScanned",
-            "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn", "knownThreadCount",
+            "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn", "liveTurn", "knownThreadCount",
             "unknownThreadCount", "unidentifiedFileCount", "subagentCount", "forkCount"]),
             "local Codex snapshot reflection exposes only the bounded metadata fields")
 

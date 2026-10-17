@@ -201,12 +201,19 @@ struct BackgroundServiceResources: Equatable, Encodable {
             }
             return "企业后台直接来源尚未连接；本地 Codex 历史记录与 Token Hub 额度分别展示。"
         }
-        if config.dataSource == "localCodex" { return "本地 Codex 当前扫描范围记录小计 · 不代表账单或实时用量；账号与组织归属未核验" }
+        if config.dataSource == "localCodex" { return "仅统计已证明经 Seasun Token Hub 路由的本地 Codex；当前扫描范围记录小计，实时速度为活动事件短窗口估算" }
         return hasRequestData ? "本次启动 · 仅统计经过本机代理的请求" : "未采集到请求数据 · 尚未观测到客户端流量"
     }
     var title: String {
         if config.dataSource == "localCodex" {
-            let rate = localSnapshot.lastTurn.map { String(format: "%.1ftok/s", $0.outputTPS) } ?? "—"
+            let rate: String
+            if let live = localSnapshot.liveTurn {
+                rate = String(format: "实时≈%.1ftok/s", live.outputTPS)
+            } else if let turn = localSnapshot.lastTurn {
+                rate = String(format: "%.1ftok/s", turn.outputTPS)
+            } else {
+                rate = "上轮均:—"
+            }
             let uncertainty = localSnapshot.unknownThreadCount + localSnapshot.unidentifiedFileCount
             let total = localSnapshot.hasCompleteAccounting ? "Σ\(formatCompactCount(localSnapshot.total))"
                 : localSnapshot.knownThreadCount > 0 ? "小计\(formatCompactCount(localSnapshot.total)) · 未核验\(uncertainty)" : "Σ— · 未核验\(uncertainty)"
@@ -223,6 +230,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         if isPreview && config.dataSource != "localCodex" {
             return "\(dataNotice) · \(sourceReadinessText)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .enterprise))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .enterprise))"
         }
+        let live = localSnapshot.liveTurn.map { String(format: "实时估算：输入 %.1f · 输出 %.1f tok/s（观测于 %@）", $0.inputTPS, $0.outputTPS, $0.observedAt.formatted()) } ?? "实时估算：未知（无新鲜活动 token_count）"
         let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
         let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
         let coverage = "扫描范围最多32个物理文件；不是全部对话；每文件头64KiB与尾256KiB，总计10MiB；" + (localSnapshot.isLimited ? "本次达到扫描上限" : "本次安全检查 \(localSnapshot.filesScanned) 个物理文件")
@@ -231,7 +239,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "已核验记录小计"
         let total = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.total) : "未知"
         let hub = tokenHubTooltipDetail
-        return "\(userFacingStatus)\n本地 Codex 当前扫描范围记录：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+        return "\(userFacingStatus)\n本地 Seasun 路由 Codex 当前扫描范围记录：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
     }
     private var tokenHubMenuSuffix: String {
         guard let snapshot = freshTokenHubQuota(at: Date()) else { return "" }
@@ -424,9 +432,11 @@ struct BackgroundServiceResources: Equatable, Encodable {
                 }
                 self.localScanRunning = true
                 let directory = LocalCodexUsageReader.defaultSessionsDirectory()
+                let routeContext = self.seasunRouteContext()
                 let cache = self.localCache
                 self.localScanQueue.async {
-                    let result = try? LocalCodexUsageReader.scan(directory: directory, now: Date(), cache: cache)
+                    let result = try? LocalCodexUsageReader.scan(directory: directory, now: Date(), cache: cache,
+                        routeContext: routeContext)
                     Task { @MainActor in
                         self.localScanRunning = false
                         guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
@@ -449,6 +459,20 @@ struct BackgroundServiceResources: Equatable, Encodable {
         }
         localScan = work
         DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0 : 5), execute: work)
+    }
+
+    /// Proves the active Codex provider is routed through this local Seasun
+    /// Token Hub before any rollout totals are accepted. Failure is represented
+    /// as `.unverified`, which makes the scanner return unknown coverage.
+    private func seasunRouteContext() -> LocalCodexRouteContext {
+        let configURL = LocalCodexUsageReader.defaultConfigURL()
+        guard let active = GatewayDiscovery.activeCodexProvider(at: configURL),
+              let connectionURLs = try? TokenHubConnectionDiscovery.readDefaultConnectionBaseURLs(),
+              let activeOrigin = GatewayDiscovery.originKey(active.origin),
+              connectionURLs.compactMap({ GatewayDiscovery.originKey($0) }).contains(activeOrigin) else {
+            return .unverified
+        }
+        return .verified(provider: active.provider, origin: activeOrigin)
     }
     /// Production refresh first uses Token Hub's own read-only connection and
     /// in-memory SSO exchange. Preview and synthetic tests retain the

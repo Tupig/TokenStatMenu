@@ -71,6 +71,30 @@ public enum GatewayDiscovery {
         }.sorted { a, b in a.isActive != b.isActive ? a.isActive : a.provider < b.provider }
     }
 
+    /// Returns the selected Codex provider and the credential-free origin of
+    /// its configured endpoint. Only the origin is used for Seasun route
+    /// verification; paths, query strings, and credentials are discarded.
+    public static func activeCodexProvider(at url: URL) -> (provider: String, origin: String)? {
+        guard let active = readCodexConfig(at: url, source: "local").first(where: \.isActive),
+              let origin = originKey(active.endpoint) else { return nil }
+        return (active.provider, origin)
+    }
+
+    public static func originKey(_ raw: String) -> String? {
+        guard let url = URL(string: raw) else { return nil }
+        return originKey(url)
+    }
+
+    public static func originKey(_ url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = url.host?.lowercased(), !host.isEmpty,
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              !host.contains(":") else { return nil }
+        let port = url.port ?? (scheme == "https" ? 443 : 80)
+        guard (1...65_535).contains(port) else { return nil }
+        return "\(scheme)://\(host):\(port)"
+    }
+
     public static func environmentCandidates(_ environment: [String: String]) -> [GatewayCandidate] {
         var result: [GatewayCandidate] = []
         if let base = environment["OPENAI_BASE_URL"], let c = candidate(baseURL: base,

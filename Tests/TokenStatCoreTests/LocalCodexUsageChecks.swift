@@ -6,6 +6,61 @@ extension CoreChecks {
     static func localCodexUsageChecks() throws {
         let now = Date(timeIntervalSince1970: 1_797_000_000)
 
+        // Seasun production mode must fail closed when the active Codex route
+        // cannot be tied to Token Hub.  The legacy no-context scan below is
+        // intentionally retained for source-independent fixtures.
+        let routeRoot = try fixtureDirectory("seasun-route-filter")
+        let routeMatchingID = "31313131-3131-4131-8131-313131313131"
+        let routeOtherID = "32323232-3232-4232-8232-323232323232"
+        try writeSession(in: routeRoot, uuid: routeMatchingID,
+            events: [tokenEvent(at: now, input: 10, output: 5)], modified: now,
+            metadataFields: ["model_provider": "seasun"])
+        try writeSession(in: routeRoot, uuid: routeOtherID,
+            events: [tokenEvent(at: now, input: 100, output: 50)], modified: now,
+            metadataFields: ["model_provider": "other"])
+        let verifiedRoute = LocalCodexRouteContext.verified(provider: "seasun", origin: "https://gateway.example")
+        let routeFiltered = try LocalCodexUsageReader.scan(directory: routeRoot, now: now,
+            cache: nil, routeContext: verifiedRoute)
+        check(routeFiltered.input == 10 && routeFiltered.output == 5
+            && routeFiltered.knownThreadCount == 1 && routeFiltered.unidentifiedFileCount == 1,
+            "verified Seasun route includes only the matching Codex provider")
+        let unverifiedRoute = try LocalCodexUsageReader.scan(directory: routeRoot, now: now,
+            cache: nil, routeContext: .unverified)
+        check(unverifiedRoute.total == 0 && unverifiedRoute.knownThreadCount == 0
+            && !unverifiedRoute.hasCompleteAccounting,
+            "unproven Seasun route never mixes local Codex totals")
+        try? FileManager.default.removeItem(at: routeRoot.deletingLastPathComponent())
+
+        let liveRoot = try fixtureDirectory("live-output-speed")
+        try writeSession(in: liveRoot, uuid: "33333333-3333-4333-8333-333333333333", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-5), output: 10),
+            turnBoundary(at: now.addingTimeInterval(-4), type: "task_started", id: "live"),
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 30),
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 50)
+        ], modified: now)
+        let liveCache = LocalCodexUsageReader.Cache()
+        let live = try LocalCodexUsageReader.scan(directory: liveRoot, now: now, cache: liveCache)
+        check(live.liveTurn?.outputTPS == 20 && live.liveTurn?.inputTPS == 0,
+            "active cumulative token_count events produce a live output TPS estimate")
+        let staleLive = try LocalCodexUsageReader.scan(directory: liveRoot,
+            now: now.addingTimeInterval(20), cache: liveCache)
+        check(staleLive.liveTurn == nil,
+            "live output TPS expires when the latest token_count event is stale")
+        try? FileManager.default.removeItem(at: liveRoot.deletingLastPathComponent())
+
+        let malformedLiveRoot = try fixtureDirectory("live-output-malformed")
+        try writeSession(in: malformedLiveRoot, uuid: "34343434-3434-4434-8434-343434343434", events: [
+            turnTokenEvent(at: now.addingTimeInterval(-3), output: 10),
+            turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "malformed-live"),
+            turnTokenEvent(at: now.addingTimeInterval(-1.5), output: 20),
+            turnTokenEvent(at: now.addingTimeInterval(-0.5), output: 25),
+            rawTokenEvent(at: now, inputLiteral: "null", outputLiteral: "30")
+        ], modified: now)
+        let malformedLive = try LocalCodexUsageReader.scan(directory: malformedLiveRoot, now: now)
+        check(malformedLive.liveTurn == nil,
+            "malformed cumulative usage in an active turn keeps live speed unknown")
+        try? FileManager.default.removeItem(at: malformedLiveRoot.deletingLastPathComponent())
+
         var refresh = LocalRefreshScheduler()
         let firstGeneration = refresh.begin(now: now)
         check(firstGeneration != nil && refresh.begin(now: now.addingTimeInterval(1)) == nil,
@@ -58,7 +113,7 @@ extension CoreChecks {
             "repeated local Codex scans replace the snapshot instead of accumulating it")
         let reflectedFields = Set(Mirror(reflecting: aggregate).children.compactMap(\.label))
         check(reflectedFields == Set(["input", "output", "total", "sessionCount", "filesScanned",
-            "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn", "knownThreadCount",
+            "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn", "liveTurn", "knownThreadCount",
             "unknownThreadCount", "unidentifiedFileCount", "subagentCount", "forkCount"]),
             "local Codex snapshot reflection exposes only the bounded metadata fields")
 
