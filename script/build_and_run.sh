@@ -5,7 +5,6 @@ cd "$ROOT"
 MODE="${1:-run}"
 APP="$ROOT/dist/TokenStatMenu.app"
 case "$MODE" in run|--build-only|--verify|--release|--universal|--logs|--telemetry|--debug) ;; *) echo "Usage: $0 [--build-only|--verify|--release|--universal|--logs|--telemetry|--debug]"; exit 2 ;; esac
-pkill -x TokenStatMenu 2>/dev/null || true
 mkdir -p "$APP/Contents/MacOS"
 # Native SwiftPM also works with Command Line Tools; no global xcode-select changes.
 if [ "$MODE" = "--universal" ]; then

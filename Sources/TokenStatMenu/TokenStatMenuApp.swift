@@ -5,7 +5,7 @@ import AppKit
     private var status: StatusBarController?
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        let model = AppModel(); self.model = model
+        let model = AppModel(startup: .production); self.model = model
         status = StatusBarController(model: model)
         if CommandLine.arguments.contains("--request-accessibility") {
             model.requestTokenHubAccessibilityAccess()

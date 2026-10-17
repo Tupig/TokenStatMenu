@@ -2,26 +2,16 @@
 
 ## 项目整体架构
 
-```mermaid
-flowchart LR
-    Local[本机 Codex 有界会话记录] --> Reader[LocalCodexUsageReader 数字快照]
-    Reader --> Menu
-    Reader --> Panel
-    Hub[已登录的 Token Hub 额度界面] -->|一次辅助功能授权| AX[有界只读 AX 扫描 + 双读一致性]
-    AX --> Panel
-    AX --> Menu
-    Client[Codex / SDK / 其他客户端] -->|HTTP + 本机令牌| Proxy[127.0.0.1 本机代理]
-    Proxy -->|企业 Key / HTTPS| API[企业网关 / OpenAI 兼容 API / Ollama]
-    API -->|SSE / NDJSON / JSON 原样转发| Proxy
-    Proxy --> Parser[StreamParser + UsageDecoder]
-    Parser --> Engine[MetricsEngine + 5 秒滑动窗口]
-    Engine --> Menu[NSStatusItem 顶部实时标题]
-    Engine --> Panel[SwiftUI 弹出面板 + 10 分钟曲线]
-    Quota[企业用量接口 + 独立 Key] --> Panel
-    Quota --> Menu
+```text
+AppKit NSStatusItem + NSPopover
+  └─ AppModel：固定专用入口、可选偏好、来源状态与刷新
+      ├─ 本地 Codex 有界记录扫描 → 小计、分类、上轮均速
+      ├─ Token Hub 兼容界面扫描 → 独立金额/窗口快照
+      └─ Seasun 直接统计源 → 尚未建立，保持未知
+SwiftUI：概览、来源说明、可选偏好
 ```
 
-本机记录模式与代理模式分别显示数据，不混合累计。本机模式默认尝试自动读取已登录 Token Hub 的额度界面；完成一次 macOS 辅助功能授权后，无需填写接口、密钥或字段。它读取的是界面快照，后台更新时间未提供，账号和组织归属也未经核验；这不是企业计费接口的实时查询。本机记录不提供逐 Token 的实时流，仍只能显示有证据的上轮均速。代理模式用于观测实际流式请求，因为应用无法凭空读取其他进程的 TLS 流；它不修改系统代理，也不自动修改 Codex 或企业客户端配置。代理统计只覆盖启动后经过它的请求。
+菜单标题由主线程低频刷新，仅在内容或颜色变化时更新。后台扫描串行、有界、可取消，退出或来源身份变化使旧结果失效。正式运行不启动本机代理，不调用任意企业 URL，不解析保存的 API 密钥。历史协议实现保留在核心库中供回归测试，不属于正式 App 的接入功能。
 
 
 ## 分文件完整源码
@@ -2417,10 +2407,10 @@ private func status(for failure: TokenHubQuotaFailure) -> TokenHubQuotaStatus {
 ```swift
 import AppKit
 import Combine
+import CoreFoundation
 #if SWIFT_PACKAGE
 @preconcurrency import TokenStatCore
 #endif
-import UniformTypeIdentifiers
 
 struct SpeedPoint: Identifiable {
     let id = UUID()
@@ -2428,38 +2418,101 @@ struct SpeedPoint: Identifiable {
     let value: Double
 }
 
+struct SeasunPreferences: Equatable {
+    var refreshSeconds: TimeInterval = 60
+    var tokenHubCompatibilityReadEnabled = true
+
+    var normalized: SeasunPreferences {
+        SeasunPreferences(refreshSeconds: refreshSeconds.isFinite && (15...3600).contains(refreshSeconds) ? refreshSeconds : 60,
+                          tokenHubCompatibilityReadEnabled: tokenHubCompatibilityReadEnabled)
+    }
+
+    init(refreshSeconds: TimeInterval = 60, tokenHubCompatibilityReadEnabled: Bool = true) {
+        self.refreshSeconds = refreshSeconds
+        self.tokenHubCompatibilityReadEnabled = tokenHubCompatibilityReadEnabled
+    }
+
+    static func decode(_ data: Data?) -> SeasunPreferences {
+        guard let data,
+              let root = try? PropertyListSerialization.propertyList(from: data, format: nil),
+              let values = root as? [String: Any] else { return SeasunPreferences() }
+
+        let refresh: TimeInterval
+        if let number = values["refreshSeconds"] as? NSNumber,
+           CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite,
+           (15...3600).contains(number.doubleValue) {
+            refresh = number.doubleValue
+        } else { refresh = 60 }
+
+        let compatibility: Bool
+        if let current = values["tokenHubCompatibilityReadEnabled"] {
+            compatibility = Self.boolean(current) ?? true
+        } else {
+            compatibility = Self.boolean(values["tokenHubAutomaticReadingEnabled"]) ?? true
+        }
+        return SeasunPreferences(refreshSeconds: refresh,
+                                 tokenHubCompatibilityReadEnabled: compatibility)
+    }
+
+    private static func boolean(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+        return number.boolValue
+    }
+}
+
+struct AppModelStartupDependencies {
+    let loadPreferences: @MainActor () throws -> Data?
+    let savePreferences: @MainActor (SeasunPreferences) throws -> Void
+    let shouldStartBackgroundServices: @MainActor () -> Bool
+
+    static var production: AppModelStartupDependencies {
+        AppModelStartupDependencies(
+            loadPreferences: { try ConfigStore.loadPreferences(at: AppPaths.configURL) },
+            savePreferences: { try ConfigStore.savePreferences($0) },
+            shouldStartBackgroundServices: { !CommandLine.arguments.contains("--disable-background-services") })
+    }
+}
+
+struct BackgroundServiceResources: Equatable, Encodable {
+    let timerCount: Int
+    let workspaceObserverCount: Int
+    let localScanQueuedCount: Int
+    let axRefreshScheduledCount: Int
+    let axScanInFlightCount: Int
+}
+
 @MainActor final class AppModel: ObservableObject {
     // Explicit launch-only flag: fixtures never masquerade as enterprise measurements.
     let isTestFixture = CommandLine.arguments.contains("--test-fixture")
     private let isPreview: Bool
+    private let startup: AppModelStartupDependencies
+    private(set) var backgroundServicesStarted = false
+    private(set) var permissionPromptRequested = false
+    @Published private(set) var preferences = SeasunPreferences()
     @Published var config = AppConfiguration()
     @Published var stats = MetricsSnapshot()
     @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
     @Published var quota: QuotaSnapshot?
     @Published var fiveHourQuota: WindowQuota?
     @Published var sevenDayQuota: WindowQuota?
-    @Published var quotaError = "未配置企业用量接口"
-    @Published var proxyStatus = "启动中"
+    @Published var quotaError = "Token Hub 界面快照数据未知"
+    @Published var sourceReadinessText = "企业后台直接来源未接通"
     @Published var message = ""
     @Published var history: [SpeedPoint] = []
     @Published var quotaLoading = false
     @Published private(set) var tokenHubQuotaSnapshot: TokenHubQuotaSnapshot?
     @Published private(set) var tokenHubQuotaStatus: TokenHubQuotaStatus = .targetNotRunning
     @Published private(set) var tokenHubQuotaFailure: TokenHubQuotaFailure?
-    @Published var tokenHubAutomaticReadingEnabled = true
+    var tokenHubAutomaticReadingEnabled: Bool {
+        get { preferences.tokenHubCompatibilityReadEnabled }
+        set { preferences.tokenHubCompatibilityReadEnabled = newValue }
+    }
     var tokenHubScanner: TokenHubQuotaScanning = TokenHubAXReader()
     var tokenHubPermissionProvider: TokenHubPermissionProviding = TokenHubNativePermissionProvider()
     var tokenHubNow: () -> Date = Date.init
     @Published var panelVisible = false
-    @Published var gateways: [GatewayCandidate] = []
-    @Published var discoveryStatus = "正在读取本机网关配置…"
-    @Published var discovering = false
     let engine = MetricsEngine()
-    private lazy var proxy = ProxyServer(engine: engine)
-    private let logger = StatLogger()
     private var timer: Timer?
-    private var quotaLoop: Task<Void, Never>?
-    private var quotaFetch: Task<Void, Never>?
     private var localScan: DispatchWorkItem?
     private var localScanRunning = false
     private let tokenHubQueue = DispatchQueue(label: "TokenStatMenu.tokenHubAX", qos: .utility)
@@ -2471,81 +2524,58 @@ struct SpeedPoint: Identifiable {
     private let localScanQueue = DispatchQueue(label: "TokenStatMenu.localCodexScan", qos: .utility)
     private var localCache = LocalCodexUsageReader.Cache()
     private var localRefreshScheduler = LocalRefreshScheduler()
-    private var proxyWasStarted = false
     private var isShuttingDown = false
     private var generation = 0
     private var tokenHubGeneration: UInt64 = 0
-    private var lastHistory = Date.distantPast
-    private(set) var localKey = ""
-    private var apiKey = ""
-    private var usageKey = ""
     var onTick: (() -> Void)?
 
-    init(preview: Bool = false) {
-        isPreview = preview
-        // Offline view rendering must never touch local configuration or credentials.
-        if preview { proxyStatus = "模拟预览 · 无网络、无本机配置"; discoveryStatus = "离线预览"; return }
-        logger.onError = { [weak self] error in Task { @MainActor in self?.message = error } }
-        do {
-            config = try ConfigStore.load()
-            if config.dataSource == "proxy" {
-                localKey = try KeychainStore.localToken()
-                apiKey = try KeychainStore.resolve("upstream", environment: "TOKENSTAT_API_KEY", validatedURL: config.endpoint)
-                usageKey = config.usageURL.isEmpty ? "" : try KeychainStore.resolve("usage", environment: "TOKENSTAT_USAGE_KEY", validatedURL: config.usageURL)
-            }
-            startServices()
-        } catch { message = error.localizedDescription; proxyStatus = "未启动：检查设置" }
-        installTokenHubWorkspaceObservers()
-        // A single 2Hz main timer updates menu text. Network callbacks never redraw the UI.
-        timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
-        timer?.tolerance = 0.1
-        RunLoop.main.add(timer!, forMode: .common)
-        if config.dataSource == "proxy" { discoverGateways() }
+    var isSeasunOnly: Bool { true }
+    var userFacingStatus: String {
+        "Seasun Token Hub 企业后台直接来源：尚未连接；额度、重置时间、月度用量和实时速度均未知。"
     }
-    /// One bounded scan at startup or on explicit refresh. Never polls the filesystem.
-    func discoverGateways() {
-        guard !discovering else { return }
-        if CommandLine.arguments.contains("--disable-discovery") { discoveryStatus = "本次启动已停用自动发现"; return }
-        discovering = true
-        let process = ProcessInfo.processInfo.environment
-        let allowed = ["OPENAI_BASE_URL", "OPENAI_MODEL", "OLLAMA_HOST"]
-        let environment = Dictionary(uniqueKeysWithValues: allowed.compactMap { name in process[name].map { (name, $0) } })
-        let home = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
-        let override = process["CODEX_HOME"].flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0) : nil }
-        let directory = override ?? home
-        let source = override == nil ? "~/.codex/config.toml" : "$CODEX_HOME/config.toml"
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let results = GatewayDiscovery.readCodexConfig(at: directory.appendingPathComponent("config.toml"), source: source)
-                + GatewayDiscovery.environmentCandidates(environment)
-            Task { @MainActor in
-                guard let self else { return }
-                self.gateways = results; self.discovering = false
-                self.discoveryStatus = results.isEmpty ? "未发现可用网关，可手动填写" : "已发现 \(results.count) 个配置 · 未读取认证信息"
-            }
+    var sourceStatus: String { "unknown" }
+    var backgroundServiceResources: BackgroundServiceResources {
+        BackgroundServiceResources(timerCount: timer == nil ? 0 : 1,
+            workspaceObserverCount: tokenHubWorkspaceObservers.count,
+            localScanQueuedCount: localScan == nil || localScan!.isCancelled ? 0 : 1,
+            axRefreshScheduledCount: tokenHubRefreshWork == nil || tokenHubRefreshWork!.isCancelled ? 0 : 1,
+            axScanInFlightCount: tokenHubScanInFlight ? 1 : 0)
+    }
+
+    init(preview: Bool = false, startup: AppModelStartupDependencies = .production) {
+        isPreview = preview
+        self.startup = startup
+        if preview {
+            sourceReadinessText = "模拟预览 · 无配置读取、无自动服务"
+            return
+        }
+        do {
+            preferences = SeasunPreferences.decode(try startup.loadPreferences()).normalized
+        } catch {
+            message = "无法读取本地偏好设置；当前使用安全默认值。"
+        }
+        applyPreferencesToPresentationConfig()
+        if startup.shouldStartBackgroundServices() {
+            backgroundServicesStarted = true
+            startBackgroundServices()
         }
     }
     func shutdown() {
-        isShuttingDown = true; generation += 1; _ = localRefreshScheduler.invalidate()
-        timer?.invalidate(); quotaLoop?.cancel(); quotaFetch?.cancel(); localScan?.cancel()
+        isShuttingDown = true; backgroundServicesStarted = false
+        generation += 1; _ = localRefreshScheduler.invalidate()
+        timer?.invalidate(); timer = nil; localScan?.cancel(); localScan = nil
         tokenHubGeneration &+= 1
         tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
         for observer in tokenHubWorkspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
         tokenHubWorkspaceObservers.removeAll()
         tokenHubQuotaSnapshot = nil; tokenHubQuotaStatus = .disabled; tokenHubQuotaFailure = nil
-        if proxyWasStarted { proxy.stop() }
     }
     func tick() {
         stats = engine.snapshot()
         let now = Date()
-        if config.dataSource == "proxy", config.historyEnabled, now.timeIntervalSince(lastHistory) >= 1 {
-            history.append(SpeedPoint(date: now, value: stats.outputTPS))
-            history.removeAll { now.timeIntervalSince($0.date) > 600 }
-            if history.count > 600 { history.removeFirst(history.count - 600) }
-            lastHistory = now
-        }
         if quota?.month != QuotaSnapshot.currentMonth(), quota != nil { quota = nil; quotaError = "已跨月，等待本月用量" }
         if tokenHubQuotaStatus == .connected, freshTokenHubQuota(at: now) == nil { tokenHubQuotaStatus = .stale }
-        pollTokenHubPermissionIfDue()
+        if backgroundServicesStarted { pollTokenHubPermissionIfDue() }
         onTick?()
     }
     var freshQuota: QuotaSnapshot? {
@@ -2554,10 +2584,11 @@ struct SpeedPoint: Identifiable {
     }
     var currencyFactor: Double { config.currency == "CNY" ? config.usdToCNY : 1 }
     var currencySymbol: String { config.currency == "CNY" ? "¥" : "$" }
-    var quotaSource: QuotaSource { config.dataSource == "localCodex" ? .localCodex : .enterprise }
-    var hasRequestData: Bool { config.dataSource == "localCodex" ? localSnapshot.knownThreadCount > 0 : stats.requests > 0 }
+    var quotaSource: QuotaSource { isPreview && config.dataSource != "localCodex" ? .enterprise : .localCodex }
+    var hasRequestData: Bool { quotaSource == .localCodex ? localSnapshot.knownThreadCount > 0 : stats.requests > 0 }
     var dataNotice: String {
         if isTestFixture { return "模拟测试 · 以下速度、Token、费用和配额均非企业真实数据" }
+        if !isPreview { return "企业后台直接来源尚未连接；本地 Codex 历史记录与 Token Hub 界面快照分别展示，不代表企业后台统计。" }
         if config.dataSource == "localCodex" { return "本地 Codex 当前扫描范围记录小计 · 不代表账单或实时用量；账号与组织归属未核验" }
         return hasRequestData ? "本次启动 · 仅统计经过本机代理的请求" : "未采集到请求数据 · 尚未观测到客户端流量"
     }
@@ -2577,8 +2608,8 @@ struct SpeedPoint: Identifiable {
         return (isTestFixture ? "测试 " : "") + "\(value) · Σ\(total) · 请求\(stats.requests)"
     }
     var menuTooltip: String {
-        guard config.dataSource == "localCodex" else {
-            return "\(dataNotice) · \(proxyStatus)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .enterprise))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .enterprise))"
+        if isPreview && config.dataSource != "localCodex" {
+            return "\(dataNotice) · \(sourceReadinessText)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .enterprise))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .enterprise))"
         }
         let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
         let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
@@ -2588,7 +2619,7 @@ struct SpeedPoint: Identifiable {
         let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "已核验记录小计"
         let total = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.total) : "未知"
         let hub = tokenHubTooltipDetail
-        return "本地 Codex 当前扫描范围记录：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+        return "\(userFacingStatus)\n本地 Codex 当前扫描范围记录：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
     }
     private var tokenHubMenuSuffix: String {
         guard let snapshot = freshTokenHubQuota(at: Date()) else { return "" }
@@ -2618,7 +2649,7 @@ struct SpeedPoint: Identifiable {
         case .unsupportedLayout: "用量页面布局暂不支持"
         case .accessFailed: "辅助功能读取失败"
         case .stale: "界面快照已过期"
-        case .connected: "已连接"
+        case .connected: "界面快照已读取"
         }
     }
     private var accountingDetail: String {
@@ -2641,82 +2672,100 @@ struct SpeedPoint: Identifiable {
         guard let ratio = (windows + [freshQuota?.fraction].compactMap { $0 }).max() else { return .labelColor }
         return ratio >= 0.95 ? .systemRed : ratio >= 0.8 ? .systemYellow : .labelColor
     }
-    func credentials() -> (String, String) { (apiKey, usageKey) }
+    /// Kept for the synthetic legacy core-state regression only; never used by the formal Settings path.
     static func configurationForApplying(_ draft: AppConfiguration,
                                          automaticReadingEnabled: Bool) -> AppConfiguration {
         var configuration = draft
         configuration.tokenHubAutomaticReadingEnabled = automaticReadingEnabled
         return configuration
     }
-    func apply(_ newConfig: AppConfiguration, upstreamKey: String, quotaKey: String) -> Bool {
-        guard stats.active == 0 else { message = "请求进行中，请等待完成后再修改代理配置"; return false }
+
+    func savePreferences(_ newPreferences: SeasunPreferences) -> Bool {
+        let normalized = newPreferences.normalized
         do {
-            var savedConfig = Self.configurationForApplying(newConfig,
-                automaticReadingEnabled: tokenHubAutomaticReadingEnabled)
-            if newConfig.dataSource == "localCodex" {
-                savedConfig.endpoint = config.endpoint; savedConfig.usageURL = config.usageURL
-            }
-            _ = try savedConfig.validated()
-            if savedConfig.dataSource == "proxy" {
-                let old = config
-                let resolvedAPI = upstreamKey.isEmpty ? (savedConfig.endpoint == old.endpoint && !apiKey.isEmpty ? apiKey : try KeychainStore.read("upstream", validatedURL: savedConfig.endpoint)) : upstreamKey
-                let resolvedUsage = quotaKey.isEmpty && !savedConfig.usageURL.isEmpty ? (savedConfig.usageURL == old.usageURL && !usageKey.isEmpty ? usageKey : try KeychainStore.read("usage", validatedURL: savedConfig.usageURL)) : quotaKey
-                try KeychainStore.write("upstream", validatedURL: savedConfig.endpoint, value: resolvedAPI)
-                if !savedConfig.usageURL.isEmpty { try KeychainStore.write("usage", validatedURL: savedConfig.usageURL, value: resolvedUsage) }
-                if localKey.isEmpty { localKey = try KeychainStore.localToken() }
-                apiKey = resolvedAPI; usageKey = resolvedUsage
-            }
-            try ConfigStore.save(savedConfig)
-            config = savedConfig
-            if !config.historyEnabled { history.removeAll() }
-            message = "设置已保存"; startServices(); return true
-        } catch { message = error.localizedDescription; return false }
-    }
-    func reload() {
-        guard stats.active == 0 else { message = "请求进行中，暂不能重新加载"; return }
-        do {
-            let loaded = try ConfigStore.load()
-            if loaded.dataSource == "proxy" {
-                localKey = try KeychainStore.localToken()
-                apiKey = try KeychainStore.resolve("upstream", environment: "TOKENSTAT_API_KEY", validatedURL: loaded.endpoint)
-                usageKey = loaded.usageURL.isEmpty ? "" : try KeychainStore.resolve("usage", environment: "TOKENSTAT_USAGE_KEY", validatedURL: loaded.usageURL)
-            } else { apiKey = ""; usageKey = ""; localKey = "" }
-            config = loaded; message = "配置已重新加载"; startServices()
+            try startup.savePreferences(normalized)
+        } catch {
+            message = "偏好设置保存失败；当前设置保持不变。"
+            return false
         }
-        catch { message = error.localizedDescription }
+        preferences = normalized
+        applyPreferencesToPresentationConfig()
+        message = "偏好设置已保存。"
+        restartBackgroundServicesIfPermitted()
+        return true
     }
-    private func startServices() {
-        generation += 1; tokenHubGeneration &+= 1; quotaLoop?.cancel(); quotaFetch?.cancel(); quotaFetch = nil; quotaLoading = false
+
+    func reload() {
+        do {
+            let loaded = try startup.loadPreferences()
+            preferences = SeasunPreferences.decode(loaded).normalized
+            applyPreferencesToPresentationConfig()
+            message = "偏好设置已重新加载。"
+            restartBackgroundServicesIfPermitted()
+        }
+        catch { message = "偏好设置重新加载失败；当前设置保持不变。" }
+    }
+
+    private func applyPreferencesToPresentationConfig() {
+        // This compatibility projection exists for the local-history views and synthetic tests.
+        // No integration field is loaded from the old plist or used to activate an app service.
+        var safe = AppConfiguration()
+        safe.dataSource = "localCodex"
+        safe.refreshSeconds = preferences.refreshSeconds
+        safe.tokenHubAutomaticReadingEnabled = preferences.tokenHubCompatibilityReadEnabled
+        config = safe
+        tokenHubQuotaStatus = preferences.tokenHubCompatibilityReadEnabled ? .targetNotRunning : .disabled
+    }
+
+    private func restartBackgroundServicesIfPermitted() {
+        guard !isPreview, !isShuttingDown else { return }
+        guard startup.shouldStartBackgroundServices() else {
+            stopBackgroundServices()
+            return
+        }
+        backgroundServicesStarted = true
+        startBackgroundServices()
+    }
+
+    private func startBackgroundServices() {
+        guard !isPreview, !isShuttingDown, backgroundServicesStarted else { return }
+        stopBackgroundResources()
+        generation += 1; tokenHubGeneration &+= 1
         tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
         tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
-        tokenHubAutomaticReadingEnabled = config.tokenHubAutomaticReadingEnabled
-        tokenHubQuotaStatus = config.dataSource == "localCodex" && tokenHubAutomaticReadingEnabled ? .targetNotRunning : .disabled
+        tokenHubQuotaStatus = tokenHubAutomaticReadingEnabled ? .targetNotRunning : .disabled
         lastTokenHubPermissionCheck = .distantPast; cachedTokenHubPermission = false
         _ = localRefreshScheduler.invalidate()
         localCache = LocalCodexUsageReader.Cache()
         localScan?.cancel(); localScan = nil
+        localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
+            filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0)
         resetQuotaState()
-        if config.dataSource == "localCodex" {
-            if proxyWasStarted { proxy.stop(); proxyWasStarted = false }
-            proxyStatus = "本地模式 · 未启动代理"
-            scheduleLocalScan(immediate: true)
-            if tokenHubAutomaticReadingEnabled { scheduleTokenHubRefresh(after: 0) }
-            return
-        }
-        proxy.onStatus = { [weak self] status in Task { @MainActor in self?.proxyStatus = status } }
-        proxy.onRecord = { [weak self] record in Task { @MainActor in if self?.config.loggingEnabled == true { self?.logger.append(record) } } }
-        proxy.start(config: config, apiKey: apiKey, localKey: localKey)
-        proxyWasStarted = true
-        if !config.usageURL.isEmpty {
-            quotaLoop = Task { [weak self] in
-                while !Task.isCancelled {
-                    guard let self else { return }
-                    self.refreshQuota()
-                    do { try await Task.sleep(nanoseconds: UInt64(self.config.refreshSeconds * 1e9)) }
-                    catch { return }
-                }
-            }
-        }
+        scheduleLocalScan(immediate: true)
+        if tokenHubAutomaticReadingEnabled { scheduleTokenHubRefresh(after: 0) }
+        installTokenHubWorkspaceObservers()
+        timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
+        timer?.tolerance = 0.1
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
+    }
+
+    private func stopBackgroundResources() {
+        timer?.invalidate(); timer = nil
+        localScan?.cancel(); localScan = nil
+        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        for observer in tokenHubWorkspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        tokenHubWorkspaceObservers.removeAll()
+    }
+
+    private func stopBackgroundServices() {
+        backgroundServicesStarted = false
+        generation += 1; tokenHubGeneration &+= 1
+        _ = localRefreshScheduler.invalidate()
+        stopBackgroundResources()
+        tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
+        tokenHubQuotaStatus = tokenHubAutomaticReadingEnabled ? .targetNotRunning : .disabled
     }
     /// Clears quota values at a source transition without performing I/O.
     func resetQuotaState() {
@@ -2724,16 +2773,16 @@ struct SpeedPoint: Identifiable {
         fiveHourQuota = nil
         sevenDayQuota = nil
         quotaLoading = false
-        quotaError = quotaSource == .localCodex ? "本地会话记录不提供月度企业配额"
-            : (config.usageURL.isEmpty ? "未配置企业用量接口，已用量未知" : "等待企业接口")
+        quotaError = "Token Hub 界面快照数据未知"
     }
     private func scheduleLocalScan(immediate: Bool = false) {
+        guard backgroundServicesStarted else { return }
         localScan?.cancel()
         let version = generation
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             Task { @MainActor in
-                guard !self.isShuttingDown, self.generation == version,
+                guard !self.isShuttingDown, self.backgroundServicesStarted, self.generation == version,
                       self.config.dataSource == "localCodex" else { return }
                 guard !self.localScanRunning else { return }
                 guard let scanGeneration = self.localRefreshScheduler.begin(now: Date()) else {
@@ -2747,7 +2796,7 @@ struct SpeedPoint: Identifiable {
                     Task { @MainActor in
                         self.localScanRunning = false
                         guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
-                            if self.config.dataSource == "localCodex", !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
+                            if self.config.dataSource == "localCodex", self.backgroundServicesStarted, !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
                             return
                         }
                         if self.config.dataSource == "localCodex" {
@@ -2759,7 +2808,7 @@ struct SpeedPoint: Identifiable {
                                 self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
                             }
                         }
-                        if self.config.dataSource == "localCodex" { self.scheduleLocalScan() }
+                        if self.config.dataSource == "localCodex", self.backgroundServicesStarted { self.scheduleLocalScan() }
                     }
                 }
             }
@@ -2807,12 +2856,11 @@ struct SpeedPoint: Identifiable {
 
     func setTokenHubAutomaticReadingEnabled(_ enabled: Bool) {
         guard tokenHubAutomaticReadingEnabled != enabled else { return }
-        tokenHubAutomaticReadingEnabled = enabled
+        preferences.tokenHubCompatibilityReadEnabled = enabled
         tokenHubGeneration &+= 1
         config.tokenHubAutomaticReadingEnabled = enabled
-        if !isPreview { try? ConfigStore.save(config) }
         tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
-        if enabled && config.dataSource == "localCodex" && !isShuttingDown {
+        if enabled && config.dataSource == "localCodex" && !isShuttingDown && (backgroundServicesStarted || isPreview) {
             tokenHubQuotaStatus = .targetNotRunning; tokenHubQuotaFailure = nil
             lastTokenHubPermissionCheck = .distantPast
             scheduleTokenHubRefresh(after: 0)
@@ -2821,6 +2869,7 @@ struct SpeedPoint: Identifiable {
 
     func requestTokenHubAccessibilityAccess() {
         guard !isPreview, !isTestFixture, config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled, !isShuttingDown else { return }
+        permissionPromptRequested = true
         tokenHubPermissionProvider.requestOnceAndOpenSystemSettings()
         lastTokenHubPermissionCheck = .distantPast
         checkTokenHubPermissionIfDue(scheduleIfGranted: false)
@@ -2863,6 +2912,7 @@ struct SpeedPoint: Identifiable {
     }
 
     private func checkTokenHubPermissionIfDue(scheduleIfGranted: Bool = true) {
+        guard backgroundServicesStarted || isPreview else { return }
         let now = tokenHubNow()
         guard now.timeIntervalSince(lastTokenHubPermissionCheck) >= 2 else { return }
         let old = cachedTokenHubPermission
@@ -2875,13 +2925,13 @@ struct SpeedPoint: Identifiable {
     }
 
     private func pollTokenHubPermissionIfDue() {
-        guard config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled, !isShuttingDown,
+        guard backgroundServicesStarted, config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled, !isShuttingDown,
               !isFixtureUsingNativeTokenHubReader else { return }
         checkTokenHubPermissionIfDue()
     }
 
     private func scheduleTokenHubRefresh(after seconds: TimeInterval) {
-        guard config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled,
+        guard (backgroundServicesStarted || isPreview), config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled,
               !isShuttingDown, !tokenHubScanInFlight, !isFixtureUsingNativeTokenHubReader else { return }
         tokenHubRefreshWork?.cancel()
         let version = tokenHubGeneration
@@ -2924,12 +2974,14 @@ struct SpeedPoint: Identifiable {
 
     /// Metadata-only lifecycle seam; no AX values or target contents are read here.
     func tokenHubApplicationDidTerminate(bundleIdentifier: String) {
+        guard isPreview || backgroundServicesStarted else { return }
         guard bundleIdentifier == TokenHubTarget.bundleID, !isShuttingDown else { return }
         invalidateTokenHubQuota(status: config.dataSource == "localCodex" ? .targetNotRunning : .disabled)
     }
 
     /// Metadata-only lifecycle seam; a launch never makes an old snapshot current.
     func tokenHubApplicationDidLaunch(bundleIdentifier: String) {
+        guard isPreview || backgroundServicesStarted else { return }
         guard bundleIdentifier == TokenHubTarget.bundleID, !isShuttingDown else { return }
         invalidateTokenHubQuota(status: config.dataSource == "localCodex" && tokenHubAutomaticReadingEnabled
             ? .targetNotRunning : .disabled)
@@ -2943,42 +2995,6 @@ struct SpeedPoint: Identifiable {
         scheduleTokenHubRefresh(after: 0)
     }
 
-    func refreshQuota() {
-        guard config.dataSource == "proxy", !config.usageURL.isEmpty, !quotaLoading else { return }
-        quotaLoading = true
-        let config = config, key = usageKey, version = generation
-        quotaFetch = Task { [weak self] in
-            defer { if self?.generation == version { self?.quotaLoading = false } }
-            do {
-                let result = try await QuotaClient.fetch(config: config, key: key)
-                guard !Task.isCancelled, self?.generation == version else { return }
-                self?.quota = result.monthly; self?.quotaError = result.monthlyMessage
-                self?.fiveHourQuota = result.fiveHour; self?.sevenDayQuota = result.sevenDay
-            } catch {
-                guard !Task.isCancelled, self?.generation == version else { return }
-                self?.quotaError = (error as? StatError)?.localizedDescription ?? "企业用量请求失败：检查网络、URL 和认证"
-            }
-        }
-    }
-    func copyConnection() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString("http://127.0.0.1:\(config.port)/v1", forType: .string)
-        message = "已复制本机 Base URL"
-    }
-    func copyKey() {
-        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(localKey, forType: .string)
-        message = "已复制本机访问令牌（仅供客户端连接本机代理）"
-    }
-    func exportLogs() {
-        let panel = NSSavePanel(); panel.nameFieldStringValue = "TokenStatMenu-statistics.jsonl"
-        panel.allowedContentTypes = [.json, .data]
-        panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            self?.logger.export(to: url) { error in
-                Task { @MainActor in self?.message = error ?? "统计日志已导出" }
-            }
-        }
-    }
 }
 ```
 
@@ -2986,7 +3002,6 @@ struct SpeedPoint: Identifiable {
 
 ```swift
 import SwiftUI
-import Charts
 #if SWIFT_PACKAGE
 import TokenStatCore
 #endif
@@ -3018,22 +3033,18 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             else {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 12) {
-                        if model.config.dataSource == "localCodex" {
-                            TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: Date()), status: model.tokenHubQuotaStatusText,
-                                enabled: model.tokenHubAutomaticReadingEnabled, refreshSeconds: model.config.refreshSeconds)
-                            localUsageCard
-                        } else { liveCard }
+                        TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: Date()), status: model.tokenHubQuotaStatusText,
+                            enabled: model.tokenHubAutomaticReadingEnabled, refreshSeconds: model.preferences.refreshSeconds)
+                        Text(model.userFacingStatus)
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                        localUsageCard
                         HStack(alignment: .top, spacing: 10) {
                             WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
                                 color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
                             WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
                                 color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
                         }
-                        if model.config.dataSource == "localCodex" {
-                            localQuotaCard
-                        } else { sessionCard; quotaCard }
-                        if model.config.dataSource == "proxy", model.config.historyEnabled, model.panelVisible { historyCard }
-                        if model.config.dataSource == "proxy" { costCard; requestCard; connectionCard }
+                        localQuotaCard
                     }.padding(.horizontal, 16).padding(.bottom, 14)
                 }
             }
@@ -3053,53 +3064,19 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 .background(PanelPalette.gradient, in: RoundedRectangle(cornerRadius: 10))
             VStack(alignment: .leading, spacing: 3) {
                 Text("TokenStatMenu").font(.system(size: 16, weight: .bold, design: .rounded))
-                Text(settings ? "本机网关与偏好设置" : (model.config.dataSource == "localCodex" ? "本地 Codex · 历史记录" : "实时用量 · 本次启动"))
+                Text(settings ? "Seasun Token Hub · 偏好设置" : "Seasun Token Hub · 后台直接来源未接通")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Spacer()
             Button { settings.toggle() } label: {
                 Image(systemName: settings ? "chart.bar.xaxis" : "slider.horizontal.3")
                     .frame(width: 28, height: 28)
-            }.buttonStyle(.borderless).foregroundStyle(.secondary).help(settings ? "返回概览" : "连接与设置")
-                .accessibilityLabel(settings ? "返回概览" : "连接与设置")
+            }.buttonStyle(.borderless).foregroundStyle(.secondary).help(settings ? "返回概览" : "偏好设置")
+                .accessibilityLabel(settings ? "返回概览" : "偏好设置")
             Button { NSApp.terminate(nil) } label: {
                 Image(systemName: "power").frame(width: 24, height: 28)
             }.buttonStyle(.borderless).foregroundStyle(.secondary).help("退出 TokenStatMenu").accessibilityLabel("退出")
         }.padding(16)
-    }
-    private var liveCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Label("实时输出", systemImage: "bolt.horizontal.fill")
-                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(PanelPalette.blue)
-                Spacer()
-                StatusPill(label: model.stats.active > 0 ? "\(model.stats.active) 个请求进行中" : model.hasRequestData ? "当前空闲" : "等待接入",
-                    color: model.stats.active > 0 ? .green : PanelPalette.violet)
-            }
-            HStack(alignment: .firstTextBaseline, spacing: 7) {
-                Text(!model.hasRequestData ? "—" : model.stats.active > 0 ? String(format: "≈%.1f", model.stats.outputTPS) : "0.0")
-                    .font(.system(size: 44, weight: .semibold, design: .rounded)).monospacedDigit()
-                Text("tok/s").font(.system(size: 14, weight: .medium)).foregroundStyle(.secondary)
-                Spacer()
-                VStack(alignment: .trailing, spacing: 5) {
-                    Text("输入 / 首输出等待").font(.system(size: 10)).foregroundStyle(.secondary)
-                    Text(model.stats.active > 0 ? String(format: "≈%.1f", model.stats.inputWaitTPS) : "—")
-                        .font(.system(size: 19, weight: .medium, design: .rounded)).monospacedDigit()
-                    Text("tok/s · 推算").font(.system(size: 9)).foregroundStyle(.secondary)
-                }
-            }
-            Text("输出为 5 秒窗口文本估算；输入比值含网络与排队时间。")
-                .font(.system(size: 10)).foregroundStyle(.secondary)
-            if let rate = model.stats.last?.serverOutputTPS {
-                metric("上次 Ollama 服务端平均输出", String(format: "%.1f tok/s", rate))
-            }
-            if let rate = model.stats.last?.serverInputTPS {
-                metric("上次 Ollama 服务端平均输入", String(format: "%.1f tok/s", rate))
-            }
-        }
-        .padding(16)
-        .background(PanelPalette.gradient.opacity(0.10), in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(PanelPalette.blue.opacity(0.22)))
     }
     private var localUsageCard: some View {
         GroupBox {
@@ -3143,114 +3120,10 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         let recorded = state.recordedAt.map { " · 记录于 \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
         return "\(state.sourceLabel) · \(state.statusLabel) · 上游已用 \(String(format: "%.1f", percent))%\(recorded)\(reset)"
     }
-    private var sessionCard: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 12) {
-                    tokenTile("总 TOKEN", value: model.stats.total, color: .primary)
-                    Divider().frame(height: 40)
-                    tokenTile("输入", value: model.stats.input, color: PanelPalette.blue)
-                    tokenTile("输出", value: model.stats.output, color: PanelPalette.violet)
-                }
-                Text(!model.hasRequestData ? "尚无请求数据；这里不代表企业总用量。" : model.stats.estimatedRequests > 0 ? "含 \(model.stats.estimatedRequests) 个请求估算，最终 usage 到达后校正。" : "累计值已由上游 usage 确认。")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-            }
-        } label: { Label("本次启动累计", systemImage: "square.stack.3d.up") }
-    }
-    private func tokenTile(_ label: String, value: Int, color: Color) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(label).font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary)
-            Text(measuredCount(value)).font(.system(size: 22, weight: .semibold, design: .rounded))
-                .foregroundStyle(color).monospacedDigit().lineLimit(1).minimumScaleFactor(0.55)
-                .textSelection(.enabled)
-        }.frame(maxWidth: .infinity, alignment: .leading)
-    }
-    private var quotaCard: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 11) {
-                HStack(spacing: 18) {
-                    QuotaRing(fraction: model.quota?.fraction)
-                    VStack(spacing: 7) {
-                        metric("已消耗", model.quota.map { count($0.used) } ?? "未知")
-                        metric("月度配额", model.quota?.limit.map(count) ?? (model.config.monthlyLimit > 0 ? count(model.config.monthlyLimit) : "未设置"))
-                        metric("剩余配额", model.quota?.remaining.map(count) ?? "未知")
-                        if let fraction = model.quota?.fraction {
-                            ProgressView(value: min(1, max(0, fraction)))
-                                .tint(fraction >= 0.95 ? .red : fraction >= 0.8 ? .yellow : PanelPalette.blue)
-                        }
-                    }
-                }
-                HStack {
-                    if let quota = model.quota {
-                        Text(model.freshQuota == nil ? "数据已过期" : "更新于 \(quota.fetchedAt.formatted(date: .omitted, time: .shortened))")
-                    } else { Text("配置用量接口后显示企业配额") }
-                    Spacer()
-                    Button { model.refreshQuota() } label: { Image(systemName: "arrow.clockwise") }
-                        .buttonStyle(.borderless).disabled(model.quotaLoading || model.config.usageURL.isEmpty)
-                        .help("刷新企业用量").accessibilityLabel("刷新企业用量")
-                }.font(.system(size: 10)).foregroundStyle(.secondary)
-                if !model.quotaError.isEmpty, !model.config.usageURL.isEmpty {
-                    Text(model.quotaError).font(.system(size: 10)).foregroundStyle(.secondary)
-                }
-            }
-        } label: { HStack { Label("企业配额", systemImage: "chart.donut"); Spacer(); Text(QuotaSnapshot.currentMonth()).font(.system(size: 10)) } }
-    }
-    private var costCard: some View {
-        GroupBox {
-            VStack(spacing: 8) {
-                metric("输入 / 百万 Token", model.config.inputPrice > 0 ? money(model.config.inputPrice * model.currencyFactor) : "未设置 / 免费")
-                metric("输出 / 百万 Token", model.config.outputPrice > 0 ? money(model.config.outputPrice * model.currencyFactor) : "未设置 / 免费")
-                metric("累计费用", !model.hasRequestData ? "—" : money(model.stats.costUSD * model.currencyFactor))
-                Text("按自定义单价估算，非企业账单；零单价不代表实际免费。缓存不另行折扣。\(model.config.currency == "CNY" ? "USD→CNY 汇率 \(model.config.usdToCNY)（手填）。" : "")")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-            }
-        } label: { Label("费用估算 · \(model.config.currency)", systemImage: "creditcard") }
-    }
-    private var requestCard: some View {
-        GroupBox {
-            VStack(spacing: 8) {
-                metric("总请求 / 失败", "\(model.stats.requests) / \(model.stats.failures)")
-                metric("平均首响应字节延迟", model.stats.averageFirstByteMS.map { String(format: "%.0f ms", $0) } ?? "—")
-                metric("平均完整请求耗时", model.stats.averageDurationMS.map { String(format: "%.0f ms", $0) } ?? "—")
-                if let last = model.stats.last {
-                    metric("上次请求", "\(last.success ? "完成" : "失败") · \(last.exact ? "usage" : "估算")")
-                    if let error = last.error { Text(error).font(.system(size: 10)).foregroundStyle(.orange) }
-                }
-            }
-        } label: { Label("请求与响应", systemImage: "arrow.left.arrow.right") }
-    }
-    private var historyCard: some View {
-        GroupBox {
-            Chart(model.history) { point in
-                AreaMark(x: .value("时间", point.date), y: .value("tok/s", point.value))
-                    .foregroundStyle(LinearGradient(colors: [PanelPalette.blue.opacity(0.22), PanelPalette.violet.opacity(0.02)], startPoint: .top, endPoint: .bottom))
-                LineMark(x: .value("时间", point.date), y: .value("tok/s", point.value))
-                    .foregroundStyle(PanelPalette.blue).lineStyle(StrokeStyle(lineWidth: 1.5))
-            }
-            .chartYScale(domain: 0...max(1, (model.history.map(\.value).max() ?? 1) * 1.1))
-            .frame(height: 96)
-            .accessibilityLabel("近十分钟输出 token 估算速度曲线")
-        } label: { Label("近 10 分钟 · 输出估算 tok/s", systemImage: "waveform.path.ecg") }
-    }
-    private var connectionCard: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 9) {
-                Text("仅统计经过本机代理的请求，不自动接管其他应用。")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-                HStack {
-                    Button("复制 Base URL") { model.copyConnection() }
-                    Button("复制本机令牌") { model.copyKey() }
-                    Spacer()
-                    Button { model.exportLogs() } label: { Image(systemName: "square.and.arrow.up") }
-                        .help("导出统计日志").accessibilityLabel("导出统计日志")
-                }.controlSize(.small)
-            }
-        } label: { Label("本机连接", systemImage: "network") }
-    }
     private var footer: some View {
         HStack(spacing: 6) {
             Circle().fill(model.stats.active > 0 ? Color.green : Color.secondary.opacity(0.5)).frame(width: 5, height: 5)
-            Text(model.message.isEmpty ? model.proxyStatus : model.message)
+            Text(model.message.isEmpty ? model.sourceReadinessText : model.message)
                 .lineLimit(2).font(.system(size: 10)).foregroundStyle(.secondary)
             Spacer(minLength: 0)
         }.padding(.horizontal, 16).padding(.vertical, 9)
@@ -3261,49 +3134,6 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private func count(_ n: Int) -> String { n.formatted() }
     private func localCount(_ n: Int) -> String { model.localSnapshot.knownThreadCount == 0 ? "—" : count(n) }
     private func count(_ n: Double) -> String { n.formatted(.number.precision(.fractionLength(0))) }
-    private func measuredCount(_ n: Int) -> String {
-        guard model.hasRequestData else { return "—" }
-        return (model.stats.estimatedRequests > 0 ? "≈" : "") + count(n)
-    }
-    private func money(_ n: Double) -> String { model.currencySymbol + String(format: "%.6f", n) }
-}
-```
-
-### Sources/TokenStatMenu/QuotaClient.swift
-
-```swift
-import Foundation
-#if SWIFT_PACKAGE
-import TokenStatCore
-#endif
-
-private final class NoRedirect: NSObject, URLSessionTaskDelegate {
-    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
-                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
-}
-
-enum QuotaClient {
-    static func fetch(config: AppConfiguration, key: String) async throws -> QuotaReport {
-        let url = try config.checkedURL(config.usageURL)
-        var request = URLRequest(url: url); request.timeoutInterval = 15
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if !key.isEmpty { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
-        let settings = URLSessionConfiguration.ephemeral
-        settings.timeoutIntervalForRequest = 15; settings.timeoutIntervalForResource = 20
-        settings.urlCache = nil; settings.httpCookieStorage = nil
-        let session = URLSession(configuration: settings, delegate: NoRedirect(), delegateQueue: nil)
-        defer { session.invalidateAndCancel() }
-        let (bytes, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw StatError.message("企业用量接口返回 HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
-        }
-        var data = Data()
-        for try await byte in bytes {
-            guard data.count < 1_048_576 else { throw StatError.message("企业用量响应超过 1MB") }
-            data.append(byte)
-        }
-        return try QuotaReport.parse(data, config: config)
-    }
 }
 ```
 
@@ -3311,161 +3141,88 @@ enum QuotaClient {
 
 ```swift
 import SwiftUI
-#if SWIFT_PACKAGE
-import TokenStatCore
-#endif
 
 @MainActor struct SettingsView: View {
     @ObservedObject var model: AppModel
-    @ValueState private var draft: AppConfiguration
-    @ValueState private var apiKey: String
-    @ValueState private var quotaKey: String
+    @ValueState private var draft: SeasunPreferences
+
     init(model: AppModel) {
         self.model = model
-        _draft = State(initialValue: model.config)
-        let keys = model.credentials()
-        _apiKey = State(initialValue: keys.0); _quotaKey = State(initialValue: keys.1)
+        _draft = State(initialValue: model.preferences)
     }
+
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 14) {
-                Picker("用量来源", selection: $draft.dataSource) {
-                    Text("本地 Codex 记录").tag("localCodex")
-                    Text("本机代理与企业接口").tag("proxy")
-                }.pickerStyle(.segmented)
-                if draft.dataSource == "proxy" {
-                    discoverySection
-                    upstreamSection
-                    priceSection
-                    quotaSection
-                } else {
-                    tokenHubSection
-                    Text("从 ~/.codex/sessions 的有限范围中读取当前扫描范围记录。依据记录中的来源与父子关系区分顶层对话、子代理和分叉；无法核验的记录单独标示，不把未知贡献当作零或完整总量。仅读取有界文件片段，不连接本机代理、不读取凭据或企业接口。切换到代理模式可恢复企业接口配置。")
-                        .font(.caption).foregroundStyle(.secondary)
+                GroupBox("Seasun Token Hub") {
+                    VStack(alignment: .leading, spacing: 8) {
+                Text(model.userFacingStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("本地 Codex 历史记录与 Token Hub 界面兼容快照各自按实际观测单独展示，不代表企业后台直连。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("企业后台直接来源：尚不可用")
+                    .font(.caption)
+                    .accessibilityIdentifier("seasun-source-status")
+                    }
                 }
-                otherSection
+                .accessibilityLabel("Seasun Token Hub")
+
+                GroupBox("可选偏好") {
+                    VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Button("保存并应用") { _ = model.apply(draft, upstreamKey: apiKey, quotaKey: quotaKey) }.buttonStyle(.borderedProminent)
-                    Button("重新加载 plist") { model.reload(); draft = model.config }
+                    Text("刷新秒数（15–3600）")
+                    Spacer()
+                    TextField("60", value: $draft.refreshSeconds, format: .number)
+                        .frame(width: 88)
+                        .multilineTextAlignment(.trailing)
+                        .labelsHidden()
+                        .accessibilityLabel("刷新秒数")
                 }
-                Text(model.isTestFixture ? "配置：隔离模拟配置" : "配置：\(AppPaths.configURL.path.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"))").font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
-            }.padding(16)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("刷新秒数（15–3600）")
+                Toggle("Token Hub 界面兼容读取（可选）", isOn: $draft.tokenHubCompatibilityReadEnabled)
+                    .accessibilityIdentifier("token-hub-compatibility-toggle")
+                    .accessibilityLabel("Token Hub 界面兼容读取（可选）")
+                Text("只读取 Token Hub 当前界面的兼容快照，不代表 Seasun 数据连接完成。默认启用，不会自动请求辅助功能授权。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button("保存偏好") {
+                        if model.savePreferences(draft) { draft = model.preferences }
+                    }.buttonStyle(.borderedProminent)
+                    Button("重新加载偏好") {
+                        model.reload()
+                        draft = model.preferences
+                    }
+                    Spacer()
+                }
+                if !model.message.isEmpty {
+                    Text(model.message).font(.caption2).foregroundStyle(.secondary)
+                }
+                    }
+                }
+
+                GroupBox("兼容读取授权") {
+                    VStack(alignment: .leading, spacing: 8) {
+                Text(model.tokenHubQuotaStatusText)
+                    .font(.caption)
+                Button("请求辅助功能访问…") {
+                    model.requestTokenHubAccessibilityAccess()
+                }
+                .disabled(model.isTestFixture || !draft.tokenHubCompatibilityReadEnabled)
+                Text("此权限仅用于读取界面快照，不用于连接企业后台。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(14)
+            .accessibilityElement(children: .contain)
         }
         .textFieldStyle(.roundedBorder)
-        .onChange(of: draft.endpoint) { _ in apiKey = "" }
-        .onChange(of: draft.usageURL) { _ in quotaKey = "" }
-    }
-    private var discoverySection: some View {
-        GroupBox("本机网关 · 自动发现") {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(model.discoveryStatus).font(.caption).foregroundStyle(.secondary)
-                ForEach(model.gateways) { gateway in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text(gateway.provider + (gateway.isActive ? " · Codex 当前配置" : "")).font(.caption).bold()
-                            Spacer()
-                            Button("填入") {
-                                if draft.endpoint != gateway.endpoint {
-                                    // Do not accidentally send old credentials to a newly chosen host.
-                                    apiKey = ""; quotaKey = ""; draft.usageURL = ""
-                                }
-                                draft.endpoint = gateway.endpoint; draft.model = gateway.model
-                                model.message = "已填入网关地址；请自行配置认证后保存。发现地址不代表已经接入流量。"
-                            }
-                        }
-                        Text(gateway.endpoint).font(.caption2).textSelection(.enabled)
-                        Text(gateway.source).font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Divider()
-                }
-                Button(model.discovering ? "扫描中…" : "重新扫描") { model.discoverGateways() }.disabled(model.discovering)
-                Text("只在本机识别地址、模型与提供方；不读取其他应用的密钥、Cookie 或认证文件。不会修改 Codex 配置，也不会联网探测。更换地址时清空待保存的旧密钥，避免误发。")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }.padding(6)
-        }
-    }
-    private var tokenHubSection: some View {
-        GroupBox("Token Hub 界面额度") {
-            VStack(alignment: .leading, spacing: 8) {
-                Toggle("自动读取当前额度面板", isOn: Binding(
-                    get: { model.tokenHubAutomaticReadingEnabled },
-                    set: { model.setTokenHubAutomaticReadingEnabled($0) }))
-                Text("仅读取已运行 Token Hub 的可访问性界面文字和进度。需要 macOS 辅助功能授权；自动读取仅在本地 Codex 模式启用。原始界面值不写入诊断或日志。账号、组织、币种与后台更新时间均未核验。")
-                    .font(.caption2).foregroundStyle(.secondary)
-                HStack {
-                    Button("请求辅助功能访问…") { model.requestTokenHubAccessibilityAccess() }
-                        .disabled(model.isTestFixture || !model.tokenHubAutomaticReadingEnabled)
-                    Text(model.tokenHubQuotaStatusText).font(.caption2).foregroundStyle(.secondary)
-                }
-            }.padding(6)
-        }
-    }
-    private var upstreamSection: some View {
-        GroupBox("API 与本机代理") {
-            VStack(alignment: .leading, spacing: 8) {
-                field("上游完整 Endpoint", text: $draft.endpoint)
-                Text("例如 https://企业网关/v1/chat/completions；Ollama 可使用 http://127.0.0.1:11434/api/chat")
-                    .font(.caption2).foregroundStyle(.secondary)
-                Text("上游 API Key（保存在钥匙串）").font(.caption)
-                SecureField("Ollama 本机可留空", text: $apiKey)
-                field("模型覆盖（留空沿用请求中的 model）", text: $draft.model)
-                HStack { Text("本机端口"); TextField("18765", value: $draft.port, format: .number.grouping(.never)).frame(width: 100) }.font(.caption)
-                Toggle("Chat 流请求附带 include_usage", isOn: $draft.includeUsage)
-                Toggle("允许远程私网 HTTP（密钥将明文传输）", isOn: $draft.allowInsecureHTTP)
-                Text("客户端 Base URL 指向本机，客户端 API Key 使用“复制本机令牌”的值。企业 Key 只填在上方。")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }.padding(6)
-        }
-    }
-    private var priceSection: some View {
-        GroupBox("自定义价格") {
-            VStack(alignment: .leading, spacing: 8) {
-                number("输入 USD / 百万 Token", value: $draft.inputPrice)
-                number("输出 USD / 百万 Token", value: $draft.outputPrice)
-                Picker("显示币种", selection: $draft.currency) { Text("USD").tag("USD"); Text("CNY").tag("CNY") }.pickerStyle(.segmented)
-                number("1 USD = CNY（手填汇率）", value: $draft.usdToCNY)
-            }.padding(6)
-        }
-    }
-    private var quotaSection: some View {
-        GroupBox("企业额度接口 · 月度 / 5 小时 / 7 天") {
-            VStack(alignment: .leading, spacing: 8) {
-                field("用量 GET URL（可留空）", text: $draft.usageURL)
-                Text("用量接口 Bearer Key（独立于推理 Key）").font(.caption)
-                SecureField("可留空；不自动复用上游密钥", text: $quotaKey)
-                field("已用 Token 字段路径", text: $draft.usedPath)
-                field("总配额字段路径（可留空）", text: $draft.limitPath)
-                field("月份字段路径（yyyy-MM；留空信任接口本月语义）", text: $draft.periodPath)
-                number("手动月度 Token 上限（0 = 接口值）", value: $draft.monthlyLimit)
-                number("刷新秒数（15–3600）", value: $draft.refreshSeconds)
-                Divider()
-                field("5 小时已用百分比字段（0–100）", text: $draft.fiveHourUsedPercentPath)
-                field("5 小时重置时间字段", text: $draft.fiveHourResetPath)
-                field("7 天已用百分比字段（0–100）", text: $draft.sevenDayUsedPercentPath)
-                field("7 天重置时间字段", text: $draft.sevenDayResetPath)
-                Text("重置时间支持 Unix 秒或 ISO 8601。缺少窗口时显示未提供；不会从月度配额或本机 Token 推算。也可接收带明确窗口时长的 Codex rateLimits 格式。")
-                    .font(.caption2).foregroundStyle(.secondary)
-                Text("月度已用量、总配额和手动月度上限必须使用 Token 数量，不能填金额或积分；窗口字段使用 0–100 的百分比。手动配额不会推算全企业已用量。达到 80% 黄色、95% 红色，仅改变菜单栏颜色。")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }.padding(6)
-        }
-    }
-    private var otherSection: some View {
-        GroupBox("历史与日志") {
-            VStack(alignment: .leading, spacing: 8) {
-                Toggle("显示近 10 分钟速度图", isOn: $draft.historyEnabled)
-                Toggle("记录脱敏请求统计日志", isOn: $draft.loggingEnabled)
-                Text("不记录提示词、回答或密钥。日志只保留当前与上一份，每份约 10MB；本次启动统计不会从日志恢复。")
-                    .font(.caption2).foregroundStyle(.secondary)
-                Button("导出日志") { model.exportLogs() }
-            }.padding(6)
-        }
-    }
-    private func field(_ label: String, text: Binding<String>) -> some View {
-        VStack(alignment: .leading, spacing: 4) { Text(label).font(.caption); TextField(label, text: text).labelsHidden() }
-    }
-    private func number(_ label: String, value: Binding<Double>) -> some View {
-        HStack { Text(label); Spacer(); TextField(label, value: value, format: .number).labelsHidden().frame(width: 110) }.font(.caption)
     }
 }
 ```
@@ -3527,54 +3284,38 @@ import SwiftUI
         }
     }
     func popoverDidClose(_ notification: Notification) { model.panelVisible = false }
-    /// Opt-in local diagnostic output for integration tests; no credentials or content.
-    /// Reports actual AppKit title and popover state, not a separately simulated UI.
+    /// Opt-in local diagnostic output for integration tests; contains only approved booleans and resource counts.
     private func writeDiagnosticsIfRequested() {
         let args = CommandLine.arguments
         guard let index = args.firstIndex(of: "--diagnostics-output"), args.indices.contains(index + 1),
               Date().timeIntervalSince(lastDiagnostic) >= 1 else { return }
         lastDiagnostic = Date()
         struct Report: Encodable {
-            let isTestFixture: Bool
-            let hasRequestData: Bool
-            let dataNotice: String
-            let discoveredGateways: Int
-            let title: String
-            let popoverShown: Bool
+            let seasunOnlyMode: Bool
+            let backgroundServicesStarted: Bool
             let statusItemVisible: Bool
-            let active: Int
-            let quotaUsed: Double?
-            let quotaFraction: Double?
-            let fiveHourUsedPercent: Double?
-            let sevenDayUsedPercent: Double?
-            let quotaError: String
-            let tokenHubSourceEnabled: Bool
-            let tokenHubPermissionGranted: Bool
-            let tokenHubPermissionRequired: Bool
-            let tokenHubWindowPresent: Bool
-            let tokenHubMenuSuffixPresent: Bool
-            let alert: String
+            let permissionPromptRequested: Bool
+            let quotaPresent: Bool
+            let resetTimePresent: Bool
+            let monthlyUsagePresent: Bool
+            let liveTokenSpeedPresent: Bool
+            let sourceStatus: String
+            let backgroundServiceResources: BackgroundServiceResources
         }
-        let appliedColor = (item.button?.attributedTitle.length ?? 0) > 0
-            ? item.button?.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
-            : nil
-        // The actual title can contain a live AX-derived percentage. Diagnostics retain only
-        // the non-AX portion and readiness booleans; no AX content crosses this sink.
-        let safeTitle = (item.button?.attributedTitle.string ?? "")
-            .replacingOccurrences(of: #" · Hub .*?$"#, with: "", options: .regularExpression)
-        let report = Report(isTestFixture: model.isTestFixture, hasRequestData: model.hasRequestData,
-            dataNotice: model.dataNotice, discoveredGateways: model.gateways.count,
-            title: safeTitle, popoverShown: popover.isShown,
-            statusItemVisible: item.isVisible, active: model.stats.active,
-            quotaUsed: model.quota?.used, quotaFraction: model.quota?.fraction,
-            fiveHourUsedPercent: model.fiveHourQuota?.usedPercent, sevenDayUsedPercent: model.sevenDayQuota?.usedPercent,
-            quotaError: model.quotaError,
-            tokenHubSourceEnabled: model.config.dataSource == "localCodex" && model.tokenHubAutomaticReadingEnabled,
-            tokenHubPermissionGranted: model.tokenHubPermissionGrantedForDiagnostics,
-            tokenHubPermissionRequired: model.tokenHubPermissionRequiredForDiagnostics,
-            tokenHubWindowPresent: model.tokenHubQuotaSnapshot?.fiveHour != nil || model.tokenHubQuotaSnapshot?.sevenDay != nil,
-            tokenHubMenuSuffixPresent: model.menuTitleContainsTokenHubSuffix,
-            alert: appliedColor == .systemRed ? "red" : appliedColor == .systemYellow ? "yellow" : "normal")
+        let snapshot = model.tokenHubQuotaSnapshot
+        let resetTimePresent = [snapshot?.fiveHour?.resetDisplay, snapshot?.sevenDay?.resetDisplay]
+            .compactMap { $0 }.contains { !$0.isEmpty }
+        let report = Report(
+            seasunOnlyMode: model.isSeasunOnly,
+            backgroundServicesStarted: model.backgroundServicesStarted,
+            statusItemVisible: item.isVisible,
+            permissionPromptRequested: model.permissionPromptRequested,
+            quotaPresent: snapshot != nil || model.quota != nil || model.fiveHourQuota != nil || model.sevenDayQuota != nil,
+            resetTimePresent: resetTimePresent,
+            monthlyUsagePresent: snapshot?.monthly != nil || model.quota?.used != nil,
+            liveTokenSpeedPresent: model.stats.active > 0,
+            sourceStatus: model.sourceStatus,
+            backgroundServiceResources: model.backgroundServiceResources)
         if let data = try? JSONEncoder().encode(report) {
             let url = URL(fileURLWithPath: args[index + 1])
             DispatchQueue.global(qos: .utility).async { try? data.write(to: url, options: .atomic) }
@@ -3587,7 +3328,6 @@ import SwiftUI
 
 ```swift
 import Foundation
-import Security
 import CryptoKit
 #if SWIFT_PACKAGE
 import TokenStatCore
@@ -3604,23 +3344,29 @@ enum AppPaths {
 }
 
 enum ConfigStore {
-    static func load() throws -> AppConfiguration {
-        guard FileManager.default.fileExists(atPath: AppPaths.configURL.path) else { return AppConfiguration() }
-        let loaded = try PropertyListSerialization.propertyList(from: Data(contentsOf: AppPaths.configURL), format: nil)
-        guard let values = loaded as? [String: Any] else { throw StatError.message("配置必须是 plist 字典") }
-        let data = try PropertyListSerialization.data(fromPropertyList: values, format: .xml, options: 0)
-        return try PropertyListDecoder().decode(AppConfiguration.self, from: data).validated()
+    static func loadPreferences(at url: URL) throws -> Data? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try Data(contentsOf: url)
     }
-    static func save(_ config: AppConfiguration) throws {
-        _ = try config.validated()
-        try FileManager.default.createDirectory(at: AppPaths.configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let encoder = PropertyListEncoder(); encoder.outputFormat = .xml
-        try encoder.encode(config).write(to: AppPaths.configURL, options: .atomic)
+
+    static func savePreferences(_ preferences: SeasunPreferences, at url: URL) throws {
+        let normalized = preferences.normalized
+        let value: [String: Any] = [
+            "refreshSeconds": normalized.refreshSeconds,
+            "tokenHubCompatibilityReadEnabled": normalized.tokenHubCompatibilityReadEnabled
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: value, format: .xml, options: 0)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
+
+    static func savePreferences(_ preferences: SeasunPreferences) throws {
+        try savePreferences(preferences, at: AppPaths.configURL)
     }
 }
 
+/// Historical identity helper retained for a pure regression test; it performs no Keychain I/O.
 enum KeychainStore {
-    private static let service = "com.tupig.TokenStatMenu"
     static func accountName(_ purpose: String, validatedURL: String) throws -> String {
         guard ["upstream", "usage"].contains(purpose),
               let url = URL(string: validatedURL), let host = url.host, !host.isEmpty,
@@ -3628,83 +3374,6 @@ enum KeychainStore {
               ["https", "http"].contains(url.scheme ?? "") else { throw StatError.message("无效密钥绑定 URL") }
         let digest = SHA256.hash(data: Data(validatedURL.utf8)).map { String(format: "%02x", $0) }.joined()
         return "\(purpose)-\(digest)"
-    }
-    static func read(_ name: String) throws -> String {
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-            kSecAttrAccount as String: name, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecItemNotFound { return "" }
-        guard status == errSecSuccess, let data = result as? Data, let text = String(data: data, encoding: .utf8) else {
-            throw StatError.message("无法读取 TokenStatMenu 钥匙串（\(status)）")
-        }
-        return text
-    }
-    static func write(_ name: String, value: String) throws {
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: name]
-        let data = Data(value.utf8)
-        var status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status == errSecItemNotFound {
-            var item = query; item[kSecValueData as String] = data
-            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            status = SecItemAdd(item as CFDictionary, nil)
-        }
-        guard status == errSecSuccess else { throw StatError.message("无法保存 TokenStatMenu 钥匙串（\(status)）") }
-    }
-    static func read(_ purpose: String, validatedURL: String) throws -> String {
-        try read(try accountName(purpose, validatedURL: validatedURL))
-    }
-    static func write(_ purpose: String, validatedURL: String, value: String) throws {
-        try write(try accountName(purpose, validatedURL: validatedURL), value: value)
-    }
-    static func resolve(_ purpose: String, environment: String, validatedURL: String) throws -> String {
-        if let value = ProcessInfo.processInfo.environment[environment] { return value }
-        return try read(purpose, validatedURL: validatedURL)
-    }
-    static func localToken() throws -> String {
-        if let value = ProcessInfo.processInfo.environment["TOKENSTAT_LOCAL_KEY"], !value.isEmpty { return value }
-        let existing = try read("local")
-        if !existing.isEmpty { return existing }
-        var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { throw StatError.message("本机令牌生成失败") }
-        let value = bytes.map { String(format: "%02x", $0) }.joined()
-        try write("local", value: value); return value
-    }
-}
-
-final class StatLogger {
-    private let queue = DispatchQueue(label: "TokenStatMenu.log", qos: .utility)
-    var onError: ((String) -> Void)?
-    func append(_ record: RequestRecord) {
-        queue.async { [self] in
-            do {
-                try FileManager.default.createDirectory(at: AppPaths.logs, withIntermediateDirectories: true)
-                let url = AppPaths.logs.appendingPathComponent("requests.jsonl")
-                let previous = AppPaths.logs.appendingPathComponent("requests.previous.jsonl")
-                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                if size > 10_000_000 {
-                    if FileManager.default.fileExists(atPath: previous.path) { try FileManager.default.removeItem(at: previous) }
-                    try FileManager.default.moveItem(at: url, to: previous)
-                }
-                let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
-                var data = try encoder.encode(record); data.append(10)
-                if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) }
-                let handle = try FileHandle(forWritingTo: url); defer { try? handle.close() }
-                try handle.seekToEnd(); try handle.write(contentsOf: data)
-            } catch { onError?("统计日志写入失败") }
-        }
-    }
-    func export(to url: URL, completion: @escaping (String?) -> Void) {
-        queue.async {
-            do {
-                var result = Data()
-                for name in ["requests.previous.jsonl", "requests.jsonl"] {
-                    let path = AppPaths.logs.appendingPathComponent(name)
-                    if FileManager.default.fileExists(atPath: path.path) { result.append(try Data(contentsOf: path)) }
-                }
-                try result.write(to: url, options: .atomic); completion(nil)
-            } catch { completion("导出失败：无法读写所选文件") }
-        }
     }
 }
 ```
@@ -3719,7 +3388,7 @@ import AppKit
     private var status: StatusBarController?
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        let model = AppModel(); self.model = model
+        let model = AppModel(startup: .production); self.model = model
         status = StatusBarController(model: model)
         if CommandLine.arguments.contains("--request-accessibility") {
             model.requestTokenHubAccessibilityAccess()
@@ -4201,50 +3870,10 @@ enum TokenHubDecimalFormatter {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>endpoint</key>
-	<string>http://127.0.0.1:11434/v1/chat/completions</string>
-	<key>model</key>
-	<string></string>
-	<key>port</key>
-	<integer>18765</integer>
-	<key>includeUsage</key>
-	<true/>
-	<key>allowInsecureHTTP</key>
-	<false/>
-	<key>inputPrice</key>
-	<real>0.0</real>
-	<key>outputPrice</key>
-	<real>0.0</real>
-	<key>currency</key>
-	<string>USD</string>
-	<key>usdToCNY</key>
-	<real>7.0</real>
-	<key>monthlyLimit</key>
-	<real>0.0</real>
-	<key>usageURL</key>
-	<string></string>
-	<key>usedPath</key>
-	<string>data.used_tokens</string>
-	<key>limitPath</key>
-	<string>data.total_tokens</string>
-	<key>periodPath</key>
-	<string>data.month</string>
 	<key>refreshSeconds</key>
 	<real>60.0</real>
-	<key>loggingEnabled</key>
-	<false/>
-	<key>historyEnabled</key>
+	<key>tokenHubCompatibilityReadEnabled</key>
 	<true/>
-	<key>tokenHubAutomaticReadingEnabled</key>
-	<true/>
-	<key>fiveHourUsedPercentPath</key>
-	<string>data.five_hour.used_percent</string>
-	<key>fiveHourResetPath</key>
-	<string>data.five_hour.resets_at</string>
-	<key>sevenDayUsedPercentPath</key>
-	<string>data.seven_day.used_percent</string>
-	<key>sevenDayResetPath</key>
-	<string>data.seven_day.resets_at</string>
 </dict>
 </plist>
 ```
@@ -4285,8 +3914,6 @@ B3117F547294E09EFEF92409 = { isa = PBXFileReference; lastKnownFileType = sourcec
 BBE06DCD34D248AEC63DEFB1 = { isa = PBXBuildFile; fileRef = B3117F547294E09EFEF92409; };
 1568C8A45BC98EBCCE9A8EA4 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "PanelStyle.swift"; sourceTree = "<group>"; };
 1C6C1E79E7D0D3008EFA0C51 = { isa = PBXBuildFile; fileRef = 1568C8A45BC98EBCCE9A8EA4; };
-54DC60746B43C432B61ADBD4 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "QuotaClient.swift"; sourceTree = "<group>"; };
-29DBAC87E7D2D08969C25259 = { isa = PBXBuildFile; fileRef = 54DC60746B43C432B61ADBD4; };
 7DBBE1964667520E74C4B575 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SettingsView.swift"; sourceTree = "<group>"; };
 DF47DB83567E12D94C90C186 = { isa = PBXBuildFile; fileRef = 7DBBE1964667520E74C4B575; };
 262E8C516B62E763FA6537BF = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "StatusBarController.swift"; sourceTree = "<group>"; };
@@ -4301,13 +3928,13 @@ F32057C12C25AA597CC2C1C9 = { isa = PBXFileReference; lastKnownFileType = sourcec
 B71BD30B9E5D41A06B13B456 = { isa = PBXBuildFile; fileRef = 9215CF293A4FF1D70E77EC32; };
 414355FEF7F80FBFD58C7086 = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "WindowQuotaCard.swift"; sourceTree = "<group>"; };
 164B1DA057D49AA2DDF2EB36 = { isa = PBXBuildFile; fileRef = 414355FEF7F80FBFD58C7086; };
-96BD6B98AF8DAF812B21484D = { isa = PBXGroup; children = (11043337019FA9BE53E5DEA5, B3117F547294E09EFEF92409, 1568C8A45BC98EBCCE9A8EA4, 54DC60746B43C432B61ADBD4, 7DBBE1964667520E74C4B575, 262E8C516B62E763FA6537BF, 3D39E548358F39784FDEFE9F, 25AEEBE9806DD6E732A43A43, F32057C12C25AA597CC2C1C9, 9215CF293A4FF1D70E77EC32, 414355FEF7F80FBFD58C7086,); path = "Sources/TokenStatMenu"; sourceTree = "<group>"; };
+96BD6B98AF8DAF812B21484D = { isa = PBXGroup; children = (11043337019FA9BE53E5DEA5, B3117F547294E09EFEF92409, 1568C8A45BC98EBCCE9A8EA4, 7DBBE1964667520E74C4B575, 262E8C516B62E763FA6537BF, 3D39E548358F39784FDEFE9F, 25AEEBE9806DD6E732A43A43, F32057C12C25AA597CC2C1C9, 9215CF293A4FF1D70E77EC32, 414355FEF7F80FBFD58C7086,); path = "Sources/TokenStatMenu"; sourceTree = "<group>"; };
 A8792157CB4F27FB949C035F = { isa = PBXFileReference; explicitFileType = wrapper.application; path = TokenStatMenu.app; sourceTree = BUILT_PRODUCTS_DIR; };
 0A3E27B8CA818264D75C8D81 = { isa = PBXGroup; children = (A8792157CB4F27FB949C035F,); name = Products; sourceTree = "<group>"; };
 9B987D631012EC23CDD96B6A = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Resources/Info.plist"; sourceTree = "<group>"; };
 652E7FD0652728D9B3EF13DF = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Resources/config.example.plist"; sourceTree = "<group>"; };
 0D6E4079E36703EBD37C0072 = { isa = PBXGroup; children = (AF7F4C7B765701F258FB7F4D, 96BD6B98AF8DAF812B21484D, 9B987D631012EC23CDD96B6A, 652E7FD0652728D9B3EF13DF, 0A3E27B8CA818264D75C8D81,); sourceTree = "<group>"; };
-878A52FC5FF6A57D50B7B870 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (6A3864C6E6DB561D02F46C35, 08BC9043587CC788D01C24E7, C6D71C6FAB45AC1E6B57A569, 2D299820E6AC3A52FFC40FC8, BACF14F65A3D26C56E4559AC, DDA47B3DEE61C34C2F297CF7, 49E56DE5EE1D3357BC99E0B5, E51281927C6E41F6B2F2A59B, 06CC516465ECBFB9656FCFE3, FE8BDDD173656D12A732897D, EE000FBD14AA318AC3D38D79, D495B366C1D0E1A6672A9637, 60476D6C0F010F89CDCF9332, BBE06DCD34D248AEC63DEFB1, 1C6C1E79E7D0D3008EFA0C51, 29DBAC87E7D2D08969C25259, DF47DB83567E12D94C90C186, 775730CD86C47FBDC9419E49, F2E25F94650242E3A64878B7, 4BE492A2D95B99D7EAB5E1B2, 3263F0161C5BC399111E323B, B71BD30B9E5D41A06B13B456, 164B1DA057D49AA2DDF2EB36,); runOnlyForDeploymentPostprocessing = 0; };
+878A52FC5FF6A57D50B7B870 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (6A3864C6E6DB561D02F46C35, 08BC9043587CC788D01C24E7, C6D71C6FAB45AC1E6B57A569, 2D299820E6AC3A52FFC40FC8, BACF14F65A3D26C56E4559AC, DDA47B3DEE61C34C2F297CF7, 49E56DE5EE1D3357BC99E0B5, E51281927C6E41F6B2F2A59B, 06CC516465ECBFB9656FCFE3, FE8BDDD173656D12A732897D, EE000FBD14AA318AC3D38D79, D495B366C1D0E1A6672A9637, 60476D6C0F010F89CDCF9332, BBE06DCD34D248AEC63DEFB1, 1C6C1E79E7D0D3008EFA0C51, DF47DB83567E12D94C90C186, 775730CD86C47FBDC9419E49, F2E25F94650242E3A64878B7, 4BE492A2D95B99D7EAB5E1B2, 3263F0161C5BC399111E323B, B71BD30B9E5D41A06B13B456, 164B1DA057D49AA2DDF2EB36,); runOnlyForDeploymentPostprocessing = 0; };
 E2AA269EB967A8853A258BFA = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 41D311A605520FC7B8B9A980 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 5DF0EAF287A59303D4EFEAF3 = { isa = XCBuildConfiguration; name = Debug; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 5.0; }; };
@@ -7714,6 +7341,490 @@ final class TokenHubQuotaStateTests: XCTestCase {
 }
 ```
 
+### Tests/TokenStatUITests/SeasunStartupContractTests.swift
+
+```swift
+import AppKit
+import SwiftUI
+import XCTest
+import TokenStatCore
+import Vision
+@testable import TokenStatMenu
+
+/// BP10b executable checks for the formal app boundary. These intentionally
+/// target the planned initializer/configuration API; do not weaken the tests
+/// to match the current legacy proxy activation path. Run only after G4 and
+/// PE approval, and after the product implementation provides this interface.
+@MainActor
+final class SeasunStartupContractTests: XCTestCase {
+    private struct IsolatedConfig {
+        let directory: URL
+        let file: URL
+        let calls = StartupCallCounts()
+
+        init() throws {
+            directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("TokenStatMenu-BP10-\(UUID().uuidString)", isDirectory: true)
+            file = directory.appendingPathComponent("config.plist")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+
+        func write(_ value: Any) throws -> Data {
+            let data = try PropertyListSerialization.data(fromPropertyList: value, format: .xml, options: 0)
+            try data.write(to: file, options: .atomic)
+            return data
+        }
+
+        func tearDown() { try? FileManager.default.removeItem(at: directory) }
+    }
+
+    private final class StartupCallCounts {
+        private let lock = NSLock()
+        private var loads = 0
+        private var saves = 0
+        private var gates = 0
+        func noteLoad() { lock.lock(); loads += 1; lock.unlock() }
+        func noteSave() { lock.lock(); saves += 1; lock.unlock() }
+        func noteGate() { lock.lock(); gates += 1; lock.unlock() }
+        func snapshot() -> (loads: Int, saves: Int, gates: Int) {
+            lock.lock(); defer { lock.unlock() }; return (loads, saves, gates)
+        }
+    }
+
+    private func makeModel(_ isolated: IsolatedConfig) -> AppModel {
+        AppModel(preview: false, startup: startup(for: isolated))
+    }
+
+    private func startup(for isolated: IsolatedConfig, shouldStartBackgroundServices: Bool = false)
+        -> AppModelStartupDependencies {
+        startup(for: isolated, shouldStartBackgroundServices: shouldStartBackgroundServices,
+                loadOverride: nil, saveOverride: nil)
+    }
+
+    private func startup(for isolated: IsolatedConfig, shouldStartBackgroundServices: Bool,
+                         loadOverride: (() throws -> Data?)?,
+                         saveOverride: ((SeasunPreferences) throws -> Void)?) -> AppModelStartupDependencies {
+        AppModelStartupDependencies(
+            loadPreferences: {
+                isolated.calls.noteLoad()
+                if let loadOverride { return try loadOverride() }
+                return try ConfigStore.loadPreferences(at: isolated.file)
+            },
+            savePreferences: { preferences in
+                isolated.calls.noteSave()
+                if let saveOverride { try saveOverride(preferences) }
+                else { try ConfigStore.savePreferences(preferences, at: isolated.file) }
+            },
+            shouldStartBackgroundServices: {
+                isolated.calls.noteGate()
+                return shouldStartBackgroundServices
+            })
+    }
+
+    private func assertQuietSafeStartup(_ model: AppModel, file: URL, source: StaticString = #filePath,
+                                        line: UInt = #line) {
+        XCTAssertTrue(model.isSeasunOnly, "legacy data source must not select an active integration", file: source, line: line)
+        assertNoBackgroundResources(model, file: source, line: line)
+        XCTAssertNil(model.tokenHubQuotaSnapshot, "startup cannot fabricate an observed quota", file: source, line: line)
+        XCTAssertFalse(model.hasRequestData, "startup cannot imply observed usage", file: source, line: line)
+        XCTAssertFalse(model.userFacingStatus.contains(file.path), "status must not reveal a config path", file: source, line: line)
+        XCTAssertFalse(model.userFacingStatus.contains("https://legacy.invalid"), "status must not expose an old endpoint", file: source, line: line)
+    }
+
+    private func assertNoBackgroundResources(_ model: AppModel, file: StaticString = #filePath, line: UInt = #line) {
+        let resources = model.backgroundServiceResources
+        XCTAssertEqual(resources.timerCount, 0, "disabled startup must own no repeating timer", file: file, line: line)
+        XCTAssertEqual(resources.workspaceObserverCount, 0, "disabled startup must install no workspace observers", file: file, line: line)
+        XCTAssertEqual(resources.localScanQueuedCount, 0, "disabled startup must queue no local scan", file: file, line: line)
+        XCTAssertEqual(resources.axRefreshScheduledCount, 0, "disabled startup must schedule no AX refresh", file: file, line: line)
+        XCTAssertEqual(resources.axScanInFlightCount, 0, "disabled startup must start no AX scan", file: file, line: line)
+    }
+
+    func testInitAndReloadKeepLegacyFilesUntouchedAndSelectSeasunSafeDefault() throws {
+        let cases: [(String, Data?)] = [
+            ("absent", nil),
+            ("legacy proxy with arbitrary endpoint", try PropertyListSerialization.data(fromPropertyList: [
+                "dataSource": "proxy", "endpoint": "https://legacy.invalid/v1/chat/completions",
+                "usageURL": "https://quota.invalid/api", "model": "old-model", "port": 18765,
+                "monthlyLimit": 900_000, "inputPrice": 1.25
+            ], format: .xml, options: 0)),
+            ("invalid legacy endpoint", try PropertyListSerialization.data(fromPropertyList: [
+                "dataSource": "proxy", "endpoint": "file:///private/legacy",
+                "usageURL": "https://quota.invalid/api"
+            ], format: .xml, options: 0)),
+            ("malformed plist", Data("not a plist".utf8)),
+            ("non-dictionary root", try PropertyListSerialization.data(fromPropertyList: ["legacy", "array"], format: .xml, options: 0))
+        ]
+
+        for (name, bytes) in cases {
+            let isolated = try IsolatedConfig()
+            defer { isolated.tearDown() }
+            if let bytes { try bytes.write(to: isolated.file, options: .atomic) }
+            let before = try? Data(contentsOf: isolated.file)
+
+            let model = makeModel(isolated)
+            defer { model.shutdown() }
+            assertQuietSafeStartup(model, file: isolated.file)
+            let afterInit = isolated.calls.snapshot()
+            XCTAssertEqual(afterInit.loads, 1, "init reads only the isolated preference file: \(name)")
+            XCTAssertEqual(afterInit.saves, 0, "init never writes preferences: \(name)")
+            XCTAssertGreaterThan(afterInit.gates, 0, "init consults the unified background gate: \(name)")
+            XCTAssertEqual(try? Data(contentsOf: isolated.file), before,
+                           "init must not migrate, normalize, or rewrite case: \(name)")
+
+            model.reload()
+            assertQuietSafeStartup(model, file: isolated.file)
+            let afterReload = isolated.calls.snapshot()
+            XCTAssertEqual(afterReload.loads, 2, "reload reads once from the isolated preference path: \(name)")
+            XCTAssertEqual(afterReload.saves, 0, "reload never writes preferences: \(name)")
+            XCTAssertGreaterThan(afterReload.gates, afterInit.gates,
+                                 "reload reuses the unified background gate: \(name)")
+            XCTAssertEqual(try? Data(contentsOf: isolated.file), before,
+                           "reload must not migrate, normalize, or rewrite case: \(name)")
+        }
+    }
+
+    func testPreferenceDefaultsValidationAndCompatibilityKeyPrecedence() throws {
+        let fixtures: [(String, [String: Any], Double, Bool)] = [
+            ("no preferences", [:], 60, true),
+            ("valid minimum and new true overrides old false", [
+                "refreshSeconds": 15.0, "tokenHubCompatibilityReadEnabled": true,
+                "tokenHubAutomaticReadingEnabled": false
+            ], 15, true),
+            ("valid maximum and new false overrides old true", [
+                "refreshSeconds": 3600.0, "tokenHubCompatibilityReadEnabled": false,
+                "tokenHubAutomaticReadingEnabled": true
+            ], 3600, false),
+            ("legacy key used only when new key is absent", [
+                "tokenHubAutomaticReadingEnabled": false
+            ], 60, false),
+            ("invalid current key defaults true without legacy fallback", [
+                "tokenHubCompatibilityReadEnabled": "invalid", "tokenHubAutomaticReadingEnabled": false
+            ], 60, true),
+            ("numeric current key defaults true without legacy fallback", [
+                "tokenHubCompatibilityReadEnabled": NSNumber(value: 0), "tokenHubAutomaticReadingEnabled": false
+            ], 60, true),
+            ("out of range refresh defaults to 60", ["refreshSeconds": 3601.0], 60, true),
+            ("below range refresh defaults to 60", ["refreshSeconds": 14.9], 60, true),
+            ("wrong-type refresh defaults to 60", ["refreshSeconds": "15"], 60, true),
+            ("boolean refresh defaults to 60", ["refreshSeconds": true], 60, true)
+        ]
+
+        for (name, plist, expectedRefresh, expectedCompatibility) in fixtures {
+            let isolated = try IsolatedConfig()
+            defer { isolated.tearDown() }
+            let original = try isolated.write(plist)
+            let model = makeModel(isolated)
+            defer { model.shutdown() }
+            XCTAssertEqual(model.preferences.refreshSeconds, expectedRefresh, name)
+            XCTAssertEqual(model.preferences.tokenHubCompatibilityReadEnabled, expectedCompatibility, name)
+            XCTAssertEqual(try? Data(contentsOf: isolated.file), original,
+                           "preference decoding at startup is read-only: \(name)")
+            XCTAssertFalse(model.permissionPromptRequested,
+                           "default-enabled AX compatibility must not prompt automatically: \(name)")
+            XCTAssertEqual(isolated.calls.snapshot().saves, 0, "decoding must never persist normalized values: \(name)")
+            assertNoBackgroundResources(model)
+        }
+    }
+
+    func testPreferenceSaveNormalizesNonFiniteAndOutOfRangeRefreshValues() throws {
+        let isolated = try IsolatedConfig()
+        defer { isolated.tearDown() }
+        let model = makeModel(isolated)
+        defer { model.shutdown() }
+        for invalid in [Double.nan, Double.infinity, -Double.infinity, 14.9, 3601] {
+            XCTAssertTrue(model.savePreferences(SeasunPreferences(refreshSeconds: invalid,
+                tokenHubCompatibilityReadEnabled: true)))
+            model.reload()
+            XCTAssertEqual(model.preferences.refreshSeconds, 60,
+                           "non-finite or out-of-range refresh interval must normalize to 60")
+        }
+    }
+
+    func testPreviewReturnsBeforeCallingPreferenceLoader() throws {
+        let isolated = try IsolatedConfig()
+        defer { isolated.tearDown() }
+        let startup = AppModelStartupDependencies(
+            loadPreferences: {
+                isolated.calls.noteLoad()
+                throw NSError(domain: "BP10PreviewMustNotLoad", code: 1)
+            },
+            savePreferences: { _ in isolated.calls.noteSave() },
+            shouldStartBackgroundServices: {
+                isolated.calls.noteGate()
+                return true
+            })
+        let model = AppModel(preview: true, startup: startup)
+        defer { model.shutdown() }
+        let calls = isolated.calls.snapshot()
+        XCTAssertEqual(calls.loads, 0, "preview must return before calling the preference loader")
+        XCTAssertEqual(calls.saves, 0)
+        XCTAssertEqual(calls.gates, 0, "preview returns before consulting the service gate")
+        assertNoBackgroundResources(model)
+    }
+
+    func testExplicitSaveWritesOnlyAllowlistedPreferencesAndReloadsThem() throws {
+        let isolated = try IsolatedConfig()
+        defer { isolated.tearDown() }
+        _ = try isolated.write([
+            "dataSource": "proxy", "endpoint": "https://legacy.invalid/v1/chat/completions",
+            "usageURL": "https://quota.invalid/api", "apiKey": "never persist or read",
+            "model": "old-model", "monthlyLimit": 900_000,
+            "tokenHubAutomaticReadingEnabled": false
+        ])
+        let model = makeModel(isolated)
+        defer { model.shutdown() }
+
+        let gateCountBeforeSave = isolated.calls.snapshot().gates
+        XCTAssertTrue(model.savePreferences(SeasunPreferences(refreshSeconds: 120,
+            tokenHubCompatibilityReadEnabled: false)))
+        assertNoBackgroundResources(model)
+        let afterSave = isolated.calls.snapshot()
+        XCTAssertEqual(afterSave.saves, 1)
+        XCTAssertGreaterThan(afterSave.gates, gateCountBeforeSave,
+                             "save must consult the same background gate as init/reload")
+        let saved = try XCTUnwrap(PropertyListSerialization.propertyList(
+            from: Data(contentsOf: isolated.file), format: nil) as? [String: Any])
+        XCTAssertEqual(Set(saved.keys), Set(["refreshSeconds", "tokenHubCompatibilityReadEnabled"]))
+        XCTAssertEqual(saved["refreshSeconds"] as? Double, 120)
+        XCTAssertEqual(saved["tokenHubCompatibilityReadEnabled"] as? Bool, false)
+        model.reload()
+        XCTAssertTrue(model.isSeasunOnly, "reload of the reduced schema remains Seasun-only")
+        assertNoBackgroundResources(model)
+        XCTAssertGreaterThan(isolated.calls.snapshot().gates, afterSave.gates,
+                             "reload must consult the unified background gate")
+        XCTAssertEqual(model.preferences.refreshSeconds, 120)
+        XCTAssertFalse(model.preferences.tokenHubCompatibilityReadEnabled)
+        XCTAssertEqual(isolated.calls.snapshot().saves, 1, "reload must not save")
+    }
+
+    func testFailedExplicitSavePreservesMemoryAndDoesNotExposeFilesystemDetails() throws {
+        let isolated = try IsolatedConfig()
+        defer { isolated.tearDown() }
+        _ = try isolated.write(["refreshSeconds": 90.0, "tokenHubCompatibilityReadEnabled": true])
+        let model = makeModel(isolated)
+        defer { model.shutdown() }
+        let originalStatus = model.userFacingStatus
+        let originalRefresh = model.preferences.refreshSeconds
+        let originalCompatibility = model.preferences.tokenHubCompatibilityReadEnabled
+
+        try FileManager.default.removeItem(at: isolated.file)
+        try FileManager.default.createDirectory(at: isolated.file, withIntermediateDirectories: false)
+        XCTAssertFalse(model.savePreferences(SeasunPreferences(refreshSeconds: 300,
+            tokenHubCompatibilityReadEnabled: false)))
+        XCTAssertEqual(model.preferences.refreshSeconds, originalRefresh)
+        XCTAssertEqual(model.preferences.tokenHubCompatibilityReadEnabled, originalCompatibility)
+        XCTAssertEqual(model.userFacingStatus, originalStatus,
+                       "failed save leaves active runtime state unchanged")
+        assertNoBackgroundResources(model)
+        XCTAssertFalse(model.message.contains(isolated.directory.path), "raw path must not be exposed")
+        XCTAssertFalse(model.message.localizedCaseInsensitiveContains("no such file"),
+                       "raw filesystem errors must not be exposed")
+    }
+
+    func testReloadLoaderFailurePreservesPreferencesAndShowsSafeStatus() throws {
+        let isolated = try IsolatedConfig()
+        defer { isolated.tearDown() }
+        let original = try isolated.write(["refreshSeconds": 90.0, "tokenHubCompatibilityReadEnabled": false])
+        var attempts = 0
+        let startup = startup(for: isolated, shouldStartBackgroundServices: false, loadOverride: {
+            attempts += 1
+            if attempts > 1 {
+                throw NSError(domain: "BP10ReloadFixture", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "secret raw path \(isolated.file.path)"])
+            }
+            return try ConfigStore.loadPreferences(at: isolated.file)
+        }, saveOverride: nil)
+        let model = AppModel(preview: false, startup: startup)
+        defer { model.shutdown() }
+        let initialStatus = model.userFacingStatus
+        XCTAssertEqual(model.preferences.refreshSeconds, 90)
+        XCTAssertFalse(model.preferences.tokenHubCompatibilityReadEnabled)
+
+        model.reload()
+        XCTAssertEqual(model.preferences.refreshSeconds, 90)
+        XCTAssertFalse(model.preferences.tokenHubCompatibilityReadEnabled)
+        XCTAssertEqual(model.userFacingStatus, initialStatus,
+                       "failed reload keeps the last accepted runtime settings")
+        XCTAssertFalse(model.message.contains(isolated.file.path))
+        XCTAssertFalse(model.message.contains("secret raw path"))
+        XCTAssertEqual(isolated.calls.snapshot().loads, 2)
+        XCTAssertEqual(isolated.calls.snapshot().saves, 0)
+        XCTAssertEqual(try Data(contentsOf: isolated.file), original)
+        assertNoBackgroundResources(model)
+    }
+
+    func testDeterministicPreferenceSaveFailurePreservesTheOldFileAndRuntimeState() throws {
+        let isolated = try IsolatedConfig()
+        defer { isolated.tearDown() }
+        let original = try isolated.write(["refreshSeconds": 90.0, "tokenHubCompatibilityReadEnabled": true])
+        let startup = startup(for: isolated, shouldStartBackgroundServices: false, loadOverride: nil,
+                              saveOverride: { _ in
+            throw NSError(domain: "BP10SaveFixture", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "secret raw path \(isolated.file.path)"])
+        })
+        let model = AppModel(preview: false, startup: startup)
+        defer { model.shutdown() }
+        let status = model.userFacingStatus
+
+        XCTAssertFalse(model.savePreferences(SeasunPreferences(refreshSeconds: 300,
+            tokenHubCompatibilityReadEnabled: false)))
+        XCTAssertEqual(model.preferences.refreshSeconds, 90)
+        XCTAssertTrue(model.preferences.tokenHubCompatibilityReadEnabled)
+        XCTAssertEqual(model.userFacingStatus, status)
+        XCTAssertFalse(model.message.contains(isolated.file.path))
+        XCTAssertFalse(model.message.contains("secret raw path"))
+        XCTAssertEqual(try Data(contentsOf: isolated.file), original,
+                       "a deterministic save closure failure cannot delete or alter the old fixture")
+        XCTAssertEqual(isolated.calls.snapshot().saves, 1)
+        assertNoBackgroundResources(model)
+    }
+
+    func testFormalStartupTooltipPreservesSyntheticLocalHistoryAlongsideUnknownSeasunSource() throws {
+        let isolated = try IsolatedConfig()
+        defer { isolated.tearDown() }
+        let model = makeModel(isolated)
+        defer { model.shutdown() }
+        XCTAssertFalse(model.sourceStatus.isEmpty)
+        XCTAssertEqual(model.sourceStatus, "unknown")
+
+        let cases: [(String, LocalCodexSnapshot, [String])] = [
+            ("complete", LocalCodexSnapshot(input: 120, output: 80, total: 200,
+                sessionCount: 2, filesScanned: 3, isLimited: false,
+                latestEventAt: Date(timeIntervalSince1970: 1_797_000_000), fiveHour: nil, sevenDay: nil,
+                knownThreadCount: 2, unknownThreadCount: 0, unidentifiedFileCount: 0,
+                subagentCount: 1, forkCount: 1,
+                lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
+                    completedAt: Date(timeIntervalSince1970: 1_797_000_000))),
+             ["输入 120", "输出 80", "总计 200 tokens", "本次扫描记录量 200 tokens",
+              "已核验线程 2", "子代理 1", "分叉 1", "顶层对话 2", "上轮记录均速：15.0 tok/s",
+              "5 小时额度：本地", "7 天额度：本地"]),
+            ("partial", LocalCodexSnapshot(input: 30, output: 20, total: 50,
+                sessionCount: 1, filesScanned: 4, isLimited: false,
+                latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+                knownThreadCount: 1, unknownThreadCount: 2, unidentifiedFileCount: 1,
+                subagentCount: 1, forkCount: 2),
+             ["输入 30", "输出 20", "总计 50 tokens", "已核验记录小计 50 tokens",
+              "已核验线程 1", "未核验线程 2", "未识别文件 1", "子代理 1", "分叉 2", "最多32个物理文件"]),
+            ("unknown", LocalCodexSnapshot(input: 0, output: 0, total: 0,
+                sessionCount: 0, filesScanned: 2, isLimited: false,
+                latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+                knownThreadCount: 0, unknownThreadCount: 2, unidentifiedFileCount: 0,
+                subagentCount: 0, forkCount: 0),
+             ["输入 未知", "输出 未知", "总计 未知 tokens", "已核验记录小计 未知 tokens",
+              "未核验线程 2", "上轮记录均速：未知"])
+        ]
+
+        for (name, snapshot, expectedLocalDetails) in cases {
+            model.localSnapshot = snapshot
+            let tooltip = model.menuTooltip
+            for detail in expectedLocalDetails {
+                XCTAssertTrue(tooltip.contains(detail), "\(name) formal tooltip preserves local history detail: \(detail)")
+            }
+            XCTAssertTrue(tooltip.contains("不是模型瞬时生成速度"), "\(name) tooltip keeps the non-instantaneous speed qualification")
+            XCTAssertTrue(tooltip.contains("Seasun Token Hub"), "\(name) tooltip identifies the enterprise direct source")
+            let directLine = tooltip.split(separator: "\n").first { $0.contains("企业后台直接来源") }
+            XCTAssertNotNil(directLine, "\(name) tooltip labels the enterprise direct source explicitly")
+            XCTAssertTrue(directLine?.contains("尚未连接") == true || directLine?.contains("尚未接通") == true,
+                          "\(name) tooltip keeps the enterprise direct source disconnected")
+            XCTAssertTrue(directLine?.contains("额度、重置时间、月度用量和实时速度均未知") == true,
+                          "\(name) tooltip scopes unknown quota and usage fields to the disconnected direct source")
+        }
+    }
+
+    func testSettingsVisibleContentShowsSeasunPreferencesWithoutGenericIntegration() throws {
+        let isolated = try IsolatedConfig()
+        defer { isolated.tearDown() }
+        let model = makeModel(isolated)
+        defer { model.shutdown() }
+        let bounds = NSRect(x: 0, y: 0, width: 460, height: 700)
+        let hostingView = NSHostingView(rootView: SettingsView(model: model).frame(width: 460, height: 700))
+        hostingView.frame = bounds
+        let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        window.contentView = hostingView
+        window.makeKeyAndOrderFront(nil)
+        window.displayIfNeeded()
+        hostingView.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        let bitmap = try XCTUnwrap(hostingView.bitmapImageRepForCachingDisplay(in: bounds))
+        hostingView.cacheDisplay(in: bounds, to: bitmap)
+        let visibleText = try recognizedText(in: bitmap).joined(separator: "\n")
+        XCTAssertTrue(visibleText.contains("Seasun Token Hub") || visibleText.contains("Token Hub"),
+                      "the rendered Settings surface names the intended source")
+        XCTAssertTrue(visibleText.contains("刷新"), "the rendered surface exposes an optional refresh preference")
+        XCTAssertTrue(visibleText.contains("兼容"), "the rendered surface exposes the optional compatibility preference")
+        for forbidden in ["上游完整 Endpoint", "API Key", "模型覆盖", "自定义价格", "企业额度接口", "手动月度 Token 上限"] {
+            XCTAssertFalse(visibleText.contains(forbidden),
+                           "the rendered Settings surface must not expose \(forbidden)")
+        }
+        XCTAssertFalse(visibleText.localizedCaseInsensitiveContains("填入企业") || visibleText.contains("连接成功"),
+                       "Settings must not imply that a generic endpoint or credential connects the Seasun source")
+    }
+
+    func testSettingsLightAndDarkRendersAreAvailableForIndependentVisualReview() throws {
+        let isolated = try IsolatedConfig()
+        defer { isolated.tearDown() }
+        let model = makeModel(isolated)
+        defer { model.shutdown() }
+        let output = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent(".build/bp10-settings-review", isDirectory: true)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        let bounds = NSRect(x: 0, y: 0, width: 460, height: 700)
+        for (name, appearance, scheme) in [("light", NSAppearance.Name.aqua, ColorScheme.light),
+                                           ("dark", NSAppearance.Name.darkAqua, ColorScheme.dark)] {
+            let background = scheme == .dark
+                ? Color(red: 0.13, green: 0.14, blue: 0.17)
+                : Color(red: 0.96, green: 0.97, blue: 0.99)
+            let root = DashboardView(model: model, settings: true)
+                .environment(\.colorScheme, scheme)
+                .frame(width: 460, height: 700)
+                .background(background)
+            let hostingView = NSHostingView(rootView: root)
+            hostingView.frame = bounds
+            hostingView.appearance = NSAppearance(named: appearance)
+            let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.appearance = NSAppearance(named: appearance)
+            window.contentView = hostingView
+            window.makeKeyAndOrderFront(nil)
+            hostingView.frame = bounds
+            window.displayIfNeeded()
+            hostingView.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            window.displayIfNeeded()
+            hostingView.needsDisplay = true
+            hostingView.layoutSubtreeIfNeeded()
+            guard let bitmap = hostingView.bitmapImageRepForCachingDisplay(in: bounds) else {
+                window.close(); XCTFail("Seasun Settings render should be available"); continue
+            }
+            hostingView.cacheDisplay(in: bounds, to: bitmap)
+            let renderedText = try recognizedText(in: bitmap).joined(separator: "\n")
+            XCTAssertTrue(renderedText.contains("Seasun Token Hub") || renderedText.contains("Token Hub"),
+                          "\(name) review render contains the intended source text")
+            XCTAssertTrue(renderedText.contains("刷新"), "\(name) review render contains the refresh preference")
+            XCTAssertTrue(renderedText.contains("兼容"), "\(name) review render contains the compatibility preference")
+            let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+            XCTAssertGreaterThan(png.count, 0)
+            try png.write(to: output.appendingPathComponent("seasun-settings-\(name).png"), options: .atomic)
+            window.close()
+        }
+        print("BP10 Seasun Settings light/dark visual review files: \(output.path)")
+    }
+
+    private func recognizedText(in bitmap: NSBitmapImageRep) throws -> [String] {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["zh-Hans", "en-US"]
+        request.usesLanguageCorrection = false
+        let handler = VNImageRequestHandler(cgImage: try XCTUnwrap(bitmap.cgImage), options: [:])
+        try handler.perform([request])
+        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+    }
+}
+```
+
 ### script/build_and_run.sh
 
 ```bash
@@ -7724,7 +7835,6 @@ cd "$ROOT"
 MODE="${1:-run}"
 APP="$ROOT/dist/TokenStatMenu.app"
 case "$MODE" in run|--build-only|--verify|--release|--universal|--logs|--telemetry|--debug) ;; *) echo "Usage: $0 [--build-only|--verify|--release|--universal|--logs|--telemetry|--debug]"; exit 2 ;; esac
-pkill -x TokenStatMenu 2>/dev/null || true
 mkdir -p "$APP/Contents/MacOS"
 # Native SwiftPM also works with Command Line Tools; no global xcode-select changes.
 if [ "$MODE" = "--universal" ]; then
@@ -7868,218 +7978,205 @@ if __name__ == "__main__":
 
 ```python
 #!/usr/bin/env python3
-"""Launches the real .app against a local fixture, with an isolated plist and test-only keys."""
-import concurrent.futures
-import http.client
+"""Isolated BP10b startup integration for the formal Seasun-only app.
+
+This test deliberately does not start a proxy/mock server, send inference
+requests, inspect credentials, or read diagnostic values. It launches only its
+own app child process against temporary plist fixtures and terminates that
+exact child PID. Source call-graph review remains necessary: the optional
+URLProtocol tripwire in XCTest cannot establish comprehensive network silence.
+"""
+from __future__ import annotations
+
 import json
 import os
 import pathlib
 import plistlib
-import socket
+import signal
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-WORK = ROOT / ".integration"
-BASE = "http://127.0.0.1:19876"
-LOCAL_KEY = "integration-local-key"
+APP = ROOT / "dist/TokenStatMenu.app"
+EXECUTABLE = APP / "Contents/MacOS/TokenStatMenu"
+ALLOWED_REPORT_KEYS = {
+    "seasunOnlyMode",
+    "backgroundServicesStarted",
+    "statusItemVisible",
+    "permissionPromptRequested",
+    "quotaPresent",
+    "resetTimePresent",
+    "monthlyUsagePresent",
+    "liveTokenSpeedPresent",
+    "sourceStatus",
+    "backgroundServiceResources",
+}
+EXPECTED_QUIET_RESOURCE_COUNTS = {
+    "timerCount": 0,
+    "workspaceObserverCount": 0,
+    "localScanQueuedCount": 0,
+    "axRefreshScheduledCount": 0,
+    "axScanInFlightCount": 0,
+}
 
 
-def fetch(path, obj=None, key=LOCAL_KEY):
-    data = None if obj is None else json.dumps(obj).encode()
-    request = urllib.request.Request(BASE + path, data=data,
-        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            return response.status, response.read()
-    except urllib.error.HTTPError as error:
-        return error.code, error.read()
-
-
-def snapshot():
-    status, data = fetch("/tokenstat/status")
-    assert status == 200
-    return json.loads(data)
-
-
-def body(model="fixture", stream=True):
-    return {"model": model, "messages": [{"role": "user", "content": "integration prompt must not appear in logs"}], "stream": stream}
-
-
-def wait_for(predicate, timeout=12):
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
+def wait_for_report(path: pathlib.Path, process: subprocess.Popen[bytes], timeout: float = 15.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise AssertionError("isolated app process exited before writing readiness booleans")
         try:
-            value = predicate()
-            if value:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
                 return value
-        except (OSError, ValueError, urllib.error.URLError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             pass
         time.sleep(0.1)
-    raise AssertionError("condition timed out")
+    raise AssertionError("timed out waiting for isolated startup readiness booleans")
 
 
-def main():
-    global WORK
-    WORK.mkdir(exist_ok=True)
-    WORK = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=WORK))
-    (ROOT / ".integration/last-run.txt").write_text(str(WORK))
-    config = {"dataSource": "proxy", "endpoint": "http://127.0.0.1:19877/v1/chat/completions", "port": 19876,
-        "usageURL": "http://127.0.0.1:19877/usage", "refreshSeconds": 15.0,
-        "inputPrice": 1.0, "outputPrice": 2.0, "loggingEnabled": True}
-    with (WORK / "config.plist").open("wb") as handle:
-        plistlib.dump(config, handle)
-    codex_home = WORK / "codex"
-    codex_home.mkdir()
-    (codex_home / "config.toml").write_text('model_provider = "fixture"\nmodel = "fixture-model"\n[model_providers.fixture]\nbase_url = "http://127.0.0.1:19877/v1"\nwire_api = "responses"\nexperimental_bearer_token = "fixture-auth-must-not-be-imported"\n')
-    server = subprocess.Popen([sys.executable, str(ROOT / "script/mock_server.py")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["pkill", "-x", "TokenStatMenu"], capture_output=True)
-    command = ["open", "-n", str(ROOT / "dist/TokenStatMenu.app"),
-        "--env", "TOKENSTAT_LOCAL_KEY=" + LOCAL_KEY,
-        "--env", "CODEX_HOME=" + str(codex_home),
-        "--env", "TOKENSTAT_API_KEY=integration-upstream-key",
-        "--env", "TOKENSTAT_USAGE_KEY=integration-quota-key",
-        "--args", "--config", str(WORK / "config.plist"), "--show-panel", "--test-fixture",
-        "--diagnostics-output", str(WORK / "ui-diagnostics.json")]
-    subprocess.run(command, check=True)
+def stop_own_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.send_signal(signal.SIGTERM)
     try:
-        wait_for(lambda: fetch("/health")[0] == 200)
-        diagnostic = WORK / "ui-diagnostics.json"
-        ui = wait_for(lambda: (r if (r := json.loads(diagnostic.read_text())).get("quotaFraction") == 0.85 else None))
-        assert ui["discoveredGateways"] == 1, ui
-        assert "fixture-auth" not in diagnostic.read_text(), ui
-        assert ui["fiveHourUsedPercent"] == 25 and ui["sevenDayUsedPercent"] == 70, ui
-        assert ui["quotaUsed"] == 850000 and ui["alert"] == "yellow", ui
-        assert ui["title"] == "测试 T:— · Σ— · 请求0" and ui["statusItemVisible"], ui
-        assert ui["isTestFixture"] and not ui["hasRequestData"], ui
-        assert "模拟测试" in ui["dataNotice"], ui
-        assert snapshot()["requests"] == 0, "startup must not manufacture usage"
-        assert fetch("/tokenstat/status", key="bad")[0] == 401
-        assert fetch("/v1/chat/completions", body(), key="bad")[0] == 401
-        assert fetch("/unsupported", body())[0] == 400
-        assert snapshot()["requests"] == 0, "rejected local requests are not upstream requests"
-        for route in ["/v1/chat/completions", "/v1/responses", "/api/chat", "/api/generate"]:
-            status, data = fetch(route, body())
-            assert status == 200 and "你好" in data.decode(), route
-        assert fetch("/v1/chat/completions", body(stream=False))[0] == 200
-        assert snapshot()["input"] == 500 and snapshot()["output"] == 250, snapshot()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            jobs = [executor.submit(fetch, "/v1/chat/completions", body("slow")) for _ in range(3)]
-            active = wait_for(lambda: (s if (s := snapshot())["active"] == 3 and s["outputTPS"] > 0 else None))
-            assert active["estimatedRequests"] >= 3
-            print("Live concurrent output TPS:", active["outputTPS"], flush=True)
-            def live_title(value):
-                title = value.get("title", "")
-                if value.get("active") != 3 or not title.startswith("测试 T:≈") or "tok/s" not in title or "Σ" not in title:
-                    return None
-                speed = title.split("≈", 1)[1].split("tok/s", 1)[0]
-                try:
-                    return value if float(speed) > 0 else None
-                except ValueError:
-                    return None
-            ui = wait_for(lambda: (r if (r := json.loads(diagnostic.read_text())) and live_title(r) else None))
-            print("Actual AppKit menu title:", ui["title"], flush=True)
-            for job in jobs:
-                assert job.result()[0] == 200
-        final = wait_for(lambda: (s if (s := snapshot())["active"] == 0 else None))
-        assert final["input"] == 800 and final["output"] == 400, final
-        assert abs(final["costUSD"] - 0.0016) < 1e-9
-        assert final["outputTPS"] == 0
-        for model, status in [("fail", 429), ("redirect", 302), ("incomplete", 200), ("malformed", 200)]:
-            assert fetch("/v1/chat/completions", body(model))[0] == status
-        failures = wait_for(lambda: (s if (s := snapshot())["failures"] == 4 else None))
-        assert failures["requests"] == 12
-        # Exercise inbound chunked HTTP as real clients such as SDK generators may use it.
-        connection = http.client.HTTPConnection("127.0.0.1", 19876, timeout=20)
-        data = json.dumps(body()).encode()
-        connection.request("POST", "/v1/chat/completions", body=[data[:7], data[7:]],
-            headers={"Authorization": "Bearer " + LOCAL_KEY, "Content-Type": "application/json"}, encode_chunked=True)
-        response = connection.getresponse(); assert response.status == 200; response.read(); connection.close()
-        final = wait_for(lambda: (s if (s := snapshot())["requests"] == 13 and s["active"] == 0 else None))
-        assert final["failures"] == 4
-        connection = http.client.HTTPConnection("127.0.0.1", 19876, timeout=20)
-        connection.request("POST", "/v1/chat/completions", body=json.dumps(body("cancel")),
-            headers={"Authorization": "Bearer " + LOCAL_KEY, "Content-Type": "application/json"})
-        response = connection.getresponse(); response.read(100); response.close(); connection.close()
-        cancelled = wait_for(lambda: (s if (s := snapshot())["active"] == 0 else None))
-        assert cancelled["requests"] == 14 and cancelled["failures"] == 5, cancelled
-        with urllib.request.urlopen("http://127.0.0.1:19877/fixture/quota95", timeout=2) as response:
-            assert response.status == 200
-        red = wait_for(lambda: (r if (r := json.loads(diagnostic.read_text())).get("alert") == "red" else None), timeout=20)
-        assert red["quotaFraction"] == 0.96 and red["quotaUsed"] == 960000, red
-        logs = WORK / "Logs/requests.jsonl"
-        wait_for(lambda: logs.exists() and len(logs.read_text().splitlines()) >= 13)
-        text = logs.read_text()
-        for secret in ["integration prompt must not", "你好", LOCAL_KEY, "integration-upstream-key", "integration-quota-key"]:
-            assert secret not in text, "logs must not contain bodies or secrets"
-        records = [json.loads(line) for line in text.splitlines()]
-        assert any(r["exact"] and r["input"] == 100 and r["output"] == 50 for r in records)
-        print("PASS: real app, AppKit title, quota/yellow+red alerts, 4 routes, streaming/nonstreaming, 3 concurrent requests, usage correction, failures, cancellation, redirect refusal, chunked input, sanitized logs", flush=True)
-        if "--keep-running" not in sys.argv:
-            # A fresh normal launch must not inherit fixture quota or imply zero measured usage.
-            subprocess.run(["pkill", "-x", "TokenStatMenu"], capture_output=True)
-            normal_config = WORK / "normal.plist"
-            with normal_config.open("wb") as handle:
-                plistlib.dump({"port": 19876, "dataSource": "proxy"}, handle)
-            normal_diagnostic = WORK / "normal-ui.json"
-            normal_command = command.copy()
-            normal_command.remove("--test-fixture")
-            normal_command[normal_command.index(str(WORK / "config.plist"))] = str(normal_config)
-            normal_command[normal_command.index(str(diagnostic))] = str(normal_diagnostic)
-            subprocess.run(normal_command, check=True)
-            normal = wait_for(lambda: json.loads(normal_diagnostic.read_text()))
-            assert normal["title"] == "T:— · Σ— · 请求0" and not normal["isTestFixture"], normal
-            assert not normal["hasRequestData"] and "未采集" in normal["dataNotice"], normal
-            assert normal.get("fiveHourUsedPercent") is None and normal.get("sevenDayUsedPercent") is None, normal
-            assert normal.get("quotaUsed") is None and normal["alert"] == "normal", normal
-            print("PASS: fixture clearly labeled; normal startup has no inherited usage or quota", flush=True)
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        # Kill only the Popen child created by this test. Never use pkill or
+        # match process names, which could terminate a user's running app.
+        process.kill()
+        process.wait(timeout=5)
 
-            # Local-source startup uses an isolated CODEX_HOME fixture and never resolves proxy credentials.
-            subprocess.run(["pkill", "-x", "TokenStatMenu"], capture_output=True)
-            local_home = WORK / "local-codex"
-            session_dir = local_home / "sessions" / "2026" / "10" / "17"
-            session_dir.mkdir(parents=True)
-            session_meta = {"type": "session_meta", "payload": {
-                "id": "12345678-1234-4234-8234-123456789abc", "source": "cli"}}
-            event = {"timestamp": "2026-10-17T03:00:00Z", "type": "event_msg", "payload": {
-                "type": "token_count", "info": {"total_token_usage": {
-                    "input_tokens": 23, "output_tokens": 7, "total_tokens": 30}}, "rate_limits": {}}}
-            (session_dir / "rollout-fixture-12345678-1234-4234-8234-123456789abc.jsonl").write_text(
-                json.dumps(session_meta) + "\n" + json.dumps(event) + "\n")
-            local_config = WORK / "local.plist"
-            with local_config.open("wb") as handle:
-                plistlib.dump({"port": 19879, "dataSource": "localCodex"}, handle)
-            local_diagnostic = WORK / "local-ui.json"
-            local_command = ["open", "-n", str(ROOT / "dist/TokenStatMenu.app"),
-                "--env", "CODEX_HOME=" + str(local_home), "--args", "--config", str(local_config),
-                "--test-fixture", "--disable-discovery", "--diagnostics-output", str(local_diagnostic)]
-            subprocess.run(local_command, check=True)
-            local = wait_for(lambda: (r if (r := json.loads(local_diagnostic.read_text())).get("hasRequestData") else None))
-            assert local["title"] == "测试 上轮均:— · Σ30 · 1顶层对话" and local["isTestFixture"], local
-            assert "模拟测试" in local["dataNotice"], local
-            assert not local["tokenHubPermissionGranted"] and not local["tokenHubPermissionRequired"], local
-            assert (local.get("quotaUsed") is None and local.get("fiveHourUsedPercent") is None
-                and local.get("sevenDayUsedPercent") is None), local
-            with socket.socket() as probe:
-                probe.settimeout(0.5)
-                assert probe.connect_ex(("127.0.0.1", 19879)) != 0, "local source must not start the proxy listener"
-            print("PASS: synthetic nested local Codex startup is ready without proxy listener or inherited quota", flush=True)
-        (WORK / "result.json").write_text(json.dumps(cancelled, indent=2))
-        if "--keep-running" in sys.argv:
-            print("Fixture running for UI inspection. PID", server.pid, flush=True)
-            return
+
+def verify_report(report: dict) -> None:
+    assert set(report) == ALLOWED_REPORT_KEYS, "diagnostics must contain only the approved readiness schema"
+    assert report["seasunOnlyMode"] is True
+    assert report["backgroundServicesStarted"] is False
+    assert report["permissionPromptRequested"] is False
+    assert report["quotaPresent"] is False
+    assert report["resetTimePresent"] is False
+    assert report["monthlyUsagePresent"] is False
+    assert report["liveTokenSpeedPresent"] is False
+    assert report["statusItemVisible"] is True
+    assert report["sourceStatus"] in {"notConnected", "unavailable", "unknown"}
+    assert report["backgroundServiceResources"] == EXPECTED_QUIET_RESOURCE_COUNTS
+
+
+def fixture_cases() -> list[tuple[str, bytes | None]]:
+    return [
+        ("no-config", None),
+        ("legacy-proxy-arbitrary-endpoint", plistlib.dumps({
+            "dataSource": "proxy",
+            "endpoint": "https://legacy.invalid/v1/chat/completions",
+            "usageURL": "https://quota.invalid/api",
+            "model": "legacy-model",
+            "port": 18765,
+            "monthlyLimit": 900000,
+            "tokenHubAutomaticReadingEnabled": False,
+        })),
+        ("invalid-legacy-endpoint", plistlib.dumps({
+            "dataSource": "proxy",
+            "endpoint": "file:///private/legacy",
+            "usageURL": "https://quota.invalid/api",
+        })),
+        ("malformed-plist", b"not a property list"),
+        ("non-dictionary-root", plistlib.dumps(["legacy", "array"])),
+    ]
+
+
+def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
+    """Run a copy of the build-only control flow with kill/build tools stubbed.
+
+    The pkill stub records a call and never signals any process. Thus this
+    check can detect a regression without risking a user-owned app process.
+    """
+    checkout = root / "build-script-fixture"
+    (checkout / "script").mkdir(parents=True)
+    (checkout / "Resources").mkdir()
+    (checkout / "Resources/Info.plist").write_bytes(b"fixture")
+    (checkout / "script/build_and_run.sh").write_bytes((ROOT / "script/build_and_run.sh").read_bytes())
+    tools = checkout / "tools"
+    tools.mkdir()
+    pkill_log = checkout / "pkill-called"
+    fake_bin = checkout / "fake-bin"
+    fake_bin.mkdir()
+
+    stubs = {
+        "pkill": "#!/bin/sh\nprintf called >> \"$BP10_PKILL_LOG\"\nexit 0\n",
+        "swift": "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = --show-bin-path ]; then printf '%s\\n' \"$BP10_FAKE_BIN\"; exit 0; fi; done\nexit 0\n",
+        "cp": "#!/bin/sh\nexit 0\n",
+        "chmod": "#!/bin/sh\nexit 0\n",
+        "codesign": "#!/bin/sh\nexit 0\n",
+    }
+    for name, content in stubs.items():
+        path = tools / name
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o755)
+
+    environment = os.environ.copy()
+    environment["PATH"] = str(tools) + os.pathsep + environment.get("PATH", "")
+    environment["BP10_PKILL_LOG"] = str(pkill_log)
+    environment["BP10_FAKE_BIN"] = str(fake_bin)
+    completed = subprocess.run(
+        ["/bin/bash", str(checkout / "script/build_and_run.sh"), "--build-only"],
+        cwd=checkout,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=20,
+        check=False,
+    )
+    assert completed.returncode == 0, "isolated --build-only control flow should complete with stubbed build tools"
+    assert not pkill_log.exists(), "--build-only must not invoke a global process-name kill"
+    print("PASS: --build-only invokes no global process kill (stubbed, isolated script copy)", flush=True)
+
+
+def run_case(name: str, source: bytes | None, root: pathlib.Path) -> None:
+    case = root / name
+    case.mkdir()
+    config = case / "config.plist"
+    if source is not None:
+        config.write_bytes(source)
+    before = config.read_bytes() if config.exists() else None
+    report_path = case / "readiness.json"
+
+    process = subprocess.Popen(
+        [str(EXECUTABLE), "--config", str(config), "--disable-background-services",
+         "--diagnostics-output", str(report_path)],
+        cwd=case,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        report = wait_for_report(report_path, process)
+        verify_report(report)
+        after = config.read_bytes() if config.exists() else None
+        assert after == before, "startup must not rewrite, migrate, or normalize the old configuration"
     finally:
-        if "--keep-running" not in sys.argv:
-            subprocess.run(["pkill", "-x", "TokenStatMenu"], capture_output=True)
-            server.terminate(); server.wait(timeout=5)
+        stop_own_process(process)
+    print(f"PASS: {name} (safe startup booleans; config unchanged)", flush=True)
+
+
+def main() -> int:
+    if not EXECUTABLE.is_file():
+        raise FileNotFoundError(f"BP10b app executable is missing: {EXECUTABLE}")
+    if not os.access(EXECUTABLE, os.X_OK):
+        raise PermissionError("BP10b app executable is not executable")
+    with tempfile.TemporaryDirectory(prefix="tokenstat-bp10-startup-") as temporary:
+        root = pathlib.Path(temporary)
+        verify_build_only_never_invokes_global_kill(root)
+        for name, source in fixture_cases():
+            run_case(name, source, root)
+    print("PASS: isolated Seasun-only startup cases; no proxy fixture server or inference traffic", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
 
 ### script/generate_xcode_project.py
@@ -8403,12 +8500,12 @@ PUBLIC_FILES = [
     "Sources/TokenStatCore/WindowQuota.swift", "Sources/TokenStatCore/RateWindow.swift", "Sources/TokenStatCore/StreamParser.swift",
     "Sources/TokenStatCore/TokenHubQuota.swift", "Sources/TokenStatCore/TokenHubAXScanning.swift",
     "Sources/TokenStatMenu/AppModel.swift", "Sources/TokenStatMenu/DashboardView.swift",
-    "Sources/TokenStatMenu/QuotaClient.swift", "Sources/TokenStatMenu/SettingsView.swift",
+    "Sources/TokenStatMenu/SettingsView.swift",
     "Sources/TokenStatMenu/StatusBarController.swift", "Sources/TokenStatMenu/Storage.swift",
     "Sources/TokenStatMenu/TokenStatMenuApp.swift", "Sources/TokenStatMenu/PanelStyle.swift", "Sources/TokenStatMenu/WindowQuotaCard.swift", "Sources/TokenStatMenu/TokenHubAXReader.swift", "Sources/TokenStatMenu/TokenHubQuotaCard.swift",
     "Resources/Info.plist", "Resources/config.example.plist", "TokenStatMenu.xcodeproj/project.pbxproj",
     "Tests/TokenStatCoreTests/CoreChecks.swift", "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/WindowQuotaChecks.swift", "Tests/TokenStatCoreTests/LocalCodexUsageChecks.swift",
-    "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift", "Tests/TokenStatCoreTests/TokenHubQuotaChecks.swift", "Tests/TokenStatUITests/TokenHubQuotaStateTests.swift",
+    "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift", "Tests/TokenStatCoreTests/TokenHubQuotaChecks.swift", "Tests/TokenStatUITests/TokenHubQuotaStateTests.swift", "Tests/TokenStatUITests/SeasunStartupContractTests.swift",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png",
@@ -8477,10 +8574,10 @@ from pathlib import Path
 from package_source import PUBLIC_FILES, ROOT
 
 SYNTHETIC_PNG_SHA256 = {
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "e03aa7d784ce5d11b8994b99fa781e560e68c51764ab80396c6bfa91c9f848d0",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "0713582fbfbeafd295fec11f9f062d929b03aa24ece2c625fb6213af51e3eb79",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "ead37da0bb4717d1cd62c040218cf82a0aef02147874ebce0865d325194b32a3",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "49dad314d7714198f49031f9c47714f5ad7a87bd88595edea1713d0003ee372a",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "9e7211478398860b90f2d62fca4c84b7cc590d38a1deb001cc636ba0355e0afe",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "5bd230f17acb18e7d6eeda0a1dbe2c8f369afbae92064ab9f5d3f9c512b0bac2",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "64ea172d17a5d3be86176c4b3ede3c7b68b6f9c841709ffa92c49edfbfdfb101",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "98c5ede0f59bd9f69d064b52b3e49731b98c70447407148b1cc84a3dc1ce352b",
 }
 
 
@@ -8547,183 +8644,56 @@ if __name__ == "__main__":
 ## 编译与使用
 
 
-### Xcode
-
-1. 完成 Xcode 首次启动、许可与组件安装。
-2. 打开 `TokenStatMenu.xcodeproj`，选择 **TokenStatMenu → My Mac**。
-3. 按 ⌘B 编译，⌘R 运行。程序只出现于菜单栏，不会打开主窗口或 Dock 图标。
-4. 项目默认本机 ad hoc 签名；向其他电脑正式分发时，使用你的 Developer ID 签名与公证。
-
-`.xcodeproj` 和 Swift Package 编译同一份源码。新增源码后执行 `python3 script/generate_xcode_project.py` 可更新 Xcode 项目文件。
-
-### 命令行（Command Line Tools 即可）
+需要 macOS 13 或更新版本，以及支持 Swift 5.9 的 Xcode/命令行工具。项目运行时只使用系统框架；UI 截图测试依赖精确版本的 swift-snapshot-testing，正式 App 不链接它。
 
 ```bash
-git clone https://github.com/Tupig/TokenStatMenu.git
-cd TokenStatMenu
-./script/build_and_run.sh                 # 构建 .app 并启动
-./script/build_and_run.sh --build-only    # 仅生成 dist/TokenStatMenu.app
-./script/build_and_run.sh --release       # 本机架构优化构建并启动
-./script/build_and_run.sh --universal     # arm64 + x86_64 Release；只构建不启动
+# 在项目目录内只构建，不关闭已运行的 App
+./script/build_and_run.sh --build-only
+
+# 打开构建产物
+open dist/TokenStatMenu.app
+
+# 仅编译 Release，不启动应用
+swift build -c release --product TokenStatMenu
+
+# 同时构建 Apple Silicon 与 Intel
+./script/build_and_run.sh --universal
 ```
 
-可将 `dist/TokenStatMenu.app` 拖到“应用程序”。开发脚本会先关闭同名进程再更新构建产物，避免覆盖正在执行的二进制。不会自动设置开机启动。
-
-当前 Swift 6.4 对 `--build-system native` 有弃用提示；采用它是为了兼容这台机器已经可用的 Command Line Tools。项目不依赖该构建系统，Xcode 项目仍可独立编译。
-
-## 首次配置与接入
-
-首次启动默认使用本机 Codex 记录：每次后台扫描完成后等待 5 秒再扫描，未变化文件仅校验元数据并复用内存中的数值摘要，只枚举已知 sessions 目录内最多 5,000 个目录项，在枚举范围按修改时间排序选取最多 32 个物理文件；不是整个账户最新 32 个对话的保证。每文件读取头部最多 64 KiB 与尾部最多 256 KiB，重叠不重复读取，单次总量最多 10 MiB。没有有效计量事件时显示未知，不把缺失当作零。未配置的新安装使用本机来源；已有明确代理配置保持代理模式。
-
-### 自动读取 Token Hub 额度
-
-1. 将编译好的 App 放在固定位置，例如 `~/Applications/TokenStatMenu.app`，打开并保持本机 Codex 来源。
-2. 在 Token Hub 中正常登录，并使“用量和限额”区域可访问。TokenStatMenu 不操作登录、刷新、滚动或切换页面。
-3. 点击 App 提供的辅助功能授权入口，在 **系统设置 → 隐私与安全性 → 辅助功能** 中开启 **TokenStatMenu**。正常启动不会自动弹出权限请求。
-4. 授权后自动检测目标并按刷新间隔读取；无需填写 API Endpoint、API Key、模型或 JSON 字段。可以在设置中关闭自动读取。
-
-面板明确标记“Token Hub 界面快照”，显示本地读取时间和“后台更新时间未提供”。5 小时和 7 天的“界面显示剩余”来自各自的已用百分比，菜单栏追加可用窗口的简写；重置时间保留来源的 `MM-dd HH:mm`，不猜年份、时区或倒计时。金额保留 `$` 符号并标记“币种未核验”，不换算为 Token、Token 成本或 USD/CNY；月度只显示来源提供的已用金额，未提供的上限和剩余保持未知。这些界面快照不触发企业用量颜色告警。
-
-关闭自动读取、切换来源、撤销权限、应用退出、读取失败或结构不支持时，旧快照会清空；不会用历史记录或另一个窗口补齐缺失值。连续两遍读取的规范化结果一致才接受。刷新在后台串行执行，一次最多 512 次节点访问、深度 16、每节点 64 个孩子、单文本 256 字符、总文本 8192 字符及整轮 3 秒，不累积任务。
-
-辅助功能授权属于 macOS 对当前应用的许可，需要你完成一次系统开关。此项目默认 ad hoc 签名，更新构建后系统可能要求重新授权；保持安装路径固定也不能保证永久授权。应用不会修改 TCC 数据库、自动授权或读取其他应用的保存凭据。
-
-以下步骤用于需要流式速度估算的**代理模式**，先在设置中切换数据来源：
-
-1. 点击菜单栏统计文字 → **设置**。
-2. 设置页会自动发现本机 Codex 配置中的网关；核对来源后点“填入”。也可手动填写上游完整 Endpoint，例如 `https://你的网关/v1/chat/completions`；填写企业推理 API Key。Ollama 本机无需 Key。
-3. 模型覆盖留空时使用客户端请求的 `model`；填写时会覆盖所有经过代理请求的模型。
-4. 保存设置，回到面板，分别复制 **Base URL** 与 **本机令牌**。
-5. 将调用方 Base URL 改成 `http://127.0.0.1:18765/v1`，调用方 API Key 使用本机令牌。企业真实 Key 保存在本 App 的钥匙串中。
-6. 发起流式请求；菜单栏显示输出估算速度。请求结束后立即回到 `0.0`，累计数量以末尾 usage 校正。
-
-示例（把 `本机令牌` 和 `模型名` 换成实际值）：
+也可打开 `TokenStatMenu.xcodeproj`，选择 TokenStatMenu Scheme 和 My Mac 后编译运行。若默认开发目录指向 Command Line Tools，可仅为当前命令设置：
 
 ```bash
-curl -N http://127.0.0.1:18765/v1/chat/completions \
-  -H 'Authorization: Bearer 本机令牌' \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"模型名","stream":true,"messages":[{"role":"user","content":"请介绍一下你自己"}]}'
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
+  -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release build
 ```
 
-支持的本机请求路径：
+`--release` 是构建后运行模式，验证时不要把它当作只构建选项；需要隔离检查请使用测试脚本。
 
-- `POST /v1/chat/completions`：OpenAI Chat SSE 或非流式 JSON。
-- `POST /v1/responses`：Responses 文本、推理摘要、工具参数 delta 与嵌套 usage。
-- `POST /api/chat`、`POST /api/generate`：Ollama 原生 NDJSON / JSON。
-- `GET /health`：仅返回进程健康，不需要令牌。
-- `GET /tokenstat/status`：需要本机令牌；返回累计与实时统计 JSON。
+构建脚本的本地 ad hoc 签名不是 Developer ID 签名或公证。对外分发应另行使用开发者证书、公证并验证下载后的 Gatekeeper 行为。辅助功能授权也可能因本地开发构建身份变化而失效。
 
-上游 URL 会保留 Endpoint 的前缀，再替换以上路由后缀。例如设置 `https://gateway.example/gateway/v1/chat/completions`，Responses 请求发往 `https://gateway.example/gateway/v1/responses`。不支持通用 CONNECT、WebSocket、未知路径、自动 SDK 模型枚举或 TLS 透明拦截。
+## 使用与偏好
 
-Codex 如使用 Responses，需要通过其受支持的自定义 provider 配置将请求接入本机 `/v1`。企业客户端可能自行覆盖配置或使用额外认证，必须按该客户端接入方式处理。本项目没有更改你现在的 Codex 或企业网关配置。
+运行后从右上角菜单栏打开面板，无主窗口。设置只包含可选的刷新与界面快照兼容偏好；不需要创建配置文件。详情见 [偏好说明](docs/CONFIGURATION.md)。如果直接企业来源尚未接通，界面会保留真实状态，不要求用户用手填接口补齐。
 
-## 关键计算口径
-
-### 本机记录身份与计量范围
-
-- 逻辑线程身份来自文件第一条完整 `session_meta.payload.id`，不使用文件名尾部 UUID：同一线程的不同 rollout 文件可能有不同文件名。祖先 metadata 不覆盖首条身份。
-- 同 inode 或能在预算内证明全文一致的副本只计一次；同一线程存在内容冲突或无法完整比较的版本时，整组标为未核算，不按修改时间猜哪份正确。
-- 根线程使用最后有效累计作为来源记录量。它可能受上游上下文处理影响，不是企业计费流水。最后明确累计损坏时不会偷偷采用旧值。
-- 复制式分叉只在初始化边界、继承基线及最终累计间的记录完整连续时，逐项计算输入、输出、总量的差。缺失、回退、越界或中间未读取时标为未核算。引用式父历史目前未核算，不减去父线程当前总量，也不把子线程继承量重复加入。
-- 小计保留可核算线程的值，未知项不会当作零。达到扫描上限时也不显示成完整 `Σ`。这些限制会导致无法提供完整历史总量，界面会如实说明。
-- `rate_limits` 缺失或为 `null` 表示没有新的额度证据，不清除已读范围内的历史快照；合法显式空对象 `{}` 清除，合法非空窗口对象整体替换，不补接其他事件的窗口。异常对象被拒绝。本地记录没有提供的 5 小时窗口仍是未知。
-
-### SSE 与 Token 计数
-
-HTTP 网络 chunk 与模型 token 不一一对应。`StreamParser` 保存未完整行的原始字节，按 LF/CRLF 提取行，多行 `data:` 合并，空行结束事件，忽略注释。中文 UTF-8 拆到不同网络回调也不会破坏字符。单事件限制约 2MB。
-
-`UsageDecoder` 读取文本、推理文本和工具参数增量。无模型 tokenizer 时，ASCII 标量暂按 0.25 token、非 ASCII 按 1 token 估算；这是明确的启发式估算，不是精确 BPE。累计原始权重后再取整，避免“每个 chunk 至少算一个 token”的偏差。图像/音频等非文本输入不能靠文本准确估算。
-
-Chat 的 `usage.prompt_tokens/completion_tokens`、Responses 的 `response.usage.input_tokens/output_tokens`、Ollama 的 `prompt_eval_count/eval_count` 到达后替换该请求累计值。重复 usage 不重复累加，reasoning 已含在上游输出 token 中时也不重复相加。没有 usage 的完成/失败请求保留估算标记。
-
-OpenAI 兼容网关可能拒绝 `stream_options.include_usage`；可在设置关闭该开关。这会降低最终统计准确度，除非上游仍返回用量。
-
-### token/s 滑动窗口
-
-使用 `ProcessInfo.systemUptime` 避免系统时间回拨影响。输出估算增量进入 100ms 分桶，保留最近 5 秒：
-
-`输出估算 tok/s = 最近 5 秒输出估算增量总和 ÷ 5`
-
-启动最初不足 5 秒仍除以 5，因此读数渐进升高；这是固定窗口平均，非瞬时 token 间隔测速。并发请求的输出合计显示。末尾 usage 的校正差值不进入滑动窗口，避免结算时出现假峰值；没有活跃请求时标题归零。
-
-输入没有逐块生成事件，面板显示 `输入 Token ÷ 从请求开始到首个输出片段的时间`，明确标记“推算”。等待首输出时使用已等待时间，实时显示的分母最低取 0.5 秒以避免启动瞬间产生极大值。它包含网络和排队，不能当作模型实际 prefill 速度。Ollama 返回 `prompt_eval_duration/eval_duration` 时，另显示上次服务端平均输入/输出速度（纳秒换算为秒）。
-
-### 刷新、成本与配额
-
-- 菜单栏 2Hz，只有标题或颜色变化时改 attributedTitle；网络回调不直接绘制 UI。
-- 曲线 1Hz、最多 600 点；仅弹出面板可见时构建图表，不使用高频动画。
-- 请求、网络、日志使用后台串行队列；统计引擎短锁保护并发，没有锁内 I/O。
-- 输入/输出单价按 **USD/百万 Token** 保存；CNY 只是用手填汇率换算显示。每请求记录开始时单价，之后改价不会改写历史费用。
-- 费用不是企业账单；缓存输入按普通输入价，失败请求缺失 usage 时也可能有估算费用。
-- 企业配额来自独立接口；手填总量仅定义上限，没有接口就显示已用/剩余/使用率未知。
-- 月度映射字段 `usedPath` / `limitPath` 是 Token 数量；5 小时与 7 天映射字段分别是 0–100 的 `used_percent`，重置时间可用 Unix 秒或 ISO 8601。也接受同一接口中的 Codex `rateLimits` 格式，并按 300 / 10080 分钟识别窗口；窗口缺失或过期时显示未提供/过期，不从月度配额或本机 Token 推算。详见 [配置说明](docs/CONFIGURATION.md)。
-- 仅配置接口提供且仍有效的配额达到 80% 时标题黄色、95% 红色，不发通知或弹窗；本地历史快照、过期或异常时间数据不驱动企业额度告警。
-
-## 本机网关自动发现与隐私
-
-本机记录模式仅扫描 `$CODEX_HOME/sessions`（未设置则 `~/.codex/sessions`）。扫描有文件数、枚举数和字节上限，拒绝符号链接；只保留计量数值、时间及扫描状态。会话文件可能含有正文，因此有界读取头部与尾部会短暂接触这些字节，但不会保留、导出或上传正文。仅在内存缓存受限的身份/摘要与计量数值，以验证去重和读取变化；这些标识不进入公开快照或日志。本机模式不读取认证文件或钥匙串，也不启动代理或访问配额接口。
-
-代理模式的网关发现会在启动时及点击“重新扫描”时读取 `$CODEX_HOME/config.toml`（未设置则 `~/.codex/config.toml`），只提取 `model`、`model_provider`、`profile` 以及 provider 的 `base_url`、`wire_api`。支持常见的单行字符串 TOML 与活动 profile；不支持的复杂形式不猜测、不导入。配置文件限制 1MB，不做目录递归扫描。
-
-也识别当前进程中的 `OPENAI_BASE_URL`、`OPENAI_MODEL`、`OLLAMA_HOST`；从 Finder 启动时不一定继承终端环境。不会执行 shell 配置文件。企业客户端只要把自定义 provider 写入上述 Codex 配置，就能通过同一机制被发现；不需要硬编码公司名称或网关域名。
-
-发现结果仅在本机内存和设置页展示，不联网验证，不写入统计日志。点击“填入”后仍需保存；更换 Endpoint 会清空表单中的旧推理/配额密钥及旧用量 URL，避免将旧凭据发给新上游。带 URL 用户名、密码、查询参数或 fragment 的候选整条拒绝导入。认证文件、浏览器数据、其他应用钥匙串和企业后台数据库均不属于发现范围。
-
-发现网关地址不等于认证成功，也不自动接管 Codex 流量。需要认证时，用户仍须通过设置提供自己有权使用的 API Key。项目自己的密钥保存在专用 Keychain 中，并按用途与完整接口 URL 分别绑定；更换接口不会自动复用其他地址的密钥。旧版未绑定地址的密钥不会自动迁移，代理模式需要重新填写；本机记录模式不需要密钥。完整数据处理说明见 [PRIVACY.md](PRIVACY.md)。
-
-企业月度接口通常与推理接口不同；本项目不会猜测计费 URL 或把金额/积分当作 Token。需配置企业文档确认的接口与字段，详见 [配置说明](docs/CONFIGURATION.md)。
+旧配置在启动和重新加载时保持原文件不变，仅读取允许的偏好。用户主动保存偏好时，原子写入两项偏好并去除旧的通用接入字段。读取或保存失败不会回退到代理或发出企业请求。
 
 ## 验证与限制
 
 ```bash
+# 核心检查
+swift run TokenStatCoreChecks
+
+# 原生 XCTest，使用合成数据与隔离偏好
+swift test
+
+# 核心、构建及独立子进程的专用启动集成
 ./script/test.sh
-# 只运行核心检查：
-swift run --build-system native TokenStatCoreChecks
 ```
 
-测试会关闭当前 TokenStatMenu，运行隔离本地配置，使用纯测试令牌；不会访问企业网关。测试通过 `--test-fixture` 参数显式启动，菜单栏加“测试”前缀，面板常显橙色“模拟测试”标记。正常启动尚无流量时显示“未采集”，累计量为 `—`；存在估算请求时累计量带 `≈`。默认结束后关闭测试 App 和 mock 服务。可用 `python3 script/integration.py --keep-running` 保留测试面板作检查，注意面板里都是模拟数据。
+集成测试使用临时配置和禁用后台服务的独立子进程，只清理自己持有的进程句柄。它不会调用企业网关、读取真实会话或触发系统授权。截图测试使用真实 SwiftUI/NSHostingView 与合成数据；新的参考图需独立视觉审查，录制本身不算通过。最新验证范围见 [验证记录](docs/VALIDATION.md)。
 
-测试报告见 `docs/VALIDATION.md`。核心测试是可执行程序，保留仅使用 Command Line Tools 的运行方式。
-
-### UI 视觉回归
-
-已接入 [SnapshotTesting](https://github.com/pointfreeco/swift-snapshot-testing) 1.19.6（MIT），版本和传递依赖记录在 `Package.resolved`。它只属于 SwiftPM 测试目标，正式菜单栏 App 不链接测试库。使用完整 Xcode 运行：
-
-```bash
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter TokenStatUISnapshotTests
-```
-
-测试比较真实 SwiftUI 工具栏的浅色、深色及设置状态，共四张已审查的合成参考图。正常测试禁止录制，缺图或图像变化即失败；参考图更新命令见 [UI 测试说明](docs/UI_TESTING.md)。像素参考图要求一致的 macOS 与显示缩放环境；CI 运行不依赖系统外观的校验，桌面视觉比较单独执行。图像快照不等于实际弹出面板的键盘焦点、点击或辅助功能验收。
-
-常见情况：
-
-- **均速一直 —**：本机模式需要在同一有界尾部中找到开始前累计、匹配的轮次开始、轮内用量更新与正常完成。缺少其中任何一项时不计算；历史导入量和扫描间隔不会用来伪造速度。代理模式需确认请求确实经过本机代理并使用本机令牌。
-- **5 小时没有数据**：先查看 Token Hub 自动读取的状态：是否已授权、目标是否运行、额度区域是否可访问、界面结构是否支持。界面没有提供的窗口不会从 7 天推算。本地记录中的历史额度仍单独展示；它不是当前企业额度。代理模式则需要接口实际提供独立窗口。
-- **企业配额未知**：Token Hub 自动读取只反映可访问界面，后台更新时间及账号归属未经核验；状态异常时显示原因并清空旧值。代理来源需检查用量 URL、独立 Key、字段路径和月份；其月度字段按 Token 解释，不能填写金额字段。独立的 Token Hub 月度卡按来源金额展示，不混入 Token 配额。
-- **图标不见**：macOS 可能关闭菜单栏项目或因刘海/其他图标拥挤而隐藏，任何 App 都不能保证绕过系统布局。检查“系统设置 → 菜单栏”。从 Finder 再次打开应用会主动打开面板。
-- **关闭面板即退出**：本项目持有 status item 和 app delegate，并显式禁止最后窗口关闭时退出。
-- **内存/CPU**：使用原生框架、有限缓冲与低频刷新，不会无限保存回答文本；SwiftUI/Charts 仍有系统开销，不承诺所有机器固定内存值。
-- **代理断开**：App 退出后代理端口停止，调用方需恢复原 Endpoint 才能直接访问上游。
-- **Xcode 报许可错误**：手动首次打开 Xcode 完成其许可流程。本项目脚本不代替用户接受协议。
-
-纯测试数据必须显式附加 `--test-fixture`，此参数标记模拟来源并隔离原生 Token Hub 读取，不会自行生成数据。调试可显式附加 `--show-panel` 和 `--diagnostics-output /tmp/tokenstat-status.json`，后者每秒输出本地诊断状态和用量摘要，不含密钥/请求正文；Token Hub 界面额度值及带额度数值的菜单后缀不进入诊断，只保留连接或字段是否可用的布尔信息。正常运行没有诊断文件写入。
-
-## 上游格式参考
-
-- [OpenAI Chat API](https://developers.openai.com/api/reference/resources/chat)
-- [OpenAI Responses 流事件](https://developers.openai.com/api/reference/resources/responses/streaming-events)
-- [Ollama Chat API](https://docs.ollama.com/api/chat)
-- [Apple NWListener](https://developer.apple.com/documentation/network/nwlistener)
+扫描有覆盖上限；身份与继承证据不足时单独标记未核算，不把未知贡献当零。金额与 Token 不互换；界面快照的 `$` 不自动认定为某一币种。不根据重置短文本猜测年份或时区。更多处理边界见 [隐私说明](PRIVACY.md) 和 [设计说明](docs/DESIGN.md)。
 
 ## 开源
 
-[MIT License](LICENSE)。发现的问题应建立 GitHub Issue，并用虚构域名、模型名与脱敏数据描述复现步骤；Issue 应链接对应修复与验证结果。请勿提交真实企业配置、凭据或日志。欢迎提交 Pull Request。
-
-发布前执行 `python3 script/package_source.py` 重新生成完整源码与源码包，再执行 `python3 script/check_public_content.py` 检查发布清单。Git 提交前使用 `--git-index` 检查实际暂存内容，并人工审查差异；检查脚本不会连接外部服务。
-
-## 界面设计参考
-
-视觉布局参考 [codexU](https://github.com/shanggqm/codexU) 的紧凑圆角卡片、半透明材质与蓝紫色强调。TokenStatMenu 的界面组件独立用 SwiftUI 实现，未复制其源码、图标、截图或配色资源。
-
-离线界面预览：`python3 script/render_preview.py`，在 `dist/previews` 生成浅色/深色概览与设置页图片。预览明确标记模拟数据，使用独立内存模型，不读取本机配置或 Keychain、不发网络请求。
+采用 [MIT 许可证](LICENSE)。请在 GitHub Issue 中使用合成示例报告问题，不提交真实凭据、企业地址、账户信息、会话正文、截图或运行日志。界面布局参考 codexU 的紧凑分组思路，采用原生系统颜色适配深浅外观；未复制其实现代码。

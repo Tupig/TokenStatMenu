@@ -1,81 +1,18 @@
-# 配置说明
+# 可选偏好说明
 
-默认配置文件：`~/Library/Application Support/TokenStatMenu/config.plist`。
-设置面板保存后生成；也可以复制 `Resources/config.example.plist` 到此位置，再点“重新加载 plist”。
-启动参数 `--config /absolute/path/config.plist` 可选择独立配置；它的日志也放在同级 `Logs` 目录。
-缺少字段会采用默认值；类型错误或非法 URL/端口会明确报错，不会静默覆盖旧配置。
+正式 App 仅面向 Seasun Token Hub；无需填写接口、密钥、模型、价格或额度。当前直接企业统计源尚未完成，填写旧配置也不能使它接通。界面会如实显示未知或不可用。
 
-密钥不写 plist：菜单设置中的推理 Key、企业用量 Key 存入专用 Keychain service `com.tupig.TokenStatMenu`，Keychain account 按用途和准确 URL 的 SHA-256 分别绑定；更换 URL 不会复用原密钥；返回原 URL 时可继续使用原绑定密钥。本机访问令牌单独保存。旧版未绑定 URL 的通用推理/用量 Key 不自动迁移，切换至代理后请重新填写。
-自动化环境可以使用 `TOKENSTAT_API_KEY`、`TOKENSTAT_USAGE_KEY`、`TOKENSTAT_LOCAL_KEY` 覆盖启动时读取值；不要把真实密钥提交到源码或测试脚本。
+不需要创建 plist。默认刷新间隔为 60 秒，界面快照兼容读取开关为开启；后者只在系统已有信任且目标额度区域可访问时读取，不自动弹出权限提示。它仍是可选兼容方式，不是安装即用的验收结果。
 
-| 字段 | 默认值/单位 | 说明 |
-|---|---|---|
-| dataSource | localCodex | `localCodex` 读取本地 Codex 会话统计；`proxy` 启用本机转发与可选企业用量接口。旧 plist 若未含该字段但显式含代理配置，按 `proxy` 迁移。 |
-| endpoint | Ollama 本机 Chat 完整 URL | 支持额外路径前缀 |
-| model | 空 | 空则保留客户端模型；非空统一覆盖 |
-| port | 18765 | 监听 127.0.0.1，范围 1024–65535 |
-| includeUsage | true | 给 Chat 流请求合并 `stream_options.include_usage` |
-| allowInsecureHTTP | false | 远程 HTTP 必须显式开启；本机 HTTP 默认允许 |
-| inputPrice / outputPrice | 0 USD/百万 Token | 使用请求开始时的单价，0 表示尚未设置 |
-| currency | USD | USD 或 CNY |
-| usdToCNY | 7.0 | 手填参考汇率，不是实时汇率 |
-| monthlyLimit | 0 token | 大于 0 覆盖接口总量；0 使用接口总量 |
-| usageURL | 空 | 企业月度与可选 5 小时 / 7 天窗口用量接口 GET URL |
-| usedPath | data.used_tokens | 数值或可解析数值字符串 |
-| limitPath | data.total_tokens | 可留空配合手动上限 |
-| periodPath | data.month | 需等于本地本月 yyyy-MM；留空信任接口的本月定义 |
-| fiveHourUsedPercentPath | data.five_hour.used_percent | 5 小时窗口已用百分比，0–100 |
-| fiveHourResetPath | data.five_hour.resets_at | 5 小时窗口重置时间，可留空 |
-| sevenDayUsedPercentPath | data.seven_day.used_percent | 7 天窗口已用百分比，0–100 |
-| sevenDayResetPath | data.seven_day.resets_at | 7 天窗口重置时间，可留空 |
-| refreshSeconds | 60 秒 | 15–3600；禁止重叠请求 |
-| loggingEnabled | false | 脱敏 JSONL 请求统计 |
-| historyEnabled | true | 10 分钟内存曲线 |
+仅支持两项可选偏好：
 
-样例响应：
+| 键 | 默认值 | 规则 |
+| --- | --- | --- |
+| `refreshSeconds` | `60` | 有限数值，15 至 3600 秒；其他输入回到默认 |
+| `tokenHubCompatibilityReadEnabled` | `true` | Boolean；关闭只停用兼容界面读取 |
 
-```json
-{
-  "data": {
-    "used_tokens": 850000,
-    "total_tokens": 1000000,
-    "month": "2026-10",
-    "five_hour": { "used_percent": 25, "resets_at": 1792246800 },
-    "seven_day": { "used_percent": 70, "resets_at": "2026-10-19T12:00:00Z" }
-  }
-}
-```
+示例位于 `Resources/config.example.plist`。配置存放在应用自己的 Application Support 目录。无需复制示例；设置页可主动保存偏好。
 
-月份必须改为实际当前月份。该示例得到剩余 150000 Token、使用率 85%，触发黄色标题。
-点分路径也支持数组下标，例如 `data.projects.0.used_tokens`。
-月度字段 `usedPath`、`limitPath` 和 `monthlyLimit` 的单位是 Token 数量；窗口字段是接口报告的已用百分比（0–100），不能填 Token 数或金额。例如数值 `85` 表示 85%，`0.85` 表示 0.85%，不是 85%。5 小时和 7 天字段分别独立映射，缺少或无效的某个窗口只会让该窗口显示未提供，不会从月度用量或本机请求推算。重置字段可为 Unix 秒或 ISO 8601；省略时仍显示百分比，但没有重置时间。窗口在重置时间已过或数据超过 `max(120 秒, 2 × 刷新间隔)` 后显示过期。
+旧 `tokenHubAutomaticReadingEnabled` 仅在新键不存在时作为兼容偏好读取。新键存在但不是 Boolean 时使用 `true`，不回退到旧键。旧 API、代理、价格和配额字段被忽略，错误 endpoint 不会阻止启动；损坏 plist 或非字典输入使用默认偏好。启动和重新加载不会写文件，主动保存才原子替换为两项允许的偏好，旧接入字段随之移除。保存失败保持原有内存状态并显示通用错误。
 
-如果配置的同一个用量接口返回 Codex `rateLimits` 对象，也可省略窗口映射路径：应用按 `windowDurationMins` 精确匹配 300（5 小时）和 10080（7 天），读取相应对象的 `usedPercent` 与可选 `resetsAt`。该格式不会改变月度字段映射；两个窗口仍分别判断，无法唯一匹配或百分比不在 0–100 时视为未提供。
-设置中的 Key 会以 `Authorization: Bearer ...` 发出。需要 Cookie、SSO 签名或自定义请求头的企业接口不属于自动适配范围：应先由企业侧提供一个返回上述 Token 字段的授权适配接口，不能在此冒充已接入。
-
-每次请求超时上限约 20 秒，响应上限 1MB；不跟随重定向。接口失败时保留上次成功值并显示错误；超过 `max(120 秒, 2 × 刷新间隔)` 标记过期；跨月清空旧月数据等待重取。配额统计以系统本地月为界，如企业采用 UTC，应由接口适配返回明确的当前周期。
-
-模型调用入口支持 Content-Length 与 chunked 编码，正文上限 8MB、header 64KB。HTTP `Expect`、重复 header、模糊 Content-Length/Transfer-Encoding 组合会被拒绝。只支持文本/JSON 请求，不是全功能通用 HTTP 代理。
-
-上游 Header 由应用生成，不转发调用方 Bearer，也不任意转发其他 Header。上游只接受固定配置 Endpoint；TLS 校验保持系统默认，不禁用证书验证。`Info.plist` 允许传输层 HTTP 是为本机 Ollama 和用户显式允许的企业内网服务，应用层仍校验远程 HTTP 开关。
-
-如果要求精确的实时 tok/s，企业网关需实时返回已生成 token 计数，或者项目需加入与模型匹配的 tokenizer。标准 OpenAI SSE 文本本身不保证携带此信息；本版本选择轻量、无第三方 tokenizer，并明确标记估算。
-
-测试与真实数据必须分开：本地联测使用独立 plist、日志目录和纯测试令牌，并携带 `--test-fixture` 启动参数。此时菜单栏与面板显示“测试 / 模拟测试”。移除参数不会验证上游是否真实；不要将模拟接口配置用于日常运行。正常首次启动若尚无本地记录，菜单栏显示 `上轮均:—`；此状态表示未知，不代表零。
-
-## 本机自动发现
-
-自动读取已知 Codex 配置位置中的非认证字段，也可重新扫描。来源路径只显示 `~/.codex/config.toml` 或 `$CODEX_HOME/config.toml` 标签。选择候选后会填入准确的 Endpoint 和当前 provider 的模型，手动保存生效。不会读取 `auth.json`、API Key 字段、Cookie、请求头值、其他应用的钥匙串或 SSO 会话。
-
-例如 Codex 中 `base_url = "https://gateway.example/airoute"` 与 `wire_api = "responses"` 会生成 `https://gateway.example/airoute/responses`，不会额外插入 `/v1`。使用 `https://gateway.example/v1` 则保留 `/v1`。对活动 profile 的 model/provider 覆盖优先于根配置。复杂 TOML 形式或重复值会被跳过；仍可手动填写。
-
-`--disable-discovery` 可在本次启动禁用发现。不使用定时文件扫描，不发网络探测，不上报发现结果。发现与手动录入一样，都无法在没有认证信息的情况下访问受保护的接口。
-
-
-## 本地 Codex 会话来源
-
-Token Hub 自动读取由 `tokenHubAutomaticReadingEnabled` 配置，默认开启，且只在 `localCodex` 模式工作。它读取已运行 Token Hub 的额度面板辅助功能树，不访问后台 API。请求系统辅助功能授权需要用户从设置按钮发起，或显式使用 `--request-accessibility` 启动；普通启动不显示授权提示。读取结果只作为单独的界面快照展示，不并入本机 Token、企业 API 配额或费用。界面快照中的账号、组织、币种和更新时间均未核验；原始 AX 值不进入诊断或日志。
-
-全新安装默认选择 `localCodex`。它读取绝对路径 `CODEX_HOME/sessions`（仅当环境变量为绝对路径），否则读取 `~/.codex/sessions`。不读取 Codex 认证数据，不调用 Keychain，不启动本机代理或企业用量接口。扫描在前次完成 5 秒后进行且不重叠；最多枚举 5,000 个目录项、处理 32 个物理文件，每个至多读取头部 64 KiB 与尾部 256 KiB，单次总字节上限 10 MiB。首条完整物理记录须有可识别线程身份的 metadata；同 inode 或可证明字节相同的副本去重，同身份冲突版本不按修改时间猜测。安全打开和路径包含检查在每次扫描执行，读取期间文件身份变化则丢弃该文件结果；内存缓存最多保存 32 份摘要，可暂时包含受限去重身份信息及内容摘要 hash，不保存正文或原始路径，也不持久化。界面将已知贡献显示为当前扫描范围记录小计，并分别说明已核验线程、未知线程、未识别文件与分类；只有无未知贡献且扫描未受限时才标为本次扫描记录量。物理文件数不等于 Codex 对话数。分叉只在历史边界、连续基线与最终累计均有证据时扣除继承量，引用式历史保持未知。最近完成 turn 的记录均速按整轮时间计算，包含工具、网络和等待，取决于会话实际记录的 output，不代表瞬时 decode 或完整输出。缺少可信 turn 边界、基线或累计计数时显示未知。本地 `rate_limits` 无论事件是否新鲜都只作为历史参考，不显示为当前企业剩余额度，也不触发企业额度告警；保留源记录的已用比例、事件时间和原重置时间。
-
-切换到 `proxy` 后，旧的 Endpoint、用量 URL 和密钥保留供代理使用。保存时密钥留空且对应 URL 未变化，会沿用已保存密钥；URL 改变时要求为新地址重新输入密钥；留空则只解析此前已绑定到该新 URL 的密钥。旧密钥仍绑定原 URL，切换回原地址时可继续使用。
+`--config <path>` 供开发时选择隔离偏好文件；`--disable-background-services` 供隔离启动验证，禁止自动本地扫描、AX 信任/读取、通知观察者和计时器。两者都不是用户正常使用的前置步骤。不要把 `--diagnostics-output` 的测试就绪输出当作统计来源。

@@ -2,49 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>endpoint</key>
-	<string>http://127.0.0.1:11434/v1/chat/completions</string>
-	<key>model</key>
-	<string></string>
-	<key>port</key>
-	<integer>18765</integer>
-	<key>includeUsage</key>
-	<true/>
-	<key>allowInsecureHTTP</key>
-	<false/>
-	<key>inputPrice</key>
-	<real>0.0</real>
-	<key>outputPrice</key>
-	<real>0.0</real>
-	<key>currency</key>
-	<string>USD</string>
-	<key>usdToCNY</key>
-	<real>7.0</real>
-	<key>monthlyLimit</key>
-	<real>0.0</real>
-	<key>usageURL</key>
-	<string></string>
-	<key>usedPath</key>
-	<string>data.used_tokens</string>
-	<key>limitPath</key>
-	<string>data.total_tokens</string>
-	<key>periodPath</key>
-	<string>data.month</string>
 	<key>refreshSeconds</key>
 	<real>60.0</real>
-	<key>loggingEnabled</key>
-	<false/>
-	<key>historyEnabled</key>
+	<key>tokenHubCompatibilityReadEnabled</key>
 	<true/>
-	<key>tokenHubAutomaticReadingEnabled</key>
-	<true/>
-	<key>fiveHourUsedPercentPath</key>
-	<string>data.five_hour.used_percent</string>
-	<key>fiveHourResetPath</key>
-	<string>data.five_hour.resets_at</string>
-	<key>sevenDayUsedPercentPath</key>
-	<string>data.seven_day.used_percent</string>
-	<key>sevenDayResetPath</key>
-	<string>data.seven_day.resets_at</string>
 </dict>
 </plist>

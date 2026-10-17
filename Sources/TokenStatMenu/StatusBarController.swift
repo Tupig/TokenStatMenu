@@ -52,54 +52,38 @@ import SwiftUI
         }
     }
     func popoverDidClose(_ notification: Notification) { model.panelVisible = false }
-    /// Opt-in local diagnostic output for integration tests; no credentials or content.
-    /// Reports actual AppKit title and popover state, not a separately simulated UI.
+    /// Opt-in local diagnostic output for integration tests; contains only approved booleans and resource counts.
     private func writeDiagnosticsIfRequested() {
         let args = CommandLine.arguments
         guard let index = args.firstIndex(of: "--diagnostics-output"), args.indices.contains(index + 1),
               Date().timeIntervalSince(lastDiagnostic) >= 1 else { return }
         lastDiagnostic = Date()
         struct Report: Encodable {
-            let isTestFixture: Bool
-            let hasRequestData: Bool
-            let dataNotice: String
-            let discoveredGateways: Int
-            let title: String
-            let popoverShown: Bool
+            let seasunOnlyMode: Bool
+            let backgroundServicesStarted: Bool
             let statusItemVisible: Bool
-            let active: Int
-            let quotaUsed: Double?
-            let quotaFraction: Double?
-            let fiveHourUsedPercent: Double?
-            let sevenDayUsedPercent: Double?
-            let quotaError: String
-            let tokenHubSourceEnabled: Bool
-            let tokenHubPermissionGranted: Bool
-            let tokenHubPermissionRequired: Bool
-            let tokenHubWindowPresent: Bool
-            let tokenHubMenuSuffixPresent: Bool
-            let alert: String
+            let permissionPromptRequested: Bool
+            let quotaPresent: Bool
+            let resetTimePresent: Bool
+            let monthlyUsagePresent: Bool
+            let liveTokenSpeedPresent: Bool
+            let sourceStatus: String
+            let backgroundServiceResources: BackgroundServiceResources
         }
-        let appliedColor = (item.button?.attributedTitle.length ?? 0) > 0
-            ? item.button?.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
-            : nil
-        // The actual title can contain a live AX-derived percentage. Diagnostics retain only
-        // the non-AX portion and readiness booleans; no AX content crosses this sink.
-        let safeTitle = (item.button?.attributedTitle.string ?? "")
-            .replacingOccurrences(of: #" · Hub .*?$"#, with: "", options: .regularExpression)
-        let report = Report(isTestFixture: model.isTestFixture, hasRequestData: model.hasRequestData,
-            dataNotice: model.dataNotice, discoveredGateways: model.gateways.count,
-            title: safeTitle, popoverShown: popover.isShown,
-            statusItemVisible: item.isVisible, active: model.stats.active,
-            quotaUsed: model.quota?.used, quotaFraction: model.quota?.fraction,
-            fiveHourUsedPercent: model.fiveHourQuota?.usedPercent, sevenDayUsedPercent: model.sevenDayQuota?.usedPercent,
-            quotaError: model.quotaError,
-            tokenHubSourceEnabled: model.config.dataSource == "localCodex" && model.tokenHubAutomaticReadingEnabled,
-            tokenHubPermissionGranted: model.tokenHubPermissionGrantedForDiagnostics,
-            tokenHubPermissionRequired: model.tokenHubPermissionRequiredForDiagnostics,
-            tokenHubWindowPresent: model.tokenHubQuotaSnapshot?.fiveHour != nil || model.tokenHubQuotaSnapshot?.sevenDay != nil,
-            tokenHubMenuSuffixPresent: model.menuTitleContainsTokenHubSuffix,
-            alert: appliedColor == .systemRed ? "red" : appliedColor == .systemYellow ? "yellow" : "normal")
+        let snapshot = model.tokenHubQuotaSnapshot
+        let resetTimePresent = [snapshot?.fiveHour?.resetDisplay, snapshot?.sevenDay?.resetDisplay]
+            .compactMap { $0 }.contains { !$0.isEmpty }
+        let report = Report(
+            seasunOnlyMode: model.isSeasunOnly,
+            backgroundServicesStarted: model.backgroundServicesStarted,
+            statusItemVisible: item.isVisible,
+            permissionPromptRequested: model.permissionPromptRequested,
+            quotaPresent: snapshot != nil || model.quota != nil || model.fiveHourQuota != nil || model.sevenDayQuota != nil,
+            resetTimePresent: resetTimePresent,
+            monthlyUsagePresent: snapshot?.monthly != nil || model.quota?.used != nil,
+            liveTokenSpeedPresent: model.stats.active > 0,
+            sourceStatus: model.sourceStatus,
+            backgroundServiceResources: model.backgroundServiceResources)
         if let data = try? JSONEncoder().encode(report) {
             let url = URL(fileURLWithPath: args[index + 1])
             DispatchQueue.global(qos: .utility).async { try? data.write(to: url, options: .atomic) }
