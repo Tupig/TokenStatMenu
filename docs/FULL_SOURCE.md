@@ -2471,11 +2471,32 @@ public struct TokenHubDirectQuotaEndpoint: Equatable, Sendable {
     public static let quotaPath = "/api/v1/auth/me/quota-usage"
 
     public static func sameOrganization(_ lhs: URL, _ rhs: URL) -> Bool {
-        guard let a = lhs.host?.lowercased(), let b = rhs.host?.lowercased(),
-              !isIPAddress(a), !isIPAddress(b) else { return false }
-        let left = a.split(separator: "."), right = b.split(separator: ".")
-        guard left.count >= 2, right.count >= 2 else { return false }
-        return left.suffix(2).elementsEqual(right.suffix(2))
+        guard let left = lhs.host?.lowercased(), let right = rhs.host?.lowercased(),
+              !isIPAddress(left), !isIPAddress(right),
+              let leftDomain = registrableDomain(left),
+              let rightDomain = registrableDomain(right) else { return false }
+        return leftDomain == rightDomain
+    }
+
+    /// Foundation does not expose the Public Suffix List.  Keep a small
+    /// conservative set of common multi-label public suffixes so a redirect
+    /// from `example.co.uk` cannot be accepted merely because it also ends in
+    /// `co.uk`. Unknown suffixes still require at least a two-label domain and
+    /// never bypass the HTTPS, credential-free URL checks above.
+    private static let multiLabelPublicSuffixes: Set<String> = [
+        "ac.uk", "co.uk", "gov.uk", "org.uk",
+        "com.au", "net.au", "org.au",
+        "co.jp", "ne.jp", "com.br", "com.cn", "com.hk", "com.mx",
+        "com.sg", "com.tr", "com.tw", "co.kr", "co.nz", "co.za"
+    ]
+
+    private static func registrableDomain(_ host: String) -> String? {
+        let labels = host.split(separator: ".").map(String.init)
+        guard labels.count >= 2 else { return nil }
+        let lastTwo = labels.suffix(2).joined(separator: ".")
+        let suffixLabelCount = multiLabelPublicSuffixes.contains(lastTwo) ? 2 : 1
+        guard labels.count > suffixLabelCount else { return nil }
+        return labels.suffix(suffixLabelCount + 1).joined(separator: ".")
     }
 
     private static func isIPAddress(_ host: String) -> Bool {
@@ -6387,6 +6408,18 @@ extension CoreChecks {
         let endpoint = try TokenHubDirectQuotaEndpoint(baseURL: URL(string: "https://aihub.example.test")!,
                                                        organizationURL: URL(string: "https://sso.example.test")!)
         check(endpoint.url.path == "/api/v1/auth/me/quota-usage", "direct endpoint appends fixed quota path")
+        check(TokenHubDirectQuotaEndpoint.sameOrganization(URL(string: "https://aihub.example.com")!,
+                                                            URL(string: "https://sso.example.com")!),
+              "same organization accepts sibling hosts under a normal registrable domain")
+        check(TokenHubDirectQuotaEndpoint.sameOrganization(URL(string: "https://aihub.example.co.uk")!,
+                                                            URL(string: "https://sso.example.co.uk")!),
+              "same organization accepts sibling hosts under a multi-label registrable domain")
+        check(!TokenHubDirectQuotaEndpoint.sameOrganization(URL(string: "https://aihub.example.co.uk")!,
+                                                             URL(string: "https://sso.other.co.uk")!),
+              "same organization rejects unrelated hosts sharing only a public suffix")
+        check(!TokenHubDirectQuotaEndpoint.sameOrganization(URL(string: "https://ai.co.uk")!,
+                                                             URL(string: "https://sso.co.uk")!),
+              "same organization rejects hosts with no registrable label")
         let routed = try TokenHubDirectQuotaEndpoint(baseURL: URL(string: "https://aihub.example.test/aimanager")!,
                                                      organizationURL: URL(string: "https://sso.example.test")!)
         check(routed.url.path == "/aimanager/api/v1/auth/me/quota-usage", "direct endpoint preserves trusted AI Manager path prefix")

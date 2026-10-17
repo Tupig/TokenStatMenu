@@ -22,7 +22,7 @@ Token Hub 界面快照使用独立模型。只在已授予系统信任时读取�
 
 ## Token Hub 直接额度入口
 
-`TokenHubDirectQuotaClient` 从 Token Hub 的 `client.connection` 与 `seasun_sso_session` 读取必要字段，构造固定回调参数并拦截 302，取出短期访问令牌后请求额度接口。请求前后重新读取设置，若会话、连接或数据库身份变化则丢弃响应。解析严格区分 `fixed_5h`、`fixed_7d` 和 `user_month`，不从金额推算 Token，也不把轮询频率当成瞬时吞吐。
+`TokenHubDirectQuotaClient` 从 Token Hub 的 `client.connection` 与 `seasun_sso_session` 读取必要字段，构造固定回调参数并拦截 302。连接和回调只接受 HTTPS、无凭据、同一可注册域名的来源；多标签公共后缀不会被当成组织域。取出短期访问令牌后请求额度接口，请求前后重新读取设置，若会话、连接或数据库身份变化则丢弃响应。解析严格区分 `fixed_5h`、`fixed_7d` 和 `user_month`，不从金额推算 Token，也不把轮询频率当成瞬时吞吐。
 
 ## 尚未解决的数据入口
 

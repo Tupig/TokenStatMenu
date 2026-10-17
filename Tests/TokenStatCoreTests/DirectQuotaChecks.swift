@@ -95,6 +95,18 @@ extension CoreChecks {
         let endpoint = try TokenHubDirectQuotaEndpoint(baseURL: URL(string: "https://aihub.example.test")!,
                                                        organizationURL: URL(string: "https://sso.example.test")!)
         check(endpoint.url.path == "/api/v1/auth/me/quota-usage", "direct endpoint appends fixed quota path")
+        check(TokenHubDirectQuotaEndpoint.sameOrganization(URL(string: "https://aihub.example.com")!,
+                                                            URL(string: "https://sso.example.com")!),
+              "same organization accepts sibling hosts under a normal registrable domain")
+        check(TokenHubDirectQuotaEndpoint.sameOrganization(URL(string: "https://aihub.example.co.uk")!,
+                                                            URL(string: "https://sso.example.co.uk")!),
+              "same organization accepts sibling hosts under a multi-label registrable domain")
+        check(!TokenHubDirectQuotaEndpoint.sameOrganization(URL(string: "https://aihub.example.co.uk")!,
+                                                             URL(string: "https://sso.other.co.uk")!),
+              "same organization rejects unrelated hosts sharing only a public suffix")
+        check(!TokenHubDirectQuotaEndpoint.sameOrganization(URL(string: "https://ai.co.uk")!,
+                                                             URL(string: "https://sso.co.uk")!),
+              "same organization rejects hosts with no registrable label")
         let routed = try TokenHubDirectQuotaEndpoint(baseURL: URL(string: "https://aihub.example.test/aimanager")!,
                                                      organizationURL: URL(string: "https://sso.example.test")!)
         check(routed.url.path == "/aimanager/api/v1/auth/me/quota-usage", "direct endpoint preserves trusted AI Manager path prefix")

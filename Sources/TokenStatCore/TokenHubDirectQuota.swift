@@ -63,11 +63,32 @@ public struct TokenHubDirectQuotaEndpoint: Equatable, Sendable {
     public static let quotaPath = "/api/v1/auth/me/quota-usage"
 
     public static func sameOrganization(_ lhs: URL, _ rhs: URL) -> Bool {
-        guard let a = lhs.host?.lowercased(), let b = rhs.host?.lowercased(),
-              !isIPAddress(a), !isIPAddress(b) else { return false }
-        let left = a.split(separator: "."), right = b.split(separator: ".")
-        guard left.count >= 2, right.count >= 2 else { return false }
-        return left.suffix(2).elementsEqual(right.suffix(2))
+        guard let left = lhs.host?.lowercased(), let right = rhs.host?.lowercased(),
+              !isIPAddress(left), !isIPAddress(right),
+              let leftDomain = registrableDomain(left),
+              let rightDomain = registrableDomain(right) else { return false }
+        return leftDomain == rightDomain
+    }
+
+    /// Foundation does not expose the Public Suffix List.  Keep a small
+    /// conservative set of common multi-label public suffixes so a redirect
+    /// from `example.co.uk` cannot be accepted merely because it also ends in
+    /// `co.uk`. Unknown suffixes still require at least a two-label domain and
+    /// never bypass the HTTPS, credential-free URL checks above.
+    private static let multiLabelPublicSuffixes: Set<String> = [
+        "ac.uk", "co.uk", "gov.uk", "org.uk",
+        "com.au", "net.au", "org.au",
+        "co.jp", "ne.jp", "com.br", "com.cn", "com.hk", "com.mx",
+        "com.sg", "com.tr", "com.tw", "co.kr", "co.nz", "co.za"
+    ]
+
+    private static func registrableDomain(_ host: String) -> String? {
+        let labels = host.split(separator: ".").map(String.init)
+        guard labels.count >= 2 else { return nil }
+        let lastTwo = labels.suffix(2).joined(separator: ".")
+        let suffixLabelCount = multiLabelPublicSuffixes.contains(lastTwo) ? 2 : 1
+        guard labels.count > suffixLabelCount else { return nil }
+        return labels.suffix(suffixLabelCount + 1).joined(separator: ".")
     }
 
     private static func isIPAddress(_ host: String) -> Bool {
