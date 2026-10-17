@@ -31,7 +31,8 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 12) {
                         TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: Date()), status: model.tokenHubQuotaStatusText,
-                            enabled: model.tokenHubAutomaticReadingEnabled, refreshSeconds: model.preferences.refreshSeconds)
+                            enabled: model.tokenHubAutomaticReadingEnabled, refreshSeconds: model.preferences.refreshSeconds,
+                            directSource: model.tokenHubQuotaIsDirect)
                         Text(model.userFacingStatus)
                             .font(.system(size: 10)).foregroundStyle(.secondary)
                         localUsageCard

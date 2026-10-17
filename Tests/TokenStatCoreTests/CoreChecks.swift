@@ -99,6 +99,7 @@ import TokenStatCore
         try localCodexUsageChecks()
         try hubChecks()
         try hubScannerChecks()
+        try directQuotaChecks()
         print("\(checks - failures)/\(checks) checks passed")
         if failures > 0 { exit(1) }
     }
