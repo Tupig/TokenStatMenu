@@ -2,7 +2,19 @@
 
 本记录只包含通用测试方法与结果，不包含真实企业网关、账号、配置、日志或会话内容。BP07 C12-b 使用固定时间和纯合成 JSONL / UI 数据。
 
-## BP07 C12-b 当前验证
+## BP08 C13 当前验证
+
+- 核心合成检查：330/330 通过。覆盖身份与属性 allowlist、共享 R15 遍历预算及边界、双读归一化、残缺窗口拒绝、权限与生命周期状态。等值数值的不同文本精度通过；不同数值或无效读数拒绝。
+- XCTest：20/20 通过，其中 Token Hub 状态测试 9 项；覆盖 fixture 原生读取抑制、注入扫描器保留、权限与模式切换、目标退出/重启后的 generation 失效、旧扫描结果丢弃、设置草稿不覆盖即时开关，以及显示精度。
+- 合成图像：Dashboard 与完整额度卡片各有浅色、深色图。卡片位于本地 Dashboard 顶部；人工检查确认完整显示 5 小时、7 天、月度、重置、来源说明，且 `62.5%`、`$3.75`、`$12.5` 未被取整。图像保存在被忽略的 `Tests/.build/c13-render/`，没有改动 SnapshotTesting 基线或加入发布清单。
+- 集成脚本：`python3 script/integration.py` 通过。代理路径检查路由、并发、流式、失败处理和日志脱敏；正常启动无测试状态继承；local Codex 使用隔离的合成会话，fixture 的辅助功能已授予/需授权两个 readiness 布尔值均保持 false，且不启动代理监听器。fixture 不请求系统授权或读取真实 AX 内容。
+- Xcode Release：arm64 项目构建通过，日志位于本地忽略路径 `.build/c13-xcode-release.log`。
+- Universal Release：`./script/build_and_run.sh --universal` 通过，最终二进制架构为 `x86_64 arm64`；`codesign --verify --deep --strict` 通过。二进制 SHA-256：`14e74cf4211adb45e87aa06153a71eacc0d650a59abb9d17956817dd3292cbc6`。构建和集成日志分别位于 `.build/c13-universal.log` 与 `.build/c13-integration.log`。
+- Swift 编译仍输出已跟踪的非阻断 warning：异步合成渲染使用 `RunLoop.current.run(until:)`（Issue #28）以及现有 Sendable 捕获/AX 常量转换提示。本轮未扩大到 warning 清理。
+
+所有 BP08 自动化输入均为合成值；没有发起系统辅助功能授权请求、读取实际 Token Hub AX 内容、安装或提升新应用。真实权限与实际窗口就绪情况仍未验证。
+
+## BP07 C12-b 历史验证
 
 - 核心检查程序：227/227 通过。覆盖本地 Codex 首记录身份、source/lineage 分类、重复 rollout 冲突与去重、fork delta、quota 快照更新、坏记录和未知贡献、缓存、生命周期、额度、路径安全与读取边界。
 - 原生 XCTest：11/11 测试通过。包括已核验小计、未知线程与未识别文件文案、顶层会话和子代理分类、完整/不完整总量标记，以及现有配额与快照回归。

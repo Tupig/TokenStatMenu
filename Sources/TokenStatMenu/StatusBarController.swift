@@ -73,18 +73,32 @@ import SwiftUI
             let fiveHourUsedPercent: Double?
             let sevenDayUsedPercent: Double?
             let quotaError: String
+            let tokenHubSourceEnabled: Bool
+            let tokenHubPermissionGranted: Bool
+            let tokenHubPermissionRequired: Bool
+            let tokenHubWindowPresent: Bool
+            let tokenHubMenuSuffixPresent: Bool
             let alert: String
         }
         let appliedColor = (item.button?.attributedTitle.length ?? 0) > 0
             ? item.button?.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
             : nil
+        // The actual title can contain a live AX-derived percentage. Diagnostics retain only
+        // the non-AX portion and readiness booleans; no AX content crosses this sink.
+        let safeTitle = (item.button?.attributedTitle.string ?? "")
+            .replacingOccurrences(of: #" · Hub .*?$"#, with: "", options: .regularExpression)
         let report = Report(isTestFixture: model.isTestFixture, hasRequestData: model.hasRequestData,
             dataNotice: model.dataNotice, discoveredGateways: model.gateways.count,
-            title: item.button?.attributedTitle.string ?? "", popoverShown: popover.isShown,
+            title: safeTitle, popoverShown: popover.isShown,
             statusItemVisible: item.isVisible, active: model.stats.active,
             quotaUsed: model.quota?.used, quotaFraction: model.quota?.fraction,
             fiveHourUsedPercent: model.fiveHourQuota?.usedPercent, sevenDayUsedPercent: model.sevenDayQuota?.usedPercent,
             quotaError: model.quotaError,
+            tokenHubSourceEnabled: model.config.dataSource == "localCodex" && model.tokenHubAutomaticReadingEnabled,
+            tokenHubPermissionGranted: model.tokenHubPermissionGrantedForDiagnostics,
+            tokenHubPermissionRequired: model.tokenHubPermissionRequiredForDiagnostics,
+            tokenHubWindowPresent: model.tokenHubQuotaSnapshot?.fiveHour != nil || model.tokenHubQuotaSnapshot?.sevenDay != nil,
+            tokenHubMenuSuffixPresent: model.menuTitleContainsTokenHubSuffix,
             alert: appliedColor == .systemRed ? "red" : appliedColor == .systemYellow ? "yellow" : "normal")
         if let data = try? JSONEncoder().encode(report) {
             let url = URL(fileURLWithPath: args[index + 1])

@@ -97,6 +97,8 @@ import TokenStatCore
         try gatewayChecks()
         try windowQuotaChecks()
         try localCodexUsageChecks()
+        try hubChecks()
+        try hubScannerChecks()
         print("\(checks - failures)/\(checks) checks passed")
         if failures > 0 { exit(1) }
     }

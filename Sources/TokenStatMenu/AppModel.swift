@@ -14,6 +14,7 @@ struct SpeedPoint: Identifiable {
 @MainActor final class AppModel: ObservableObject {
     // Explicit launch-only flag: fixtures never masquerade as enterprise measurements.
     let isTestFixture = CommandLine.arguments.contains("--test-fixture")
+    private let isPreview: Bool
     @Published var config = AppConfiguration()
     @Published var stats = MetricsSnapshot()
     @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
@@ -25,6 +26,13 @@ struct SpeedPoint: Identifiable {
     @Published var message = ""
     @Published var history: [SpeedPoint] = []
     @Published var quotaLoading = false
+    @Published private(set) var tokenHubQuotaSnapshot: TokenHubQuotaSnapshot?
+    @Published private(set) var tokenHubQuotaStatus: TokenHubQuotaStatus = .targetNotRunning
+    @Published private(set) var tokenHubQuotaFailure: TokenHubQuotaFailure?
+    @Published var tokenHubAutomaticReadingEnabled = true
+    var tokenHubScanner: TokenHubQuotaScanning = TokenHubAXReader()
+    var tokenHubPermissionProvider: TokenHubPermissionProviding = TokenHubNativePermissionProvider()
+    var tokenHubNow: () -> Date = Date.init
     @Published var panelVisible = false
     @Published var gateways: [GatewayCandidate] = []
     @Published var discoveryStatus = "正在读取本机网关配置…"
@@ -37,12 +45,19 @@ struct SpeedPoint: Identifiable {
     private var quotaFetch: Task<Void, Never>?
     private var localScan: DispatchWorkItem?
     private var localScanRunning = false
+    private let tokenHubQueue = DispatchQueue(label: "TokenStatMenu.tokenHubAX", qos: .utility)
+    private var tokenHubRefreshWork: DispatchWorkItem?
+    private var tokenHubScanInFlight = false
+    private var tokenHubWorkspaceObservers: [NSObjectProtocol] = []
+    private var lastTokenHubPermissionCheck = Date.distantPast
+    private var cachedTokenHubPermission = false
     private let localScanQueue = DispatchQueue(label: "TokenStatMenu.localCodexScan", qos: .utility)
     private var localCache = LocalCodexUsageReader.Cache()
     private var localRefreshScheduler = LocalRefreshScheduler()
     private var proxyWasStarted = false
     private var isShuttingDown = false
     private var generation = 0
+    private var tokenHubGeneration: UInt64 = 0
     private var lastHistory = Date.distantPast
     private(set) var localKey = ""
     private var apiKey = ""
@@ -50,6 +65,7 @@ struct SpeedPoint: Identifiable {
     var onTick: (() -> Void)?
 
     init(preview: Bool = false) {
+        isPreview = preview
         // Offline view rendering must never touch local configuration or credentials.
         if preview { proxyStatus = "模拟预览 · 无网络、无本机配置"; discoveryStatus = "离线预览"; return }
         logger.onError = { [weak self] error in Task { @MainActor in self?.message = error } }
@@ -62,6 +78,7 @@ struct SpeedPoint: Identifiable {
             }
             startServices()
         } catch { message = error.localizedDescription; proxyStatus = "未启动：检查设置" }
+        installTokenHubWorkspaceObservers()
         // A single 2Hz main timer updates menu text. Network callbacks never redraw the UI.
         timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
         timer?.tolerance = 0.1
@@ -90,7 +107,16 @@ struct SpeedPoint: Identifiable {
             }
         }
     }
-    func shutdown() { isShuttingDown = true; generation += 1; _ = localRefreshScheduler.invalidate(); timer?.invalidate(); quotaLoop?.cancel(); quotaFetch?.cancel(); localScan?.cancel(); if proxyWasStarted { proxy.stop() } }
+    func shutdown() {
+        isShuttingDown = true; generation += 1; _ = localRefreshScheduler.invalidate()
+        timer?.invalidate(); quotaLoop?.cancel(); quotaFetch?.cancel(); localScan?.cancel()
+        tokenHubGeneration &+= 1
+        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        for observer in tokenHubWorkspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        tokenHubWorkspaceObservers.removeAll()
+        tokenHubQuotaSnapshot = nil; tokenHubQuotaStatus = .disabled; tokenHubQuotaFailure = nil
+        if proxyWasStarted { proxy.stop() }
+    }
     func tick() {
         stats = engine.snapshot()
         let now = Date()
@@ -101,6 +127,8 @@ struct SpeedPoint: Identifiable {
             lastHistory = now
         }
         if quota?.month != QuotaSnapshot.currentMonth(), quota != nil { quota = nil; quotaError = "已跨月，等待本月用量" }
+        if tokenHubQuotaStatus == .connected, freshTokenHubQuota(at: now) == nil { tokenHubQuotaStatus = .stale }
+        pollTokenHubPermissionIfDue()
         onTick?()
     }
     var freshQuota: QuotaSnapshot? {
@@ -123,7 +151,8 @@ struct SpeedPoint: Identifiable {
             let total = localSnapshot.hasCompleteAccounting ? "Σ\(formatCompactCount(localSnapshot.total))"
                 : localSnapshot.knownThreadCount > 0 ? "小计\(formatCompactCount(localSnapshot.total)) · 未核验\(uncertainty)" : "Σ— · 未核验\(uncertainty)"
             let sessions = localSnapshot.hasCompleteAccounting ? " · \(localSnapshot.sessionCount)顶层对话" : ""
-            return (isTestFixture ? "测试 " : "") + "上轮均:\(rate) · \(total)\(sessions)"
+            let quotaSuffix = tokenHubMenuSuffix
+            return (isTestFixture ? "测试 " : "") + "上轮均:\(rate) · \(total)\(sessions)\(quotaSuffix)"
         }
         let value = !hasRequestData ? "T:—" : stats.active > 0
             ? String(format: "T:≈%.1ftok/s", stats.outputTPS) : "T:0.0tok/s"
@@ -141,7 +170,39 @@ struct SpeedPoint: Identifiable {
         let output = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.output) : "未知"
         let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "已核验记录小计"
         let total = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.total) : "未知"
-        return "本地 Codex 当前扫描范围记录：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+        let hub = tokenHubTooltipDetail
+        return "本地 Codex 当前扫描范围记录：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(turn)；含工具、网络和等待；不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+    }
+    private var tokenHubMenuSuffix: String {
+        guard let snapshot = freshTokenHubQuota(at: Date()) else { return "" }
+        let windows = [snapshot.fiveHour.map { "5h剩 \(percentText($0.remainingPercent))%" },
+                       snapshot.sevenDay.map { "7d剩 \(percentText($0.remainingPercent))%" }].compactMap { $0 }
+        return windows.isEmpty ? "" : " · Hub \(windows.joined(separator: " / "))"
+    }
+    var menuTitleContainsTokenHubSuffix: Bool { !tokenHubMenuSuffix.isEmpty }
+    var tokenHubPermissionGrantedForDiagnostics: Bool { cachedTokenHubPermission }
+    var tokenHubPermissionRequiredForDiagnostics: Bool { tokenHubQuotaStatus == .permissionRequired }
+    private var tokenHubTooltipDetail: String {
+        let snapshot = freshTokenHubQuota(at: Date())
+        let five = snapshot?.fiveHour.map { "界面显示剩余 \(percentText($0.remainingPercent))%（5 小时）" } ?? "5 小时未知"
+        let seven = snapshot?.sevenDay.map { "界面显示剩余 \(percentText($0.remainingPercent))%（7 天）" } ?? "7 天未知"
+        return "Token Hub 界面快照：\(five) · \(seven)；\(tokenHubQuotaStatusText)；后台更新时间未提供；币种未核验"
+    }
+    private func percentText(_ value: Decimal) -> String {
+        TokenHubDecimalFormatter.string(value)
+    }
+    var tokenHubQuotaStatusText: String {
+        switch tokenHubQuotaStatus {
+        case .disabled: "自动读取已关闭"
+        case .permissionRequired: "未授权辅助功能"
+        case .targetNotRunning: "Token Hub 未运行"
+        case .ambiguousTarget: "检测到多个 Token Hub 进程"
+        case .quotaGroupUnavailable: "找不到用量和限额页"
+        case .unsupportedLayout: "用量页面布局暂不支持"
+        case .accessFailed: "辅助功能读取失败"
+        case .stale: "界面快照已过期"
+        case .connected: "已连接"
+        }
     }
     private var accountingDetail: String {
         "已核验线程 \(localSnapshot.knownThreadCount) · 未核验线程 \(localSnapshot.unknownThreadCount) · 未识别文件 \(localSnapshot.unidentifiedFileCount) · 子代理 \(localSnapshot.subagentCount) · 分叉 \(localSnapshot.forkCount) · 顶层对话 \(localSnapshot.sessionCount)"
@@ -164,10 +225,17 @@ struct SpeedPoint: Identifiable {
         return ratio >= 0.95 ? .systemRed : ratio >= 0.8 ? .systemYellow : .labelColor
     }
     func credentials() -> (String, String) { (apiKey, usageKey) }
+    static func configurationForApplying(_ draft: AppConfiguration,
+                                         automaticReadingEnabled: Bool) -> AppConfiguration {
+        var configuration = draft
+        configuration.tokenHubAutomaticReadingEnabled = automaticReadingEnabled
+        return configuration
+    }
     func apply(_ newConfig: AppConfiguration, upstreamKey: String, quotaKey: String) -> Bool {
         guard stats.active == 0 else { message = "请求进行中，请等待完成后再修改代理配置"; return false }
         do {
-            var savedConfig = newConfig
+            var savedConfig = Self.configurationForApplying(newConfig,
+                automaticReadingEnabled: tokenHubAutomaticReadingEnabled)
             if newConfig.dataSource == "localCodex" {
                 savedConfig.endpoint = config.endpoint; savedConfig.usageURL = config.usageURL
             }
@@ -201,7 +269,12 @@ struct SpeedPoint: Identifiable {
         catch { message = error.localizedDescription }
     }
     private func startServices() {
-        generation += 1; quotaLoop?.cancel(); quotaFetch?.cancel(); quotaFetch = nil; quotaLoading = false
+        generation += 1; tokenHubGeneration &+= 1; quotaLoop?.cancel(); quotaFetch?.cancel(); quotaFetch = nil; quotaLoading = false
+        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
+        tokenHubAutomaticReadingEnabled = config.tokenHubAutomaticReadingEnabled
+        tokenHubQuotaStatus = config.dataSource == "localCodex" && tokenHubAutomaticReadingEnabled ? .targetNotRunning : .disabled
+        lastTokenHubPermissionCheck = .distantPast; cachedTokenHubPermission = false
         _ = localRefreshScheduler.invalidate()
         localCache = LocalCodexUsageReader.Cache()
         localScan?.cancel(); localScan = nil
@@ -209,7 +282,9 @@ struct SpeedPoint: Identifiable {
         if config.dataSource == "localCodex" {
             if proxyWasStarted { proxy.stop(); proxyWasStarted = false }
             proxyStatus = "本地模式 · 未启动代理"
-            scheduleLocalScan(immediate: true); return
+            scheduleLocalScan(immediate: true)
+            if tokenHubAutomaticReadingEnabled { scheduleTokenHubRefresh(after: 0) }
+            return
         }
         proxy.onStatus = { [weak self] status in Task { @MainActor in self?.proxyStatus = status } }
         proxy.onRecord = { [weak self] record in Task { @MainActor in if self?.config.loggingEnabled == true { self?.logger.append(record) } } }
@@ -275,6 +350,182 @@ struct SpeedPoint: Identifiable {
         localScan = work
         DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0 : 5), execute: work)
     }
+    func refreshTokenHubQuota() {
+        guard !isShuttingDown else { return }
+        guard !isFixtureUsingNativeTokenHubReader else { return }
+        guard config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled else {
+            invalidateTokenHubQuota(status: .disabled); tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+            return
+        }
+        checkTokenHubPermissionIfDue(scheduleIfGranted: false)
+        guard cachedTokenHubPermission else { invalidateTokenHubQuota(status: .permissionRequired); return }
+        guard !tokenHubScanInFlight else { return }
+        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        tokenHubScanInFlight = true
+        let version = tokenHubGeneration, mode: TokenHubRunMode = .localCodex
+        let now = tokenHubNow(), interval = config.refreshSeconds
+        let scanner = tokenHubScanner
+        let permission = cachedTokenHubPermission
+        tokenHubQueue.async { [weak self] in
+            let result = scanner.scan(now: now, monotonicNow: { ProcessInfo.processInfo.systemUptime },
+                                      permissionTrusted: permission, refreshSeconds: interval,
+                                      mode: mode, generation: version)
+            Task { @MainActor in
+                guard let self else { return }
+                self.tokenHubScanInFlight = false
+                guard !self.isShuttingDown, self.tokenHubGeneration == version,
+                      self.config.dataSource == "localCodex", self.tokenHubAutomaticReadingEnabled,
+                      self.cachedTokenHubPermission else {
+                    if !self.isShuttingDown, self.config.dataSource == "localCodex",
+                       self.tokenHubAutomaticReadingEnabled, self.cachedTokenHubPermission {
+                        self.scheduleTokenHubRefresh(after: 0)
+                    }
+                    return
+                }
+                self.applyTokenHubQuotaResult(result, generation: version, mode: mode, now: self.tokenHubNow())
+                self.scheduleTokenHubRefresh(after: self.config.refreshSeconds)
+            }
+        }
+    }
+
+    func setTokenHubAutomaticReadingEnabled(_ enabled: Bool) {
+        guard tokenHubAutomaticReadingEnabled != enabled else { return }
+        tokenHubAutomaticReadingEnabled = enabled
+        tokenHubGeneration &+= 1
+        config.tokenHubAutomaticReadingEnabled = enabled
+        if !isPreview { try? ConfigStore.save(config) }
+        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        if enabled && config.dataSource == "localCodex" && !isShuttingDown {
+            tokenHubQuotaStatus = .targetNotRunning; tokenHubQuotaFailure = nil
+            lastTokenHubPermissionCheck = .distantPast
+            scheduleTokenHubRefresh(after: 0)
+        } else { invalidateTokenHubQuota(status: .disabled) }
+    }
+
+    func requestTokenHubAccessibilityAccess() {
+        guard !isPreview, !isTestFixture, config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled, !isShuttingDown else { return }
+        tokenHubPermissionProvider.requestOnceAndOpenSystemSettings()
+        lastTokenHubPermissionCheck = .distantPast
+        checkTokenHubPermissionIfDue(scheduleIfGranted: false)
+        if cachedTokenHubPermission { refreshTokenHubQuota() }
+        else { invalidateTokenHubQuota(status: .permissionRequired) }
+    }
+
+    func invalidateTokenHubQuota(status: TokenHubQuotaStatus) {
+        tokenHubGeneration &+= 1
+        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil; tokenHubQuotaStatus = status
+    }
+
+    func applyTokenHubQuotaResult(_ result: TokenHubQuotaResult, generation resultGeneration: UInt64,
+                                  mode: TokenHubRunMode, now: Date) {
+        guard !isShuttingDown, tokenHubGeneration == resultGeneration, cachedTokenHubPermission,
+              config.dataSource == "localCodex", mode == .localCodex,
+              tokenHubAutomaticReadingEnabled else { return }
+        if result.status == .connected, let snapshot = result.snapshot {
+            if let previous = tokenHubQuotaSnapshot, previous.identity != snapshot.identity {
+                tokenHubQuotaSnapshot = nil
+            }
+            tokenHubQuotaSnapshot = snapshot
+            tokenHubQuotaStatus = snapshot.observedAt > now || now.timeIntervalSince(snapshot.observedAt) > max(120, config.refreshSeconds * 2)
+                ? .stale : .connected
+            tokenHubQuotaFailure = nil
+        } else {
+            tokenHubQuotaSnapshot = nil
+            tokenHubQuotaStatus = result.status
+            tokenHubQuotaFailure = result.failure
+        }
+    }
+
+    func freshTokenHubQuota(at now: Date) -> TokenHubQuotaSnapshot? {
+        guard config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled,
+              tokenHubQuotaStatus == .connected, let snapshot = tokenHubQuotaSnapshot,
+              snapshot.observedAt <= now,
+              now.timeIntervalSince(snapshot.observedAt) <= max(120, config.refreshSeconds * 2) else { return nil }
+        return snapshot
+    }
+
+    private func checkTokenHubPermissionIfDue(scheduleIfGranted: Bool = true) {
+        let now = tokenHubNow()
+        guard now.timeIntervalSince(lastTokenHubPermissionCheck) >= 2 else { return }
+        let old = cachedTokenHubPermission
+        cachedTokenHubPermission = tokenHubPermissionProvider.isTrusted()
+        lastTokenHubPermissionCheck = now
+        if old && !cachedTokenHubPermission { invalidateTokenHubQuota(status: .permissionRequired) }
+        if scheduleIfGranted && !old && cachedTokenHubPermission && config.dataSource == "localCodex" && tokenHubAutomaticReadingEnabled {
+            scheduleTokenHubRefresh(after: 0)
+        }
+    }
+
+    private func pollTokenHubPermissionIfDue() {
+        guard config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled, !isShuttingDown,
+              !isFixtureUsingNativeTokenHubReader else { return }
+        checkTokenHubPermissionIfDue()
+    }
+
+    private func scheduleTokenHubRefresh(after seconds: TimeInterval) {
+        guard config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled,
+              !isShuttingDown, !tokenHubScanInFlight, !isFixtureUsingNativeTokenHubReader else { return }
+        tokenHubRefreshWork?.cancel()
+        let version = tokenHubGeneration
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, !self.isShuttingDown, self.tokenHubGeneration == version,
+                      self.config.dataSource == "localCodex", self.tokenHubAutomaticReadingEnabled else { return }
+                self.refreshTokenHubQuota()
+            }
+        }
+        tokenHubRefreshWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, seconds), execute: work)
+    }
+
+    static func shouldSuppressNativeTokenHubRead(isTestFixture: Bool, scannerIsNative: Bool) -> Bool {
+        isTestFixture && scannerIsNative
+    }
+    var isFixtureUsingNativeTokenHubReader: Bool {
+        Self.shouldSuppressNativeTokenHubRead(isTestFixture: isTestFixture,
+            scannerIsNative: tokenHubScanner is TokenHubAXReader)
+    }
+
+    private func installTokenHubWorkspaceObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      let bundleID = app.bundleIdentifier else { return }
+                Task { @MainActor in
+                    if name == NSWorkspace.didLaunchApplicationNotification {
+                        self?.tokenHubApplicationDidLaunch(bundleIdentifier: bundleID)
+                    } else {
+                        self?.tokenHubApplicationDidTerminate(bundleIdentifier: bundleID)
+                    }
+                }
+            }
+            tokenHubWorkspaceObservers.append(observer)
+        }
+    }
+
+    /// Metadata-only lifecycle seam; no AX values or target contents are read here.
+    func tokenHubApplicationDidTerminate(bundleIdentifier: String) {
+        guard bundleIdentifier == TokenHubTarget.bundleID, !isShuttingDown else { return }
+        invalidateTokenHubQuota(status: config.dataSource == "localCodex" ? .targetNotRunning : .disabled)
+    }
+
+    /// Metadata-only lifecycle seam; a launch never makes an old snapshot current.
+    func tokenHubApplicationDidLaunch(bundleIdentifier: String) {
+        guard bundleIdentifier == TokenHubTarget.bundleID, !isShuttingDown else { return }
+        invalidateTokenHubQuota(status: config.dataSource == "localCodex" && tokenHubAutomaticReadingEnabled
+            ? .targetNotRunning : .disabled)
+        guard config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled,
+              !isFixtureUsingNativeTokenHubReader else { return }
+        checkTokenHubPermissionIfDue(scheduleIfGranted: false)
+        guard cachedTokenHubPermission else {
+            tokenHubQuotaStatus = .permissionRequired
+            return
+        }
+        scheduleTokenHubRefresh(after: 0)
+    }
+
     func refreshQuota() {
         guard config.dataSource == "proxy", !config.usageURL.isEmpty, !quotaLoading else { return }
         quotaLoading = true

@@ -27,6 +27,7 @@ import TokenStatCore
                     priceSection
                     quotaSection
                 } else {
+                    tokenHubSection
                     Text("从 ~/.codex/sessions 的有限范围中读取当前扫描范围记录。依据记录中的来源与父子关系区分顶层对话、子代理和分叉；无法核验的记录单独标示，不把未知贡献当作零或完整总量。仅读取有界文件片段，不连接本机代理、不读取凭据或企业接口。切换到代理模式可恢复企业接口配置。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -68,6 +69,22 @@ import TokenStatCore
                 Button(model.discovering ? "扫描中…" : "重新扫描") { model.discoverGateways() }.disabled(model.discovering)
                 Text("只在本机识别地址、模型与提供方；不读取其他应用的密钥、Cookie 或认证文件。不会修改 Codex 配置，也不会联网探测。更换地址时清空待保存的旧密钥，避免误发。")
                     .font(.caption2).foregroundStyle(.secondary)
+            }.padding(6)
+        }
+    }
+    private var tokenHubSection: some View {
+        GroupBox("Token Hub 界面额度") {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("自动读取当前额度面板", isOn: Binding(
+                    get: { model.tokenHubAutomaticReadingEnabled },
+                    set: { model.setTokenHubAutomaticReadingEnabled($0) }))
+                Text("仅读取已运行 Token Hub 的可访问性界面文字和进度。需要 macOS 辅助功能授权；自动读取仅在本地 Codex 模式启用。原始界面值不写入诊断或日志。账号、组织、币种与后台更新时间均未核验。")
+                    .font(.caption2).foregroundStyle(.secondary)
+                HStack {
+                    Button("请求辅助功能访问…") { model.requestTokenHubAccessibilityAccess() }
+                        .disabled(model.isTestFixture || !model.tokenHubAutomaticReadingEnabled)
+                    Text(model.tokenHubQuotaStatusText).font(.caption2).foregroundStyle(.secondary)
+                }
             }.padding(6)
         }
     }

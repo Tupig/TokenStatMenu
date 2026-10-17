@@ -36,6 +36,8 @@
 	<false/>
 	<key>historyEnabled</key>
 	<true/>
+	<key>tokenHubAutomaticReadingEnabled</key>
+	<true/>
 	<key>fiveHourUsedPercentPath</key>
 	<string>data.five_hour.used_percent</string>
 	<key>fiveHourResetPath</key>

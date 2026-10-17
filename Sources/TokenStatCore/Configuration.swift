@@ -23,8 +23,10 @@ public struct AppConfiguration: Codable, Equatable {
     public var refreshSeconds = 60.0
     public var loggingEnabled = false
     public var historyEnabled = true
+    /// Automatically reads the visible Token Hub quota panel in local Codex mode.
+    public var tokenHubAutomaticReadingEnabled = true
     public init() {}
-    private enum CodingKeys: String, CodingKey { case dataSource, endpoint, model, port, includeUsage, allowInsecureHTTP, inputPrice, outputPrice, currency, usdToCNY, monthlyLimit, usageURL, usedPath, limitPath, periodPath, fiveHourUsedPercentPath, fiveHourResetPath, sevenDayUsedPercentPath, sevenDayResetPath, refreshSeconds, loggingEnabled, historyEnabled }
+    private enum CodingKeys: String, CodingKey { case dataSource, endpoint, model, port, includeUsage, allowInsecureHTTP, inputPrice, outputPrice, currency, usdToCNY, monthlyLimit, usageURL, usedPath, limitPath, periodPath, fiveHourUsedPercentPath, fiveHourResetPath, sevenDayUsedPercentPath, sevenDayResetPath, refreshSeconds, loggingEnabled, historyEnabled, tokenHubAutomaticReadingEnabled }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         dataSource = try c.decodeIfPresent(String.self, forKey: .dataSource) ?? ((c.contains(.endpoint) || c.contains(.usageURL)) ? "proxy" : "localCodex")
@@ -42,6 +44,7 @@ public struct AppConfiguration: Codable, Equatable {
         sevenDayResetPath = try c.decodeIfPresent(String.self, forKey: .sevenDayResetPath) ?? "data.seven_day.resets_at"
         refreshSeconds = try c.decodeIfPresent(Double.self, forKey: .refreshSeconds) ?? 60
         loggingEnabled = try c.decodeIfPresent(Bool.self, forKey: .loggingEnabled) ?? false; historyEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyEnabled) ?? true
+        tokenHubAutomaticReadingEnabled = try c.decodeIfPresent(Bool.self, forKey: .tokenHubAutomaticReadingEnabled) ?? true
     }
 
     public func validated() throws -> AppConfiguration {

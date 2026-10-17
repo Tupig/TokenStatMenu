@@ -7,6 +7,9 @@ import AppKit
         NSApp.setActivationPolicy(.accessory)
         let model = AppModel(); self.model = model
         status = StatusBarController(model: model)
+        if CommandLine.arguments.contains("--request-accessibility") {
+            model.requestTokenHubAccessibilityAccess()
+        }
         // Explicit inspection option only. Normal launches never open a window/popover.
         if CommandLine.arguments.contains("--show-panel") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.status?.show() }

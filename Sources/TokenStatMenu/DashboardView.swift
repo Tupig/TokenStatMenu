@@ -31,14 +31,20 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             else {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 12) {
-                        if model.config.dataSource == "localCodex" { localUsageCard } else { liveCard }
+                        if model.config.dataSource == "localCodex" {
+                            TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: Date()), status: model.tokenHubQuotaStatusText,
+                                enabled: model.tokenHubAutomaticReadingEnabled, refreshSeconds: model.config.refreshSeconds)
+                            localUsageCard
+                        } else { liveCard }
                         HStack(alignment: .top, spacing: 10) {
                             WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
                                 color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
                             WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
                                 color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
                         }
-                        if model.config.dataSource == "localCodex" { localQuotaCard } else { sessionCard; quotaCard }
+                        if model.config.dataSource == "localCodex" {
+                            localQuotaCard
+                        } else { sessionCard; quotaCard }
                         if model.config.dataSource == "proxy", model.config.historyEnabled, model.panelVisible { historyCard }
                         if model.config.dataSource == "proxy" { costCard; requestCard; connectionCard }
                     }.padding(.horizontal, 16).padding(.bottom, 14)

@@ -192,6 +192,7 @@ def main():
             local = wait_for(lambda: (r if (r := json.loads(local_diagnostic.read_text())).get("hasRequestData") else None))
             assert local["title"] == "测试 上轮均:— · Σ30 · 1顶层对话" and local["isTestFixture"], local
             assert "模拟测试" in local["dataNotice"], local
+            assert not local["tokenHubPermissionGranted"] and not local["tokenHubPermissionRequired"], local
             assert (local.get("quotaUsed") is None and local.get("fiveHourUsedPercent") is None
                 and local.get("sevenDayUsedPercent") is None), local
             with socket.socket() as probe:
