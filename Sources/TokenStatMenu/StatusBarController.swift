@@ -66,15 +66,24 @@ import SwiftUI
             let quotaPresent: Bool
             let directQuotaPresent: Bool
             let directQuotaStatus: String
+            let fiveHourPresent: Bool
+            let sevenDayPresent: Bool
+            let fiveHourResetPresent: Bool
+            let sevenDayResetPresent: Bool
             let resetTimePresent: Bool
             let monthlyUsagePresent: Bool
             let liveTokenSpeedPresent: Bool
             let sourceStatus: String
             let backgroundServiceResources: BackgroundServiceResources
         }
-        let snapshot = model.tokenHubQuotaSnapshot
-        let resetTimePresent = [snapshot?.fiveHour?.resetDisplay, snapshot?.sevenDay?.resetDisplay]
-            .compactMap { $0 }.contains { !$0.isEmpty }
+        let snapshot = model.freshTokenHubQuota(at: Date())
+        func hasReset(_ value: String?) -> Bool {
+            guard let value else { return false }
+            return !value.isEmpty && value != "未知"
+        }
+        let fiveHourResetPresent = hasReset(snapshot?.fiveHour?.resetDisplay)
+        let sevenDayResetPresent = hasReset(snapshot?.sevenDay?.resetDisplay)
+        let resetTimePresent = fiveHourResetPresent || sevenDayResetPresent
         let report = Report(
             seasunOnlyMode: model.isSeasunOnly,
             backgroundServicesStarted: model.backgroundServicesStarted,
@@ -83,10 +92,14 @@ import SwiftUI
             quotaPresent: snapshot != nil || model.quota != nil || model.fiveHourQuota != nil || model.sevenDayQuota != nil,
             directQuotaPresent: model.tokenHubQuotaIsDirect && snapshot != nil,
             directQuotaStatus: model.tokenHubQuotaStatusText,
+            fiveHourPresent: snapshot?.fiveHour != nil,
+            sevenDayPresent: snapshot?.sevenDay != nil,
+            fiveHourResetPresent: fiveHourResetPresent,
+            sevenDayResetPresent: sevenDayResetPresent,
             resetTimePresent: resetTimePresent,
             monthlyUsagePresent: snapshot?.monthly != nil || model.quota?.used != nil,
             liveTokenSpeedPresent: model.config.dataSource == "localCodex"
-                ? model.localSnapshot.liveTurn != nil : model.stats.active > 0,
+                ? model.freshLocalLiveTurn != nil : model.stats.active > 0,
             sourceStatus: model.sourceStatus,
             backgroundServiceResources: model.backgroundServiceResources)
         if let data = try? JSONEncoder().encode(report) {

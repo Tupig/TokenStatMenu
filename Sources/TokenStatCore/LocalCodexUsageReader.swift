@@ -152,7 +152,7 @@ public enum LocalCodexUsageReader {
         let latestEventAt: Date?; let tailLimited: Bool; let headComplete: Bool; let hasFutureTurn: Bool
         let contentHash: String?; let signature: FileSignature
     }
-    fileprivate struct CachedFileSummary { let summary: FileSummary }
+    fileprivate struct CachedFileSummary { let summary: FileSummary; let evaluatedAt: Date }
     public final class Cache {
         public struct Diagnostics: Equatable {
             public fileprivate(set) var bytesRead = 0; public fileprivate(set) var parsedFiles = 0
@@ -246,7 +246,9 @@ public enum LocalCodexUsageReader {
                 if timestampChanged { cache.entries = cache.entries.filter { $0.key.device != signature.device || $0.key.inode != signature.inode } }
             }
             if fst.st_size < 0 { unsafeCandidate = true; continue }
-            if let cached = cache?.entries[signature] {
+            // A clock rollback can turn previously current evidence into future
+            // evidence. Reparse it rather than reusing a time-dependent result.
+            if let cached = cache?.entries[signature], now >= cached.evaluatedAt {
                 cache?.hit()
                 let cachedSummary = cached.summary
                 let cachedLive: LocalLiveTurnSummary? = cachedSummary.live.flatMap { live in
@@ -293,9 +295,13 @@ public enum LocalCodexUsageReader {
             if parsed.identity == nil { unidentified += 1 }
             if parsed.tailLimited || !parsed.headComplete { limited = true; coverageLimited = true }
             summaries.append(parsed)
-            if let cache, parsed.identity != nil {
-                cache.entries[signature] = CachedFileSummary(summary: parsed)
+            if let cache, parsed.identity != nil, !parsed.hasFutureTurn {
+                cache.entries[signature] = CachedFileSummary(summary: parsed, evaluatedAt: now)
                 if cache.entries.count > maxFiles { cache.entries.removeValue(forKey: cache.entries.keys.first!) }
+            } else {
+                // Future lifecycle/counter evidence must be rejudged as time
+                // catches up, including when the file itself remains unchanged.
+                cache?.entries.removeValue(forKey: signature)
             }
         }
         if let cache { cache.entries = cache.entries.filter { liveSignatures.contains($0.key) } }
@@ -334,7 +340,9 @@ public enum LocalCodexUsageReader {
             if let event = summary.latestEventAt, latestEvent == nil || event > latestEvent! { latestEvent = event }
             if let live = summary.live, live.observedAt <= now {
                 liveInputTPS += live.inputTPS; liveOutputTPS += live.outputTPS
-                if latestLiveAt == nil || live.observedAt > latestLiveAt! { latestLiveAt = live.observedAt }
+                // The aggregate expires when its oldest included component
+                // expires; a newer session cannot extend an older one's rate.
+                if latestLiveAt == nil || live.observedAt < latestLiveAt! { latestLiveAt = live.observedAt }
             }
         }
         var input = 0, output = 0, total = 0
@@ -426,6 +434,7 @@ public enum LocalCodexUsageReader {
         let tokenEvents = decoded.filter { $0.type == "token_count" }
         let cumulativeTokenEvents = tokenEvents.filter(\.hasCumulativePayload)
         let validCounters = cumulativeTokenEvents.filter { $0.usage != nil }
+        let hasFutureCounter = cumulativeTokenEvents.contains { $0.date > now }
         let lastToken = cumulativeTokenEvents.last
         let observedLineSegments = wholeFileRead ? [mappedHeadSlots] : [mappedHeadSlots, mappedTailSlots]
         let latestCounterSegment = observedLineSegments.lastIndex(where: { $0.contains(where: { $0?.hasCumulativePayload == true }) })
@@ -438,21 +447,28 @@ public enum LocalCodexUsageReader {
         var contribution: Record? = nil
         if lineage == .root {
             if let lastToken, let usage = lastToken.usage,
-               !cumulativeTokenEvents.contains(where: \.invalidLifecycleTimestamp), !hasIncompleteTailFragment,
+               !cumulativeTokenEvents.contains(where: \.invalidLifecycleTimestamp), !hasFutureCounter, !hasIncompleteTailFragment,
                !hasBadLineAfterLatestCounter, (wholeFileRead || latestCounterInTail) { contribution = usage }
-        } else if (lineage == .subagent || lineage == .fork), !hasHistoryBase, headComplete, !tailLimited,
+        } else if (lineage == .subagent || lineage == .fork), !hasHistoryBase, !hasFutureCounter, headComplete, !tailLimited,
                   continuousRead, forkHasCompleteLines, let delta = forkContribution(payload: payload, events: decoded) { contribution = delta }
         let rateEvents = tokenEvents.map { ($0.date, $0.quotaUpdate) }
         let resolvedQuota = resolveRate(rateEvents, now: now)
         let rate = resolvedQuota.record
         let turnSegments = observedLineSegments.flatMap { parsedSegments($0) }
         let turn = turnSegments.compactMap { completedTurns(in: $0, now: now) }.max(by: { $0.completedAt < $1.completedAt })
-        let live = liveTurn(in: decoded, now: now)
+        // Live lifecycle evidence must be in the final continuous segment. A
+        // corrupt record, unread middle, or incomplete tail cannot be bridged.
+        let live: LocalLiveTurnSummary?
+        if !hasIncompleteTailFragment, let finalSlots = observedLineSegments.last,
+           finalSlots.last.flatMap({ $0 }) != nil,
+           let finalSegment = parsedSegments(finalSlots).last {
+            live = liveTurn(in: finalSegment, now: now)
+        } else { live = nil }
         let latestUsageDate = validCounters.last?.date
         return FileSummary(identity: identity, lineage: lineage, isFork: isFork, sourceKnownTop: sourceKnownTop,
             contribution: contribution, rate: rate, quotaDate: resolvedQuota.date, turn: turn, live: live, latestEventAt: latestUsageDate,
             tailLimited: tailLimited, headComplete: headComplete,
-            hasFutureTurn: decoded.contains(where: { $0.type == "task_complete" && $0.date > now }),
+            hasFutureTurn: decoded.contains(where: { ["task_started", "task_complete", "turn_aborted", "token_count"].contains($0.type) && $0.date > now }),
             contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature)
     }
 
@@ -486,6 +502,11 @@ public enum LocalCodexUsageReader {
               let type = root["type"] as? String else { return nil }
         let payload = root["payload"] as? [String: Any] ?? [:]
         let date = parseDate(root["timestamp"]) ?? .distantPast
+        // A malformed event envelope is a continuity barrier, just like broken
+        // JSON; otherwise it could silently hide a lifecycle boundary.
+        if type == "event_msg" {
+            guard let kind = payload["type"] as? String, !kind.isEmpty else { return nil }
+        }
         let eventType = type == "event_msg" ? (payload["type"] as? String ?? "") : type
         var usage: Record?, rate: Record?
         let info = payload["info"] as? [String: Any]
@@ -536,36 +557,63 @@ public enum LocalCodexUsageReader {
     /// two monotonic cumulative counters. A missing or stale tail is unknown.
     private static func liveTurn(in events: [ParsedEvent], now: Date) -> LocalLiveTurnSummary? {
         let freshnessLimit: TimeInterval = 15
-        var activeStart: Int?
         var activeID: String?
-        for index in events.indices {
-            let event = events[index]
+        var openIDs: [String: Int] = [:], seenIDs = Set<String>()
+        var ambiguous = false
+        var lastDate: Date?
+        var counters: [Record] = []
+        for event in events {
+            let validTime = !event.invalidLifecycleTimestamp && event.date <= now
             switch event.type {
             case "task_started":
-                if let id = event.turnID, !id.isEmpty { activeStart = index; activeID = id }
+                let id = event.turnID ?? ""
+                let unique = seenIDs.insert(id).inserted
+                if openIDs.isEmpty {
+                    activeID = id.isEmpty ? nil : id
+                    ambiguous = id.isEmpty || !unique || !validTime
+                    lastDate = event.date
+                    counters.removeAll(keepingCapacity: true)
+                } else {
+                    // Keep all open IDs so closing one overlapping task cannot
+                    // make the other task appear independently attributable.
+                    ambiguous = true
+                }
+                openIDs[id, default: 0] += 1
             case "task_complete", "turn_aborted":
-                if let id = event.turnID, id == activeID { activeStart = nil; activeID = nil }
-                else if event.turnID == nil, event.type == "turn_aborted" { activeStart = nil; activeID = nil }
+                if !validTime || lastDate.map({ event.date < $0 }) == true { ambiguous = true }
+                if let id = event.turnID, let count = openIDs[id] {
+                    if count == 1 { openIDs.removeValue(forKey: id) } else { openIDs[id] = count - 1 }
+                } else if event.turnID == nil, event.type == "turn_aborted" {
+                    openIDs.removeAll()
+                } else { ambiguous = true }
+                if openIDs.isEmpty {
+                    activeID = nil; lastDate = nil
+                    counters.removeAll(keepingCapacity: true)
+                }
+            case "token_count":
+                guard activeID != nil else { continue }
+                if !validTime || lastDate.map({ event.date < $0 }) == true { ambiguous = true }
+                lastDate = event.date
+                guard event.hasCumulativePayload else { continue }
+                guard let usage = event.usage else { ambiguous = true; continue }
+                if let previous = counters.last,
+                   usage.input < previous.input || usage.output < previous.output || usage.total < previous.total {
+                    ambiguous = true
+                }
+                // Keep just the last pair after validating every observed
+                // counter, so a prior reset cannot be hidden by two good ones.
+                if counters.count == 2 { counters.removeFirst() }
+                counters.append(usage)
             default: break
             }
         }
-        guard let start = activeStart, activeID != nil, start + 1 < events.count else { return nil }
-        let counterEvents = events[(start + 1)...].filter {
-            $0.type == "token_count" && $0.hasCumulativePayload && $0.date <= now
-        }
-        guard counterEvents.allSatisfy({ $0.usage != nil && !$0.invalidLifecycleTimestamp }) else { return nil }
-        let counters = counterEvents
-        guard let latest = counters.last, let previous = counters.dropLast().last,
-              let latestUsage = latest.usage, let previousUsage = previous.usage,
-              latest.date >= previous.date,
+        guard activeID != nil, !ambiguous, openIDs.count == 1,
+              let latest = counters.last, let previous = counters.dropLast().last,
               now.timeIntervalSince(latest.date) <= freshnessLimit else { return nil }
         let elapsed = latest.date.timeIntervalSince(previous.date)
-        guard elapsed > 0,
-              latestUsage.input >= previousUsage.input,
-              latestUsage.output >= previousUsage.output,
-              latestUsage.total >= previousUsage.total else { return nil }
-        return LocalLiveTurnSummary(inputTPS: Double(latestUsage.input - previousUsage.input) / elapsed,
-            outputTPS: Double(latestUsage.output - previousUsage.output) / elapsed,
+        guard elapsed > 0 else { return nil }
+        return LocalLiveTurnSummary(inputTPS: Double(latest.input - previous.input) / elapsed,
+            outputTPS: Double(latest.output - previous.output) / elapsed,
             observedAt: latest.date)
     }
 

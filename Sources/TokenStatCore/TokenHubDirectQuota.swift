@@ -70,11 +70,9 @@ public struct TokenHubDirectQuotaEndpoint: Equatable, Sendable {
         return leftDomain == rightDomain
     }
 
-    /// Foundation does not expose the Public Suffix List.  Keep a small
-    /// conservative set of common multi-label public suffixes so a redirect
-    /// from `example.co.uk` cannot be accepted merely because it also ends in
-    /// `co.uk`. Unknown suffixes still require at least a two-label domain and
-    /// never bypass the HTTPS, credential-free URL checks above.
+    /// This compatibility heuristic recognizes only the suffixes listed below;
+    /// it is not a complete Public Suffix List or a redirect trust boundary.
+    /// Callback Locations must match the original verified origin exactly.
     private static let multiLabelPublicSuffixes: Set<String> = [
         "ac.uk", "co.uk", "gov.uk", "org.uk",
         "com.au", "net.au", "org.au",
@@ -117,7 +115,8 @@ public enum TokenHubConnectionDiscovery {
     }
 
     public static func readAIManagerBaseURL(at url: URL) throws -> URL {
-        guard let db = try? openDatabase(at: url) else { throw TokenHubDirectQuotaFailure.connectionUnavailable }
+        guard let database = try? openDatabase(at: url) else { throw TokenHubDirectQuotaFailure.connectionUnavailable }
+        let db = database.handle
         defer { sqlite3_close(db) }
         guard let values = try readSetting(db: db, key: "client.connection"),
               let base = values["aiManagerBaseUrl"] as? String,
@@ -145,7 +144,8 @@ public enum TokenHubConnectionDiscovery {
               url.resolvingSymlinksInPath() == url.standardizedFileURL else {
             throw TokenHubDirectQuotaFailure.databaseUnsafe
         }
-        let db = try openDatabase(at: url)
+        let database = try openDatabase(at: url)
+        let db = database.handle
         defer { sqlite3_close(db) }
         guard let connection = try readSetting(db: db, key: "client.connection") else {
             throw TokenHubDirectQuotaFailure.connectionMalformed
@@ -166,7 +166,8 @@ public enum TokenHubConnectionDiscovery {
               url.resolvingSymlinksInPath() == url.standardizedFileURL else {
             throw TokenHubDirectQuotaFailure.databaseUnsafe
         }
-        let db = try openDatabase(at: url)
+        let database = try openDatabase(at: url)
+        let db = database.handle
         defer { sqlite3_close(db) }
         guard let connection = try readSetting(db: db, key: "client.connection"),
               let aiString = connection["aiManagerBaseUrl"] as? String,
@@ -184,13 +185,13 @@ public enum TokenHubConnectionDiscovery {
             throw TokenHubDirectQuotaFailure.sessionUnavailable
         }
         guard expiresAt.timeIntervalSince(now) > 30 else { throw TokenHubDirectQuotaFailure.credentialExpired }
-        return TokenHubStoredSettings(aiManagerBaseURL: ai, ssoBaseURL: sso,
+        return TokenHubStoredSettings(databaseIdentity: database.identity, aiManagerBaseURL: ai, ssoBaseURL: sso,
                                       session: TokenHubStoredSession(token: token, verifySign: verifySign,
                                                                       channel: channel, tokenType: tokenType,
                                                                       expiresAt: expiresAt))
     }
 
-    private static func openDatabase(at url: URL) throws -> OpaquePointer {
+    private static func openDatabase(at url: URL) throws -> (handle: OpaquePointer, identity: TokenHubDatabaseIdentity) {
         let manager = FileManager.default
         guard manager.fileExists(atPath: url.path),
               let attributes = try? manager.attributesOfItem(atPath: url.path),
@@ -222,7 +223,10 @@ public enum TokenHubConnectionDiscovery {
             sqlite3_close(db)
             throw TokenHubDirectQuotaFailure.databaseUnsafe
         }
-        return db
+        // Carry the identity verified against the actual open descriptor into
+        // the request transaction. Equal JSON from a replacement inode is not
+        // the same trusted local database.
+        return (db, TokenHubDatabaseIdentity(device: info.st_dev, inode: info.st_ino))
     }
 
     private static func sessionExpiry(_ value: Any?) -> Date? {
@@ -264,7 +268,13 @@ fileprivate struct TokenHubStoredSession: Equatable {
     let expiresAt: Date
 }
 
+fileprivate struct TokenHubDatabaseIdentity: Equatable {
+    let device: dev_t
+    let inode: ino_t
+}
+
 fileprivate struct TokenHubStoredSettings: Equatable {
+    let databaseIdentity: TokenHubDatabaseIdentity
     let aiManagerBaseURL: URL
     let ssoBaseURL: URL
     let session: TokenHubStoredSession
@@ -303,22 +313,34 @@ public struct TokenHubDirectQuotaClient: Sendable {
         do { access = try await callbackRequest(callbackURL) }
         catch let error as TokenHubDirectQuotaFailure { throw error }
         catch { throw TokenHubDirectQuotaFailure.exchangeFailed }
+        try Self.requireUnchangedSettings(settings, home: home, now: now)
         var response = try await quotaResponse(endpoint: endpoint.url, access: access)
         // Token Hub's own business flow refreshes the broker token once after
         // a 401. Never retry other statuses and never persist the new token.
         if response.statusCode == 401 {
-            do { access = try await callbackRequest(callbackURL) }
+            // Re-read once before the second exchange. If the Hub session or
+            // endpoints changed, let the next refresh start a new transaction
+            // rather than combine data from two identities in this one.
+            let refreshed = try TokenHubConnectionDiscovery.readDefaultStoredSettings(home: home, now: now)
+            guard refreshed == settings else { throw TokenHubDirectQuotaFailure.identityChanged }
+            let refreshedCallbackURL = try Self.callbackURL(baseURL: refreshed.aiManagerBaseURL, session: refreshed.session)
+            do { access = try await callbackRequest(refreshedCallbackURL) }
             catch let error as TokenHubDirectQuotaFailure { throw error }
             catch { throw TokenHubDirectQuotaFailure.exchangeFailed }
+            try Self.requireUnchangedSettings(settings, home: home, now: now)
             response = try await quotaResponse(endpoint: endpoint.url, access: access)
         }
         guard (200..<300).contains(response.statusCode) else {
             throw TokenHubDirectQuotaFailure.httpStatus(response.statusCode)
         }
         guard response.data.count <= 1_048_576 else { throw TokenHubDirectQuotaFailure.responseTooLarge }
-        let latest = try TokenHubConnectionDiscovery.readDefaultStoredSettings(home: home, now: now)
-        guard latest == settings else { throw TokenHubDirectQuotaFailure.identityChanged }
+        try Self.requireUnchangedSettings(settings, home: home, now: now)
         return try TokenHubDirectQuotaDecoder.decode(response.data, identity: identity, now: now)
+    }
+
+    private static func requireUnchangedSettings(_ expected: TokenHubStoredSettings, home: URL, now: Date) throws {
+        let latest = try TokenHubConnectionDiscovery.readDefaultStoredSettings(home: home, now: now)
+        guard latest == expected else { throw TokenHubDirectQuotaFailure.identityChanged }
     }
 
     private func quotaResponse(endpoint: URL, access: String) async throws -> TokenHubDirectQuotaHTTPResponse {
@@ -377,29 +399,56 @@ public struct TokenHubDirectQuotaClient: Sendable {
         catch {
             guard delegate.location != nil else { throw TokenHubDirectQuotaFailure.exchangeFailed }
         }
-        guard let location = delegate.location,
+        guard let location = delegate.location else { throw TokenHubDirectQuotaFailure.redirectMissing }
+        return try accessToken(fromCallbackLocation: location, callbackURL: url)
+    }
+
+    /// Decodes a captured Location without navigating to it. Keeping this pure
+    /// makes the redirect trust boundary testable without a session or network.
+    public static func accessToken(fromCallbackLocation location: String, callbackURL: URL) throws -> String {
+        // The Location carries a bearer token. A common organization suffix is
+        // insufficient: do not accept even a sibling host, query, userinfo, or
+        // nondefault port. No request is sent to this URL.
+        guard location.utf8.count <= 65_536,
+              !location.unicodeScalars.contains(where: { $0.properties.isWhitespace || CharacterSet.controlCharacters.contains($0) }),
+              callbackURL.scheme?.lowercased() == "https",
+              callbackURL.user == nil, callbackURL.password == nil,
+              callbackURL.port == nil || callbackURL.port == 443,
+              let originalHost = callbackURL.host?.lowercased(), !originalHost.isEmpty,
               let locationURL = URL(string: location),
+              let components = URLComponents(url: locationURL, resolvingAgainstBaseURL: false),
               locationURL.scheme?.lowercased() == "https",
-              locationURL.host != nil,
-              TokenHubDirectQuotaEndpoint.sameOrganization(url, locationURL),
-              locationURL.path == Self.expectedCallbackLocationPath(for: url),
-              let fragment = URLComponents(url: locationURL, resolvingAgainstBaseURL: false)?.fragment,
+              locationURL.host?.lowercased() == originalHost,
+              locationURL.port == nil || locationURL.port == 443,
+              locationURL.user == nil, locationURL.password == nil,
+              components.query == nil,
+              let expectedPath = Self.expectedCallbackLocationPath(for: callbackURL),
+              components.percentEncodedPath == expectedPath,
+              let fragment = components.percentEncodedFragment,
               let fragmentComponents = URLComponents(string: "https://local.invalid/?\(fragment)"),
-              fragmentComponents.queryItems?.first(where: { $0.name == "redirect" })?.value.map({ $0 == "/me/api-key" }) ?? true,
-              let token = fragmentComponents.queryItems?.first(where: { $0.name == "access_token" })?.value,
-              !token.isEmpty, token.count <= 16_384,
-              token.unicodeScalars.allSatisfy({ !$0.properties.isWhitespace }) else {
+              fragmentComponents.fragment == nil,
+              let items = fragmentComponents.queryItems else {
+            throw TokenHubDirectQuotaFailure.accessTokenMissing
+        }
+        let tokens = items.filter { $0.name == "access_token" }
+        let redirects = items.filter { $0.name == "redirect" }
+        guard tokens.count == 1, redirects.count <= 1,
+              redirects.first.map({ $0.value == "/me/api-key" }) ?? true,
+              let token = tokens.first?.value, !token.isEmpty, token.count <= 16_384,
+              token.unicodeScalars.allSatisfy({ !$0.properties.isWhitespace && !CharacterSet.controlCharacters.contains($0) }) else {
             throw TokenHubDirectQuotaFailure.accessTokenMissing
         }
         return token
     }
 
-    private static func expectedCallbackLocationPath(for callbackURL: URL) -> String {
+    private static func expectedCallbackLocationPath(for callbackURL: URL) -> String? {
         let suffix = "/api/v1/auth/it-sso/callback"
-        guard callbackURL.path.hasSuffix(suffix) else { return "" }
-        let prefix = String(callbackURL.path.dropLast(suffix.count))
+        guard let path = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.percentEncodedPath,
+              path.hasSuffix(suffix) else { return nil }
+        let prefix = String(path.dropLast(suffix.count))
         return (prefix == "/" ? "" : prefix) + "/auth/it/callback"
     }
+
 }
 
 private final class TokenHubRedirectBlocker: NSObject, URLSessionTaskDelegate {
