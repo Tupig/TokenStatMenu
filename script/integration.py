@@ -28,6 +28,8 @@ ALLOWED_REPORT_KEYS = {
     "statusItemVisible",
     "permissionPromptRequested",
     "quotaPresent",
+    "directQuotaPresent",
+    "directQuotaStatus",
     "resetTimePresent",
     "monthlyUsagePresent",
     "liveTokenSpeedPresent",
@@ -77,6 +79,8 @@ def verify_report(report: dict) -> None:
     assert report["backgroundServicesStarted"] is False
     assert report["permissionPromptRequested"] is False
     assert report["quotaPresent"] is False
+    assert report["directQuotaPresent"] is False
+    assert isinstance(report["directQuotaStatus"], str) and report["directQuotaStatus"]
     assert report["resetTimePresent"] is False
     assert report["monthlyUsagePresent"] is False
     assert report["liveTokenSpeedPresent"] is False

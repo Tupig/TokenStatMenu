@@ -1,5 +1,30 @@
 # 验证记录
 
+## BP18 — Seasun 路由归属与活动速度回归（2026-10-18）
+
+- 核心检查：358/358 通过。新增合成 rollout 覆盖当前 `model_provider` 与 Token Hub connection origin 匹配/不匹配两种情况；未验证路由的文件保持未知，不会混入 Token 总量。
+- 活动速度回归覆盖未完成 `task_started` 轮次的两条累计 `token_count` 差分，以及超过 15 秒没有新事件时回到未知。实现只保留输入/输出速率与观测时间，不保留正文、URL 或会话标识。
+- `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`：31/31 通过；`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./script/test.sh`：通过，包含隔离 no-config 启动场景和公开文件检查。
+- 当前本机实际启动当前构建并使用不存在的临时配置文件时，脱敏诊断为 `directQuotaPresent=true`、`monthlyUsagePresent=true`、`resetTimePresent=true`、`permissionPromptRequested=false`、`liveTokenSpeedPresent=true`；临时配置文件保持不存在。
+- 本轮未把实时估算称作网关权威速度；没有新鲜本地事件时菜单栏回退为上轮均速或未知。
+
+## BP17 — 零配置实机自动读取（2026-10-18）
+
+- 在本机已运行的 Seasun Token Hub 环境中，使用一个不存在的临时配置文件路径启动当前构建；应用没有创建该配置文件，也没有请求辅助功能授权。
+- 菜单栏 App 的脱敏布尔诊断在等待后台刷新后为：`seasunOnlyMode=true`、`backgroundServicesStarted=true`、`permissionPromptRequested=false`、`directQuotaPresent=true`、`monthlyUsagePresent=true`、`resetTimePresent=true`、`liveTokenSpeedPresent=false`。
+- 本次只读取诊断布尔值和状态文本，没有输出或保存真实额度、账号、网关 URL、会话值、令牌或会话正文；测试结束后只终止本次启动的 TokenStatMenu 进程。
+- 该证据证明当前本机的安装后零配置自动读取路径已连通；不同 Token Hub 版本、未登录状态、过期会话或企业网络策略仍可能安全地显示未知/不可用。
+
+## BP16 — 直接额度来源实机核验（2026-10-18）
+
+- 只读静态检查确认 Token Hub 的回调参数、短期令牌边界、额度路径和 401 单次重试规则；源码不包含本机域名、账号、会话值或额度值。
+- CoreChecks：347/347 通过；Xcode `swift test`：31/31 通过；TokenStatMenu debug 构建通过。
+- 在本机已登录且正在运行的 Token Hub 上，默认启动 TokenStatMenu 后只记录布尔诊断：`directQuotaPresent=true`、`monthlyUsagePresent=true`、`resetTimePresent=true`、`permissionPromptRequested=false`、`sourceStatus=unknown`（历史字段）。实际额度、令牌、账号和 URL 未写入诊断或仓库。
+- 直接客户端从 Token Hub 数据库只读读取连接与 SSO 会话，内存完成回调交换，拦截重定向，再读取三类窗口；请求前后重读设置，身份变化时丢弃结果。无 Accessibility 授权也能完成该来源；界面兼容读取仍是可选回退。
+- 真实瞬时 token/s 未宣称完成；菜单栏继续显示有完整轮次证据的均速或未知。
+
+上述实机证据只证明当前本机环境的来源与字段一致性，不代表所有账号、Token Hub 版本、网络策略或企业组织都相同。
+
 ## Seasun 专用启动修正
 
 本轮完成独立契约、实际检查充分性及实现审查。正式启动只读取两项可选偏好；旧代理配置不再激活监听、密钥读取或任意企业请求。默认/旧配置/损坏配置、原子保存、失败保留、preview 惰性、后台资源隔离与正式菜单详情均有合成检查。
@@ -14,7 +39,7 @@
 
 本轮保留一次验证偏差：曾误用会在编译后运行 App 的 Release 脚本选项，短暂启动非隔离的开发产物。已按精确可执行路径关闭该实例，原有安装实例保留。该实例可能执行了正常的本地或界面后台读取；没有采集或发布实际数值，但不能声称整个验证过程完全没有真实读取。后续 Release 编译使用不启动应用的 SwiftPM 命令，双架构模式仅构建。此偏差不作为真实额度或自动接入验证结果。
 
-上述检查不证明真实企业额度、账号归属、后台刷新或瞬时 token/s 已接通。无需新增权限的安装即用目标仍未完成。非阻断的现有构建警告另行跟踪；本地 ad hoc 签名不等于 Developer ID 分发或公证。
+上述历史检查不覆盖 BP16 的直接额度实机核验；本节首段记录的 BP16 证据优先。瞬时 token/s 仍未完成；非阻断的现有构建警告另行跟踪；本地 ad hoc 签名不等于 Developer ID 分发或公证。
 
 以下保留以前版本的验证记录作为历史基线，不代替本轮结果。
 

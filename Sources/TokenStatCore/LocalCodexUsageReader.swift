@@ -14,6 +14,7 @@ public struct LocalCodexSnapshot: Equatable {
     public let fiveHour: WindowQuota?
     public let sevenDay: WindowQuota?
     public let lastTurn: LocalTurnSummary?
+    public let liveTurn: LocalLiveTurnSummary?
     public let knownThreadCount: Int
     public let unknownThreadCount: Int
     public let unidentifiedFileCount: Int
@@ -26,10 +27,11 @@ public struct LocalCodexSnapshot: Equatable {
     public init(input: Int, output: Int, total: Int, sessionCount: Int, filesScanned: Int,
                 isLimited: Bool, latestEventAt: Date?, fiveHour: WindowQuota?, sevenDay: WindowQuota?,
                 knownThreadCount: Int = 0, unknownThreadCount: Int = 0, unidentifiedFileCount: Int = 0,
-                subagentCount: Int = 0, forkCount: Int = 0, lastTurn: LocalTurnSummary? = nil) {
+                subagentCount: Int = 0, forkCount: Int = 0, lastTurn: LocalTurnSummary? = nil,
+                liveTurn: LocalLiveTurnSummary? = nil) {
         self.input = input; self.output = output; self.total = total; self.sessionCount = sessionCount
         self.filesScanned = filesScanned; self.isLimited = isLimited; self.latestEventAt = latestEventAt
-        self.fiveHour = fiveHour; self.sevenDay = sevenDay; self.lastTurn = lastTurn
+        self.fiveHour = fiveHour; self.sevenDay = sevenDay; self.lastTurn = lastTurn; self.liveTurn = liveTurn
         self.knownThreadCount = knownThreadCount; self.unknownThreadCount = unknownThreadCount
         self.unidentifiedFileCount = unidentifiedFileCount; self.subagentCount = subagentCount; self.forkCount = forkCount
     }
@@ -42,6 +44,48 @@ public struct LocalTurnSummary: Equatable {
     public var outputTPS: Double { Double(outputTokens) / durationSeconds }
     public init(outputTokens: Int, durationSeconds: Double, completedAt: Date) {
         self.outputTokens = outputTokens; self.durationSeconds = durationSeconds; self.completedAt = completedAt
+    }
+}
+
+/// A short-lived estimate derived from two recent cumulative `token_count`
+/// events while a Codex task is still active. It expires quickly when the
+/// rollout stops advancing and is kept separate from completed-turn averages.
+public struct LocalLiveTurnSummary: Equatable {
+    public let inputTPS: Double
+    public let outputTPS: Double
+    public let observedAt: Date
+
+    public init(inputTPS: Double, outputTPS: Double, observedAt: Date) {
+        self.inputTPS = inputTPS; self.outputTPS = outputTPS; self.observedAt = observedAt
+    }
+}
+
+/// A verified association between the active Codex provider and Seasun Token
+/// Hub. The origin is proved by the caller and is not retained in public state.
+public struct LocalCodexRouteContext: Equatable, Sendable {
+    public let provider: String?
+    public let isVerified: Bool
+    fileprivate let fingerprint: String
+
+    public static let unverified = LocalCodexRouteContext(provider: nil, isVerified: false,
+        fingerprint: "unverified")
+
+    public static func verified(provider: String, origin: String) -> LocalCodexRouteContext {
+        let normalizedProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedOrigin = origin.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedProvider.isEmpty, !normalizedOrigin.isEmpty,
+              normalizedOrigin.hasPrefix("https://") else { return .unverified }
+        return LocalCodexRouteContext(provider: normalizedProvider, isVerified: true,
+            fingerprint: "verified|\(normalizedProvider)|\(normalizedOrigin)")
+    }
+
+    fileprivate init(provider: String?, isVerified: Bool, fingerprint: String) {
+        self.provider = provider; self.isVerified = isVerified; self.fingerprint = fingerprint
+    }
+
+    fileprivate func accepts(_ modelProvider: String?) -> Bool {
+        guard isVerified, let provider, let modelProvider else { return false }
+        return provider == modelProvider
     }
 }
 
@@ -104,6 +148,7 @@ public enum LocalCodexUsageReader {
     fileprivate struct FileSummary {
         let identity: String?; let lineage: Lineage; let isFork: Bool; let sourceKnownTop: Bool
         let contribution: Record?; let rate: Record?; let quotaDate: Date?; let turn: LocalTurnSummary?
+        let live: LocalLiveTurnSummary?
         let latestEventAt: Date?; let tailLimited: Bool; let headComplete: Bool; let hasFutureTurn: Bool
         let contentHash: String?; let signature: FileSignature
     }
@@ -117,6 +162,7 @@ public enum LocalCodexUsageReader {
         public var entryCount: Int { entries.count }
         fileprivate var entries: [FileSignature: CachedFileSummary] = [:]
         fileprivate var rootIdentity: FileSignature?
+        fileprivate var routeFingerprint: String?
         fileprivate var beforePostReadValidation: (() -> Void)?
         public init() {}
         init(beforePostReadValidation: @escaping () -> Void) { self.beforePostReadValidation = beforePostReadValidation }
@@ -132,11 +178,26 @@ public enum LocalCodexUsageReader {
         if let configured = environment["CODEX_HOME"], configured.hasPrefix("/") { return URL(fileURLWithPath: configured).appendingPathComponent("sessions") }
         return home.appendingPathComponent(".codex").appendingPathComponent("sessions")
     }
+    public static func defaultConfigURL(environment: [String: String] = ProcessInfo.processInfo.environment,
+                                        home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
+        if let configured = environment["CODEX_HOME"], configured.hasPrefix("/") {
+            return URL(fileURLWithPath: configured).appendingPathComponent("config.toml")
+        }
+        return home.appendingPathComponent(".codex").appendingPathComponent("config.toml")
+    }
     public static func scan(directory: URL, now: Date = Date()) throws -> LocalCodexSnapshot { try scan(directory: directory, now: now, cache: nil) }
+    public static func scan(directory: URL, now: Date = Date(),
+                            routeContext: LocalCodexRouteContext?) throws -> LocalCodexSnapshot {
+        try scan(directory: directory, now: now, cache: nil, routeContext: routeContext)
+    }
 
-    public static func scan(directory: URL, now: Date = Date(), cache: Cache?) throws -> LocalCodexSnapshot {
+    public static func scan(directory: URL, now: Date = Date(), cache: Cache?,
+                            routeContext: LocalCodexRouteContext? = nil) throws -> LocalCodexSnapshot {
         cache?.resetDiagnostics()
         func empty() -> LocalCodexSnapshot { LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil) }
+        if let cache, cache.routeFingerprint != routeContext?.fingerprint {
+            cache.entries.removeAll(); cache.routeFingerprint = routeContext?.fingerprint
+        }
         var st = stat()
         guard lstat(directory.path, &st) == 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty() }
         guard (st.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; return empty() }
@@ -185,14 +246,18 @@ public enum LocalCodexUsageReader {
                 if timestampChanged { cache.entries = cache.entries.filter { $0.key.device != signature.device || $0.key.inode != signature.inode } }
             }
             if fst.st_size < 0 { unsafeCandidate = true; continue }
-        if let cached = cache?.entries[signature] {
+            if let cached = cache?.entries[signature] {
                 cache?.hit()
                 let cachedSummary = cached.summary
+                let cachedLive: LocalLiveTurnSummary? = cachedSummary.live.flatMap { live in
+                    guard live.observedAt <= now, now.timeIntervalSince(live.observedAt) <= 15 else { return nil }
+                    return live
+                }
                 let refreshed = FileSummary(identity: cachedSummary.identity, lineage: cachedSummary.lineage,
                     isFork: cachedSummary.isFork,
                     sourceKnownTop: cachedSummary.sourceKnownTop, contribution: cachedSummary.contribution,
                     rate: cachedSummary.rate,
-                    quotaDate: cachedSummary.quotaDate, turn: cachedSummary.hasFutureTurn ? nil : cachedSummary.turn, latestEventAt: cachedSummary.latestEventAt,
+                    quotaDate: cachedSummary.quotaDate, turn: cachedSummary.hasFutureTurn ? nil : cachedSummary.turn, live: cachedLive, latestEventAt: cachedSummary.latestEventAt,
                     tailLimited: cachedSummary.tailLimited, headComplete: cachedSummary.headComplete,
                     hasFutureTurn: cachedSummary.hasFutureTurn, contentHash: cachedSummary.contentHash, signature: cachedSummary.signature)
                 summaries.append(refreshed); filesScanned += 1
@@ -222,7 +287,8 @@ public enum LocalCodexUsageReader {
             cache?.beforePostReadValidation?()
             var after = stat(); guard fstat(fd, &after) == 0, FileSignature(after) == signature else { cache?.entries.removeValue(forKey: signature); unsafeCandidate = true; continue }
             cache?.parsed()
-            let parsed = parseFile(bytes: bytes, size: size, now: now, signature: signature)
+            let parsed = parseFile(bytes: bytes, size: size, now: now, signature: signature,
+                                   routeContext: routeContext)
             filesScanned += 1
             if parsed.identity == nil { unidentified += 1 }
             if parsed.tailLimited || !parsed.headComplete { limited = true; coverageLimited = true }
@@ -251,6 +317,7 @@ public enum LocalCodexUsageReader {
         }
         var known: [Record] = [], unknownThreads = 0, topLevelCount = 0, subagentCount = 0, forkCount = 0
         var latestTurn: LocalTurnSummary?, latestEvent: Date?
+        var liveInputTPS = 0.0, liveOutputTPS = 0.0, latestLiveAt: Date?
         for (_, variants) in grouped {
             let hashes = variants.compactMap(\.contentHash)
             guard variants.count == 1 || hashes.count == variants.count && Set(hashes).count == 1,
@@ -265,6 +332,10 @@ public enum LocalCodexUsageReader {
             }
             if let turn = summary.turn, turn.completedAt <= now, latestTurn == nil || turn.completedAt > latestTurn!.completedAt { latestTurn = turn }
             if let event = summary.latestEventAt, latestEvent == nil || event > latestEvent! { latestEvent = event }
+            if let live = summary.live, live.observedAt <= now {
+                liveInputTPS += live.inputTPS; liveOutputTPS += live.outputTPS
+                if latestLiveAt == nil || live.observedAt > latestLiveAt! { latestLiveAt = live.observedAt }
+            }
         }
         var input = 0, output = 0, total = 0
         for record in known {
@@ -273,14 +344,17 @@ public enum LocalCodexUsageReader {
             input = i; output = o; total = t
         }
         let finalRate = quotaWinner?.1
+        let liveTurn = latestLiveAt.map { LocalLiveTurnSummary(inputTPS: liveInputTPS,
+            outputTPS: liveOutputTPS, observedAt: $0) }
         return LocalCodexSnapshot(input: input, output: output, total: total, sessionCount: topLevelCount,
             filesScanned: filesScanned, isLimited: limited || unsafeCandidate || coverageLimited, latestEventAt: latestEvent,
             fiveHour: finalRate?.five, sevenDay: finalRate?.seven, knownThreadCount: known.count,
             unknownThreadCount: unknownThreads, unidentifiedFileCount: unidentifiedCount,
-            subagentCount: subagentCount, forkCount: forkCount, lastTurn: latestTurn)
+            subagentCount: subagentCount, forkCount: forkCount, lastTurn: latestTurn, liveTurn: liveTurn)
     }
 
-    private static func parseFile(bytes: Data, size: Int, now: Date, signature: FileSignature) -> FileSummary {
+    private static func parseFile(bytes: Data, size: Int, now: Date, signature: FileSignature,
+                                 routeContext: LocalCodexRouteContext?) -> FileSummary {
         let headLength = min(size, headLimit), tailLength = max(0, bytes.count - headLength)
         let head = bytes.prefix(headLength), tail = tailLength > 0 ? bytes.suffix(tailLength) : Data()
         let tailLimited = size > headLimit + tailLimit
@@ -308,7 +382,7 @@ public enum LocalCodexUsageReader {
         else { identity = nil }
         guard let identity else {
             return FileSummary(identity: nil, lineage: .unknown, isFork: false, sourceKnownTop: false, contribution: nil, rate: nil,
-                quotaDate: nil, turn: nil, latestEventAt: nil, tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false,
+                quotaDate: nil, turn: nil, live: nil, latestEventAt: nil, tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false,
                 contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature)
         }
         func remap(_ event: ParsedEvent) -> ParsedEvent {
@@ -321,9 +395,15 @@ public enum LocalCodexUsageReader {
         let mappedHeadSlots = headSlots.map { $0.map(remap) }
         let mappedTailSlots = tailSlots.map { $0.map(remap) }
         decoded = (wholeFileRead ? mappedHeadSlots : mappedHeadSlots + mappedTailSlots).compactMap { $0 }
-        guard let firstMetaLine = firstPhysicalLine else { return FileSummary(identity: nil, lineage: .unknown, isFork: false, sourceKnownTop: false, contribution: nil, rate: nil, quotaDate: nil, turn: nil, latestEventAt: nil, tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false, contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature) }
+        guard let firstMetaLine = firstPhysicalLine else { return FileSummary(identity: nil, lineage: .unknown, isFork: false, sourceKnownTop: false, contribution: nil, rate: nil, quotaDate: nil, turn: nil, live: nil, latestEventAt: nil, tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false, contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature) }
         let metadata = (try? JSONSerialization.jsonObject(with: Data(firstMetaLine))) as? [String: Any]
         let payload = metadata?["payload"] as? [String: Any] ?? [:]
+        if let routeContext, !routeContext.accepts(payload["model_provider"] as? String) {
+            return FileSummary(identity: nil, lineage: .unknown, isFork: false, sourceKnownTop: false,
+                contribution: nil, rate: nil, quotaDate: nil, turn: nil, live: nil, latestEventAt: nil,
+                tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false,
+                contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature)
+        }
         let (source, sourceSubagentKind) = sessionSource(payload["source"])
         let threadSource = payload["thread_source"] as? String
         let sourceIsRootString = payload["source"] as? String == source && isTopRootSource(source)
@@ -367,9 +447,10 @@ public enum LocalCodexUsageReader {
         let rate = resolvedQuota.record
         let turnSegments = observedLineSegments.flatMap { parsedSegments($0) }
         let turn = turnSegments.compactMap { completedTurns(in: $0, now: now) }.max(by: { $0.completedAt < $1.completedAt })
+        let live = liveTurn(in: decoded, now: now)
         let latestUsageDate = validCounters.last?.date
         return FileSummary(identity: identity, lineage: lineage, isFork: isFork, sourceKnownTop: sourceKnownTop,
-            contribution: contribution, rate: rate, quotaDate: resolvedQuota.date, turn: turn, latestEventAt: latestUsageDate,
+            contribution: contribution, rate: rate, quotaDate: resolvedQuota.date, turn: turn, live: live, latestEventAt: latestUsageDate,
             tailLimited: tailLimited, headComplete: headComplete,
             hasFutureTurn: decoded.contains(where: { $0.type == "task_complete" && $0.date > now }),
             contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature)
@@ -449,6 +530,43 @@ public enum LocalCodexUsageReader {
         }
         if !current.isEmpty { segments.append(current) }
         return segments
+    }
+
+    /// Derive a short-lived output/input rate only from a still-open task and
+    /// two monotonic cumulative counters. A missing or stale tail is unknown.
+    private static func liveTurn(in events: [ParsedEvent], now: Date) -> LocalLiveTurnSummary? {
+        let freshnessLimit: TimeInterval = 15
+        var activeStart: Int?
+        var activeID: String?
+        for index in events.indices {
+            let event = events[index]
+            switch event.type {
+            case "task_started":
+                if let id = event.turnID, !id.isEmpty { activeStart = index; activeID = id }
+            case "task_complete", "turn_aborted":
+                if let id = event.turnID, id == activeID { activeStart = nil; activeID = nil }
+                else if event.turnID == nil, event.type == "turn_aborted" { activeStart = nil; activeID = nil }
+            default: break
+            }
+        }
+        guard let start = activeStart, activeID != nil, start + 1 < events.count else { return nil }
+        let counterEvents = events[(start + 1)...].filter {
+            $0.type == "token_count" && $0.hasCumulativePayload && $0.date <= now
+        }
+        guard counterEvents.allSatisfy({ $0.usage != nil && !$0.invalidLifecycleTimestamp }) else { return nil }
+        let counters = counterEvents
+        guard let latest = counters.last, let previous = counters.dropLast().last,
+              let latestUsage = latest.usage, let previousUsage = previous.usage,
+              latest.date >= previous.date,
+              now.timeIntervalSince(latest.date) <= freshnessLimit else { return nil }
+        let elapsed = latest.date.timeIntervalSince(previous.date)
+        guard elapsed > 0,
+              latestUsage.input >= previousUsage.input,
+              latestUsage.output >= previousUsage.output,
+              latestUsage.total >= previousUsage.total else { return nil }
+        return LocalLiveTurnSummary(inputTPS: Double(latestUsage.input - previousUsage.input) / elapsed,
+            outputTPS: Double(latestUsage.output - previousUsage.output) / elapsed,
+            observedAt: latest.date)
     }
 
     private static func quotaUpdate(_ value: Any?, at date: Date) -> QuotaUpdate {

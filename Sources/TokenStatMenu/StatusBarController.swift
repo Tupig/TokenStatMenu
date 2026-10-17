@@ -64,6 +64,8 @@ import SwiftUI
             let statusItemVisible: Bool
             let permissionPromptRequested: Bool
             let quotaPresent: Bool
+            let directQuotaPresent: Bool
+            let directQuotaStatus: String
             let resetTimePresent: Bool
             let monthlyUsagePresent: Bool
             let liveTokenSpeedPresent: Bool
@@ -79,9 +81,12 @@ import SwiftUI
             statusItemVisible: item.isVisible,
             permissionPromptRequested: model.permissionPromptRequested,
             quotaPresent: snapshot != nil || model.quota != nil || model.fiveHourQuota != nil || model.sevenDayQuota != nil,
+            directQuotaPresent: model.tokenHubQuotaIsDirect && snapshot != nil,
+            directQuotaStatus: model.tokenHubQuotaStatusText,
             resetTimePresent: resetTimePresent,
             monthlyUsagePresent: snapshot?.monthly != nil || model.quota?.used != nil,
-            liveTokenSpeedPresent: model.stats.active > 0,
+            liveTokenSpeedPresent: model.config.dataSource == "localCodex"
+                ? model.localSnapshot.liveTurn != nil : model.stats.active > 0,
             sourceStatus: model.sourceStatus,
             backgroundServiceResources: model.backgroundServiceResources)
         if let data = try? JSONEncoder().encode(report) {

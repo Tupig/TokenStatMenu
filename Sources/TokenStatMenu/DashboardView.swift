@@ -31,7 +31,8 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 12) {
                         TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: Date()), status: model.tokenHubQuotaStatusText,
-                            enabled: model.tokenHubAutomaticReadingEnabled, refreshSeconds: model.preferences.refreshSeconds)
+                            enabled: model.tokenHubAutomaticReadingEnabled, refreshSeconds: model.preferences.refreshSeconds,
+                            directSource: model.tokenHubQuotaIsDirect)
                         Text(model.userFacingStatus)
                             .font(.system(size: 10)).foregroundStyle(.secondary)
                         localUsageCard
@@ -88,13 +89,20 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 metric("已识别顶层对话", "\(model.localSnapshot.sessionCount)")
                 metric("已识别子代理 / 分叉", "\(model.localSnapshot.subagentCount) / \(model.localSnapshot.forkCount)")
                 metric("最近用量事件", model.localSnapshot.latestEventAt?.formatted(date: .abbreviated, time: .shortened) ?? "未发现")
+                if let live = model.localSnapshot.liveTurn {
+                    metric("实时估算 · 输入 tok/s", String(format: "%.1f", live.inputTPS))
+                    metric("实时估算 · 输出 tok/s", String(format: "%.1f", live.outputTPS))
+                    metric("实时观测时间", live.observedAt.formatted(date: .abbreviated, time: .shortened))
+                } else {
+                    metric("实时估算 · 输出 tok/s", "未知")
+                }
                 if let turn = model.localSnapshot.lastTurn {
                     metric("上轮记录均速", String(format: "%.1f tok/s", turn.outputTPS))
                     metric("上轮完成时间", turn.completedAt.formatted(date: .abbreviated, time: .shortened))
                 } else {
                     metric("上轮记录均速", "未知")
                 }
-                Text("仅汇总本次扫描中可核算的记录，未核验项不计入小计。顶层对话数不包含子代理和分叉；这里不是完整历史或企业账单。上轮均速含工具、网络和等待，不是模型瞬时生成速度。\(model.localSnapshot.isLimited ? "已达到扫描范围限制。" : "")")
+                Text("仅汇总已证明经 Seasun Token Hub 路由且本次扫描可核算的记录，未核验项不计入小计。实时值来自活动 token_count 的短窗口估算，事件停止推进时会变为未知；上轮均速含工具、网络和等待。\(model.localSnapshot.isLimited ? "已达到扫描范围限制。" : "")")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
         } label: { Label("本地记录用量", systemImage: "doc.text.magnifyingglass") }
