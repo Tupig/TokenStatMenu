@@ -1,5 +1,12 @@
 # 验证记录
 
+## BP17 — 零配置实机自动读取（2026-10-18）
+
+- 在本机已运行的 Seasun Token Hub 环境中，使用一个不存在的临时配置文件路径启动当前构建；应用没有创建该配置文件，也没有请求辅助功能授权。
+- 菜单栏 App 的脱敏布尔诊断在等待后台刷新后为：`seasunOnlyMode=true`、`backgroundServicesStarted=true`、`permissionPromptRequested=false`、`directQuotaPresent=true`、`monthlyUsagePresent=true`、`resetTimePresent=true`、`liveTokenSpeedPresent=false`。
+- 本次只读取诊断布尔值和状态文本，没有输出或保存真实额度、账号、网关 URL、会话值、令牌或会话正文；测试结束后只终止本次启动的 TokenStatMenu 进程。
+- 该证据证明当前本机的安装后零配置自动读取路径已连通；不同 Token Hub 版本、未登录状态、过期会话或企业网络策略仍可能安全地显示未知/不可用。
+
 ## BP16 — 直接额度来源实机核验（2026-10-18）
 
 - 只读静态检查确认 Token Hub 的回调参数、短期令牌边界、额度路径和 401 单次重试规则；源码不包含本机域名、账号、会话值或额度值。
