@@ -13151,7 +13151,11 @@ def workflow_contract(document: dict, raw: str) -> None:
 
 class WorkflowChecks(unittest.TestCase):
     def test_repository_has_one_workflow_entrypoint(self):
-        workflow_files = sorted(path.name for path in (PROJECT / ".github/workflows").glob("*.yml"))
+        workflow_root = PROJECT / ".github/workflows"
+        workflow_files = sorted(
+            path.name for path in workflow_root.iterdir()
+            if path.is_file() and path.suffix in {".yml", ".yaml"}
+        )
         self.assertEqual(workflow_files, ["ci.yml"])
 
     def test_release_workflow_has_bounded_tag_only_write_permissions(self):
@@ -14130,6 +14134,8 @@ PUBLIC_FILES = [
     "docs/README.md", "docs/wiki/Home.md", "docs/wiki/安装与使用.md", "docs/wiki/统计口径.md",
     "docs/wiki/常见问题.md", "docs/wiki/编译指南.md", "docs/wiki/测试指南.md", "docs/wiki/命令行参数.md",
     "docs/wiki/CI-CD.md", "docs/wiki/贡献指南.md",
+    "docs/superpowers/specs/2026-10-18-accuracy-and-validation-optimization-design.md",
+    "docs/superpowers/plans/2026-10-18-accuracy-and-validation-optimization.md",
     "docs/PERFORMANCE.md", "docs/DESIGN.md", "docs/IMPLEMENTATION.md", "docs/CONFIGURATION.md", "docs/VALIDATION.md", "docs/UI_TESTING.md", "docs/FULL_SOURCE.md",
 ]
 
