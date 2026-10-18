@@ -1,97 +1,145 @@
 # TokenStatMenu
 
-面向 Seasun Token Hub 用户的原生 macOS 菜单栏统计工具，使用 Swift、SwiftUI 和 AppKit，提供中文界面。安装后自动发现本机已登录的 Token Hub，并在内存中交换短期会话后读取只读额度；不要求用户填写接口、密钥、模型或字段。本机记录按当前 Codex provider 与 Token Hub origin 的匹配关系筛选；这不能证明同名历史会话的实际路由，记录小计与企业额度分开显示。活动轮次有连续、新鲜的累计事件时显示“实时估算” token/s，事件停止推进则回退为上轮均速或未知。
+<img src="Resources/AppIcon.png" width="96" alt="TokenStatMenu 应用图标">
 
-正式 App 已收敛为 Seasun 专用入口：不再提供通用 API 配置、代理模式、模型与价格填写。旧代理配置不会启动代理、访问旧接口或读取保存的密钥；无配置和损坏的旧配置都使用安全默认偏好。企业额度来源只依赖本机已登录 Token Hub 的只读会话。
+面向 **Seasun Token Hub** 用户的原生 macOS 菜单栏统计工具，使用 Swift、SwiftUI 和 AppKit，提供中文界面。在本机 Token Hub 已运行并登录的前提下，自动读取 5 小时、7 天与月度额度，并展示当前配置关联的本地 Codex 记录，无需填写接口、密钥、模型或字段。
 
-## 当前可用数据
+**从这里开始：[文档中心](docs/wiki/Home.md) · [安装与使用](docs/wiki/安装与使用.md) · [统计口径](docs/wiki/统计口径.md) · [常见问题](docs/wiki/常见问题.md)**
 
-| 显示内容 | 来源与限制 |
+> [!IMPORTANT]
+> 菜单栏的“实时≈”是本地活动记录的 token/s 估算；“上轮均”包含工具、网络与等待时间。权威服务端瞬时吞吐尚未接通，见 [Issue #37](https://github.com/Tupig/TokenStatMenu/issues/37)。本地记录小计、企业额度金额和完整账户账单是不同数据，不能互相替代。
+
+## 功能与适用范围
+
+| 能看到什么 | 来源与实际含义 |
 | --- | --- |
-| 输入、输出、总 Token 小计与线程分类 | 当前配置关联的本机 Codex 有界会话记录，历史路由未核验；不是本次启动消耗、企业完整账单或全部对话 |
-| 实时估算 token/s | 活动 `token_count` 累计值短窗口差分；最后事件超过 15 秒显示未知，不伪造网关权威速度 |
-| 上轮记录均速 | 有完整开始/用量/完成证据的轮次；包含工具、网络与等待，作为实时估算回退 |
-| 5 小时、7 天剩余额度、重置时间与月度金额 | 自动复用本机已登录 Token Hub 的会话，读取其既有后台额度响应；来源缺失的字段保持未知，金额不转换为 Token |
-| 可选金额界面快照 | 直接来源不可用时的辅助功能兼容读取；依赖已有系统信任与可访问的额度区域，明确标注界面来源 |
-| 本地历史窗口 | Codex 记录中的历史参考；账号、组织归属未核验，不作企业当前额度 |
-| 无权限、无来源或缺失字段 | 明确显示不可用或未知，不以零、其他窗口或历史数据代替 |
+| 菜单栏速度 | 有新鲜、连续的活动累计记录时显示输入／输出速率估算；没有依据时显示未知或上轮均速 |
+| 5 小时与 7 天额度 | Token Hub 后台只读响应中的金额额度、剩余比例和重置时间；缺失窗口保持未知 |
+| 月度用量 | 后台提供的月度金额，与本地 Token 量分开显示 |
+| 本地 Token 与对话分类 | 有界扫描内可核算的输入、输出、总量与线程分类；不代表本次启动消耗或侧栏全部对话 |
+| 可选界面兼容快照 | 已有辅助功能信任时的回退来源，明确标注“界面”；关闭它不会关闭后台直接读取 |
+| 中文菜单栏界面 | 无主窗口、适配深浅色，不使用 Electron，不引入第三方运行时框架 |
 
-默认接入的前提是本机已正常运行并登录 Seasun Token Hub。直接额度读取不依赖辅助功能权限，也不受兼容读取开关影响；正常启动不会请求额外系统权限。工具只复用 Token Hub 自有数据库内必要的现有登录材料，不修改企业网关或 Codex 的连接设置。会话材料仅用于向该配置中既有的 HTTPS 来源完成交换，不发送到遥测或其他第三方服务。
+应用目前专用于 Seasun Token Hub。通用 API、Ollama、手填网关、价格和代理接入不属于正式界面；核心库保留的旧协议代码用于回归测试，不能据此推断正式 App 已支持这些接入方式。
+
+当前配置只能关联同名 provider 的本地记录，不能反向证明全部历史会话的实际网关路由。无法核算、超出覆盖范围或来源缺失的部分会标为未知，不当作零。完整解释见 [统计口径](docs/wiki/统计口径.md)。
+
+## 快速开始
+
+需要 macOS 13 或更新版本，Apple Silicon 或 Intel Mac，以及支持 Swift 5.9 的 Xcode／命令行工具。Apple Silicon 为优先验证平台，Intel 已有交叉构建；不能把交叉构建当作 Intel 硬件验收。
+
+1. 在本机正常启动并登录 Seasun Token Hub。
+2. 克隆仓库并构建应用：
+
+   ```bash
+   git clone https://github.com/Tupig/TokenStatMenu.git
+   cd TokenStatMenu
+   ./script/build_and_run.sh --build-only
+   ```
+
+3. 先退出已运行的旧版 TokenStatMenu，再打开新产物：
+
+   ```bash
+   open dist/TokenStatMenu.app
+   ```
+
+正常启动只显示菜单栏条目，点击后展开面板；没有主窗口属于预期行为。不需要创建 plist，也不需要授予辅助功能权限来连接后台。设置里的辅助功能入口仅用于可选界面兼容读取。
+
+首次构建可能需要联网解析测试依赖，正式 App 运行时只使用系统框架。当前没有正式的 GitHub Release 下载或 Developer ID 公证产物；构建脚本提供的是本地 ad hoc 签名。固定路径安装、升级、回退和首次打开说明见 [安装与使用](docs/wiki/安装与使用.md)。
+
+## 文档导航
+
+文档采用 README 入口、文档中心和专题页的结构。可以按下面的任务选择阅读路径，也可从 [文档目录](docs/README.md) 查找全部页面。
+
+| 你要做什么 | 建议阅读 |
+| --- | --- |
+| 第一次运行或更新应用 | [安装与使用](docs/wiki/安装与使用.md) → [可选偏好](docs/CONFIGURATION.md) |
+| 看懂速度、额度和会话数 | [统计口径](docs/wiki/统计口径.md) → [常见问题](docs/wiki/常见问题.md) |
+| 了解读取范围和会话复用 | [隐私说明](PRIVACY.md) → [设计说明](docs/DESIGN.md) |
+| 编译、测试或调试 | [编译指南](docs/wiki/编译指南.md) → [测试指南](docs/wiki/测试指南.md) → [命令行参数](docs/wiki/命令行参数.md) |
+| 查看自动检查与交付状态 | [CI/CD](docs/wiki/CI-CD.md) → [实现范围](docs/IMPLEMENTATION.md) → [验证记录](docs/VALIDATION.md) |
+| 报告问题或贡献代码 | [贡献指南](docs/wiki/贡献指南.md) → [Issues](https://github.com/Tupig/TokenStatMenu/issues) |
+| 按文件阅读全部源码 | [完整源码文档](docs/FULL_SOURCE.md) |
 
 ## 整体架构
 
 ```text
 AppKit NSStatusItem + NSPopover
-  └─ AppModel：固定专用入口、可选偏好、来源状态与刷新
-      ├─ 当前 Seasun origin 配置匹配 + 本地 Codex 有界记录扫描 → 小计、分类、实时估算/上轮均速
-      ├─ Token Hub 只读会话交换 → 企业 5 小时/7 天/月度额度
-      ├─ Token Hub 兼容界面扫描 → 无直连时的可选独立金额/窗口快照
-SwiftUI：概览、来源说明、可选偏好
+  └─ AppModel：专用启动、来源状态、可选偏好与后台调度
+      ├─ Token Hub 只读会话交换 → 5 小时／7 天／月度后台额度
+      ├─ 当前 provider 与 Hub origin 匹配 → 有界本地 Codex 记录扫描
+      │   └─ Token 小计、线程分类、活动速率估算、完整轮次均速
+      └─ 已有系统信任下的可选 AX 兼容读取 → 独立界面快照
+SwiftUI：概览、数据来源、偏好设置
 ```
 
-菜单标题由主线程低频刷新，仅在内容或颜色变化时更新；标题、详情与诊断共用实时值的 15 秒时效判断。后台扫描串行、有界、可取消，目标退出或来源身份变化使旧结果失效；目标重新启动后自动重试直接来源。正式运行不启动本机代理，不调用任意企业 URL，不解析保存的 API 密钥。历史协议实现保留在核心库中供回归测试，不属于正式 App 的接入功能。
+后台额度、界面快照与本地记录各自保留来源语义。后台直接读取不受可选 AX 开关影响；目标退出或身份变化会失效旧结果，重新运行后再识别并读取。正式运行不启动旧代理、不改 Hub／Codex 连接配置，也不调用任意用户填写的企业 URL。
+
+来源流程、计量边界、刷新时效与安全失败条件见 [设计说明](docs/DESIGN.md)。
 
 ## 文件与职责
 
-- `Sources/TokenStatMenu/`：菜单栏、弹出面板、专用启动与偏好、兼容界面读取。
-- `Sources/TokenStatCore/`：记录解析、核算、窗口模型和历史协议组件。
-- `Tests/`：合成数据的核心检查、原生界面及专用启动回归。
-- `Resources/`：应用元数据与仅含可选偏好的示例 plist。
-- `script/`：构建、隔离集成、截图和公开源码导出。
-- `docs/FULL_SOURCE.md`：按架构、分文件源码、构建步骤生成的完整源码文档。
+| 位置 | 职责 |
+| --- | --- |
+| `Sources/TokenStatMenu/` | AppKit 菜单栏与弹出面板、SwiftUI 界面、来源调度、偏好存储与 AX 适配 |
+| `Sources/TokenStatCore/` | 本地记录核算、后台额度交换与解析、窗口模型及旧协议回归组件 |
+| `Resources/` | 应用元数据、图标与仅含可选偏好的示例 plist |
+| `Tests/` | 纯合成核心检查、原生状态与界面快照测试 |
+| `script/` | 原生构建、隔离集成、离线渲染、文档校验与源码导出 |
+| `docs/wiki/` | 面向使用者、开发者和贡献者的专题指南 |
+| `docs/DESIGN.md`、`docs/IMPLEMENTATION.md` | 设计细节、当前支持范围与剩余工作 |
+| `docs/VALIDATION.md` | 有日期和范围的验证记录；历史通过不自动等于当前全部能力已验收 |
+| `docs/FULL_SOURCE.md` | 由脚本生成的架构、分文件完整源码和构建说明，不手工编辑 |
 
 ## 构建与运行
 
-需要 macOS 13 或更新版本，以及支持 Swift 5.9 的 Xcode/命令行工具。项目运行时只使用系统框架；UI 截图测试依赖精确版本的 swift-snapshot-testing，正式 App 不链接它。
+在仓库根目录执行。构建不会按进程名关闭其他应用，打开新实例前应先退出旧版，避免误看另一份构建。
 
-```bash
-# 在项目目录内只构建，不关闭已运行的 App
-./script/build_and_run.sh --build-only
+| 命令 | 结果 |
+| --- | --- |
+| `./script/build_and_run.sh --build-only` | 构建本机架构 Debug `.app`，不启动应用 |
+| `./script/build_and_run.sh --universal` | 构建 arm64 与 x86_64 Release 通用 `.app`，不启动应用 |
+| `./script/build_and_run.sh` | 构建并运行本机架构 Debug `.app` |
+| `./script/build_and_run.sh --release` | 构建后运行本机架构 Release `.app`，不是只编译模式 |
+| `swift build -c release --product TokenStatMenu` | 编译 SwiftPM 可执行目标；不会单独完成 `.app` 资源打包 |
 
-# 打开构建产物
-open dist/TokenStatMenu.app
-
-# 仅编译 Release，不启动应用
-swift build -c release --product TokenStatMenu
-
-# 同时构建 Apple Silicon 与 Intel
-./script/build_and_run.sh --universal
-```
-
-也可打开 `TokenStatMenu.xcodeproj`，选择 TokenStatMenu Scheme 和 My Mac 后编译运行。若默认开发目录指向 Command Line Tools，可仅为当前命令设置：
+也可打开 `TokenStatMenu.xcodeproj`，选择 TokenStatMenu Scheme 和 My Mac 编译。若默认开发目录仍指向 Command Line Tools，可只为当前命令选择完整 Xcode：
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
-  -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release build
+  -project TokenStatMenu.xcodeproj \
+  -scheme TokenStatMenu \
+  -configuration Release build
 ```
 
-`--release` 是构建后运行模式，验证时不要把它当作只构建选项；需要隔离检查请使用测试脚本。
+更多环境准备、图标资源、双架构、构建身份和常见错误见 [编译指南](docs/wiki/编译指南.md)；发布前检查与签名限制见 [CI/CD](docs/wiki/CI-CD.md)。
 
-构建脚本的本地 ad hoc 签名不是 Developer ID 签名或公证。对外分发应另行使用开发者证书、公证并验证下载后的 Gatekeeper 行为。辅助功能授权也可能因本地开发构建身份变化而失效。
-
-## 使用与偏好
-
-应用版本为 1.1.0（build 2），便于区分早期构建。运行后从右上角菜单栏打开面板，无主窗口。设置只包含可选的刷新与界面快照兼容偏好；不需要创建配置文件。详情见 [偏好说明](docs/CONFIGURATION.md)。应用会读取 Token Hub 自有数据库中的必要连接/登录材料到内存，拦截 SSO 回调重定向并用短期令牌请求只读额度；不会把会话或额度写入日志、配置或仓库。会话过期、变化、多实例或入口不可用时，界面显示具体不可用状态。
-
-旧配置在启动和重新加载时保持原文件不变，仅读取允许的偏好。用户主动保存偏好时，原子写入两项偏好并去除旧的通用接入字段。读取或保存失败不会回退到代理或发出企业请求。
-
-## 验证与限制
+## 验证与维护
 
 ```bash
-# 核心检查
+# 纯合成核心检查
 swift run TokenStatCoreChecks
 
-# 原生 XCTest，使用合成数据与隔离偏好
+# 原生 XCTest 与界面回归
 swift test
 
-# 核心、构建及独立子进程的专用启动集成
+# 核心、只构建及隔离启动集成
 ./script/test.sh
+
+# 更新完整源码文档，并按白名单打包源码
+python3 script/package_source.py
+
+# 检查文档链接与公开内容
+python3 script/check_docs.py
+python3 script/check_public_content.py
 ```
 
-集成测试使用临时配置和禁用后台服务的独立子进程，只清理自己持有的进程句柄。合成测试不会调用企业网关或读取真实会话；真实本机核验只记录 HTTP 状态、字段结构和布尔就绪信息。截图测试使用真实 SwiftUI/NSHostingView 与合成数据；新的参考图需独立视觉审查，录制本身不算通过。最新验证范围见 [验证记录](docs/VALIDATION.md)。
+真实机器核验与合成测试分开记录；后者不能证明企业账号、完整账单或真实服务器吞吐正确。视觉参考图只使用合成数据，录制图像本身不算通过。详细方法见 [测试指南](docs/wiki/测试指南.md) 和 [UI 测试说明](docs/UI_TESTING.md)，最近的结果与限制见 [验证记录](docs/VALIDATION.md)。
 
-扫描有覆盖上限；身份与继承证据不足时单独标记未核算，不把未知贡献当零。损坏 JSON、读取缺口、不完整尾行、重叠轮次、未来或倒序时间都不能跨过去继续生成实时估算。当前配置匹配不能回溯认证历史路由，真实服务端瞬时吞吐仍由 [Issue #37](https://github.com/Tupig/TokenStatMenu/issues/37) 跟踪。金额与 Token 不互换；界面快照的 `$` 不自动认定为某一币种。不根据重置短文本猜测年份或时区。更多处理边界见 [隐私说明](PRIVACY.md) 和 [设计说明](docs/DESIGN.md)。
+## 隐私与开源
 
-## 开源
+应用只读获取 Token Hub 必要的连接与现有登录材料，在内存中向其既有 HTTPS 来源交换短期会话并读取额度。它不会把令牌、账号、实际额度或响应正文写入正常日志、配置或源码仓库；本地会话文件在解析时可能短暂接触正文，但仅提取允许的计量和身份字段，不保存或上传正文。完整读取边界与开源检查方法见 [隐私说明](PRIVACY.md)。
 
-采用 [MIT 许可证](LICENSE)。请在 GitHub Issue 中使用合成示例报告问题，不提交真实凭据、企业地址、账户信息、会话正文、截图或运行日志。界面布局参考 codexU 的紧凑分组思路，采用原生系统颜色适配深浅外观；未复制其实现代码。
+采用 [MIT 许可证](LICENSE)。报告问题时只提交版本、状态描述、操作步骤和合成示例，不提交凭据、企业地址、账户数据库、会话正文或原始运行截图。贡献流程见 [贡献指南](docs/wiki/贡献指南.md)。
+
+界面布局参考 codexU 的紧凑分组思路；文档组织参考 [TuPigGHD2Chinese](https://github.com/Tupig/TuPigGHD2Chinese) 的文档中心与专题导航，内容依据本项目的实际实现编写。

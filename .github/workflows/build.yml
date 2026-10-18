@@ -12,6 +12,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Documentation links and synthetic checker fixtures
+        run: python3 script/check_docs.py --self-test
       - name: Public content guardrail
         run: python3 script/check_public_content.py --git-index
       - name: Core and gateway discovery checks

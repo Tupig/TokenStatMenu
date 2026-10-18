@@ -417,6 +417,51 @@ final class SeasunStartupContractTests: XCTestCase {
                        "Settings must not imply that a generic endpoint or credential connects the Seasun source")
     }
 
+    func testSettingsSourceStatusFollowsFreshDirectObservationAndFailure() async throws {
+        let now = Date(timeIntervalSince1970: 1_797_000_000)
+        let identity = TokenHubIdentity(pid: 944, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic Settings Hub.app/Contents/MacOS/Hub")
+        let snapshot = TokenHubQuotaSnapshot(identity: identity,
+            fiveHour: TokenHubWindowQuota(kind: .fiveHour, usedAmount: 25, limitAmount: 100,
+                sourceSymbol: "$", usedPercent: 25, resetDisplay: "合成重置时间"),
+            sevenDay: nil, monthly: nil, observedAt: now)
+        var failure: TokenHubDirectQuotaFailure?
+        var clock = now
+        let direct = TokenHubDirectQuotaDependencies(discoverTarget: { identity },
+            identityIsCurrent: { $0 == identity }, fetch: { _, _ in
+                if let failure { throw failure }
+                return snapshot
+            })
+        let model = AppModel(preview: true, directQuota: direct)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        model.tokenHubAutomaticReadingEnabled = false
+        model.tokenHubNow = { clock }
+        let settings = SettingsView(model: model)
+
+        XCTAssertTrue(settings.sourceStatusText.contains("尚未连接"),
+                      "unobserved source cannot claim a connected enterprise backend")
+        model.refreshTokenHubQuota()
+        for _ in 0..<100 where !model.tokenHubQuotaIsDirect { await Task.yield() }
+        XCTAssertTrue(model.tokenHubQuotaIsDirect, "synthetic direct observation must be accepted")
+        XCTAssertTrue(settings.sourceStatusText.contains("已直接读取"),
+                      "Settings must reflect the same direct observation as the dashboard")
+        XCTAssertFalse(settings.sourceStatusText.contains("尚不可用"))
+        XCTAssertFalse(model.tokenHubAutomaticReadingEnabled,
+                       "optional AX compatibility is disabled throughout this direct-only check")
+
+        clock = now.addingTimeInterval(121)
+        XCTAssertTrue(settings.sourceStatusText.contains("过期"),
+                      "Settings cannot describe an expired direct snapshot as connected")
+        failure = .credentialExpired
+        model.refreshTokenHubQuota()
+        for _ in 0..<100 where model.tokenHubDirectFailure == nil { await Task.yield() }
+        XCTAssertEqual(model.tokenHubDirectFailure, .credentialExpired)
+        XCTAssertTrue(settings.sourceStatusText.contains("会话已过期"),
+                      "Settings must preserve the actual sanitized direct failure")
+        XCTAssertFalse(settings.sourceStatusText.contains("已直接读取"))
+    }
+
     func testSettingsLightAndDarkRendersAreAvailableForIndependentVisualReview() throws {
         let isolated = try IsolatedConfig()
         defer { isolated.tearDown() }

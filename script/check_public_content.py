@@ -5,6 +5,8 @@ This is a guardrail, not a substitute for reviewing the exact diff. Reports
 locations/categories only, never the matched secret value. No network calls.
 """
 import argparse
+import hashlib
+import struct
 import re
 import subprocess
 from pathlib import Path
@@ -16,6 +18,32 @@ SYNTHETIC_PNG_SHA256 = {
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "64ea172d17a5d3be86176c4b3ede3c7b68b6f9c841709ffa92c49edfbfdfb101",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "98c5ede0f59bd9f69d064b52b3e49731b98c70447407148b1cc84a3dc1ce352b",
 }
+
+
+# Original code-native assets, independently reviewed at 1024/64/32px.
+# No wildcard, file extension, or directory grants a binary exception.
+REVIEWED_ICON_ASSETS = {
+    "Resources/AppIcon.png": ("png-rgba-1024", "664e54034f49380b3dc60d72841ec8c7d9bae142e5e20f154c8e5dfcbae1e16f"),
+    "Resources/AppIcon.icns": ("icns", "edfc3aa520be04f987cc6c8a273995f57bafca68603d89f8265c640d0009e980"),
+}
+
+
+def reviewed_icon_failure(name: str, data: bytes):
+    format_name, digest = REVIEWED_ICON_ASSETS[name]
+    if format_name == "png-rgba-1024":
+        if (len(data) < 33 or not data.startswith(b"\x89PNG\r\n\x1a\n")
+                or data[8:16] != b"\x00\x00\x00\rIHDR"
+                or struct.unpack(">II", data[16:24]) != (1024, 1024)
+                or data[24:26] != b"\x08\x06"):
+            return "reviewed icon PNG format/dimensions/alpha mismatch"
+    elif format_name == "icns":
+        if len(data) < 8 or data[:4] != b"icns" or struct.unpack(">I", data[4:8])[0] != len(data):
+            return "reviewed icon ICNS signature/length mismatch"
+    else:
+        return "unsupported reviewed icon format"
+    if hashlib.sha256(data).hexdigest() != digest:
+        return "reviewed icon hash mismatch"
+    return None
 
 
 def main():
@@ -49,8 +77,12 @@ def main():
             if path.is_symlink() or not path.is_file():
                 failures.append((name, 0, "missing or symbolic-link file")); continue
             data = path.read_bytes()
+        if name in REVIEWED_ICON_ASSETS:
+            reason = reviewed_icon_failure(name, data)
+            if reason:
+                failures.append((name, 0, reason))
+            continue
         if name in SYNTHETIC_PNG_SHA256:
-            import hashlib
             if not data.startswith(b"\x89PNG\r\n\x1a\n"):
                 failures.append((name, 0, "reviewed synthetic PNG signature mismatch")); continue
             if hashlib.sha256(data).hexdigest() != SYNTHETIC_PNG_SHA256[name]:

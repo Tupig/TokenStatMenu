@@ -100,6 +100,22 @@ struct BackgroundServiceResources: Equatable, Encodable {
     let axScanInFlightCount: Int
 }
 
+/// Clock-derived presentation changes are distinct from new measurements.
+/// Comparing these cheap booleans keeps the half-second menu cadence without
+/// formatting dates or invalidating every SwiftUI view when nothing changed.
+struct PresentationTimeState: Equatable {
+    struct Window: Equatable {
+        let futureObservation: Bool
+        let fresh: Bool
+        let resetPassed: Bool
+    }
+    let localLive: Bool
+    let tokenHubFresh: Bool
+    let monthlyFresh: Bool
+    let fiveHour: Window?
+    let sevenDay: Window?
+}
+
 @MainActor final class AppModel: ObservableObject {
     // Explicit launch-only flag: fixtures never masquerade as enterprise measurements.
     let isTestFixture = CommandLine.arguments.contains("--test-fixture")
@@ -109,20 +125,36 @@ struct BackgroundServiceResources: Equatable, Encodable {
     private let usesDirectQuotaSource: Bool
     private(set) var backgroundServicesStarted = false
     private(set) var permissionPromptRequested = false
-    @Published private(set) var preferences = SeasunPreferences()
-    @Published var config = AppConfiguration()
+    @Published private(set) var preferences = SeasunPreferences() {
+        didSet { capturePresentationTimeBaseline() }
+    }
+    @Published var config = AppConfiguration() {
+        didSet { capturePresentationTimeBaseline() }
+    }
     @Published var stats = MetricsSnapshot()
-    @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
-    @Published var quota: QuotaSnapshot?
-    @Published var fiveHourQuota: WindowQuota?
-    @Published var sevenDayQuota: WindowQuota?
+    @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0) {
+        didSet { capturePresentationTimeBaseline() }
+    }
+    @Published var quota: QuotaSnapshot? {
+        didSet { capturePresentationTimeBaseline() }
+    }
+    @Published var fiveHourQuota: WindowQuota? {
+        didSet { capturePresentationTimeBaseline() }
+    }
+    @Published var sevenDayQuota: WindowQuota? {
+        didSet { capturePresentationTimeBaseline() }
+    }
     @Published var quotaError = "Token Hub 界面快照数据未知"
     @Published var sourceReadinessText = "企业后台直接来源未接通"
     @Published var message = ""
     @Published var history: [SpeedPoint] = []
     @Published var quotaLoading = false
-    @Published private(set) var tokenHubQuotaSnapshot: TokenHubQuotaSnapshot?
-    @Published private(set) var tokenHubQuotaStatus: TokenHubQuotaStatus = .targetNotRunning
+    @Published private(set) var tokenHubQuotaSnapshot: TokenHubQuotaSnapshot? {
+        didSet { capturePresentationTimeBaseline() }
+    }
+    @Published private(set) var tokenHubQuotaStatus: TokenHubQuotaStatus = .targetNotRunning {
+        didSet { capturePresentationTimeBaseline() }
+    }
     @Published private(set) var tokenHubQuotaFailure: TokenHubQuotaFailure?
     @Published private(set) var tokenHubDirectFailure: TokenHubDirectQuotaFailure?
     private(set) var tokenHubQuotaIsDirect = false
@@ -152,6 +184,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
     private var generation = 0
     private var tokenHubGeneration: UInt64 = 0
     private var tokenHubAXGeneration: UInt64 = 0
+    private var lastPresentationTimeState: PresentationTimeState?
     var onTick: (() -> Void)?
 
     var isSeasunOnly: Bool { true }
@@ -207,16 +240,53 @@ struct BackgroundServiceResources: Equatable, Encodable {
         tokenHubDirectFailure = nil; tokenHubQuotaIsDirect = false; tokenHubDirectScanInFlight = false
     }
     func tick() {
-        stats = engine.snapshot()
-        let now = Date()
-        if quota?.month != QuotaSnapshot.currentMonth(), quota != nil { quota = nil; quotaError = "已跨月，等待本月用量" }
-        if tokenHubQuotaStatus == .connected, freshTokenHubQuota(at: now) == nil { tokenHubQuotaStatus = .stale }
+        // The formal local-history mode never consumes proxy engine metrics.
+        // Publishing its identical empty snapshot would redraw a hidden or
+        // open dashboard twice a second. Legacy proxy previews keep sampling.
+        if config.dataSource != "localCodex" { stats = engine.snapshot() }
+        let now = tokenHubNow()
+        var publishedTransition = false
+        // Check presence first: creating a date formatter for an absent quota
+        // was otherwise part of every idle menu tick.
+        if let quota, quota.month != QuotaSnapshot.currentMonth(at: now) {
+            self.quota = nil; quotaError = "已跨月，等待本月用量"
+            publishedTransition = true
+        }
+        if tokenHubQuotaStatus == .connected, freshTokenHubQuota(at: now) == nil {
+            tokenHubQuotaStatus = .stale
+            publishedTransition = true
+        }
         if backgroundServicesStarted { pollTokenHubPermissionIfDue() }
+        let timeState = presentationTimeState
+        if let previous = lastPresentationTimeState, previous != timeState, !publishedTransition {
+            objectWillChange.send()
+        }
+        lastPresentationTimeState = timeState
         onTick?()
     }
     var freshQuota: QuotaSnapshot? {
-        guard let quota, quota.month == QuotaSnapshot.currentMonth(), Date().timeIntervalSince(quota.fetchedAt) < max(120, config.refreshSeconds * 2) else { return nil }
+        let now = tokenHubNow()
+        guard let quota, quota.month == QuotaSnapshot.currentMonth(at: now),
+              quota.fetchedAt <= now,
+              now.timeIntervalSince(quota.fetchedAt) < max(120, config.refreshSeconds * 2) else { return nil }
         return quota
+    }
+    /// A measurement can arrive and expire between timer ticks. Remember
+    /// its time state after the input mutation, since SwiftUI may render that
+    /// intervening published value even if the previous tick had no live data.
+    private func capturePresentationTimeBaseline() {
+        lastPresentationTimeState = presentationTimeState
+    }
+    var presentationTimeState: PresentationTimeState {
+        let now = tokenHubNow()
+        func window(_ value: WindowQuota?) -> PresentationTimeState.Window? {
+            value.map { PresentationTimeState.Window(futureObservation: $0.fetchedAt > now,
+                fresh: $0.isFresh(at: now, refreshSeconds: config.refreshSeconds),
+                resetPassed: $0.resetsAt.map { $0 <= now } ?? false) }
+        }
+        return PresentationTimeState(localLive: freshLocalLiveTurn != nil,
+            tokenHubFresh: freshTokenHubQuota(at: now) != nil, monthlyFresh: freshQuota != nil,
+            fiveHour: window(fiveHourQuota), sevenDay: window(sevenDayQuota))
     }
     var currencyFactor: Double { config.currency == "CNY" ? config.usdToCNY : 1 }
     var currencySymbol: String { config.currency == "CNY" ? "¥" : "$" }
@@ -284,7 +354,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         return "\(userFacingStatus)\n当前配置关联的本机 Codex 记录，历史路由未核验；当前扫描范围：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
     }
     private var tokenHubMenuSuffix: String {
-        guard let snapshot = freshTokenHubQuota(at: Date()) else { return "" }
+        guard let snapshot = freshTokenHubQuota(at: tokenHubNow()) else { return "" }
         let windows = [snapshot.fiveHour.map { "5h剩 \(percentText($0.remainingPercent))%" },
                        snapshot.sevenDay.map { "7d剩 \(percentText($0.remainingPercent))%" }].compactMap { $0 }
         return windows.isEmpty ? "" : " · Hub \(windows.joined(separator: " / "))"
@@ -293,7 +363,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
     var tokenHubPermissionGrantedForDiagnostics: Bool { cachedTokenHubPermission }
     var tokenHubPermissionRequiredForDiagnostics: Bool { tokenHubQuotaStatus == .permissionRequired }
     private var tokenHubTooltipDetail: String {
-        let snapshot = freshTokenHubQuota(at: Date())
+        let snapshot = freshTokenHubQuota(at: tokenHubNow())
         let five = snapshot?.fiveHour.map { "界面显示剩余 \(percentText($0.remainingPercent))%（5 小时）" } ?? "5 小时未知"
         let seven = snapshot?.sevenDay.map { "界面显示剩余 \(percentText($0.remainingPercent))%（7 天）" } ?? "7 天未知"
         let source = tokenHubQuotaIsDirect ? "Token Hub 后台直接响应" : "Token Hub 界面快照"
@@ -338,7 +408,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         "已核验线程 \(localSnapshot.knownThreadCount) · 未核验线程 \(localSnapshot.unknownThreadCount) · 未识别文件 \(localSnapshot.unidentifiedFileCount) · 子代理 \(localSnapshot.subagentCount) · 分叉 \(localSnapshot.forkCount) · 顶层对话 \(localSnapshot.sessionCount)"
     }
     private func quotaDescription(_ quota: WindowQuota?, source: QuotaSource) -> String {
-        let presentation = WindowQuotaCard.presentation(for: quota, refreshSeconds: config.refreshSeconds, source: source)
+        let presentation = WindowQuotaCard.presentation(for: quota, at: tokenHubNow(), refreshSeconds: config.refreshSeconds, source: source)
         guard let usedPercent = presentation.usedPercent else { return "\(presentation.sourceLabel) · \(presentation.statusLabel)" }
         let resetLabel = source == .localCodex || !presentation.isFresh ? "原重置时间" : "重置时间"
         let reset = presentation.resetsAt.map { "，\(resetLabel) \($0.formatted())" } ?? "，重置时间未知"
@@ -350,7 +420,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
     var alertColor: NSColor {
         guard quotaSource == .enterprise else { return .labelColor }
         let windows = (quotaSource == .enterprise ? [fiveHourQuota, sevenDayQuota].compactMap { $0 } : [])
-            .filter { $0.isFresh(refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
+            .filter { $0.isFresh(at: tokenHubNow(), refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
         guard let ratio = (windows + [freshQuota?.fraction].compactMap { $0 }).max() else { return .labelColor }
         return ratio >= 0.95 ? .systemRed : ratio >= 0.8 ? .systemYellow : .labelColor
     }

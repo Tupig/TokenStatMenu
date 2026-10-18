@@ -4,6 +4,7 @@ import argparse
 import shutil
 import zipfile
 from pathlib import Path
+from check_docs import rebase_links
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = [
@@ -17,7 +18,7 @@ PUBLIC_FILES = [
     "Sources/TokenStatMenu/SettingsView.swift",
     "Sources/TokenStatMenu/StatusBarController.swift", "Sources/TokenStatMenu/Storage.swift",
     "Sources/TokenStatMenu/TokenStatMenuApp.swift", "Sources/TokenStatMenu/PanelStyle.swift", "Sources/TokenStatMenu/WindowQuotaCard.swift", "Sources/TokenStatMenu/TokenHubAXReader.swift", "Sources/TokenStatMenu/TokenHubQuotaCard.swift",
-    "Resources/Info.plist", "Resources/config.example.plist", "TokenStatMenu.xcodeproj/project.pbxproj",
+    "Resources/Info.plist", "Resources/config.example.plist", "Resources/AppIcon.png", "Resources/AppIcon.icns", "TokenStatMenu.xcodeproj/project.pbxproj",
     "Tests/TokenStatCoreTests/CoreChecks.swift", "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/WindowQuotaChecks.swift", "Tests/TokenStatCoreTests/LocalCodexUsageChecks.swift", "Tests/TokenStatCoreTests/DirectQuotaChecks.swift",
     "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift", "Tests/TokenStatCoreTests/TokenHubQuotaChecks.swift", "Tests/TokenStatUITests/TokenHubQuotaStateTests.swift", "Tests/TokenStatUITests/SeasunStartupContractTests.swift",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png",
@@ -25,14 +26,18 @@ PUBLIC_FILES = [
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png",
     "script/build_and_run.sh", "script/test.sh", "script/mock_server.py", "script/integration.py",
-    "script/generate_xcode_project.py", "script/render_preview.py", "script/RenderPreview.swift", "script/package_source.py", "script/check_public_content.py",
-    "docs/DESIGN.md", "docs/IMPLEMENTATION.md", "docs/CONFIGURATION.md", "docs/VALIDATION.md", "docs/UI_TESTING.md", "docs/FULL_SOURCE.md",
+    "script/BenchmarkMenu.swift", "script/benchmark_menu.py", "script/RenderAppIcon.swift", "script/make_app_icon.sh", "script/check_docs.py", "script/generate_xcode_project.py", "script/render_preview.py", "script/RenderPreview.swift", "script/package_source.py", "script/check_public_content.py",
+    "docs/README.md", "docs/wiki/Home.md", "docs/wiki/安装与使用.md", "docs/wiki/统计口径.md",
+    "docs/wiki/常见问题.md", "docs/wiki/编译指南.md", "docs/wiki/测试指南.md", "docs/wiki/命令行参数.md",
+    "docs/wiki/CI-CD.md", "docs/wiki/贡献指南.md",
+    "docs/PERFORMANCE.md", "docs/DESIGN.md", "docs/IMPLEMENTATION.md", "docs/CONFIGURATION.md", "docs/VALIDATION.md", "docs/UI_TESTING.md", "docs/FULL_SOURCE.md",
 ]
 
 
 def source_document():
     readme = (ROOT / "README.md").read_text()
     architecture = readme.split("## 整体架构\n", 1)[1].split("## 文件与职责", 1)[0]
+    architecture = rebase_links(architecture, "README.md", "docs/FULL_SOURCE.md")
     parts = ["# TokenStatMenu 完整源码\n\n## 项目整体架构\n", architecture, "\n## 分文件完整源码\n"]
     languages = {".swift": "swift", ".plist": "xml", ".pbxproj": "text", ".py": "python", ".sh": "bash", ".yml": "yaml"}
     for name in PUBLIC_FILES:
@@ -40,7 +45,8 @@ def source_document():
         if path.suffix not in languages:
             continue
         parts += [f"\n### {name}\n\n```{languages[path.suffix]}\n", path.read_text().rstrip(), "\n```\n"]
-    parts += ["\n## 编译与使用\n\n", readme.split("## 构建与运行\n", 1)[1]]
+    usage = rebase_links(readme.split("## 构建与运行\n", 1)[1], "README.md", "docs/FULL_SOURCE.md")
+    parts += ["\n## 编译与使用\n\n", usage]
     (ROOT / "docs/FULL_SOURCE.md").write_text("".join(parts))
 
 
