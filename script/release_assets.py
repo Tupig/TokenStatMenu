@@ -419,7 +419,21 @@ class GitHubClient:
         _require(tag == self.identity.tag, "unexpected remote release lookup")
         value = self._get(self.base + "/releases/tags/" + tag, missing=True)
         if value is None:
-            return None
+            releases = self._get(self.base + "/releases?per_page=100")
+            _require(isinstance(releases, list) and len(releases) < 100,
+                     "remote release list is invalid or incomplete")
+            matching = [item for item in releases
+                        if isinstance(item, dict) and item.get("tag_name") == tag]
+            _require(len(matching) <= 1, "multiple remote releases match the requested tag")
+            value = matching[0] if matching else None
+            if value is None:
+                return None
+            # A tag endpoint miss is only recoverable for the intended draft
+            # resume path. A published/prerelease match indicates conflicting
+            # remote state and must fail closed rather than be guessed at.
+            _require(type(value.get("draft")) is bool and value.get("draft") is True
+                     and type(value.get("prerelease")) is bool and value.get("prerelease") is False,
+                     "tag lookup miss found a non-resumable remote release")
         _require(type(value.get("id")) is int and type(value.get("draft")) is bool
                  and type(value.get("prerelease")) is bool,
                  "invalid remote release metadata")
