@@ -4,6 +4,12 @@
 
 ## 正式 App 能力矩阵
 
+### 阶段 1 数据口径修正（2026-10-18）
+
+本阶段让 Dashboard 额度新鲜度与 `AppModel` 使用同一份 model clock；可选诊断输出路径在 `StatusBarController` 初始化时解析一次，刷新菜单时不会反复扫描命令行参数，诊断路径继续使用其现有的节流时钟。C29 合成回归同时锁定完整扫描与达到上限时的展示标签（`Σ`、`小计`、`未核验`、顶层对话和文件范围）。
+
+数据口径保持分层。5 小时、7 天和月度值仍来自 Token Hub 的只读额度来源；本机 Codex 输入/输出/总量和会话分类仍是有界扫描的小计或完整扫描量；活动 token/s 只能在有新鲜累计事件时显示本机短窗口估算。当前没有企业网关提供的权威瞬时 token/s 时间序列，因此 `liveTokenSpeedPresent` 在缺少新鲜活动证据时继续为 `false`，界面显示未知，不用刷新间隔或历史差值代替。真实 Settings AX 树验收仍属于 [Issue #33](https://github.com/Tupig/TokenStatMenu/issues/33) 的后续环境阶段；CLT linker warning 继续由 [Issue #52](https://github.com/Tupig/TokenStatMenu/issues/52) 跟踪。
+
 这里描述当前产品入口，而不是核心库中所有历史代码的能力。正式 App 聚焦 Seasun Token Hub，不要求用户配置自定义 API、代理、密钥、模型、单价或配额。
 
 | 能力 | 当前状态 | 说明与限制 |

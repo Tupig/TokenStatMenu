@@ -31,6 +31,8 @@ PUBLIC_FILES = [
     "docs/README.md", "docs/wiki/Home.md", "docs/wiki/安装与使用.md", "docs/wiki/统计口径.md",
     "docs/wiki/常见问题.md", "docs/wiki/编译指南.md", "docs/wiki/测试指南.md", "docs/wiki/命令行参数.md",
     "docs/wiki/CI-CD.md", "docs/wiki/贡献指南.md",
+    "docs/superpowers/specs/2026-10-18-accuracy-and-validation-optimization-design.md",
+    "docs/superpowers/plans/2026-10-18-accuracy-and-validation-optimization.md",
     "docs/PERFORMANCE.md", "docs/DESIGN.md", "docs/IMPLEMENTATION.md", "docs/CONFIGURATION.md", "docs/VALIDATION.md", "docs/UI_TESTING.md", "docs/FULL_SOURCE.md",
 ]
 

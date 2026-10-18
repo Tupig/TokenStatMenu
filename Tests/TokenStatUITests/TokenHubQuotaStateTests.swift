@@ -167,6 +167,56 @@ final class TokenHubQuotaStateTests: XCTestCase {
         controller.toggle()
     }
 
+    func testDiagnosticsURLIsCachedAndNilDisablesOutput() async throws {
+        _ = NSApplication.shared
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenStatMenu-diagnostics-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appendingPathComponent("report.json")
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let controller = StatusBarController(model: model, diagnosticsURL: output)
+
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: output.path) { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        let firstData = try Data(contentsOf: output)
+        let firstAttributes = try FileManager.default.attributesOfItem(atPath: output.path)
+        let firstModificationDate = try XCTUnwrap(firstAttributes[.modificationDate] as? Date)
+        let firstObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: firstData) as? [String: Any])
+        let approvedKeys: Set<String> = [
+            "seasunOnlyMode", "backgroundServicesStarted", "statusItemVisible",
+            "permissionPromptRequested", "quotaPresent", "directQuotaPresent",
+            "directQuotaStatus", "fiveHourPresent", "sevenDayPresent",
+            "fiveHourResetPresent", "sevenDayResetPresent", "resetTimePresent",
+            "monthlyUsagePresent", "liveTokenSpeedPresent", "sourceStatus",
+            "backgroundServiceResources"
+        ]
+        XCTAssertEqual(Set(firstObject.keys), approvedKeys)
+
+        controller.refreshTitle()
+        try await Task.sleep(for: .milliseconds(100))
+        let secondData = try Data(contentsOf: output)
+        let secondAttributes = try FileManager.default.attributesOfItem(atPath: output.path)
+        let secondModificationDate = try XCTUnwrap(secondAttributes[.modificationDate] as? Date)
+        XCTAssertEqual(secondData, firstData)
+        XCTAssertEqual(secondModificationDate, firstModificationDate,
+                       "the one-second diagnostic throttle should avoid a second write")
+
+        let nilOutput = directory.appendingPathComponent("nil.json")
+        let nilModel = AppModel(preview: true)
+        defer { nilModel.shutdown() }
+        let nilController = StatusBarController(model: nilModel, diagnosticsURL: nil)
+        nilController.refreshTitle()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: nilOutput.path))
+        withExtendedLifetime(controller) {}
+        withExtendedLifetime(nilController) {}
+    }
+
     func testTooltipFormattingIsReusedForIdleTicksButTracksValuesAndTimeBoundaries() throws {
         _ = NSApplication.shared
         let model = AppModel(preview: true)
@@ -261,6 +311,31 @@ final class TokenHubQuotaStateTests: XCTestCase {
         for _ in 0..<100 { model.tick() }
         XCTAssertEqual(tooltipBuilds, afterExpiry, "an expired snapshot must not cause endless redraws")
         withExtendedLifetime(controller) {}
+    }
+
+    func testTokenHubCardUsesModelClockForFreshness() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = HubManualClock(observedAt)
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1)
+        await settle(model, status: .connected)
+
+        let dashboard = DashboardView(model: model)
+        XCTAssertNotNil(dashboard.tokenHubCard.snapshot,
+                       "the card should use the injected model clock at the observation time")
+
+        clock.now = observedAt.addingTimeInterval(120)
+        XCTAssertNotNil(dashboard.tokenHubCard.snapshot,
+                       "the inclusive freshness boundary should remain visible")
+        clock.now = observedAt.addingTimeInterval(120.001)
+        XCTAssertNil(dashboard.tokenHubCard.snapshot,
+                     "the card should expire from the injected model clock")
     }
 
     func testLiveObservationBetweenTicksStillInvalidatesAtItsNextExpiry() {
@@ -419,6 +494,37 @@ final class TokenHubQuotaStateTests: XCTestCase {
         defer { model.shutdown() }
         model.config.dataSource = "localCodex"
         XCTAssertTrue(model.title.hasPrefix("上轮均:— ·"), "unknown speed must not duplicate its label")
+    }
+
+    func testUnknownAndAccountingLabelsRemainExplicitWhenSourcesAreMissing() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+
+        // No live turn, completed turn, or quota windows is the synthetic
+        // missing-data state used by a fresh or stale local scan.
+        model.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0,
+            sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 0,
+            unknownThreadCount: 0)
+        XCTAssertTrue(model.title.contains("上轮均:—"))
+        XCTAssertTrue(model.menuTooltip.contains("实时估算：未知"))
+        XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
+        XCTAssertTrue(model.menuTooltip.contains("7 天未知"))
+
+        model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
+            sessionCount: 2, filesScanned: 32, isLimited: true, latestEventAt: nil,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
+            unknownThreadCount: 2)
+        XCTAssertTrue(model.title.contains("小计"))
+        XCTAssertTrue(model.title.contains("未核验"))
+
+        model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
+            sessionCount: 2, filesScanned: 3, isLimited: false, latestEventAt: nil,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
+            unknownThreadCount: 0)
+        XCTAssertTrue(model.title.contains("Σ"))
+        XCTAssertTrue(model.title.contains("顶层对话"))
     }
 
     private func directModel(_ harness: HubDirectHarness, clock: HubManualClock,
