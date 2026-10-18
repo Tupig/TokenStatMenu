@@ -9,9 +9,11 @@ typealias ValueState<Value> = SwiftUI.State<Value>
 @MainActor struct DashboardView: View {
     @ObservedObject var model: AppModel
     @ValueState private var settings = false
-    init(model: AppModel, settings: Bool = false) {
+    private let initialLocalHistoryExpanded: Bool
+    init(model: AppModel, settings: Bool = false, localHistoryExpanded: Bool = false) {
         self.model = model
         _settings = State(initialValue: settings)
+        initialLocalHistoryExpanded = localHistoryExpanded
     }
     var body: some View {
         VStack(spacing: 0) {
@@ -29,19 +31,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             if settings { SettingsView(model: model) }
             else {
                 ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        tokenHubCard
-                        Text(model.userFacingStatus)
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
-                        localUsageCard
-                        HStack(alignment: .top, spacing: 10) {
-                            WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
-                                color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
-                            WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
-                                color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
-                        }
-                        localQuotaCard
-                    }.padding(.horizontal, 16).padding(.bottom, 14)
+                    overviewContent
                 }
             }
             footer
@@ -49,6 +39,33 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         .frame(width: 460, height: 700)
         .background(.regularMaterial)
         .background(PanelPalette.gradient.opacity(0.09))
+        .groupBoxStyle(PanelCardStyle())
+        .tint(PanelPalette.blue)
+    }
+    /// Shared with full-content rendering checks, including the actual card
+    /// styles and insets rather than a reconstruction outside the ScrollView.
+    var overviewContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            tokenHubCard
+            Text(model.userFacingStatus)
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            localUsageCard
+            if model.quotaSource == .localCodex {
+                LocalHistoryDisclosure(initiallyExpanded: initialLocalHistoryExpanded) {
+                    localQuotaCard
+                }
+            } else {
+                // The generic enterprise branch is available to synthetic
+                // previews only; production local history has its own section.
+                HStack(alignment: .top, spacing: 10) {
+                    WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
+                        color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
+                    WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
+                        color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
+                }
+            }
+        }
+        .padding(.horizontal, 16).padding(.bottom, 14)
         .groupBoxStyle(PanelCardStyle())
         .tint(PanelPalette.blue)
     }
@@ -113,13 +130,21 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private var localQuotaCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
-                metric("5 小时额度", localQuotaDescription(model.fiveHourQuota))
-                metric("7 天额度", localQuotaDescription(model.sevenDayQuota))
+                historyWindow("5 小时历史", quota: model.fiveHourQuota)
+                historyWindow("7 天历史", quota: model.sevenDayQuota)
                 Text("本地记录额度始终只是历史参考，不论事件是否新鲜；不代表当前企业剩余额度，也不触发企业额度告警。保留源记录的已用比例、记录时间和原重置时间。")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
             }
-        } label: { Label("本地额度快照", systemImage: "chart.bar") }
+        } label: { Label("本地 Codex 历史 · 账号/组织未核验", systemImage: "clock") }
+    }
+    private func historyWindow(_ title: String, quota: WindowQuota?) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.system(size: 11, weight: .medium))
+            Text(localQuotaDescription(quota))
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        }
     }
     private func localQuotaDescription(_ quota: WindowQuota?) -> String {
         let state = WindowQuotaCard.presentation(for: quota, refreshSeconds: model.config.refreshSeconds, source: .localCodex)
@@ -142,4 +167,27 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private func count(_ n: Int) -> String { n.formatted() }
     private func localCount(_ n: Int) -> String { model.localSnapshot.knownThreadCount == 0 ? "—" : count(n) }
     private func count(_ n: Double) -> String { n.formatted(.number.precision(.fractionLength(0))) }
+}
+
+/// Expansion belongs to this installed view, never to the model or preferences.
+/// Keeping the State here also lets a detached overview be hosted for rendering
+/// without accessing a State projection on an uninstalled DashboardView value.
+private struct LocalHistoryDisclosure<Content: View>: View {
+    @ValueState private var expanded: Bool
+    private let content: Content
+
+    init(initiallyExpanded: Bool, @ViewBuilder content: () -> Content) {
+        _expanded = SwiftUI.State(initialValue: initiallyExpanded)
+        self.content = content()
+    }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            content.padding(.top, 8)
+        } label: {
+            Label("本地历史额度（非企业当前额度）", systemImage: "clock.arrow.circlepath")
+                .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+        }
+        .accessibilityHint("只显示本地历史记录，不代表企业当前剩余额度")
+    }
 }

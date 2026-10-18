@@ -1,0 +1,83 @@
+name: macOS release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate tag, version, source commit and main ancestry
+        run: |
+          python3 -B script/release_assets.py preflight --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
+      - name: Documentation links and synthetic checker fixtures
+        run: python3 -B script/check_docs.py --self-test
+      - name: Public content guardrail
+        run: python3 -B script/check_public_content.py --git-index
+      - name: Release contract and private native fixtures
+        run: python3 -B script/test_release_assets.py
+      - name: Core and gateway discovery checks
+        run: swift run TokenStatCoreChecks
+      - name: Compile UI target and run OS-independent checks
+        run: |
+          swift test --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
+          swift test --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
+      - name: Native Xcode build
+        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-Release-CI CODE_SIGNING_ALLOWED=NO build
+      - name: Build and ad hoc sign Universal app without launching
+        run: ./script/build_and_run.sh --universal
+      - name: Export reviewed source and require committed generated document
+        run: |
+          python3 -B script/package_source.py
+          git diff --exit-code
+      - name: Package exactly four assets with native checks
+        run: python3 -B script/release_assets.py package --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --app dist/TokenStatMenu.app --source dist/TokenStatMenu-source.zip --directory dist/release
+      - name: Verify asset identities, payloads and checksums
+        run: python3 -B script/release_assets.py verify --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --directory dist/release
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (Node 24)
+        with:
+          name: tokenstatmenu-release
+          if-no-files-found: error
+          path: |
+            dist/release/TokenStatMenu-${{ env.RELEASE_VERSION }}-universal.zip
+            dist/release/TokenStatMenu-${{ env.RELEASE_VERSION }}-source.zip
+            dist/release/release-manifest.json
+            dist/release/SHA256SUMS
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.repository == 'Tupig/TokenStatMenu' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2 (Node 24)
+        with:
+          name: tokenstatmenu-release
+          path: dist/release
+      - name: Verify downloaded assets against this source before writes
+        run: python3 -B script/release_assets.py verify --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --directory dist/release
+      - name: Resume matching draft, verify remote bytes and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B script/release_assets.py publish --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --directory dist/release

@@ -26,7 +26,26 @@
 
 ## 快速开始
 
-需要 macOS 13 或更新版本，Apple Silicon 或 Intel Mac，以及支持 Swift 5.9 的 Xcode／命令行工具。Apple Silicon 为优先验证平台，Intel 已有交叉构建；不能把交叉构建当作 Intel 硬件验收。
+需要 macOS 13 或更新版本，Apple Silicon 或 Intel Mac。Homebrew 安装从正式版本源码在本机编译，需要完整 Xcode 15 或更新版本；Homebrew 对宿主系统的支持范围另以其要求为准。Apple Silicon 为优先验证平台，Intel 已有交叉构建；不能把交叉构建当作 Intel 硬件验收。
+
+先正常启动并登录 Seasun Token Hub，再通过项目的 [Homebrew tap](https://github.com/Tupig/homebrew-tokenstatmenu) 安装和打开：
+
+```bash
+brew install Tupig/tokenstatmenu/tokenstatmenu
+tokenstatmenu
+```
+
+安装与升级只更新磁盘上的应用，不会自动启动、退出或重启已有实例。更新时先从 TokenStatMenu 菜单退出应用，再执行：
+
+```bash
+brew update
+brew upgrade Tupig/tokenstatmenu/tokenstatmenu
+tokenstatmenu
+```
+
+Homebrew 从正式 Release 的校验源码包构建原生 App，使用本机 ad hoc 签名；正式 App 仅依赖系统框架。它不会替换个人“应用程序”目录中的手动安装副本，也没有应用内自动更新器。完整说明见 [安装与使用](docs/wiki/安装与使用.md)。
+
+开发者也可直接构建源码：
 
 1. 在本机正常启动并登录 Seasun Token Hub。
 2. 克隆仓库并构建应用：
@@ -45,7 +64,7 @@
 
 正常启动只显示菜单栏条目，点击后展开面板；没有主窗口属于预期行为。不需要创建 plist，也不需要授予辅助功能权限来连接后台。设置里的辅助功能入口仅用于可选界面兼容读取。
 
-首次构建可能需要联网解析测试依赖，正式 App 运行时只使用系统框架。当前没有正式的 GitHub Release 下载或 Developer ID 公证产物；构建脚本提供的是本地 ad hoc 签名。固定路径安装、升级、回退和首次打开说明见 [安装与使用](docs/wiki/安装与使用.md)。
+首次 SwiftPM 构建可能需要联网解析测试依赖。版本发行由 GitHub Actions 构建 Universal 应用包、源码包与校验文件，入口为 [GitHub Releases](https://github.com/Tupig/TokenStatMenu/releases)。二进制发行使用 ad hoc 签名，尚未完成 Developer ID 签名或 Apple 公证；Homebrew 通过在本机编译源码安装。固定路径安装、升级、回退和首次打开说明见 [安装与使用](docs/wiki/安装与使用.md)。
 
 ## 文档导航
 
@@ -132,7 +151,12 @@ python3 script/package_source.py
 # 检查文档链接与公开内容
 python3 script/check_docs.py
 python3 script/check_public_content.py
+
+# 发布资产合同（合成 Git/ZIP 与隔离的本机签名样本）
+python3 -B script/test_release_assets.py
 ```
+
+正式版本推送 `vMAJOR.MINOR.PATCH` 标签后，由 [macOS release 工作流](.github/workflows/release.yml) 检查版本、源码提交和 `main` 归属，构建 arm64 + x86_64 Universal App，并发布应用 ZIP、源码 ZIP、`release-manifest.json` 和 `SHA256SUMS`。构建检查与写入 Release 的作业分开授权；相同内容可安全重跑，不会覆盖不同内容的既有资产。维护者步骤和失败恢复见 [CI/CD](docs/wiki/CI-CD.md)。
 
 真实机器核验与合成测试分开记录；后者不能证明企业账号、完整账单或真实服务器吞吐正确。视觉参考图只使用合成数据，录制图像本身不算通过。详细方法见 [测试指南](docs/wiki/测试指南.md) 和 [UI 测试说明](docs/UI_TESTING.md)，最近的结果与限制见 [验证记录](docs/VALIDATION.md)。
 
