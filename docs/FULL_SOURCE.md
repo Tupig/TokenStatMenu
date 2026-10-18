@@ -11938,7 +11938,21 @@ class GitHubClient:
         _require(tag == self.identity.tag, "unexpected remote release lookup")
         value = self._get(self.base + "/releases/tags/" + tag, missing=True)
         if value is None:
-            return None
+            releases = self._get(self.base + "/releases?per_page=100")
+            _require(isinstance(releases, list) and len(releases) < 100,
+                     "remote release list is invalid or incomplete")
+            matching = [item for item in releases
+                        if isinstance(item, dict) and item.get("tag_name") == tag]
+            _require(len(matching) <= 1, "multiple remote releases match the requested tag")
+            value = matching[0] if matching else None
+            if value is None:
+                return None
+            # A tag endpoint miss is only recoverable for the intended draft
+            # resume path. A published/prerelease match indicates conflicting
+            # remote state and must fail closed rather than be guessed at.
+            _require(type(value.get("draft")) is bool and value.get("draft") is True
+                     and type(value.get("prerelease")) is bool and value.get("prerelease") is False,
+                     "tag lookup miss found a non-resumable remote release")
         _require(type(value.get("id")) is int and type(value.get("draft")) is bool
                  and type(value.get("prerelease")) is bool,
                  "invalid remote release metadata")
@@ -12614,6 +12628,54 @@ class ReleaseChecks(unittest.TestCase):
         # publisher. The adapter must never coerce any metadata to false.
         with mock.patch.object(client, "_get", return_value=dict(baseline, prerelease=True)):
             self.assertIs(client.lookup(TAG)["prerelease"], True)
+
+    def test_github_lookup_404_fallback_accepts_one_exact_draft_only(self):
+        client = release.GitHubClient(self.fixture.identity)
+        draft = {"id": 77, "tag_name": TAG, "draft": True, "prerelease": False}
+        calls = []
+        def get(path, *, missing=False):
+            calls.append((path, missing))
+            if path.endswith("/releases/tags/" + TAG):
+                return None
+            return [dict(draft), {"id": 78, "tag_name": "v1.1.30", "draft": True, "prerelease": False}]
+        with mock.patch.object(client, "_get", side_effect=get):
+            self.assertEqual(client.lookup(TAG), {"id": 77, "tag": TAG, "draft": True, "prerelease": False})
+        self.assertEqual(calls, [("repos/Tupig/TokenStatMenu/releases/tags/" + TAG, True),
+                                 ("repos/Tupig/TokenStatMenu/releases?per_page=100", False)])
+
+    def test_github_lookup_404_fallback_empty_or_unrelated_is_absent(self):
+        client = release.GitHubClient(self.fixture.identity)
+        for releases in [[], [{"id": 78, "tag_name": "v1.1.30", "draft": True, "prerelease": False}]]:
+            with self.subTest(releases=releases), mock.patch.object(
+                    client, "_get", side_effect=[None, releases]):
+                self.assertIsNone(client.lookup(TAG))
+
+    def test_github_lookup_404_fallback_rejects_duplicate_conflicts_and_bad_lists(self):
+        client = release.GitHubClient(self.fixture.identity)
+        valid = {"id": 77, "tag_name": TAG, "draft": True, "prerelease": False}
+        cases = [
+            [valid, dict(valid, id=78)],
+            [dict(valid, draft=False)],
+            [dict(valid, prerelease=True)],
+            [dict(valid, tag_name=TAG, draft="true")],
+            [{"id": 77, "tag_name": TAG}],
+            [{"id": 77, "tag_name": TAG, "draft": True, "prerelease": False}] * 100,
+            {"items": [valid]},
+        ]
+        for releases in cases:
+            with self.subTest(releases=releases), mock.patch.object(
+                    client, "_get", side_effect=[None, releases]):
+                with self.assertRaises((ValueError, RuntimeError)):
+                    client.lookup(TAG)
+
+    def test_publish_resumes_single_fallback_draft_without_creating_release(self):
+        f = self.fixture
+        f.synthetic_assets()
+        client = FakeClient(f, draft=True, existing=["release-manifest.json"])
+        release.publish_release(f.root, f.assets, f.identity, client)
+        self.assertNotIn("create_draft", [item[0] for item in client.mutations])
+        self.assertFalse(client.remote["draft"])
+        self.assertEqual(len([item for item in client.mutations if item[0] == "upload"]), 3)
 
     def test_publish_conflicts_or_retagging_never_mutate_remote_release(self):
         f = self.fixture
