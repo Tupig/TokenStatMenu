@@ -4,6 +4,9 @@ dist/
 .integration/
 .release-staging/
 .codex/
+.agents/
+/.specify/
+/specs/
 .env
 .env.*
 *.log

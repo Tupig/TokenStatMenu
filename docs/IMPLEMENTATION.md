@@ -2,6 +2,18 @@
 
 [返回文档中心](wiki/Home.md)
 
+## 当前一致性、额度与响应性修复
+
+本轮把 5 小时、7 天和月度字段的来源边界固定下来。直接解码器保留月度可选总额和窗口 `resetAt`；总额缺失时只显示已用，剩余、百分比和进度保持未知。缺失或歧义的 5 小时、7 天窗口分别保持未知，不能从另一窗口、本地历史或月度字段推断。显示百分比统一使用最多两位小数，告警阈值和进度始终使用未四舍五入的 `Decimal`。
+
+本地 JSONL 读取器在文件没有末尾换行时保留完整 JSON；截断片段仍是连续性屏障。顶层累计事件必须按物理顺序保持时间、输入、输出和总量单调，并满足 `total_tokens >= input_tokens + output_tokens`；回退、未来事件和不一致总量只让受影响线程变成未知。一个模型时钟值 `observationNow` 同时传给本地扫描、直接额度 freshness 和菜单展示。
+
+本地路由发现、Token Hub 进程/设置/SQLite 读取和直接额度请求都在 worker actor 内进行。跨 actor 只返回 `DirectQuotaTransportSnapshot` 的脱敏额度、来源、时钟和 freshness 字段，不携带 PID、可执行路径、数据库 inode、UUID、URL、会话、bearer、原始响应或 route fingerprint。主 actor 通过 generation 和取消检查拒绝迟到结果；主线程不执行同步来源发现。
+
+菜单面板只在打开时采集新鲜本地活动估算并维护最近十分钟、最多 1200 点的曲线；过期或未知样本不会写成零。设置/退出按钮共用中性色样式和 30×30 命中区域，活动指示点使用新鲜本地 live estimate。直接额度卡为 5 小时、7 天和月度总额提供进度条，月度 used-only 响应保持明确的未知状态。
+
+网络策略移除了全局 `NSAllowsArbitraryLoads`。远程来源必须 HTTPS，Token Hub 继续校验同源重定向和 URL 字段；loopback/local compatibility 只由合成检查单独覆盖。远程明文 HTTP、userinfo、query/fragment、主机/端口变化和不安全 `Location` 均拒绝。当前真实企业权威 token/s 时间序列仍未接通，无法用本地估算代替该结论。
+
 ## 正式 App 能力矩阵
 
 ### 阶段 1 数据口径修正（2026-10-18）

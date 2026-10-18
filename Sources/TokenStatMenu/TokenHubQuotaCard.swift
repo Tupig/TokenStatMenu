@@ -36,10 +36,11 @@ enum TokenHubDecimalFormatter {
                     .font(.system(size: 9)).foregroundStyle(.secondary)
                 if let snapshot {
                     if let window = snapshot.fiveHour { row("5 小时", window.usedPercent, window.usedAmount, window.limitAmount, window.sourceSymbol, window.resetDisplay) }
+                    else { unknownWindowRow("5 小时") }
                     if let window = snapshot.sevenDay { row("7 天", window.usedPercent, window.usedAmount, window.limitAmount, window.sourceSymbol, window.resetDisplay) }
+                    else { unknownWindowRow("7 天") }
                     if let monthly = snapshot.monthly {
-                        HStack { Text("月度已用"); Spacer(); Text("\(monthly.sourceSymbol)\(amount(monthly.usedAmount))").monospacedDigit() }
-                            .font(.system(size: 10))
+                        monthlyRow(monthly)
                     }
                     Text("\(directSource ? "后台读取" : "界面读取")于 \(snapshot.observedAt.formatted(.dateTime.hour().minute()))；快照有效期 \(Int(max(120, refreshSeconds * 2))) 秒")
                         .font(.system(size: 9)).foregroundStyle(.secondary)
@@ -49,17 +50,68 @@ enum TokenHubDecimalFormatter {
             }.frame(maxWidth: .infinity, alignment: .leading)
         } label: { Label(directSource ? "Token Hub 企业额度" : "Token Hub 界面额度快照", systemImage: "window.ceiling") }
     }
+    private func monthlyRow(_ monthly: TokenHubMonthlyUsage) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text("月度").fontWeight(.medium)
+                Spacer(minLength: 0)
+                if let usedPercent = monthly.usedPercent {
+                    Text("已用 \(TwoDecimalPercentFormatter.string(usedPercent))")
+                        .fontWeight(.semibold).monospacedDigit()
+                } else {
+                    Text("已用").fontWeight(.semibold)
+                }
+            }
+            if let limit = monthly.limitAmount, let usedPercent = monthly.usedPercent {
+                let usedFraction = min(1, max(0, NSDecimalNumber(decimal: usedPercent / 100).doubleValue))
+                GeometryReader { geometry in
+                    Capsule().fill(PanelPalette.blue.opacity(0.12))
+                    Capsule().fill(PanelPalette.blue)
+                        .frame(width: geometry.size.width * usedFraction)
+                }
+                .frame(height: 5)
+                HStack {
+                    Text("\(monthly.sourceSymbol)\(amount(monthly.usedAmount)) / \(monthly.sourceSymbol)\(amount(limit))")
+                        .monospacedDigit()
+                    Spacer(minLength: 0)
+                    if let remaining = monthly.remainingAmount {
+                        Text("剩余 \(monthly.sourceSymbol)\(amount(remaining))")
+                            .foregroundStyle(.secondary).monospacedDigit()
+                    }
+                }
+            } else {
+                Text("已用 \(monthly.sourceSymbol)\(amount(monthly.usedAmount)) · 后台未提供月度总额，剩余与进度未知")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.system(size: 10))
+    }
+    private func unknownWindowRow(_ title: String) -> some View {
+        HStack {
+            Text(title).fontWeight(.medium)
+            Spacer(minLength: 0)
+            Text("未知").foregroundStyle(.secondary)
+        }
+        .font(.system(size: 10))
+    }
     private func row(_ title: String, _ usedPercent: Decimal, _ used: Decimal, _ limit: Decimal, _ symbol: String, _ reset: String) -> some View {
         let remainingPercent = Decimal(100) - usedPercent
+        let usedFraction = min(1, max(0, NSDecimalNumber(decimal: usedPercent / 100).doubleValue))
         return VStack(alignment: .leading, spacing: 3) {
             HStack {
                 Text(title).fontWeight(.medium)
                 Spacer(minLength: 0)
-            Text("剩余 \(TokenHubDecimalFormatter.string(remainingPercent))%")
+            Text("剩余 \(TwoDecimalPercentFormatter.string(remainingPercent))")
                 .fontWeight(.semibold).monospacedDigit()
             }
+            GeometryReader { geometry in
+                Capsule().fill(PanelPalette.blue.opacity(0.12))
+                Capsule().fill(PanelPalette.blue)
+                    .frame(width: geometry.size.width * usedFraction)
+            }
+            .frame(height: 5)
             HStack {
-                Text("\(directSource ? "后台已用" : "界面已用") \(TokenHubDecimalFormatter.string(usedPercent))% · \(symbol)\(amount(used)) / \(symbol)\(amount(limit))")
+                Text("\(directSource ? "后台已用" : "界面已用") \(TwoDecimalPercentFormatter.string(usedPercent)) · \(symbol)\(amount(used)) / \(symbol)\(amount(limit))")
                     .monospacedDigit()
                 Spacer(minLength: 0)
                 Text(Self.resetLabel(reset)).foregroundStyle(.secondary)

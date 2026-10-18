@@ -236,7 +236,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
         XCTAssertTrue(local.menuTooltip.contains("5 小时额度：本地"))
         XCTAssertTrue(local.menuTooltip.contains("7 天额度：本地"))
         XCTAssertFalse(local.menuTooltip.contains("当前企业"))
-        XCTAssertTrue(local.menuTooltip.contains("99.0%"), "local tooltip retains the original percentage")
+        XCTAssertTrue(local.menuTooltip.contains("99.00%"), "local tooltip renders two decimal places")
         XCTAssertTrue(local.menuTooltip.contains("重置"), "local tooltip includes the reset time when present")
 
         for (window, percent) in [(300, 77.0), (10080, 78.0)] {
@@ -293,7 +293,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
         enterprise.fiveHourQuota = currentEnterprise.fiveHour
         enterprise.sevenDayQuota = currentEnterprise.sevenDay
         XCTAssertTrue(enterprise.menuTooltip.contains("企业"), "proxy tooltip identifies its quota source")
-        XCTAssertTrue(enterprise.menuTooltip.contains("96.0%"), "proxy tooltip retains the original percentage")
+        XCTAssertTrue(enterprise.menuTooltip.contains("96.00%"), "proxy tooltip renders two decimal places")
         XCTAssertTrue(enterprise.menuTooltip.contains("重置"), "proxy tooltip includes the reset time")
         XCTAssertEqual(enterprise.quotaSource, .enterprise)
         let enterpriseCard = WindowQuotaCard.presentation(for: try XCTUnwrap(currentEnterprise.fiveHour), at: now,

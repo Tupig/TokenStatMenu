@@ -341,7 +341,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         harness.complete(1)
         await settle(model, status: .connected)
         model.tick()
-        XCTAssertTrue(model.title.contains("Hub 5h剩 70% / 7d剩 60%"))
+        XCTAssertTrue(model.title.contains("Hub 5h剩 70.00% / 7d剩 60.00%"))
         XCTAssertTrue(displayedTooltip.contains("5 小时）"))
         let beforeBoundary = tooltipBuilds
         clock.now = observedAt.addingTimeInterval(120)
@@ -1040,8 +1040,8 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let (model, scanner, _) = configuredModel(result(now: now), clock: HubManualClock(now))
         defer { model.shutdown() }
         await refresh(model, scanner: scanner)
-        XCTAssertTrue(model.title.contains("5h剩 62.5%"), "the actual menu title must retain a fractional remaining percent")
-        XCTAssertTrue(model.menuTooltip.contains("界面显示剩余 62.5%"), "the actual tooltip must retain a fractional remaining percent")
+        XCTAssertTrue(model.title.contains("5h剩 62.50%"), "the actual menu title must retain a two-decimal remaining percent")
+        XCTAssertTrue(model.menuTooltip.contains("界面显示剩余 62.50%"), "the actual tooltip must retain a two-decimal remaining percent")
 
         let snapshot = try! XCTUnwrap(model.tokenHubQuotaSnapshot)
         XCTAssertEqual(TokenHubDecimalFormatter.string(snapshot.fiveHour!.usedAmount), "3.75",
@@ -1430,5 +1430,125 @@ extension TokenHubQuotaStateTests {
         XCTAssertEqual(resources.axScanInFlightCount, 0)
         let requestsAfterShutdown = await harness.requests
         XCTAssertEqual(requestsAfterShutdown, 1)
+    }
+
+    func testDirectAlertThresholdsUseFullPrecisionAndTwoDecimalDisplay() async {
+        let identity = TokenHubIdentity(pid: 990, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic Threshold Hub.app/Contents/MacOS/Hub")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        func color(for usedPercent: Decimal) async -> NSColor {
+            let snapshot = TokenHubQuotaSnapshot(identity: identity,
+                fiveHour: TokenHubWindowQuota(kind: .fiveHour, usedAmount: usedPercent,
+                    limitAmount: 100, sourceSymbol: "$", usedPercent: usedPercent,
+                    resetDisplay: "synthetic reset", resetAt: now.addingTimeInterval(3600)),
+                sevenDay: nil, monthly: nil, observedAt: now)
+            let direct = TokenHubDirectQuotaDependencies(discoverTarget: { identity },
+                identityIsCurrent: { $0 == identity }, fetch: { _, _ in snapshot })
+            let model = AppModel(preview: true, directQuota: direct)
+            defer { model.shutdown() }
+            model.config.dataSource = "localCodex"
+            model.tokenHubAutomaticReadingEnabled = false
+            model.tokenHubNow = { now }
+            model.refreshTokenHubQuota()
+            for _ in 0..<100 where !model.tokenHubQuotaIsDirect {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertTrue(model.tokenHubQuotaIsDirect)
+            return model.alertColor
+        }
+
+        let belowYellow = await color(for: Decimal(string: "79.995")!)
+        let aboveYellow = await color(for: Decimal(string: "80.005")!)
+        let belowRed = await color(for: Decimal(string: "94.995")!)
+        let aboveRed = await color(for: Decimal(string: "95.005")!)
+        XCTAssertEqual(belowYellow, .labelColor)
+        XCTAssertEqual(aboveYellow, .systemYellow)
+        XCTAssertEqual(belowRed, .systemYellow)
+        XCTAssertEqual(aboveRed, .systemRed)
+        XCTAssertEqual(TwoDecimalPercentFormatter.string(Decimal(string: "37.5")!), "37.50%")
+    }
+
+    func testDirectMonthlyLimitAndMissingWindowFactsRemainIndependent() async {
+        let identity = TokenHubIdentity(pid: 991, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic Monthly Hub.app/Contents/MacOS/Hub")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let monthly = TokenHubMonthlyUsage(usedAmount: Decimal(string: "37.5")!, sourceSymbol: "$",
+            limitAmount: Decimal(string: "100")!)
+        let snapshot = TokenHubQuotaSnapshot(identity: identity,
+            fiveHour: nil,
+            sevenDay: TokenHubWindowQuota(kind: .sevenDay, usedAmount: 40, limitAmount: 100,
+                sourceSymbol: "$", usedPercent: 40, resetDisplay: "synthetic 7d reset",
+                resetAt: now.addingTimeInterval(3600)),
+            monthly: monthly, observedAt: now)
+        let direct = TokenHubDirectQuotaDependencies(discoverTarget: { identity },
+            identityIsCurrent: { $0 == identity }, fetch: { _, _ in snapshot })
+        let model = AppModel(preview: true, directQuota: direct)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        model.tokenHubAutomaticReadingEnabled = false
+        model.tokenHubNow = { now }
+        model.refreshTokenHubQuota()
+        for _ in 0..<100 where !model.tokenHubQuotaIsDirect {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        let current = try! XCTUnwrap(model.tokenHubQuotaSnapshot)
+        XCTAssertNil(current.fiveHour, "a missing five-hour window stays unknown")
+        XCTAssertEqual(current.sevenDay?.remainingPercent, 60)
+        XCTAssertEqual(current.monthly?.remainingAmount, Decimal(string: "62.5"))
+        XCTAssertEqual(current.monthly?.usedPercent, Decimal(string: "37.5"))
+        XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
+        XCTAssertTrue(model.title.contains("7d剩 60.00%"))
+
+        let card = TokenHubQuotaCard(snapshot: current, status: model.tokenHubQuotaStatusText,
+            enabled: true, refreshSeconds: 60, directSource: true)
+        let host = NSHostingView(rootView: card.frame(width: 420))
+        host.frame = NSRect(x: 0, y: 0, width: 420, height: 260)
+        host.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(host.fittingSize.height, 0)
+
+        let usedOnly = TokenHubMonthlyUsage(usedAmount: 12, sourceSymbol: "$", limitAmount: nil)
+        XCTAssertNil(usedOnly.remainingAmount)
+        XCTAssertNil(usedOnly.usedPercent)
+    }
+
+    func testFreshLocalActivityBuildsBoundedHistoryAndStopsWhenStale() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        model.panelVisible = true
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        var now = base
+        model.tokenHubNow = { now }
+        for index in 0..<1_300 {
+            now = base.addingTimeInterval(Double(index) * 0.5)
+            model.localSnapshot = LocalCodexSnapshot(input: 10, output: 20, total: 30,
+                sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: now,
+                fiveHour: nil, sevenDay: nil, knownThreadCount: 1, unknownThreadCount: 0,
+                liveTurn: LocalLiveTurnSummary(inputTPS: 4, outputTPS: 8, observedAt: now))
+            model.tick()
+        }
+        XCTAssertEqual(model.history.count, 1_200)
+        XCTAssertTrue(model.activityIsLive)
+        let retained = model.history.count
+        now = now.addingTimeInterval(16)
+        model.localSnapshot = LocalCodexSnapshot(input: 10, output: 20, total: 30,
+            sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: now,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 1, unknownThreadCount: 0,
+            liveTurn: LocalLiveTurnSummary(inputTPS: 4, outputTPS: 8, observedAt: now.addingTimeInterval(-16)))
+        model.tick()
+        XCTAssertFalse(model.activityIsLive)
+        XCTAssertEqual(model.history.count, retained, "stale estimates do not append synthetic zero points")
+    }
+
+    func testHeaderActionsShareSymmetricNeutralGeometry() {
+        XCTAssertEqual(HeaderActionMetrics.actionSize, 30)
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let host = NSHostingView(rootView: DashboardView(model: model))
+        host.frame = NSRect(x: 0, y: 0, width: 460, height: 700)
+        host.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(host.fittingSize.width, 0)
+        XCTAssertGreaterThan(host.fittingSize.height, 0)
     }
 }

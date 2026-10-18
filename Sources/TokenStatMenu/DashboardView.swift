@@ -88,12 +88,12 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             Spacer()
             Button { settings.toggle() } label: {
                 Image(systemName: settings ? "chart.bar.xaxis" : "slider.horizontal.3")
-                    .frame(width: 28, height: 28)
-            }.buttonStyle(.borderless).foregroundStyle(.secondary).help(settings ? "返回概览" : "偏好设置")
+                    .frame(width: HeaderActionMetrics.actionSize, height: HeaderActionMetrics.actionSize)
+            }.buttonStyle(NeutralHeaderActionButtonStyle()).help(settings ? "返回概览" : "偏好设置")
                 .accessibilityLabel(settings ? "返回概览" : "偏好设置")
             Button { NSApp.terminate(nil) } label: {
-                Image(systemName: "power").frame(width: 24, height: 28)
-            }.buttonStyle(.borderless).foregroundStyle(.secondary).help("退出 TokenStatMenu").accessibilityLabel("退出")
+                Image(systemName: "power").frame(width: HeaderActionMetrics.actionSize, height: HeaderActionMetrics.actionSize)
+            }.buttonStyle(NeutralHeaderActionButtonStyle()).help("退出 TokenStatMenu").accessibilityLabel("退出")
         }.padding(16)
     }
     private var localUsageCard: some View {
@@ -115,6 +115,11 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                     metric("实时观测时间", live.observedAt.formatted(date: .abbreviated, time: .shortened))
                 } else {
                     metric("实时估算 · 输出 tok/s", "未知")
+                }
+                if !model.history.isEmpty {
+                    SpeedHistorySparkline(points: model.history)
+                        .frame(height: 42)
+                        .accessibilityLabel("最近十分钟输出 token 每秒变化")
                 }
                 if let turn = model.localSnapshot.lastTurn {
                     metric("上轮记录均速", String(format: "%.1f tok/s", turn.outputTPS))
@@ -151,11 +156,11 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         guard let percent = state.usedPercent else { return state.statusLabel }
         let reset = state.resetsAt.map { " · \($0.formatted(date: .abbreviated, time: .shortened))重置" } ?? " · 重置时间未知"
         let recorded = state.recordedAt.map { " · 记录于 \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
-        return "\(state.sourceLabel) · \(state.statusLabel) · 上游已用 \(String(format: "%.1f", percent))%\(recorded)\(reset)"
+        return "\(state.sourceLabel) · \(state.statusLabel) · 上游已用 \(TwoDecimalPercentFormatter.string(percent))\(recorded)\(reset)"
     }
     private var footer: some View {
         HStack(spacing: 6) {
-            Circle().fill(model.stats.active > 0 ? Color.green : Color.secondary.opacity(0.5)).frame(width: 5, height: 5)
+            Circle().fill(model.activityIsLive ? Color.green : Color.secondary.opacity(0.5)).frame(width: 5, height: 5)
             Text(model.message.isEmpty ? model.sourceReadinessText : model.message)
                 .lineLimit(2).font(.system(size: 10)).foregroundStyle(.secondary)
             Spacer(minLength: 0)
@@ -189,5 +194,32 @@ private struct LocalHistoryDisclosure<Content: View>: View {
                 .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
         }
         .accessibilityHint("只显示本地历史记录，不代表企业当前剩余额度")
+    }
+}
+
+private struct SpeedHistorySparkline: View {
+    let points: [SpeedPoint]
+
+    var body: some View {
+        GeometryReader { proxy in
+            let values = points.map(\.value)
+            let maximum = max(values.max() ?? 1, 1)
+            let minimum = values.min() ?? 0
+            let span = max(maximum - minimum, 1)
+            Path { path in
+                for (index, point) in points.enumerated() {
+                    let x = points.count <= 1 ? 0 : proxy.size.width * CGFloat(index) / CGFloat(points.count - 1)
+                    let y = proxy.size.height * (1 - CGFloat((point.value - minimum) / span))
+                    if index == 0 { path.move(to: CGPoint(x: x, y: y)) }
+                    else { path.addLine(to: CGPoint(x: x, y: y)) }
+                }
+            }
+            .stroke(PanelPalette.blue, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+            .overlay(alignment: .topLeading) {
+                Text("近 10 分钟 · 输出 tok/s")
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityElement(children: .ignore)
     }
 }

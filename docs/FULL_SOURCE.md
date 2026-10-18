@@ -871,7 +871,12 @@ public enum LocalCodexUsageReader {
         let tailLimited = size > headLimit + tailLimit
         let wholeFileRead = size <= headLimit + tailLimit
         let headComplete = wholeFileRead || size <= headLimit || head.last == 10
-        let headLines = wholeFileRead ? completeLines(Data(bytes), startsAtFileStart: true, endsAtFileEnd: size <= bytes.count && bytes.last == 10) : completeLines(Data(head), startsAtFileStart: true, endsAtFileEnd: false)
+        // `endsAtFileEnd` means the bounded read reached EOF; it does not mean
+        // that EOF was terminated by a newline. A final non-empty segment is a
+        // candidate complete record when the bytes cover the whole file. The
+        // parser below decides whether malformed JSON makes it a continuity
+        // barrier.
+        let headLines = wholeFileRead ? completeLines(Data(bytes), startsAtFileStart: true, endsAtFileEnd: size <= bytes.count) : completeLines(Data(head), startsAtFileStart: true, endsAtFileEnd: false)
         let tailLines = !wholeFileRead && tailLength > 0 ? completeLines(Data(tail), startsAtFileStart: false, endsAtFileEnd: true) : []
         let headSlots = headLines.enumerated().map { parseLine($0.element, fallbackOrdinal: $0.offset) }
         let decodedHead = headSlots.compactMap { $0 }
@@ -881,10 +886,15 @@ public enum LocalCodexUsageReader {
         let decodedTail = tailSlots.compactMap { $0 }
         var decoded = tailLength > 0 ? decodedHead + decodedTail : decodedHead
         let continuousRead = wholeFileRead
-        let incompleteTail = bytes.last != 10
-            ? Data(bytes[(bytes.lastIndex(of: 10).map { bytes.index(after: $0) } ?? bytes.startIndex)...])
-            : Data()
-        let hasIncompleteTailFragment = !incompleteTail.isEmpty
+        let finalLineWithoutLF: Data.SubSequence? = bytes.last == 10 ? nil :
+            bytes[(bytes.lastIndex(of: 10).map { bytes.index(after: $0) } ?? bytes.startIndex)...]
+        // A no-final-LF line is complete when it parsed as a valid JSON event.
+        // Keep malformed fragments as continuity barriers so they cannot make
+        // a bounded history look complete.
+        let hasIncompleteTailFragment: Bool = {
+            guard let finalLineWithoutLF else { return false }
+            return parseLine(finalLineWithoutLF, fallbackOrdinal: -1) == nil
+        }()
         let identity: String?
         let firstPhysicalLine = completeLines(Data(bytes.prefix(headLength)), startsAtFileStart: true, endsAtFileEnd: size <= headLength).first
         if let first = firstPhysicalLine, !first.isEmpty, let object = try? JSONSerialization.jsonObject(with: Data(first)),
@@ -946,12 +956,13 @@ public enum LocalCodexUsageReader {
             return observedLineSegments[segmentIndex].dropFirst(lineIndex + 1).contains(where: { $0 == nil })
         }()
         let latestCounterInTail = !wholeFileRead && !mappedTailSlots.isEmpty && mappedTailSlots.contains(where: { $0?.hasCumulativePayload == true })
-        let forkHasCompleteLines = wholeFileRead && mappedHeadSlots.allSatisfy { $0 != nil } && incompleteTail.isEmpty
+        let forkHasCompleteLines = wholeFileRead && mappedHeadSlots.allSatisfy { $0 != nil } && !hasIncompleteTailFragment
         var contribution: Record? = nil
         if lineage == .root {
             if let lastToken, let usage = lastToken.usage,
-               !cumulativeTokenEvents.contains(where: \.invalidLifecycleTimestamp), !hasFutureCounter, !hasIncompleteTailFragment,
-               !hasBadLineAfterLatestCounter, (wholeFileRead || latestCounterInTail) { contribution = usage }
+               validCumulativeSequence(cumulativeTokenEvents, now: now), !hasFutureCounter,
+               !hasIncompleteTailFragment, !hasBadLineAfterLatestCounter,
+               (wholeFileRead || latestCounterInTail) { contribution = usage }
         } else if (lineage == .subagent || lineage == .fork), !hasHistoryBase, !hasFutureCounter, headComplete, !tailLimited,
                   continuousRead, forkHasCompleteLines, let delta = forkContribution(payload: payload, events: decoded) { contribution = delta }
         let rateEvents = tokenEvents.map { ($0.date, $0.quotaUpdate) }
@@ -1041,8 +1052,10 @@ public enum LocalCodexUsageReader {
         guard !data.isEmpty else { return [] }
         var lines = data.split(separator: 10, omittingEmptySubsequences: false)
         if !startsAtFileStart { lines.removeFirst() }
-        lines.removeLast()
-        _ = endsAtFileEnd
+        // A trailing LF creates an empty terminator; a nonempty final segment
+        // is complete only when this read reached EOF. For head chunks that do
+        // not reach EOF, retain only newline-terminated records.
+        if let last = lines.last, last.isEmpty || !endsAtFileEnd { lines.removeLast() }
         return lines
     }
 
@@ -1254,6 +1267,29 @@ public enum LocalCodexUsageReader {
     }
     private static func uint(_ value: Any?) -> UInt64? {
         guard let n = integer(value), let u = UInt64(exactly: n) else { return nil }; return u
+    }
+    /// Validate one physical root's cumulative evidence before publishing its
+    /// final counter. JSONL order is authoritative when timestamps are equal;
+    /// strict reversals, future/invalid lifecycle timestamps, counter resets,
+    /// and totals smaller than input+output make the whole thread unknown.
+    private static func validCumulativeSequence(_ events: [ParsedEvent], now: Date) -> Bool {
+        guard !events.isEmpty else { return false }
+        var previousDate: Date?
+        var previous: Record?
+        for event in events {
+            guard event.hasCumulativePayload, let usage = event.usage,
+                  !event.invalidLifecycleTimestamp, usage.date <= now else { return false }
+            if let previousDate, usage.date < previousDate { return false }
+            if let previous,
+               usage.input < previous.input || usage.output < previous.output || usage.total < previous.total {
+                return false
+            }
+            let (minimumTotal, overflow) = usage.input.addingReportingOverflow(usage.output)
+            guard !overflow, usage.total >= minimumTotal else { return false }
+            previousDate = usage.date
+            previous = usage
+        }
+        return true
     }
     private static func isMonotonic(_ values: [Int]) -> Bool { zip(values, values.dropFirst()).allSatisfy { $0 <= $1 } }
     private static func integer(_ value: Any?) -> Int? {
@@ -2046,19 +2082,35 @@ public struct TokenHubWindowQuota: Equatable, Sendable {
     public let usedPercent: Decimal
     public var remainingPercent: Decimal { Decimal(100) - usedPercent }
     public let resetDisplay: String
+    /// Source reset timestamp, when the direct endpoint supplied one. AX
+    /// display-only rows leave this nil rather than guessing a date.
+    public let resetAt: Date?
 
     public init(kind: TokenHubWindowKind, usedAmount: Decimal, limitAmount: Decimal,
-                sourceSymbol: String, usedPercent: Decimal, resetDisplay: String) {
+                sourceSymbol: String, usedPercent: Decimal, resetDisplay: String,
+                resetAt: Date? = nil) {
         self.kind = kind; self.usedAmount = usedAmount; self.limitAmount = limitAmount
         self.sourceSymbol = sourceSymbol; self.usedPercent = usedPercent; self.resetDisplay = resetDisplay
+        self.resetAt = resetAt
     }
 }
 
 public struct TokenHubMonthlyUsage: Equatable, Sendable {
     public let usedAmount: Decimal
     public let sourceSymbol: String
-    public init(usedAmount: Decimal, sourceSymbol: String) {
-        self.usedAmount = usedAmount; self.sourceSymbol = sourceSymbol
+    /// Monthly total is optional because some enterprise responses expose
+    /// usage without a quota. Derived values stay unknown in that case.
+    public let limitAmount: Decimal?
+    public var remainingAmount: Decimal? {
+        guard let limitAmount, limitAmount > 0, usedAmount >= 0, usedAmount <= limitAmount else { return nil }
+        return limitAmount - usedAmount
+    }
+    public var usedPercent: Decimal? {
+        guard let limitAmount, limitAmount > 0, usedAmount >= 0, usedAmount <= limitAmount else { return nil }
+        return (usedAmount / limitAmount) * Decimal(100)
+    }
+    public init(usedAmount: Decimal, sourceSymbol: String, limitAmount: Decimal? = nil) {
+        self.usedAmount = usedAmount; self.sourceSymbol = sourceSymbol; self.limitAmount = limitAmount
     }
 }
 
@@ -3165,7 +3217,11 @@ public enum TokenHubDirectQuotaDecoder {
             throw TokenHubDirectQuotaFailure.malformedResponse
         }
         let symbol = displaySymbol(currency)
-        let fallbackReset = date(dataObject["reset_at"] ?? object["reset_at"])
+        let fallbackResetRaw = dataObject["reset_at"] ?? object["reset_at"]
+        if let fallbackResetRaw, !(fallbackResetRaw is NSNull), date(fallbackResetRaw) == nil {
+            throw TokenHubDirectQuotaFailure.malformedResponse
+        }
+        let fallbackReset = date(fallbackResetRaw)
         var five: TokenHubWindowQuota?
         var seven: TokenHubWindowQuota?
         var monthly: TokenHubMonthlyUsage?
@@ -3176,12 +3232,16 @@ public enum TokenHubDirectQuotaDecoder {
                     guard let used = decimal(window["used_amount"]), used >= 0 else {
                         throw TokenHubDirectQuotaFailure.malformedResponse
                     }
+                    let monthlyLimit: Decimal?
                     if let rawLimit = window["quota_amount"], !(rawLimit is NSNull) {
                         guard let limit = decimal(rawLimit), limit > 0, used <= limit else {
                             throw TokenHubDirectQuotaFailure.malformedResponse
                         }
+                        monthlyLimit = limit
+                    } else {
+                        monthlyLimit = nil
                     }
-                    monthly = TokenHubMonthlyUsage(usedAmount: used, sourceSymbol: symbol)
+                    monthly = TokenHubMonthlyUsage(usedAmount: used, sourceSymbol: symbol, limitAmount: monthlyLimit)
                 }
                 continue
             }
@@ -3196,12 +3256,22 @@ public enum TokenHubDirectQuotaDecoder {
             guard percent >= 0, percent <= Decimal(100) else {
                 throw TokenHubDirectQuotaFailure.malformedResponse
             }
-            if let start = date(window["period_start"]), let end = date(window["period_end"]), end <= start {
+            let rawStart = window["period_start"]
+            let rawEnd = window["period_end"]
+            if let rawStart, !(rawStart is NSNull), date(rawStart) == nil {
                 throw TokenHubDirectQuotaFailure.malformedResponse
             }
-            let reset = (date(window["period_end"]) ?? fallbackReset).map { format($0, timeZone: timeZone) } ?? "未知"
+            if let rawEnd, !(rawEnd is NSNull), date(rawEnd) == nil {
+                throw TokenHubDirectQuotaFailure.malformedResponse
+            }
+            if let start = date(rawStart), let end = date(rawEnd), end <= start {
+                throw TokenHubDirectQuotaFailure.malformedResponse
+            }
+            let resetAt = date(rawEnd) ?? fallbackReset
+            let reset = resetAt.map { format($0, timeZone: timeZone) } ?? "未知"
             let quota = TokenHubWindowQuota(kind: kind, usedAmount: used, limitAmount: limit,
-                                             sourceSymbol: symbol, usedPercent: percent, resetDisplay: reset)
+                                             sourceSymbol: symbol, usedPercent: percent, resetDisplay: reset,
+                                             resetAt: resetAt)
             if kind == .fiveHour { five = quota } else { seven = quota }
         }
         guard five != nil || seven != nil || monthly != nil else { throw TokenHubDirectQuotaFailure.noRecognizedWindows }
@@ -3261,7 +3331,10 @@ public enum TokenHubDirectQuotaDecoder {
         switch currency.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
         case "USD", "$": return "$"
         case "CNY", "RMB", "¥": return "¥"
-        default: return currency.trimmingCharacters(in: .whitespacesAndNewlines)
+        case "EUR", "€": return "€"
+        case "GBP", "£": return "£"
+        case "JPY", "JP¥": return "¥"
+        default: return "¤"
         }
     }
 
@@ -3354,29 +3427,87 @@ struct AppModelStartupDependencies {
     }
 }
 
+/// The only direct-quota value allowed to cross the worker boundary.  It
+/// deliberately contains no process identity, URL, database path, session,
+/// bearer token, or response body.  The worker validates the target identity
+/// before and after the request and returns only these displayable facts.
+struct DirectQuotaTransportSnapshot: Sendable {
+    let fiveHour: TokenHubWindowQuota?
+    let sevenDay: TokenHubWindowQuota?
+    let monthly: TokenHubMonthlyUsage?
+    let observedAt: Date
+
+    func materializedSnapshot() -> TokenHubQuotaSnapshot {
+        // The model keeps the historical snapshot shape for compatibility with
+        // synthetic tests. Production never exposes the real PID or executable
+        // path; worker-side identity checks already completed this transaction.
+        // Keep the legacy snapshot shape for UI/tests, but never carry the
+        // worker's real PID or executable path across the actor boundary.
+        let sanitizedIdentity = TokenHubIdentity(pid: 0, bundleID: TokenHubTarget.bundleID,
+                                                  executablePath: "sanitized")
+        return TokenHubQuotaSnapshot(identity: sanitizedIdentity, fiveHour: fiveHour,
+                                     sevenDay: sevenDay, monthly: monthly,
+                                     observedAt: observedAt)
+    }
+
+    init(snapshot: TokenHubQuotaSnapshot) {
+        fiveHour = snapshot.fiveHour; sevenDay = snapshot.sevenDay
+        monthly = snapshot.monthly; observedAt = snapshot.observedAt
+    }
+}
+
+/// Owns process discovery, settings/SQLite reads and the authenticated direct
+/// fetch away from the main actor. No identity or credential leaves this actor.
+private actor TokenHubDirectQuotaWorker {
+    private let client = TokenHubDirectQuotaClient()
+
+    func fetch(now: Date) async throws -> DirectQuotaTransportSnapshot {
+        let applications = NSRunningApplication.runningApplications(withBundleIdentifier: TokenHubTarget.bundleID)
+            .filter { !$0.isTerminated }
+        guard !applications.isEmpty else { throw TokenHubQuotaFailure.noTarget }
+        guard applications.count == 1, let app = applications.first,
+              let executable = app.executableURL?.standardizedFileURL.path,
+              let bundle = app.bundleIdentifier else {
+            throw applications.count > 1 ? TokenHubQuotaFailure.multipleTargets : TokenHubQuotaFailure.identityChanged
+        }
+        let identity = TokenHubIdentity(pid: app.processIdentifier, bundleID: bundle, executablePath: executable)
+        let snapshot = try await client.fetch(identity: identity, now: now)
+        try Task.checkCancellation()
+        // TokenHubDirectQuotaClient revalidates its settings/database identity
+        // around the network exchange. Do not return the target identity.
+        return DirectQuotaTransportSnapshot(snapshot: snapshot)
+    }
+}
+
 /// Keep external process discovery and authenticated I/O outside lifecycle
 /// handling. Explicit injection also lets previews exercise the direct path
 /// using entirely synthetic identities and responses.
 struct TokenHubDirectQuotaDependencies {
-    let discoverTarget: @MainActor () throws -> TokenHubIdentity
-    let identityIsCurrent: @MainActor (TokenHubIdentity) -> Bool
-    let fetch: @MainActor (TokenHubIdentity, Date) async throws -> TokenHubQuotaSnapshot
+    let discoverTarget: () throws -> TokenHubIdentity
+    let identityIsCurrent: (TokenHubIdentity) -> Bool
+    let fetch: (TokenHubIdentity, Date) async throws -> TokenHubQuotaSnapshot
+    /// Production uses this worker closure. The three actor-isolated closures
+    /// remain as a compatibility seam for synthetic tests only.
+    let workerFetch: (@Sendable (Date) async throws -> DirectQuotaTransportSnapshot)?
+
+    init(discoverTarget: @escaping () throws -> TokenHubIdentity,
+         identityIsCurrent: @escaping (TokenHubIdentity) -> Bool,
+         fetch: @escaping (TokenHubIdentity, Date) async throws -> TokenHubQuotaSnapshot,
+         workerFetch: (@Sendable (Date) async throws -> DirectQuotaTransportSnapshot)? = nil) {
+        self.discoverTarget = discoverTarget
+        self.identityIsCurrent = identityIsCurrent
+        self.fetch = fetch
+        self.workerFetch = workerFetch
+    }
 
     static var production: TokenHubDirectQuotaDependencies {
-        let discover: @MainActor () throws -> TokenHubIdentity = {
-            let applications = NSRunningApplication.runningApplications(withBundleIdentifier: TokenHubTarget.bundleID)
-                .filter { !$0.isTerminated }
-            guard !applications.isEmpty else { throw TokenHubQuotaFailure.noTarget }
-            guard applications.count == 1 else { throw TokenHubQuotaFailure.multipleTargets }
-            guard let app = applications.first,
-                  let executable = app.executableURL?.standardizedFileURL.path,
-                  let bundle = app.bundleIdentifier else { throw TokenHubQuotaFailure.identityChanged }
-            return TokenHubIdentity(pid: app.processIdentifier, bundleID: bundle, executablePath: executable)
-        }
-        let client = TokenHubDirectQuotaClient()
-        return TokenHubDirectQuotaDependencies(discoverTarget: discover,
-            identityIsCurrent: { (try? discover()) == $0 },
-            fetch: { try await client.fetch(identity: $0, now: $1) })
+        let worker = TokenHubDirectQuotaWorker()
+        // These compatibility closures are intentionally inert in production;
+        // all discovery/settings/network work is owned by the actor above.
+        return TokenHubDirectQuotaDependencies(discoverTarget: { throw TokenHubQuotaFailure.noTarget },
+            identityIsCurrent: { _ in false },
+            fetch: { _, _ in throw TokenHubDirectQuotaFailure.transportFailed },
+            workerFetch: { now in try await worker.fetch(now: now) })
     }
 }
 
@@ -3403,19 +3534,54 @@ actor LocalCodexScanWorker {
                                                        cache: cache, routeContext: routeContext)
         return Result(snapshot: snapshot, diagnostics: cache.diagnostics)
     }
+
+    /// Production discovery stays inside the same worker as file scanning so
+    /// session paths and route origins never cross back through the main actor.
+    func scanDefault(now: Date, generation: Int) throws -> Result {
+        let directory = LocalCodexUsageReader.defaultSessionsDirectory()
+        let routeContext = AppModel.seasunRouteContext()
+        return try scan(directory: directory, now: now, generation: generation, routeContext: routeContext)
+    }
 }
 
 /// Resolve the same permitted inputs on the main actor, then run bounded file
 /// I/O in the cache owner. Injection replaces external I/O in lifecycle checks.
 struct LocalCodexScanDependencies {
-    let resolveInputs: @MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext)
-    let scan: @Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result
+    struct Inputs: Sendable {
+        let directory: URL
+        let routeContext: LocalCodexRouteContext
+    }
+    /// Legacy injected seams are optional so production can expose only the
+    /// worker-owned `scanDefault` path. Keeping these seams available for
+    /// synthetic tests does not make a real sessions URL cross the actor
+    /// boundary in the production configuration.
+    let resolveInputs: (@MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext))?
+    let scan: (@Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result)?
+    let scanDefault: (@Sendable (Date, Int) async throws -> LocalCodexScanWorker.Result)?
+
+    init(resolveInputs: @escaping @MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext),
+         scan: @escaping @Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result,
+         scanDefault: (@Sendable (Date, Int) async throws -> LocalCodexScanWorker.Result)? = nil) {
+        self.resolveInputs = resolveInputs
+        self.scan = scan
+        self.scanDefault = scanDefault
+    }
+
+    private init(resolveInputs: (@MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext))?,
+                 scan: (@Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result)?,
+                 scanDefault: (@Sendable (Date, Int) async throws -> LocalCodexScanWorker.Result)?) {
+        self.resolveInputs = resolveInputs
+        self.scan = scan
+        self.scanDefault = scanDefault
+    }
 
     @MainActor static var production: LocalCodexScanDependencies {
         let worker = LocalCodexScanWorker()
-        return LocalCodexScanDependencies(resolveInputs: {
-            (LocalCodexUsageReader.defaultSessionsDirectory(), AppModel.seasunRouteContext())
-        }, scan: { try await worker.scan(directory: $0, now: $1, generation: $2, routeContext: $3) })
+        // Do not retain a production closure that resolves the real sessions
+        // URL on the main actor. Discovery and route reading remain inside the
+        // same worker that owns the cache and performs the bounded file scan.
+        return LocalCodexScanDependencies(resolveInputs: nil, scan: nil,
+            scanDefault: { now, generation in try await worker.scanDefault(now: now, generation: generation) })
     }
 }
 
@@ -3425,6 +3591,13 @@ struct BackgroundServiceResources: Equatable, Encodable {
     let localScanQueuedCount: Int
     let axRefreshScheduledCount: Int
     let axScanInFlightCount: Int
+}
+
+/// A model-captured time used by one refresh request. Capturing this before a
+/// delayed work item is enqueued keeps local/direct workers from consulting
+/// independent wall clocks after the scheduling delay.
+private struct RefreshObservationContext: Sendable, Equatable {
+    let observationNow: Date
 }
 
 /// Clock-derived presentation changes are distinct from new measurements.
@@ -3457,7 +3630,13 @@ struct PresentationTimeState: Equatable {
         didSet { capturePresentationTimeBaseline() }
     }
     @Published var config = AppConfiguration() {
-        didSet { capturePresentationTimeBaseline() }
+        didSet {
+            if oldValue.dataSource != config.dataSource {
+                history.removeAll(keepingCapacity: true)
+                lastHistorySampleAt = .distantPast
+            }
+            capturePresentationTimeBaseline()
+        }
     }
     @Published var stats = MetricsSnapshot()
     @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0) {
@@ -3510,7 +3689,11 @@ struct PresentationTimeState: Equatable {
     private var tokenHubGeneration: UInt64 = 0
     private var tokenHubAXGeneration: UInt64 = 0
     private var lastPresentationTimeState: PresentationTimeState?
+    private var lastHistorySampleAt = Date.distantPast
     var onTick: (() -> Void)?
+
+    private static let historyDuration: TimeInterval = 10 * 60
+    private static let historyCapacity = 1_200
 
     var isSeasunOnly: Bool { true }
     var tokenHubQuotaReadingEnabled: Bool { usesDirectQuotaSource || tokenHubAutomaticReadingEnabled }
@@ -3524,6 +3707,9 @@ struct PresentationTimeState: Equatable {
         return "Seasun Token Hub 企业后台直接来源：尚未连接；额度、重置时间、月度用量和实时速度均未知。"
     }
     var sourceStatus: String { "unknown" }
+    var activityIsLive: Bool {
+        config.dataSource == "localCodex" ? freshLocalLiveTurn != nil : stats.active > 0
+    }
     var backgroundServiceResources: BackgroundServiceResources {
         BackgroundServiceResources(timerCount: timer == nil ? 0 : 1,
             workspaceObserverCount: tokenHubWorkspaceObservers.count,
@@ -3586,12 +3772,26 @@ struct PresentationTimeState: Equatable {
             publishedTransition = true
         }
         if backgroundServicesStarted { pollTokenHubPermissionIfDue() }
+        updateLocalHistory(at: now)
         let timeState = presentationTimeState
         if let previous = lastPresentationTimeState, previous != timeState, !publishedTransition {
             objectWillChange.send()
         }
         lastPresentationTimeState = timeState
         onTick?()
+    }
+
+    /// Keep one bounded point per half-second for ten minutes. Only fresh local
+    /// estimates enter this series; stale or unknown values create no fake
+    /// zero-speed samples and mode switches cannot leak proxy observations.
+    private func updateLocalHistory(at now: Date) {
+        guard panelVisible, config.dataSource == "localCodex", let live = freshLocalLiveTurn,
+              now.timeIntervalSince(lastHistorySampleAt) >= 0.5 else { return }
+        lastHistorySampleAt = now
+        let point = SpeedPoint(date: now, value: live.outputTPS)
+        let cutoff = now.addingTimeInterval(-Self.historyDuration)
+        history = (history + [point]).filter { $0.date >= cutoff }
+        if history.count > Self.historyCapacity { history.removeFirst(history.count - Self.historyCapacity) }
     }
     var freshQuota: QuotaSnapshot? {
         let now = tokenHubNow()
@@ -3684,8 +3884,8 @@ struct PresentationTimeState: Equatable {
     }
     private var tokenHubMenuSuffix: String {
         guard let snapshot = freshTokenHubQuota(at: tokenHubNow()) else { return "" }
-        let windows = [snapshot.fiveHour.map { "5h剩 \(percentText($0.remainingPercent))%" },
-                       snapshot.sevenDay.map { "7d剩 \(percentText($0.remainingPercent))%" }].compactMap { $0 }
+        let windows = [snapshot.fiveHour.map { "5h剩 \(percentText($0.remainingPercent))" },
+                       snapshot.sevenDay.map { "7d剩 \(percentText($0.remainingPercent))" }].compactMap { $0 }
         return windows.isEmpty ? "" : " · Hub \(windows.joined(separator: " / "))"
     }
     var menuTitleContainsTokenHubSuffix: Bool { !tokenHubMenuSuffix.isEmpty }
@@ -3693,15 +3893,15 @@ struct PresentationTimeState: Equatable {
     var tokenHubPermissionRequiredForDiagnostics: Bool { tokenHubQuotaStatus == .permissionRequired }
     private var tokenHubTooltipDetail: String {
         let snapshot = freshTokenHubQuota(at: tokenHubNow())
-        let five = snapshot?.fiveHour.map { "界面显示剩余 \(percentText($0.remainingPercent))%（5 小时）" } ?? "5 小时未知"
-        let seven = snapshot?.sevenDay.map { "界面显示剩余 \(percentText($0.remainingPercent))%（7 天）" } ?? "7 天未知"
+        let five = snapshot?.fiveHour.map { "界面显示剩余 \(percentText($0.remainingPercent))（5 小时）" } ?? "5 小时未知"
+        let seven = snapshot?.sevenDay.map { "界面显示剩余 \(percentText($0.remainingPercent))（7 天）" } ?? "7 天未知"
         let source = tokenHubQuotaIsDirect ? "Token Hub 后台直接响应" : "Token Hub 界面快照"
         let timing = tokenHubQuotaIsDirect ? "后台响应已提供" : "后台更新时间未提供"
         let currency = tokenHubQuotaIsDirect ? "币种来自后台响应" : "币种未核验"
         return "\(source)：\(five) · \(seven)；\(tokenHubQuotaStatusText)；\(timing)；\(currency)"
     }
     private func percentText(_ value: Decimal) -> String {
-        TokenHubDecimalFormatter.string(value)
+        TwoDecimalPercentFormatter.string(value)
     }
     var tokenHubQuotaStatusText: String {
         if tokenHubQuotaIsDirect, tokenHubQuotaStatus == .connected { return "企业后台已直接读取" }
@@ -3742,11 +3942,18 @@ struct PresentationTimeState: Equatable {
         let resetLabel = source == .localCodex || !presentation.isFresh ? "原重置时间" : "重置时间"
         let reset = presentation.resetsAt.map { "，\(resetLabel) \($0.formatted())" } ?? "，重置时间未知"
         let recorded = presentation.recordedAt.map { "，记录于 \($0.formatted())" } ?? ""
-        return "\(presentation.sourceLabel) · \(presentation.statusLabel)，上游已用 \(String(format: "%.1f", usedPercent))%\(reset)\(recorded)"
+        return "\(presentation.sourceLabel) · \(presentation.statusLabel)，上游已用 \(TwoDecimalPercentFormatter.string(usedPercent))\(reset)\(recorded)"
     }
     private func formatCount(_ value: Int) -> String { value.formatted(.number) }
     private func formatCompactCount(_ value: Int) -> String { value.formatted(.number.notation(.compactName)) }
     var alertColor: NSColor {
+        if tokenHubQuotaIsDirect, let snapshot = freshTokenHubQuota(at: tokenHubNow()) {
+            let windows = [snapshot.fiveHour?.usedPercent, snapshot.sevenDay?.usedPercent].compactMap { $0 }
+            guard let used = windows.max() else { return .labelColor }
+            if used >= Decimal(string: "95")! { return .systemRed }
+            if used >= Decimal(string: "80")! { return .systemYellow }
+            return .labelColor
+        }
         guard quotaSource == .enterprise else { return .labelColor }
         let windows = (quotaSource == .enterprise ? [fiveHourQuota, sevenDayQuota].compactMap { $0 } : [])
             .filter { $0.isFresh(at: tokenHubNow(), refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
@@ -3812,6 +4019,8 @@ struct PresentationTimeState: Equatable {
         guard !isPreview, !isShuttingDown, backgroundServicesStarted else { return }
         stopBackgroundResources()
         generation += 1; tokenHubGeneration &+= 1
+        history.removeAll(keepingCapacity: true)
+        lastHistorySampleAt = .distantPast
         tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
         tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
         tokenHubDirectFailure = nil; tokenHubQuotaIsDirect = false; tokenHubDirectScanInFlight = false
@@ -3824,8 +4033,9 @@ struct PresentationTimeState: Equatable {
             knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0,
             subagentCount: 0, forkCount: 0)
         resetQuotaState()
-        scheduleLocalScan(immediate: true)
-        if tokenHubQuotaReadingEnabled { scheduleTokenHubRefresh(after: 0) }
+        let observationNow = tokenHubNow()
+        scheduleLocalScan(immediate: true, observationNow: observationNow)
+        if tokenHubQuotaReadingEnabled { scheduleTokenHubRefresh(after: 0, observationNow: observationNow) }
         installTokenHubWorkspaceObservers()
         timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
         timer?.tolerance = 0.1
@@ -3857,8 +4067,9 @@ struct PresentationTimeState: Equatable {
         quotaLoading = false
         quotaError = "Token Hub 界面快照数据未知"
     }
-    private func scheduleLocalScan(immediate: Bool = false) {
+    private func scheduleLocalScan(immediate: Bool = false, observationNow scheduledObservationNow: Date? = nil) {
         guard backgroundServicesStarted else { return }
+        let context = RefreshObservationContext(observationNow: scheduledObservationNow ?? tokenHubNow())
         localScan?.cancel()
         let version = generation
         let work = DispatchWorkItem { [weak self] in
@@ -3871,8 +4082,22 @@ struct PresentationTimeState: Equatable {
                     self.scheduleLocalScan(immediate: false); return
                 }
                 self.localScanRunning = true
-                let inputs = self.localScanning.resolveInputs()
-                let result = try? await self.localScanning.scan(inputs.directory, Date(), version, inputs.routeContext)
+                let observationNow = context.observationNow
+                // Production discovers the path and route inside the scan
+                // worker. Injected legacy seams remain available for tests.
+                let result: LocalCodexScanWorker.Result?
+                if let scanDefault = self.localScanning.scanDefault {
+                    result = try? await scanDefault(observationNow, version)
+                } else {
+                    if let resolveInputs = self.localScanning.resolveInputs,
+                       let scan = self.localScanning.scan {
+                        let inputs = resolveInputs()
+                        result = try? await scan(inputs.directory, observationNow,
+                                                version, inputs.routeContext)
+                    } else {
+                        result = nil
+                    }
+                }
                 self.localScanRunning = false
                 guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
                     if self.config.dataSource == "localCodex", self.backgroundServicesStarted, !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
@@ -3897,7 +4122,7 @@ struct PresentationTimeState: Equatable {
     /// Associates the current Codex provider with this local Token Hub's
     /// configured origin. Historical rollout routes are not independently
     /// verifiable from the current provider name and configuration alone.
-    fileprivate static func seasunRouteContext() -> LocalCodexRouteContext {
+    nonisolated fileprivate static func seasunRouteContext() -> LocalCodexRouteContext {
         let configURL = LocalCodexUsageReader.defaultConfigURL()
         guard let active = GatewayDiscovery.activeCodexProvider(at: configURL),
               let connectionURLs = try? TokenHubConnectionDiscovery.readDefaultConnectionBaseURLs(),
@@ -3910,7 +4135,7 @@ struct PresentationTimeState: Equatable {
     /// Production refresh first uses Token Hub's own read-only connection and
     /// in-memory SSO exchange. Preview and synthetic tests retain the
     /// bounded AX scanner path without touching real local credentials.
-    func refreshTokenHubQuota() {
+    func refreshTokenHubQuota(observationNow: Date? = nil) {
         guard !isShuttingDown else { return }
         guard config.dataSource == "localCodex", tokenHubQuotaReadingEnabled else {
             invalidateTokenHubQuota(status: .disabled); tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
@@ -3922,6 +4147,38 @@ struct PresentationTimeState: Equatable {
         }
         if tokenHubAutomaticReadingEnabled { checkTokenHubPermissionIfDue(scheduleIfGranted: false) }
         guard !tokenHubDirectScanInFlight else { return }
+
+        let version = tokenHubGeneration
+        let now = observationNow ?? tokenHubNow()
+        let source = directQuota
+        let interval = config.refreshSeconds
+        // Production resolves the target, reads settings and performs the
+        // direct request inside its worker actor. Only the sanitized DTO
+        // returns to this main-actor model.
+        if let workerFetch = source.workerFetch {
+            tokenHubDirectScanInFlight = true
+            Task { [weak self] in
+                let result: Result<DirectQuotaTransportSnapshot, Error>
+                do { result = .success(try await workerFetch(now)) }
+                catch { result = .failure(error) }
+                guard let self else { return }
+                guard !self.isShuttingDown, self.tokenHubGeneration == version else { return }
+                self.tokenHubDirectScanInFlight = false
+                guard self.config.dataSource == "localCodex", self.tokenHubQuotaReadingEnabled else { return }
+                switch result {
+                case .success(let transport):
+                    self.tokenHubQuotaSnapshot = transport.materializedSnapshot()
+                    self.tokenHubStatusConnected(interval: interval)
+                case .failure(let error):
+                    self.tokenHubStatusFailed(error, interval: interval)
+                }
+            }
+            return
+        }
+
+        // Compatibility path for injected synthetic tests. Production never
+        // reaches this branch, so its discovery and settings reads stay off
+        // the main actor.
         let identity: TokenHubIdentity
         do { identity = try directQuota.discoverTarget() }
         catch {
@@ -3933,10 +4190,6 @@ struct PresentationTimeState: Equatable {
             scheduleTokenHubRefresh(after: config.refreshSeconds)
             return
         }
-        let version = tokenHubGeneration
-        let now = tokenHubNow()
-        let source = directQuota
-        let interval = config.refreshSeconds
         tokenHubDirectScanInFlight = true
         Task { [weak self] in
             let result: Result<TokenHubQuotaSnapshot, Error>
@@ -3961,28 +4214,50 @@ struct PresentationTimeState: Equatable {
                     return
                 }
                 self.tokenHubQuotaSnapshot = snapshot
-                self.tokenHubQuotaStatus = .connected
-                self.tokenHubQuotaFailure = nil
-                self.tokenHubDirectFailure = nil
-                self.tokenHubQuotaIsDirect = true
-                self.sourceReadinessText = "企业额度已自动读取 Token Hub 后台"
-                self.scheduleTokenHubRefresh(after: interval)
+                self.tokenHubStatusConnected(interval: interval)
             case .failure(let error):
-                let failure = (error as? TokenHubDirectQuotaFailure) ?? .transportFailed
-                self.tokenHubQuotaSnapshot = nil
-                self.tokenHubQuotaIsDirect = false
-                self.tokenHubDirectFailure = failure
-                self.tokenHubQuotaStatus = .accessFailed
-                self.tokenHubQuotaFailure = nil
-                self.sourceReadinessText = "企业后台直接来源：\(self.directFailureText(failure))"
-                // AX is an optional compatibility fallback only when the user
-                // has already granted trust; it never gates direct reading.
-                if self.tokenHubAutomaticReadingEnabled, self.cachedTokenHubPermission, !self.isFixtureUsingNativeTokenHubReader {
-                    self.refreshTokenHubQuotaUsingAccessibility()
-                } else {
-                    self.scheduleTokenHubRefresh(after: interval)
-                }
+                self.tokenHubStatusFailed(error, interval: interval)
             }
+        }
+    }
+
+    private func tokenHubStatusConnected(interval: TimeInterval) {
+        tokenHubQuotaStatus = .connected
+        tokenHubQuotaFailure = nil
+        tokenHubDirectFailure = nil
+        tokenHubQuotaIsDirect = true
+        sourceReadinessText = "企业额度已自动读取 Token Hub 后台"
+        scheduleTokenHubRefresh(after: interval)
+    }
+
+    private func tokenHubStatusFailed(_ error: Error, interval: TimeInterval) {
+        let failure = (error as? TokenHubDirectQuotaFailure) ?? .transportFailed
+        tokenHubQuotaSnapshot = nil
+        tokenHubQuotaIsDirect = false
+        tokenHubDirectFailure = failure
+        if let targetFailure = error as? TokenHubQuotaFailure, targetFailure == .noTarget {
+            tokenHubDirectFailure = nil
+            tokenHubQuotaStatus = .targetNotRunning
+            sourceReadinessText = "Token Hub 未运行"
+            scheduleTokenHubRefresh(after: interval)
+            return
+        }
+        if let targetFailure = error as? TokenHubQuotaFailure, targetFailure == .multipleTargets {
+            tokenHubDirectFailure = nil
+            tokenHubQuotaStatus = .ambiguousTarget
+            sourceReadinessText = "检测到多个 Token Hub 进程"
+            scheduleTokenHubRefresh(after: interval)
+            return
+        }
+        tokenHubQuotaStatus = .accessFailed
+        tokenHubQuotaFailure = nil
+        sourceReadinessText = "企业后台直接来源：\(directFailureText(failure))"
+        // AX is an optional compatibility fallback only when the user has
+        // already granted trust; it never gates direct reading.
+        if tokenHubAutomaticReadingEnabled, cachedTokenHubPermission, !isFixtureUsingNativeTokenHubReader {
+            refreshTokenHubQuotaUsingAccessibility()
+        } else {
+            scheduleTokenHubRefresh(after: interval)
         }
     }
 
@@ -4024,7 +4299,7 @@ struct PresentationTimeState: Equatable {
                 }
                 return
             }
-            self.applyTokenHubQuotaResult(result, generation: version, mode: mode, now: self.tokenHubNow())
+            self.applyTokenHubQuotaResult(result, generation: version, mode: mode, now: now)
             self.scheduleTokenHubRefresh(after: self.config.refreshSeconds)
         }
     }
@@ -4132,16 +4407,17 @@ struct PresentationTimeState: Equatable {
         checkTokenHubPermissionIfDue()
     }
 
-    private func scheduleTokenHubRefresh(after seconds: TimeInterval) {
+    private func scheduleTokenHubRefresh(after seconds: TimeInterval, observationNow scheduledObservationNow: Date? = nil) {
         guard (backgroundServicesStarted || isPreview), config.dataSource == "localCodex", tokenHubQuotaReadingEnabled,
               !isShuttingDown, (usesDirectQuotaSource || !tokenHubScanInFlight), !isFixtureUsingNativeTokenHubReader else { return }
+        let context = RefreshObservationContext(observationNow: scheduledObservationNow ?? tokenHubNow())
         tokenHubRefreshWork?.cancel()
         let version = tokenHubGeneration
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor in
                 guard let self, !self.isShuttingDown, self.tokenHubGeneration == version,
                       self.config.dataSource == "localCodex", self.tokenHubQuotaReadingEnabled else { return }
-                self.refreshTokenHubQuota()
+                self.refreshTokenHubQuota(observationNow: context.observationNow)
             }
         }
         tokenHubRefreshWork = work
@@ -4297,12 +4573,12 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             Spacer()
             Button { settings.toggle() } label: {
                 Image(systemName: settings ? "chart.bar.xaxis" : "slider.horizontal.3")
-                    .frame(width: 28, height: 28)
-            }.buttonStyle(.borderless).foregroundStyle(.secondary).help(settings ? "返回概览" : "偏好设置")
+                    .frame(width: HeaderActionMetrics.actionSize, height: HeaderActionMetrics.actionSize)
+            }.buttonStyle(NeutralHeaderActionButtonStyle()).help(settings ? "返回概览" : "偏好设置")
                 .accessibilityLabel(settings ? "返回概览" : "偏好设置")
             Button { NSApp.terminate(nil) } label: {
-                Image(systemName: "power").frame(width: 24, height: 28)
-            }.buttonStyle(.borderless).foregroundStyle(.secondary).help("退出 TokenStatMenu").accessibilityLabel("退出")
+                Image(systemName: "power").frame(width: HeaderActionMetrics.actionSize, height: HeaderActionMetrics.actionSize)
+            }.buttonStyle(NeutralHeaderActionButtonStyle()).help("退出 TokenStatMenu").accessibilityLabel("退出")
         }.padding(16)
     }
     private var localUsageCard: some View {
@@ -4324,6 +4600,11 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                     metric("实时观测时间", live.observedAt.formatted(date: .abbreviated, time: .shortened))
                 } else {
                     metric("实时估算 · 输出 tok/s", "未知")
+                }
+                if !model.history.isEmpty {
+                    SpeedHistorySparkline(points: model.history)
+                        .frame(height: 42)
+                        .accessibilityLabel("最近十分钟输出 token 每秒变化")
                 }
                 if let turn = model.localSnapshot.lastTurn {
                     metric("上轮记录均速", String(format: "%.1f tok/s", turn.outputTPS))
@@ -4360,11 +4641,11 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         guard let percent = state.usedPercent else { return state.statusLabel }
         let reset = state.resetsAt.map { " · \($0.formatted(date: .abbreviated, time: .shortened))重置" } ?? " · 重置时间未知"
         let recorded = state.recordedAt.map { " · 记录于 \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
-        return "\(state.sourceLabel) · \(state.statusLabel) · 上游已用 \(String(format: "%.1f", percent))%\(recorded)\(reset)"
+        return "\(state.sourceLabel) · \(state.statusLabel) · 上游已用 \(TwoDecimalPercentFormatter.string(percent))\(recorded)\(reset)"
     }
     private var footer: some View {
         HStack(spacing: 6) {
-            Circle().fill(model.stats.active > 0 ? Color.green : Color.secondary.opacity(0.5)).frame(width: 5, height: 5)
+            Circle().fill(model.activityIsLive ? Color.green : Color.secondary.opacity(0.5)).frame(width: 5, height: 5)
             Text(model.message.isEmpty ? model.sourceReadinessText : model.message)
                 .lineLimit(2).font(.system(size: 10)).foregroundStyle(.secondary)
             Spacer(minLength: 0)
@@ -4398,6 +4679,33 @@ private struct LocalHistoryDisclosure<Content: View>: View {
                 .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
         }
         .accessibilityHint("只显示本地历史记录，不代表企业当前剩余额度")
+    }
+}
+
+private struct SpeedHistorySparkline: View {
+    let points: [SpeedPoint]
+
+    var body: some View {
+        GeometryReader { proxy in
+            let values = points.map(\.value)
+            let maximum = max(values.max() ?? 1, 1)
+            let minimum = values.min() ?? 0
+            let span = max(maximum - minimum, 1)
+            Path { path in
+                for (index, point) in points.enumerated() {
+                    let x = points.count <= 1 ? 0 : proxy.size.width * CGFloat(index) / CGFloat(points.count - 1)
+                    let y = proxy.size.height * (1 - CGFloat((point.value - minimum) / span))
+                    if index == 0 { path.move(to: CGPoint(x: x, y: y)) }
+                    else { path.addLine(to: CGPoint(x: x, y: y)) }
+                }
+            }
+            .stroke(PanelPalette.blue, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+            .overlay(alignment: .topLeading) {
+                Text("近 10 分钟 · 输出 tok/s")
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityElement(children: .ignore)
     }
 }
 ```
@@ -4756,6 +5064,7 @@ import AppKit
 ### Sources/TokenStatMenu/PanelStyle.swift
 
 ```swift
+import Foundation
 import SwiftUI
 
 // Original native components inspired by compact translucent desktop dashboards.
@@ -4764,6 +5073,34 @@ enum PanelPalette {
     static let blue = Color(red: 0.24, green: 0.43, blue: 0.96)
     static let violet = Color(red: 0.55, green: 0.39, blue: 0.89)
     static let gradient = LinearGradient(colors: [blue, violet], startPoint: .topLeading, endPoint: .bottomTrailing)
+}
+
+enum TwoDecimalPercentFormatter {
+    static func string(_ value: Double) -> String {
+        String(format: "%.2f%%", locale: Locale(identifier: "en_US_POSIX"), value)
+    }
+
+    static func string(_ value: Decimal) -> String {
+        let number = NSDecimalNumber(decimal: value).doubleValue
+        return string(number)
+    }
+}
+
+enum HeaderActionMetrics {
+    static let actionSize: CGFloat = 30
+}
+
+/// Header actions intentionally ignore the dashboard's accent tint. This
+/// keeps the settings and quit hit targets visually neutral and symmetric,
+/// including when the popover opens with keyboard focus.
+struct NeutralHeaderActionButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.secondary)
+            .background(Color.clear)
+            .contentShape(Rectangle())
+            .opacity(configuration.isPressed ? 0.65 : 1)
+    }
 }
 
 struct PanelCardStyle: GroupBoxStyle {
@@ -4872,8 +5209,8 @@ struct WindowQuotaCard: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text(source == .localCodex ? presentation.usedPercent.map { String(format: "%.1f%%", $0) } ?? "—"
-                        : fresh ? String(format: "%.1f%%", quota!.remainingPercent) : "—")
+                    Text(source == .localCodex ? presentation.usedPercent.map { TwoDecimalPercentFormatter.string($0) } ?? "—"
+                        : fresh ? TwoDecimalPercentFormatter.string(quota!.remainingPercent) : "—")
                         .font(.system(size: 27, weight: .semibold, design: .rounded))
                         .monospacedDigit().foregroundStyle(fresh ? color : .secondary)
                         .lineLimit(1).minimumScaleFactor(0.75)
@@ -4892,7 +5229,7 @@ struct WindowQuotaCard: View {
                     }.frame(height: 5)
                 }
                 if let used = presentation.usedPercent {
-                    Text(String(format: "上游已用 %.1f%%", used))
+                    Text("上游已用 " + TwoDecimalPercentFormatter.string(used))
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                     if !fresh {
                         Text(presentation.statusLabel + (source == .enterprise ? " · 等待刷新" : ""))
@@ -5202,10 +5539,11 @@ enum TokenHubDecimalFormatter {
                     .font(.system(size: 9)).foregroundStyle(.secondary)
                 if let snapshot {
                     if let window = snapshot.fiveHour { row("5 小时", window.usedPercent, window.usedAmount, window.limitAmount, window.sourceSymbol, window.resetDisplay) }
+                    else { unknownWindowRow("5 小时") }
                     if let window = snapshot.sevenDay { row("7 天", window.usedPercent, window.usedAmount, window.limitAmount, window.sourceSymbol, window.resetDisplay) }
+                    else { unknownWindowRow("7 天") }
                     if let monthly = snapshot.monthly {
-                        HStack { Text("月度已用"); Spacer(); Text("\(monthly.sourceSymbol)\(amount(monthly.usedAmount))").monospacedDigit() }
-                            .font(.system(size: 10))
+                        monthlyRow(monthly)
                     }
                     Text("\(directSource ? "后台读取" : "界面读取")于 \(snapshot.observedAt.formatted(.dateTime.hour().minute()))；快照有效期 \(Int(max(120, refreshSeconds * 2))) 秒")
                         .font(.system(size: 9)).foregroundStyle(.secondary)
@@ -5215,17 +5553,68 @@ enum TokenHubDecimalFormatter {
             }.frame(maxWidth: .infinity, alignment: .leading)
         } label: { Label(directSource ? "Token Hub 企业额度" : "Token Hub 界面额度快照", systemImage: "window.ceiling") }
     }
+    private func monthlyRow(_ monthly: TokenHubMonthlyUsage) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text("月度").fontWeight(.medium)
+                Spacer(minLength: 0)
+                if let usedPercent = monthly.usedPercent {
+                    Text("已用 \(TwoDecimalPercentFormatter.string(usedPercent))")
+                        .fontWeight(.semibold).monospacedDigit()
+                } else {
+                    Text("已用").fontWeight(.semibold)
+                }
+            }
+            if let limit = monthly.limitAmount, let usedPercent = monthly.usedPercent {
+                let usedFraction = min(1, max(0, NSDecimalNumber(decimal: usedPercent / 100).doubleValue))
+                GeometryReader { geometry in
+                    Capsule().fill(PanelPalette.blue.opacity(0.12))
+                    Capsule().fill(PanelPalette.blue)
+                        .frame(width: geometry.size.width * usedFraction)
+                }
+                .frame(height: 5)
+                HStack {
+                    Text("\(monthly.sourceSymbol)\(amount(monthly.usedAmount)) / \(monthly.sourceSymbol)\(amount(limit))")
+                        .monospacedDigit()
+                    Spacer(minLength: 0)
+                    if let remaining = monthly.remainingAmount {
+                        Text("剩余 \(monthly.sourceSymbol)\(amount(remaining))")
+                            .foregroundStyle(.secondary).monospacedDigit()
+                    }
+                }
+            } else {
+                Text("已用 \(monthly.sourceSymbol)\(amount(monthly.usedAmount)) · 后台未提供月度总额，剩余与进度未知")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.system(size: 10))
+    }
+    private func unknownWindowRow(_ title: String) -> some View {
+        HStack {
+            Text(title).fontWeight(.medium)
+            Spacer(minLength: 0)
+            Text("未知").foregroundStyle(.secondary)
+        }
+        .font(.system(size: 10))
+    }
     private func row(_ title: String, _ usedPercent: Decimal, _ used: Decimal, _ limit: Decimal, _ symbol: String, _ reset: String) -> some View {
         let remainingPercent = Decimal(100) - usedPercent
+        let usedFraction = min(1, max(0, NSDecimalNumber(decimal: usedPercent / 100).doubleValue))
         return VStack(alignment: .leading, spacing: 3) {
             HStack {
                 Text(title).fontWeight(.medium)
                 Spacer(minLength: 0)
-            Text("剩余 \(TokenHubDecimalFormatter.string(remainingPercent))%")
+            Text("剩余 \(TwoDecimalPercentFormatter.string(remainingPercent))")
                 .fontWeight(.semibold).monospacedDigit()
             }
+            GeometryReader { geometry in
+                Capsule().fill(PanelPalette.blue.opacity(0.12))
+                Capsule().fill(PanelPalette.blue)
+                    .frame(width: geometry.size.width * usedFraction)
+            }
+            .frame(height: 5)
             HStack {
-                Text("\(directSource ? "后台已用" : "界面已用") \(TokenHubDecimalFormatter.string(usedPercent))% · \(symbol)\(amount(used)) / \(symbol)\(amount(limit))")
+                Text("\(directSource ? "后台已用" : "界面已用") \(TwoDecimalPercentFormatter.string(usedPercent)) · \(symbol)\(amount(used)) / \(symbol)\(amount(limit))")
                     .monospacedDigit()
                 Spacer(minLength: 0)
                 Text(Self.resetLabel(reset)).foregroundStyle(.secondary)
@@ -5254,9 +5643,6 @@ enum TokenHubDecimalFormatter {
 <key>LSUIElement</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSHighResolutionCapable</key><true/>
-<key>NSAppTransportSecurity</key><dict>
-<key>NSAllowsArbitraryLoads</key><true/>
-</dict>
 </dict></plist>
 ```
 
@@ -5751,14 +6137,14 @@ extension CoreChecks {
         try writeSession(in: aggregateRoot, uuid: secondID,
             events: [tokenEvent(at: now.addingTimeInterval(-60), input: 4, output: 6)], modified: now)
         let aggregate = try LocalCodexUsageReader.scan(directory: aggregateRoot, now: now)
-        check(aggregate.input == 6 && aggregate.output == 9 && aggregate.total == 15,
-            "local Codex totals use each session's last cumulative counter, including a lower reset value")
+        check(aggregate.input == 4 && aggregate.output == 6 && aggregate.total == 10,
+            "a root counter reset is excluded instead of being reported as complete accounting")
         check(aggregate.sessionCount == 2 && aggregate.latestEventAt == now.addingTimeInterval(-60),
             "local Codex reports metadata-backed top-level count and latest event timestamp")
-        check(aggregate.knownThreadCount == 2 && aggregate.unknownThreadCount == 0
-            && aggregate.unidentifiedFileCount == 0 && aggregate.hasCompleteAccounting,
-            "two valid root metadata records produce complete accounting independently of session count")
-        check(aggregate.input == 6 && aggregate.output == 9,
+        check(aggregate.knownThreadCount == 1 && aggregate.unknownThreadCount == 1
+            && aggregate.unidentifiedFileCount == 0 && !aggregate.hasCompleteAccounting,
+            "a root reset marks only the affected thread unknown")
+        check(aggregate.input == 4 && aggregate.output == 6,
             "cached input and reasoning output subfields are not added twice")
         let rescanned = try LocalCodexUsageReader.scan(directory: aggregateRoot, now: now)
         check(rescanned.input == aggregate.input && rescanned.output == aggregate.output
@@ -5778,6 +6164,28 @@ extension CoreChecks {
             && exactZero.total == 0,
             "a metadata-backed known zero is distinguishable from absence of any known thread")
         try? FileManager.default.removeItem(at: exactZeroRoot.deletingLastPathComponent())
+
+        let noFinalLFRoot = try fixtureDirectory("complete-no-final-lf")
+        let noFinalLFID = "13131313-1313-4313-8313-131313131313"
+        try writeSession(in: noFinalLFRoot, uuid: noFinalLFID,
+            events: [tokenEvent(at: now.addingTimeInterval(-1), input: 7, output: 5)],
+            modified: now, finalNewline: false)
+        let noFinalLF = try LocalCodexUsageReader.scan(directory: noFinalLFRoot, now: now)
+        check(noFinalLF.input == 7 && noFinalLF.output == 5 && noFinalLF.total == 12
+            && noFinalLF.knownThreadCount == 1 && noFinalLF.hasCompleteAccounting,
+            "a complete final JSONL event is retained without a trailing LF")
+        try? FileManager.default.removeItem(at: noFinalLFRoot.deletingLastPathComponent())
+
+        let truncatedFinalRoot = try fixtureDirectory("truncated-final-no-lf")
+        let truncatedFinalID = "14141414-1414-4414-8414-141414141414"
+        try writeSession(in: truncatedFinalRoot, uuid: truncatedFinalID,
+            events: [tokenEvent(at: now.addingTimeInterval(-2), input: 3, output: 2)],
+            modified: now, suffix: Data("{\"type\":\"event_msg\"".utf8), finalNewline: false)
+        let truncatedFinal = try LocalCodexUsageReader.scan(directory: truncatedFinalRoot, now: now)
+        check(truncatedFinal.input == 0 && truncatedFinal.output == 0 && truncatedFinal.total == 0
+            && !truncatedFinal.hasCompleteAccounting,
+            "a malformed final no-LF fragment remains unknown instead of being counted")
+        try? FileManager.default.removeItem(at: truncatedFinalRoot.deletingLastPathComponent())
 
         let noEvidenceRoot = try fixtureDirectory("no-accounting-evidence")
         let noEvidence = try LocalCodexUsageReader.scan(directory: noEvidenceRoot, now: now)
@@ -6036,6 +6444,11 @@ extension CoreChecks {
         let originalFileSize = try Data(contentsOf: cachedPath).count
         check(sameSizeRewrite.count == originalFileSize,
             "same-size cache rewrite fixture preserves byte count")
+        if let range = sameSizeRewrite.range(of: Data("\"total_tokens\":7".utf8)) {
+            sameSizeRewrite.replaceSubrange(range, with: Data("\"total_tokens\":8".utf8))
+        } else {
+            check(false, "same-size cache rewrite fixture locates the matching total count")
+        }
         try sameSizeRewrite.write(to: cachedPath)
         try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(2)], ofItemAtPath: cachedPath.path)
         let rewrittenCache = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
@@ -6756,7 +7169,8 @@ extension CoreChecks {
 
         let exactRoot = try fixtureDirectory("exact-large-integer")
         try writeSession(in: exactRoot, uuid: "14141414-1414-4414-8414-141414141414",
-            events: [rawTokenEvent(at: now, inputLiteral: "9007199254740993", outputLiteral: "0")], modified: now)
+            events: [rawTokenEvent(at: now, inputLiteral: "9007199254740993", outputLiteral: "0",
+                                   totalLiteral: "9007199254740993")], modified: now)
         let exactLarge = try LocalCodexUsageReader.scan(directory: exactRoot, now: now)
         check(exactLarge.input == 9_007_199_254_740_993,
             "large JSON integer above 2^53 is parsed without floating point rounding")
@@ -6888,7 +7302,8 @@ extension CoreChecks {
 
         let overflowRoot = try fixtureDirectory("aggregate-overflow")
         try writeSession(in: overflowRoot, uuid: "ffffffff-ffff-4fff-8fff-ffffffffffff",
-            events: [rawTokenEvent(at: now, inputLiteral: String(Int.max), outputLiteral: "0")], modified: now)
+            events: [rawTokenEvent(at: now, inputLiteral: String(Int.max), outputLiteral: "0",
+                                   totalLiteral: String(Int.max))], modified: now)
         try writeSession(in: overflowRoot, uuid: "abababab-abab-4bab-8bab-abababababab",
             events: [rawTokenEvent(at: now, inputLiteral: "1", outputLiteral: "0")], modified: now)
         do {
@@ -7118,12 +7533,16 @@ extension CoreChecks {
     private static func writeSession(in directory: URL, uuid: String, events: [Data], modified: Date,
                                      prefix: Data = Data(), suffix: Data = Data(),
                                      metadataID: String? = nil, metadataSource: Any? = "cli",
-                                     metadataFields: [String: Any] = [:], metadata: Data? = nil) throws {
+                                     metadataFields: [String: Any] = [:], metadata: Data? = nil,
+                                     finalNewline: Bool = true) throws {
         var data = metadata ?? sessionMetadata(id: metadataID ?? uuid, source: metadataSource, fields: metadataFields)
         if !data.isEmpty { data.append(10) }
-        data.append(prefix)
-        for event in events { data.append(event); data.append(10) }
-        data.append(suffix)
+        data.append(contentsOf: prefix)
+        for (index, event) in events.enumerated() {
+            data.append(contentsOf: event)
+            if finalNewline || index < events.count - 1 || !suffix.isEmpty { data.append(10) }
+        }
+        data.append(contentsOf: suffix)
         let url = sessionURL(in: directory, uuid: uuid)
         try data.write(to: url)
         try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: url.path)
@@ -7279,6 +7698,9 @@ extension CoreChecks {
               "direct quota derives percentages from exact amounts")
         check(decoded.fiveHour?.resetDisplay == "01-15 08:00" && decoded.sevenDay?.resetDisplay == "01-15 08:00",
               "direct quota formats period end without guessing a year")
+        check(decoded.fiveHour?.resetAt == Date(timeIntervalSince1970: 1_800_000_000)
+            && decoded.sevenDay?.resetAt == Date(timeIntervalSince1970: 1_800_000_000),
+              "direct quota retains source period end for freshness checks")
         check(decoded.fiveHour?.sourceSymbol == "$" && decoded.sevenDay?.sourceSymbol == "$",
               "direct quota normalizes USD currency to a display symbol")
 
@@ -7293,6 +7715,14 @@ extension CoreChecks {
         check(wrappedDecoded.fiveHour?.usedPercent == Decimal(0) && wrappedDecoded.sevenDay?.usedPercent == Decimal(100),
               "direct quota accepts numeric Unix period timestamps")
         check(wrappedDecoded.fiveHour?.sourceSymbol == "¥", "direct quota normalizes CNY currency")
+        let unknownCurrency = json(#"{"data":{"currency":"https://example.invalid/account","windows":[{"kind":"fixed_5h","quota_amount":10,"used_amount":2}]}}"#)
+        let unknownCurrencyDecoded = try TokenHubDirectQuotaDecoder.decode(
+            unknownCurrency,
+            identity: identity,
+            now: now,
+            timeZone: TimeZone(secondsFromGMT: 0)!
+        )
+        check(unknownCurrencyDecoded.fiveHour?.sourceSymbol == "¤", "unknown currency cannot leak a URL or account label into UI")
         let rootShape = json("""
         {"code":"OK","currency":"USD","windows":[{"kind":"fixed_5h","quota_amount":10,"used_amount":2}]}
         """)
@@ -7312,10 +7742,35 @@ extension CoreChecks {
         let monthlyDecoded = try TokenHubDirectQuotaDecoder.decode(monthly, identity: identity, now: now)
         check(monthlyDecoded.monthly?.usedAmount == Decimal(string: "12.5") && monthlyDecoded.fiveHour == nil,
               "direct quota preserves a monthly window without inventing rolling windows")
+        check(monthlyDecoded.monthly?.limitAmount == Decimal(100)
+            && monthlyDecoded.monthly?.remainingAmount == Decimal(string: "87.5")
+            && monthlyDecoded.monthly?.usedPercent == Decimal(string: "12.5"),
+              "direct quota preserves monthly limit and derives remaining percentage")
         let userMonth = json(#"{"data":{"currency":"USD","windows":[{"kind":"user_month","quota_amount":100,"used_amount":12.5}]}}"#)
         let userMonthDecoded = try TokenHubDirectQuotaDecoder.decode(userMonth, identity: identity, now: now)
         check(userMonthDecoded.monthly != nil,
               "direct quota maps the Token Hub user_month window")
+        let duplicateMonthly = json(#"{"data":{"currency":"USD","windows":[{"kind":"monthly","quota_amount":100,"used_amount":1},{"kind":"user_month","quota_amount":100,"used_amount":1}]}}"#)
+        do {
+            _ = try TokenHubDirectQuotaDecoder.decode(duplicateMonthly, identity: identity, now: now)
+            check(false, "duplicate direct monthly windows reject")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .duplicateMonthly, "duplicate direct monthly windows report typed failure")
+        }
+        let invalidMonthlyLimit = json(#"{"data":{"currency":"USD","windows":[{"kind":"monthly","quota_amount":-1,"used_amount":1}]}}"#)
+        do {
+            _ = try TokenHubDirectQuotaDecoder.decode(invalidMonthlyLimit, identity: identity, now: now)
+            check(false, "invalid direct monthly limit rejects")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .malformedResponse, "invalid direct monthly limit reports malformed response")
+        }
+        let invalidPeriodEnd = json(#"{"data":{"currency":"USD","windows":[{"kind":"five_hours","quota_amount":10,"used_amount":1,"period_end":"not-a-date"}]}}"#)
+        do {
+            _ = try TokenHubDirectQuotaDecoder.decode(invalidPeriodEnd, identity: identity, now: now)
+            check(false, "invalid direct reset date rejects")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .malformedResponse, "invalid direct reset date reports malformed response")
+        }
 
         let malformed = json(#"{"data":{"currency":"USD","windows":[{"kind":"five_hours","quota_amount":10,"used_amount":11}]}}"#)
         do { _ = try TokenHubDirectQuotaDecoder.decode(malformed, identity: identity, now: now); check(false, "used above limit rejects direct quota") }
@@ -7507,6 +7962,10 @@ extension CoreChecks {
         let noMonthlyLimit = try TokenHubDirectQuotaDecoder.decode(response(kind: "user_month", field: "quota_amount", literal: "null"),
             identity: identity, now: now)
         check(noMonthlyLimit.monthly?.usedAmount == Decimal(0), "optional monthly null limit remains supported")
+        check(noMonthlyLimit.monthly?.limitAmount == nil
+            && noMonthlyLimit.monthly?.remainingAmount == nil
+            && noMonthlyLimit.monthly?.usedPercent == nil,
+              "used-only monthly response keeps limit-derived fields unknown")
     }
 }
 
@@ -7903,7 +8362,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
         XCTAssertTrue(local.menuTooltip.contains("5 小时额度：本地"))
         XCTAssertTrue(local.menuTooltip.contains("7 天额度：本地"))
         XCTAssertFalse(local.menuTooltip.contains("当前企业"))
-        XCTAssertTrue(local.menuTooltip.contains("99.0%"), "local tooltip retains the original percentage")
+        XCTAssertTrue(local.menuTooltip.contains("99.00%"), "local tooltip renders two decimal places")
         XCTAssertTrue(local.menuTooltip.contains("重置"), "local tooltip includes the reset time when present")
 
         for (window, percent) in [(300, 77.0), (10080, 78.0)] {
@@ -7960,7 +8419,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
         enterprise.fiveHourQuota = currentEnterprise.fiveHour
         enterprise.sevenDayQuota = currentEnterprise.sevenDay
         XCTAssertTrue(enterprise.menuTooltip.contains("企业"), "proxy tooltip identifies its quota source")
-        XCTAssertTrue(enterprise.menuTooltip.contains("96.0%"), "proxy tooltip retains the original percentage")
+        XCTAssertTrue(enterprise.menuTooltip.contains("96.00%"), "proxy tooltip renders two decimal places")
         XCTAssertTrue(enterprise.menuTooltip.contains("重置"), "proxy tooltip includes the reset time")
         XCTAssertEqual(enterprise.quotaSource, .enterprise)
         let enterpriseCard = WindowQuotaCard.presentation(for: try XCTUnwrap(currentEnterprise.fiveHour), at: now,
@@ -9324,7 +9783,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         harness.complete(1)
         await settle(model, status: .connected)
         model.tick()
-        XCTAssertTrue(model.title.contains("Hub 5h剩 70% / 7d剩 60%"))
+        XCTAssertTrue(model.title.contains("Hub 5h剩 70.00% / 7d剩 60.00%"))
         XCTAssertTrue(displayedTooltip.contains("5 小时）"))
         let beforeBoundary = tooltipBuilds
         clock.now = observedAt.addingTimeInterval(120)
@@ -10023,8 +10482,8 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let (model, scanner, _) = configuredModel(result(now: now), clock: HubManualClock(now))
         defer { model.shutdown() }
         await refresh(model, scanner: scanner)
-        XCTAssertTrue(model.title.contains("5h剩 62.5%"), "the actual menu title must retain a fractional remaining percent")
-        XCTAssertTrue(model.menuTooltip.contains("界面显示剩余 62.5%"), "the actual tooltip must retain a fractional remaining percent")
+        XCTAssertTrue(model.title.contains("5h剩 62.50%"), "the actual menu title must retain a two-decimal remaining percent")
+        XCTAssertTrue(model.menuTooltip.contains("界面显示剩余 62.50%"), "the actual tooltip must retain a two-decimal remaining percent")
 
         let snapshot = try! XCTUnwrap(model.tokenHubQuotaSnapshot)
         XCTAssertEqual(TokenHubDecimalFormatter.string(snapshot.fiveHour!.usedAmount), "3.75",
@@ -10413,6 +10872,126 @@ extension TokenHubQuotaStateTests {
         XCTAssertEqual(resources.axScanInFlightCount, 0)
         let requestsAfterShutdown = await harness.requests
         XCTAssertEqual(requestsAfterShutdown, 1)
+    }
+
+    func testDirectAlertThresholdsUseFullPrecisionAndTwoDecimalDisplay() async {
+        let identity = TokenHubIdentity(pid: 990, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic Threshold Hub.app/Contents/MacOS/Hub")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        func color(for usedPercent: Decimal) async -> NSColor {
+            let snapshot = TokenHubQuotaSnapshot(identity: identity,
+                fiveHour: TokenHubWindowQuota(kind: .fiveHour, usedAmount: usedPercent,
+                    limitAmount: 100, sourceSymbol: "$", usedPercent: usedPercent,
+                    resetDisplay: "synthetic reset", resetAt: now.addingTimeInterval(3600)),
+                sevenDay: nil, monthly: nil, observedAt: now)
+            let direct = TokenHubDirectQuotaDependencies(discoverTarget: { identity },
+                identityIsCurrent: { $0 == identity }, fetch: { _, _ in snapshot })
+            let model = AppModel(preview: true, directQuota: direct)
+            defer { model.shutdown() }
+            model.config.dataSource = "localCodex"
+            model.tokenHubAutomaticReadingEnabled = false
+            model.tokenHubNow = { now }
+            model.refreshTokenHubQuota()
+            for _ in 0..<100 where !model.tokenHubQuotaIsDirect {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertTrue(model.tokenHubQuotaIsDirect)
+            return model.alertColor
+        }
+
+        let belowYellow = await color(for: Decimal(string: "79.995")!)
+        let aboveYellow = await color(for: Decimal(string: "80.005")!)
+        let belowRed = await color(for: Decimal(string: "94.995")!)
+        let aboveRed = await color(for: Decimal(string: "95.005")!)
+        XCTAssertEqual(belowYellow, .labelColor)
+        XCTAssertEqual(aboveYellow, .systemYellow)
+        XCTAssertEqual(belowRed, .systemYellow)
+        XCTAssertEqual(aboveRed, .systemRed)
+        XCTAssertEqual(TwoDecimalPercentFormatter.string(Decimal(string: "37.5")!), "37.50%")
+    }
+
+    func testDirectMonthlyLimitAndMissingWindowFactsRemainIndependent() async {
+        let identity = TokenHubIdentity(pid: 991, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic Monthly Hub.app/Contents/MacOS/Hub")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let monthly = TokenHubMonthlyUsage(usedAmount: Decimal(string: "37.5")!, sourceSymbol: "$",
+            limitAmount: Decimal(string: "100")!)
+        let snapshot = TokenHubQuotaSnapshot(identity: identity,
+            fiveHour: nil,
+            sevenDay: TokenHubWindowQuota(kind: .sevenDay, usedAmount: 40, limitAmount: 100,
+                sourceSymbol: "$", usedPercent: 40, resetDisplay: "synthetic 7d reset",
+                resetAt: now.addingTimeInterval(3600)),
+            monthly: monthly, observedAt: now)
+        let direct = TokenHubDirectQuotaDependencies(discoverTarget: { identity },
+            identityIsCurrent: { $0 == identity }, fetch: { _, _ in snapshot })
+        let model = AppModel(preview: true, directQuota: direct)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        model.tokenHubAutomaticReadingEnabled = false
+        model.tokenHubNow = { now }
+        model.refreshTokenHubQuota()
+        for _ in 0..<100 where !model.tokenHubQuotaIsDirect {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        let current = try! XCTUnwrap(model.tokenHubQuotaSnapshot)
+        XCTAssertNil(current.fiveHour, "a missing five-hour window stays unknown")
+        XCTAssertEqual(current.sevenDay?.remainingPercent, 60)
+        XCTAssertEqual(current.monthly?.remainingAmount, Decimal(string: "62.5"))
+        XCTAssertEqual(current.monthly?.usedPercent, Decimal(string: "37.5"))
+        XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
+        XCTAssertTrue(model.title.contains("7d剩 60.00%"))
+
+        let card = TokenHubQuotaCard(snapshot: current, status: model.tokenHubQuotaStatusText,
+            enabled: true, refreshSeconds: 60, directSource: true)
+        let host = NSHostingView(rootView: card.frame(width: 420))
+        host.frame = NSRect(x: 0, y: 0, width: 420, height: 260)
+        host.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(host.fittingSize.height, 0)
+
+        let usedOnly = TokenHubMonthlyUsage(usedAmount: 12, sourceSymbol: "$", limitAmount: nil)
+        XCTAssertNil(usedOnly.remainingAmount)
+        XCTAssertNil(usedOnly.usedPercent)
+    }
+
+    func testFreshLocalActivityBuildsBoundedHistoryAndStopsWhenStale() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        model.panelVisible = true
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        var now = base
+        model.tokenHubNow = { now }
+        for index in 0..<1_300 {
+            now = base.addingTimeInterval(Double(index) * 0.5)
+            model.localSnapshot = LocalCodexSnapshot(input: 10, output: 20, total: 30,
+                sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: now,
+                fiveHour: nil, sevenDay: nil, knownThreadCount: 1, unknownThreadCount: 0,
+                liveTurn: LocalLiveTurnSummary(inputTPS: 4, outputTPS: 8, observedAt: now))
+            model.tick()
+        }
+        XCTAssertEqual(model.history.count, 1_200)
+        XCTAssertTrue(model.activityIsLive)
+        let retained = model.history.count
+        now = now.addingTimeInterval(16)
+        model.localSnapshot = LocalCodexSnapshot(input: 10, output: 20, total: 30,
+            sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: now,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 1, unknownThreadCount: 0,
+            liveTurn: LocalLiveTurnSummary(inputTPS: 4, outputTPS: 8, observedAt: now.addingTimeInterval(-16)))
+        model.tick()
+        XCTAssertFalse(model.activityIsLive)
+        XCTAssertEqual(model.history.count, retained, "stale estimates do not append synthetic zero points")
+    }
+
+    func testHeaderActionsShareSymmetricNeutralGeometry() {
+        XCTAssertEqual(HeaderActionMetrics.actionSize, 30)
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let host = NSHostingView(rootView: DashboardView(model: model))
+        host.frame = NSRect(x: 0, y: 0, width: 460, height: 700)
+        host.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(host.fittingSize.width, 0)
+        XCTAssertGreaterThan(host.fittingSize.height, 0)
     }
 }
 ```
@@ -14395,10 +14974,10 @@ from pathlib import Path
 from package_source import PUBLIC_FILES, ROOT
 
 SYNTHETIC_PNG_SHA256 = {
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "a6f5da19785b39f043e35fd6fa9e8aa020825ca3c9b4e16a1d65103d49d69c6c",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "fae572d44db34764be5c73fab64ca349b8e8bcb668a9f4a75c40535fb568e26b",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "64ea172d17a5d3be86176c4b3ede3c7b68b6f9c841709ffa92c49edfbfdfb101",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "98c5ede0f59bd9f69d064b52b3e49731b98c70447407148b1cc84a3dc1ce352b",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "ead24ba5ff05e81ddb9f042e1e601725a052e3835ca5c8b980ab70ce7f516617",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "9819e254364e4ba2bc5c60ff2e4574fa4828264aa341b05920349333b253b91d",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "00285b94a18af9ca7ac7220e0f8eb08932916868756e3de4807a6633e77611a8",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "66b9653affa7b809eaa53f2c6e16f706830c3401f5377d5b441fa208be434c53",
 }
 
 

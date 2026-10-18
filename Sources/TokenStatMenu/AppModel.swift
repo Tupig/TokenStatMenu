@@ -66,29 +66,87 @@ struct AppModelStartupDependencies {
     }
 }
 
+/// The only direct-quota value allowed to cross the worker boundary.  It
+/// deliberately contains no process identity, URL, database path, session,
+/// bearer token, or response body.  The worker validates the target identity
+/// before and after the request and returns only these displayable facts.
+struct DirectQuotaTransportSnapshot: Sendable {
+    let fiveHour: TokenHubWindowQuota?
+    let sevenDay: TokenHubWindowQuota?
+    let monthly: TokenHubMonthlyUsage?
+    let observedAt: Date
+
+    func materializedSnapshot() -> TokenHubQuotaSnapshot {
+        // The model keeps the historical snapshot shape for compatibility with
+        // synthetic tests. Production never exposes the real PID or executable
+        // path; worker-side identity checks already completed this transaction.
+        // Keep the legacy snapshot shape for UI/tests, but never carry the
+        // worker's real PID or executable path across the actor boundary.
+        let sanitizedIdentity = TokenHubIdentity(pid: 0, bundleID: TokenHubTarget.bundleID,
+                                                  executablePath: "sanitized")
+        return TokenHubQuotaSnapshot(identity: sanitizedIdentity, fiveHour: fiveHour,
+                                     sevenDay: sevenDay, monthly: monthly,
+                                     observedAt: observedAt)
+    }
+
+    init(snapshot: TokenHubQuotaSnapshot) {
+        fiveHour = snapshot.fiveHour; sevenDay = snapshot.sevenDay
+        monthly = snapshot.monthly; observedAt = snapshot.observedAt
+    }
+}
+
+/// Owns process discovery, settings/SQLite reads and the authenticated direct
+/// fetch away from the main actor. No identity or credential leaves this actor.
+private actor TokenHubDirectQuotaWorker {
+    private let client = TokenHubDirectQuotaClient()
+
+    func fetch(now: Date) async throws -> DirectQuotaTransportSnapshot {
+        let applications = NSRunningApplication.runningApplications(withBundleIdentifier: TokenHubTarget.bundleID)
+            .filter { !$0.isTerminated }
+        guard !applications.isEmpty else { throw TokenHubQuotaFailure.noTarget }
+        guard applications.count == 1, let app = applications.first,
+              let executable = app.executableURL?.standardizedFileURL.path,
+              let bundle = app.bundleIdentifier else {
+            throw applications.count > 1 ? TokenHubQuotaFailure.multipleTargets : TokenHubQuotaFailure.identityChanged
+        }
+        let identity = TokenHubIdentity(pid: app.processIdentifier, bundleID: bundle, executablePath: executable)
+        let snapshot = try await client.fetch(identity: identity, now: now)
+        try Task.checkCancellation()
+        // TokenHubDirectQuotaClient revalidates its settings/database identity
+        // around the network exchange. Do not return the target identity.
+        return DirectQuotaTransportSnapshot(snapshot: snapshot)
+    }
+}
+
 /// Keep external process discovery and authenticated I/O outside lifecycle
 /// handling. Explicit injection also lets previews exercise the direct path
 /// using entirely synthetic identities and responses.
 struct TokenHubDirectQuotaDependencies {
-    let discoverTarget: @MainActor () throws -> TokenHubIdentity
-    let identityIsCurrent: @MainActor (TokenHubIdentity) -> Bool
-    let fetch: @MainActor (TokenHubIdentity, Date) async throws -> TokenHubQuotaSnapshot
+    let discoverTarget: () throws -> TokenHubIdentity
+    let identityIsCurrent: (TokenHubIdentity) -> Bool
+    let fetch: (TokenHubIdentity, Date) async throws -> TokenHubQuotaSnapshot
+    /// Production uses this worker closure. The three actor-isolated closures
+    /// remain as a compatibility seam for synthetic tests only.
+    let workerFetch: (@Sendable (Date) async throws -> DirectQuotaTransportSnapshot)?
+
+    init(discoverTarget: @escaping () throws -> TokenHubIdentity,
+         identityIsCurrent: @escaping (TokenHubIdentity) -> Bool,
+         fetch: @escaping (TokenHubIdentity, Date) async throws -> TokenHubQuotaSnapshot,
+         workerFetch: (@Sendable (Date) async throws -> DirectQuotaTransportSnapshot)? = nil) {
+        self.discoverTarget = discoverTarget
+        self.identityIsCurrent = identityIsCurrent
+        self.fetch = fetch
+        self.workerFetch = workerFetch
+    }
 
     static var production: TokenHubDirectQuotaDependencies {
-        let discover: @MainActor () throws -> TokenHubIdentity = {
-            let applications = NSRunningApplication.runningApplications(withBundleIdentifier: TokenHubTarget.bundleID)
-                .filter { !$0.isTerminated }
-            guard !applications.isEmpty else { throw TokenHubQuotaFailure.noTarget }
-            guard applications.count == 1 else { throw TokenHubQuotaFailure.multipleTargets }
-            guard let app = applications.first,
-                  let executable = app.executableURL?.standardizedFileURL.path,
-                  let bundle = app.bundleIdentifier else { throw TokenHubQuotaFailure.identityChanged }
-            return TokenHubIdentity(pid: app.processIdentifier, bundleID: bundle, executablePath: executable)
-        }
-        let client = TokenHubDirectQuotaClient()
-        return TokenHubDirectQuotaDependencies(discoverTarget: discover,
-            identityIsCurrent: { (try? discover()) == $0 },
-            fetch: { try await client.fetch(identity: $0, now: $1) })
+        let worker = TokenHubDirectQuotaWorker()
+        // These compatibility closures are intentionally inert in production;
+        // all discovery/settings/network work is owned by the actor above.
+        return TokenHubDirectQuotaDependencies(discoverTarget: { throw TokenHubQuotaFailure.noTarget },
+            identityIsCurrent: { _ in false },
+            fetch: { _, _ in throw TokenHubDirectQuotaFailure.transportFailed },
+            workerFetch: { now in try await worker.fetch(now: now) })
     }
 }
 
@@ -115,19 +173,54 @@ actor LocalCodexScanWorker {
                                                        cache: cache, routeContext: routeContext)
         return Result(snapshot: snapshot, diagnostics: cache.diagnostics)
     }
+
+    /// Production discovery stays inside the same worker as file scanning so
+    /// session paths and route origins never cross back through the main actor.
+    func scanDefault(now: Date, generation: Int) throws -> Result {
+        let directory = LocalCodexUsageReader.defaultSessionsDirectory()
+        let routeContext = AppModel.seasunRouteContext()
+        return try scan(directory: directory, now: now, generation: generation, routeContext: routeContext)
+    }
 }
 
 /// Resolve the same permitted inputs on the main actor, then run bounded file
 /// I/O in the cache owner. Injection replaces external I/O in lifecycle checks.
 struct LocalCodexScanDependencies {
-    let resolveInputs: @MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext)
-    let scan: @Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result
+    struct Inputs: Sendable {
+        let directory: URL
+        let routeContext: LocalCodexRouteContext
+    }
+    /// Legacy injected seams are optional so production can expose only the
+    /// worker-owned `scanDefault` path. Keeping these seams available for
+    /// synthetic tests does not make a real sessions URL cross the actor
+    /// boundary in the production configuration.
+    let resolveInputs: (@MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext))?
+    let scan: (@Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result)?
+    let scanDefault: (@Sendable (Date, Int) async throws -> LocalCodexScanWorker.Result)?
+
+    init(resolveInputs: @escaping @MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext),
+         scan: @escaping @Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result,
+         scanDefault: (@Sendable (Date, Int) async throws -> LocalCodexScanWorker.Result)? = nil) {
+        self.resolveInputs = resolveInputs
+        self.scan = scan
+        self.scanDefault = scanDefault
+    }
+
+    private init(resolveInputs: (@MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext))?,
+                 scan: (@Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result)?,
+                 scanDefault: (@Sendable (Date, Int) async throws -> LocalCodexScanWorker.Result)?) {
+        self.resolveInputs = resolveInputs
+        self.scan = scan
+        self.scanDefault = scanDefault
+    }
 
     @MainActor static var production: LocalCodexScanDependencies {
         let worker = LocalCodexScanWorker()
-        return LocalCodexScanDependencies(resolveInputs: {
-            (LocalCodexUsageReader.defaultSessionsDirectory(), AppModel.seasunRouteContext())
-        }, scan: { try await worker.scan(directory: $0, now: $1, generation: $2, routeContext: $3) })
+        // Do not retain a production closure that resolves the real sessions
+        // URL on the main actor. Discovery and route reading remain inside the
+        // same worker that owns the cache and performs the bounded file scan.
+        return LocalCodexScanDependencies(resolveInputs: nil, scan: nil,
+            scanDefault: { now, generation in try await worker.scanDefault(now: now, generation: generation) })
     }
 }
 
@@ -137,6 +230,13 @@ struct BackgroundServiceResources: Equatable, Encodable {
     let localScanQueuedCount: Int
     let axRefreshScheduledCount: Int
     let axScanInFlightCount: Int
+}
+
+/// A model-captured time used by one refresh request. Capturing this before a
+/// delayed work item is enqueued keeps local/direct workers from consulting
+/// independent wall clocks after the scheduling delay.
+private struct RefreshObservationContext: Sendable, Equatable {
+    let observationNow: Date
 }
 
 /// Clock-derived presentation changes are distinct from new measurements.
@@ -169,7 +269,13 @@ struct PresentationTimeState: Equatable {
         didSet { capturePresentationTimeBaseline() }
     }
     @Published var config = AppConfiguration() {
-        didSet { capturePresentationTimeBaseline() }
+        didSet {
+            if oldValue.dataSource != config.dataSource {
+                history.removeAll(keepingCapacity: true)
+                lastHistorySampleAt = .distantPast
+            }
+            capturePresentationTimeBaseline()
+        }
     }
     @Published var stats = MetricsSnapshot()
     @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0) {
@@ -222,7 +328,11 @@ struct PresentationTimeState: Equatable {
     private var tokenHubGeneration: UInt64 = 0
     private var tokenHubAXGeneration: UInt64 = 0
     private var lastPresentationTimeState: PresentationTimeState?
+    private var lastHistorySampleAt = Date.distantPast
     var onTick: (() -> Void)?
+
+    private static let historyDuration: TimeInterval = 10 * 60
+    private static let historyCapacity = 1_200
 
     var isSeasunOnly: Bool { true }
     var tokenHubQuotaReadingEnabled: Bool { usesDirectQuotaSource || tokenHubAutomaticReadingEnabled }
@@ -236,6 +346,9 @@ struct PresentationTimeState: Equatable {
         return "Seasun Token Hub 企业后台直接来源：尚未连接；额度、重置时间、月度用量和实时速度均未知。"
     }
     var sourceStatus: String { "unknown" }
+    var activityIsLive: Bool {
+        config.dataSource == "localCodex" ? freshLocalLiveTurn != nil : stats.active > 0
+    }
     var backgroundServiceResources: BackgroundServiceResources {
         BackgroundServiceResources(timerCount: timer == nil ? 0 : 1,
             workspaceObserverCount: tokenHubWorkspaceObservers.count,
@@ -298,12 +411,26 @@ struct PresentationTimeState: Equatable {
             publishedTransition = true
         }
         if backgroundServicesStarted { pollTokenHubPermissionIfDue() }
+        updateLocalHistory(at: now)
         let timeState = presentationTimeState
         if let previous = lastPresentationTimeState, previous != timeState, !publishedTransition {
             objectWillChange.send()
         }
         lastPresentationTimeState = timeState
         onTick?()
+    }
+
+    /// Keep one bounded point per half-second for ten minutes. Only fresh local
+    /// estimates enter this series; stale or unknown values create no fake
+    /// zero-speed samples and mode switches cannot leak proxy observations.
+    private func updateLocalHistory(at now: Date) {
+        guard panelVisible, config.dataSource == "localCodex", let live = freshLocalLiveTurn,
+              now.timeIntervalSince(lastHistorySampleAt) >= 0.5 else { return }
+        lastHistorySampleAt = now
+        let point = SpeedPoint(date: now, value: live.outputTPS)
+        let cutoff = now.addingTimeInterval(-Self.historyDuration)
+        history = (history + [point]).filter { $0.date >= cutoff }
+        if history.count > Self.historyCapacity { history.removeFirst(history.count - Self.historyCapacity) }
     }
     var freshQuota: QuotaSnapshot? {
         let now = tokenHubNow()
@@ -396,8 +523,8 @@ struct PresentationTimeState: Equatable {
     }
     private var tokenHubMenuSuffix: String {
         guard let snapshot = freshTokenHubQuota(at: tokenHubNow()) else { return "" }
-        let windows = [snapshot.fiveHour.map { "5h剩 \(percentText($0.remainingPercent))%" },
-                       snapshot.sevenDay.map { "7d剩 \(percentText($0.remainingPercent))%" }].compactMap { $0 }
+        let windows = [snapshot.fiveHour.map { "5h剩 \(percentText($0.remainingPercent))" },
+                       snapshot.sevenDay.map { "7d剩 \(percentText($0.remainingPercent))" }].compactMap { $0 }
         return windows.isEmpty ? "" : " · Hub \(windows.joined(separator: " / "))"
     }
     var menuTitleContainsTokenHubSuffix: Bool { !tokenHubMenuSuffix.isEmpty }
@@ -405,15 +532,15 @@ struct PresentationTimeState: Equatable {
     var tokenHubPermissionRequiredForDiagnostics: Bool { tokenHubQuotaStatus == .permissionRequired }
     private var tokenHubTooltipDetail: String {
         let snapshot = freshTokenHubQuota(at: tokenHubNow())
-        let five = snapshot?.fiveHour.map { "界面显示剩余 \(percentText($0.remainingPercent))%（5 小时）" } ?? "5 小时未知"
-        let seven = snapshot?.sevenDay.map { "界面显示剩余 \(percentText($0.remainingPercent))%（7 天）" } ?? "7 天未知"
+        let five = snapshot?.fiveHour.map { "界面显示剩余 \(percentText($0.remainingPercent))（5 小时）" } ?? "5 小时未知"
+        let seven = snapshot?.sevenDay.map { "界面显示剩余 \(percentText($0.remainingPercent))（7 天）" } ?? "7 天未知"
         let source = tokenHubQuotaIsDirect ? "Token Hub 后台直接响应" : "Token Hub 界面快照"
         let timing = tokenHubQuotaIsDirect ? "后台响应已提供" : "后台更新时间未提供"
         let currency = tokenHubQuotaIsDirect ? "币种来自后台响应" : "币种未核验"
         return "\(source)：\(five) · \(seven)；\(tokenHubQuotaStatusText)；\(timing)；\(currency)"
     }
     private func percentText(_ value: Decimal) -> String {
-        TokenHubDecimalFormatter.string(value)
+        TwoDecimalPercentFormatter.string(value)
     }
     var tokenHubQuotaStatusText: String {
         if tokenHubQuotaIsDirect, tokenHubQuotaStatus == .connected { return "企业后台已直接读取" }
@@ -454,11 +581,18 @@ struct PresentationTimeState: Equatable {
         let resetLabel = source == .localCodex || !presentation.isFresh ? "原重置时间" : "重置时间"
         let reset = presentation.resetsAt.map { "，\(resetLabel) \($0.formatted())" } ?? "，重置时间未知"
         let recorded = presentation.recordedAt.map { "，记录于 \($0.formatted())" } ?? ""
-        return "\(presentation.sourceLabel) · \(presentation.statusLabel)，上游已用 \(String(format: "%.1f", usedPercent))%\(reset)\(recorded)"
+        return "\(presentation.sourceLabel) · \(presentation.statusLabel)，上游已用 \(TwoDecimalPercentFormatter.string(usedPercent))\(reset)\(recorded)"
     }
     private func formatCount(_ value: Int) -> String { value.formatted(.number) }
     private func formatCompactCount(_ value: Int) -> String { value.formatted(.number.notation(.compactName)) }
     var alertColor: NSColor {
+        if tokenHubQuotaIsDirect, let snapshot = freshTokenHubQuota(at: tokenHubNow()) {
+            let windows = [snapshot.fiveHour?.usedPercent, snapshot.sevenDay?.usedPercent].compactMap { $0 }
+            guard let used = windows.max() else { return .labelColor }
+            if used >= Decimal(string: "95")! { return .systemRed }
+            if used >= Decimal(string: "80")! { return .systemYellow }
+            return .labelColor
+        }
         guard quotaSource == .enterprise else { return .labelColor }
         let windows = (quotaSource == .enterprise ? [fiveHourQuota, sevenDayQuota].compactMap { $0 } : [])
             .filter { $0.isFresh(at: tokenHubNow(), refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
@@ -524,6 +658,8 @@ struct PresentationTimeState: Equatable {
         guard !isPreview, !isShuttingDown, backgroundServicesStarted else { return }
         stopBackgroundResources()
         generation += 1; tokenHubGeneration &+= 1
+        history.removeAll(keepingCapacity: true)
+        lastHistorySampleAt = .distantPast
         tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
         tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
         tokenHubDirectFailure = nil; tokenHubQuotaIsDirect = false; tokenHubDirectScanInFlight = false
@@ -536,8 +672,9 @@ struct PresentationTimeState: Equatable {
             knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0,
             subagentCount: 0, forkCount: 0)
         resetQuotaState()
-        scheduleLocalScan(immediate: true)
-        if tokenHubQuotaReadingEnabled { scheduleTokenHubRefresh(after: 0) }
+        let observationNow = tokenHubNow()
+        scheduleLocalScan(immediate: true, observationNow: observationNow)
+        if tokenHubQuotaReadingEnabled { scheduleTokenHubRefresh(after: 0, observationNow: observationNow) }
         installTokenHubWorkspaceObservers()
         timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
         timer?.tolerance = 0.1
@@ -569,8 +706,9 @@ struct PresentationTimeState: Equatable {
         quotaLoading = false
         quotaError = "Token Hub 界面快照数据未知"
     }
-    private func scheduleLocalScan(immediate: Bool = false) {
+    private func scheduleLocalScan(immediate: Bool = false, observationNow scheduledObservationNow: Date? = nil) {
         guard backgroundServicesStarted else { return }
+        let context = RefreshObservationContext(observationNow: scheduledObservationNow ?? tokenHubNow())
         localScan?.cancel()
         let version = generation
         let work = DispatchWorkItem { [weak self] in
@@ -583,8 +721,22 @@ struct PresentationTimeState: Equatable {
                     self.scheduleLocalScan(immediate: false); return
                 }
                 self.localScanRunning = true
-                let inputs = self.localScanning.resolveInputs()
-                let result = try? await self.localScanning.scan(inputs.directory, Date(), version, inputs.routeContext)
+                let observationNow = context.observationNow
+                // Production discovers the path and route inside the scan
+                // worker. Injected legacy seams remain available for tests.
+                let result: LocalCodexScanWorker.Result?
+                if let scanDefault = self.localScanning.scanDefault {
+                    result = try? await scanDefault(observationNow, version)
+                } else {
+                    if let resolveInputs = self.localScanning.resolveInputs,
+                       let scan = self.localScanning.scan {
+                        let inputs = resolveInputs()
+                        result = try? await scan(inputs.directory, observationNow,
+                                                version, inputs.routeContext)
+                    } else {
+                        result = nil
+                    }
+                }
                 self.localScanRunning = false
                 guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
                     if self.config.dataSource == "localCodex", self.backgroundServicesStarted, !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
@@ -609,7 +761,7 @@ struct PresentationTimeState: Equatable {
     /// Associates the current Codex provider with this local Token Hub's
     /// configured origin. Historical rollout routes are not independently
     /// verifiable from the current provider name and configuration alone.
-    fileprivate static func seasunRouteContext() -> LocalCodexRouteContext {
+    nonisolated fileprivate static func seasunRouteContext() -> LocalCodexRouteContext {
         let configURL = LocalCodexUsageReader.defaultConfigURL()
         guard let active = GatewayDiscovery.activeCodexProvider(at: configURL),
               let connectionURLs = try? TokenHubConnectionDiscovery.readDefaultConnectionBaseURLs(),
@@ -622,7 +774,7 @@ struct PresentationTimeState: Equatable {
     /// Production refresh first uses Token Hub's own read-only connection and
     /// in-memory SSO exchange. Preview and synthetic tests retain the
     /// bounded AX scanner path without touching real local credentials.
-    func refreshTokenHubQuota() {
+    func refreshTokenHubQuota(observationNow: Date? = nil) {
         guard !isShuttingDown else { return }
         guard config.dataSource == "localCodex", tokenHubQuotaReadingEnabled else {
             invalidateTokenHubQuota(status: .disabled); tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
@@ -634,6 +786,38 @@ struct PresentationTimeState: Equatable {
         }
         if tokenHubAutomaticReadingEnabled { checkTokenHubPermissionIfDue(scheduleIfGranted: false) }
         guard !tokenHubDirectScanInFlight else { return }
+
+        let version = tokenHubGeneration
+        let now = observationNow ?? tokenHubNow()
+        let source = directQuota
+        let interval = config.refreshSeconds
+        // Production resolves the target, reads settings and performs the
+        // direct request inside its worker actor. Only the sanitized DTO
+        // returns to this main-actor model.
+        if let workerFetch = source.workerFetch {
+            tokenHubDirectScanInFlight = true
+            Task { [weak self] in
+                let result: Result<DirectQuotaTransportSnapshot, Error>
+                do { result = .success(try await workerFetch(now)) }
+                catch { result = .failure(error) }
+                guard let self else { return }
+                guard !self.isShuttingDown, self.tokenHubGeneration == version else { return }
+                self.tokenHubDirectScanInFlight = false
+                guard self.config.dataSource == "localCodex", self.tokenHubQuotaReadingEnabled else { return }
+                switch result {
+                case .success(let transport):
+                    self.tokenHubQuotaSnapshot = transport.materializedSnapshot()
+                    self.tokenHubStatusConnected(interval: interval)
+                case .failure(let error):
+                    self.tokenHubStatusFailed(error, interval: interval)
+                }
+            }
+            return
+        }
+
+        // Compatibility path for injected synthetic tests. Production never
+        // reaches this branch, so its discovery and settings reads stay off
+        // the main actor.
         let identity: TokenHubIdentity
         do { identity = try directQuota.discoverTarget() }
         catch {
@@ -645,10 +829,6 @@ struct PresentationTimeState: Equatable {
             scheduleTokenHubRefresh(after: config.refreshSeconds)
             return
         }
-        let version = tokenHubGeneration
-        let now = tokenHubNow()
-        let source = directQuota
-        let interval = config.refreshSeconds
         tokenHubDirectScanInFlight = true
         Task { [weak self] in
             let result: Result<TokenHubQuotaSnapshot, Error>
@@ -673,28 +853,50 @@ struct PresentationTimeState: Equatable {
                     return
                 }
                 self.tokenHubQuotaSnapshot = snapshot
-                self.tokenHubQuotaStatus = .connected
-                self.tokenHubQuotaFailure = nil
-                self.tokenHubDirectFailure = nil
-                self.tokenHubQuotaIsDirect = true
-                self.sourceReadinessText = "企业额度已自动读取 Token Hub 后台"
-                self.scheduleTokenHubRefresh(after: interval)
+                self.tokenHubStatusConnected(interval: interval)
             case .failure(let error):
-                let failure = (error as? TokenHubDirectQuotaFailure) ?? .transportFailed
-                self.tokenHubQuotaSnapshot = nil
-                self.tokenHubQuotaIsDirect = false
-                self.tokenHubDirectFailure = failure
-                self.tokenHubQuotaStatus = .accessFailed
-                self.tokenHubQuotaFailure = nil
-                self.sourceReadinessText = "企业后台直接来源：\(self.directFailureText(failure))"
-                // AX is an optional compatibility fallback only when the user
-                // has already granted trust; it never gates direct reading.
-                if self.tokenHubAutomaticReadingEnabled, self.cachedTokenHubPermission, !self.isFixtureUsingNativeTokenHubReader {
-                    self.refreshTokenHubQuotaUsingAccessibility()
-                } else {
-                    self.scheduleTokenHubRefresh(after: interval)
-                }
+                self.tokenHubStatusFailed(error, interval: interval)
             }
+        }
+    }
+
+    private func tokenHubStatusConnected(interval: TimeInterval) {
+        tokenHubQuotaStatus = .connected
+        tokenHubQuotaFailure = nil
+        tokenHubDirectFailure = nil
+        tokenHubQuotaIsDirect = true
+        sourceReadinessText = "企业额度已自动读取 Token Hub 后台"
+        scheduleTokenHubRefresh(after: interval)
+    }
+
+    private func tokenHubStatusFailed(_ error: Error, interval: TimeInterval) {
+        let failure = (error as? TokenHubDirectQuotaFailure) ?? .transportFailed
+        tokenHubQuotaSnapshot = nil
+        tokenHubQuotaIsDirect = false
+        tokenHubDirectFailure = failure
+        if let targetFailure = error as? TokenHubQuotaFailure, targetFailure == .noTarget {
+            tokenHubDirectFailure = nil
+            tokenHubQuotaStatus = .targetNotRunning
+            sourceReadinessText = "Token Hub 未运行"
+            scheduleTokenHubRefresh(after: interval)
+            return
+        }
+        if let targetFailure = error as? TokenHubQuotaFailure, targetFailure == .multipleTargets {
+            tokenHubDirectFailure = nil
+            tokenHubQuotaStatus = .ambiguousTarget
+            sourceReadinessText = "检测到多个 Token Hub 进程"
+            scheduleTokenHubRefresh(after: interval)
+            return
+        }
+        tokenHubQuotaStatus = .accessFailed
+        tokenHubQuotaFailure = nil
+        sourceReadinessText = "企业后台直接来源：\(directFailureText(failure))"
+        // AX is an optional compatibility fallback only when the user has
+        // already granted trust; it never gates direct reading.
+        if tokenHubAutomaticReadingEnabled, cachedTokenHubPermission, !isFixtureUsingNativeTokenHubReader {
+            refreshTokenHubQuotaUsingAccessibility()
+        } else {
+            scheduleTokenHubRefresh(after: interval)
         }
     }
 
@@ -736,7 +938,7 @@ struct PresentationTimeState: Equatable {
                 }
                 return
             }
-            self.applyTokenHubQuotaResult(result, generation: version, mode: mode, now: self.tokenHubNow())
+            self.applyTokenHubQuotaResult(result, generation: version, mode: mode, now: now)
             self.scheduleTokenHubRefresh(after: self.config.refreshSeconds)
         }
     }
@@ -844,16 +1046,17 @@ struct PresentationTimeState: Equatable {
         checkTokenHubPermissionIfDue()
     }
 
-    private func scheduleTokenHubRefresh(after seconds: TimeInterval) {
+    private func scheduleTokenHubRefresh(after seconds: TimeInterval, observationNow scheduledObservationNow: Date? = nil) {
         guard (backgroundServicesStarted || isPreview), config.dataSource == "localCodex", tokenHubQuotaReadingEnabled,
               !isShuttingDown, (usesDirectQuotaSource || !tokenHubScanInFlight), !isFixtureUsingNativeTokenHubReader else { return }
+        let context = RefreshObservationContext(observationNow: scheduledObservationNow ?? tokenHubNow())
         tokenHubRefreshWork?.cancel()
         let version = tokenHubGeneration
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor in
                 guard let self, !self.isShuttingDown, self.tokenHubGeneration == version,
                       self.config.dataSource == "localCodex", self.tokenHubQuotaReadingEnabled else { return }
-                self.refreshTokenHubQuota()
+                self.refreshTokenHubQuota(observationNow: context.observationNow)
             }
         }
         tokenHubRefreshWork = work

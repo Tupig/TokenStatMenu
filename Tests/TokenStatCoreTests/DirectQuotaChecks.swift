@@ -53,6 +53,9 @@ extension CoreChecks {
               "direct quota derives percentages from exact amounts")
         check(decoded.fiveHour?.resetDisplay == "01-15 08:00" && decoded.sevenDay?.resetDisplay == "01-15 08:00",
               "direct quota formats period end without guessing a year")
+        check(decoded.fiveHour?.resetAt == Date(timeIntervalSince1970: 1_800_000_000)
+            && decoded.sevenDay?.resetAt == Date(timeIntervalSince1970: 1_800_000_000),
+              "direct quota retains source period end for freshness checks")
         check(decoded.fiveHour?.sourceSymbol == "$" && decoded.sevenDay?.sourceSymbol == "$",
               "direct quota normalizes USD currency to a display symbol")
 
@@ -67,6 +70,14 @@ extension CoreChecks {
         check(wrappedDecoded.fiveHour?.usedPercent == Decimal(0) && wrappedDecoded.sevenDay?.usedPercent == Decimal(100),
               "direct quota accepts numeric Unix period timestamps")
         check(wrappedDecoded.fiveHour?.sourceSymbol == "¥", "direct quota normalizes CNY currency")
+        let unknownCurrency = json(#"{"data":{"currency":"https://example.invalid/account","windows":[{"kind":"fixed_5h","quota_amount":10,"used_amount":2}]}}"#)
+        let unknownCurrencyDecoded = try TokenHubDirectQuotaDecoder.decode(
+            unknownCurrency,
+            identity: identity,
+            now: now,
+            timeZone: TimeZone(secondsFromGMT: 0)!
+        )
+        check(unknownCurrencyDecoded.fiveHour?.sourceSymbol == "¤", "unknown currency cannot leak a URL or account label into UI")
         let rootShape = json("""
         {"code":"OK","currency":"USD","windows":[{"kind":"fixed_5h","quota_amount":10,"used_amount":2}]}
         """)
@@ -86,10 +97,35 @@ extension CoreChecks {
         let monthlyDecoded = try TokenHubDirectQuotaDecoder.decode(monthly, identity: identity, now: now)
         check(monthlyDecoded.monthly?.usedAmount == Decimal(string: "12.5") && monthlyDecoded.fiveHour == nil,
               "direct quota preserves a monthly window without inventing rolling windows")
+        check(monthlyDecoded.monthly?.limitAmount == Decimal(100)
+            && monthlyDecoded.monthly?.remainingAmount == Decimal(string: "87.5")
+            && monthlyDecoded.monthly?.usedPercent == Decimal(string: "12.5"),
+              "direct quota preserves monthly limit and derives remaining percentage")
         let userMonth = json(#"{"data":{"currency":"USD","windows":[{"kind":"user_month","quota_amount":100,"used_amount":12.5}]}}"#)
         let userMonthDecoded = try TokenHubDirectQuotaDecoder.decode(userMonth, identity: identity, now: now)
         check(userMonthDecoded.monthly != nil,
               "direct quota maps the Token Hub user_month window")
+        let duplicateMonthly = json(#"{"data":{"currency":"USD","windows":[{"kind":"monthly","quota_amount":100,"used_amount":1},{"kind":"user_month","quota_amount":100,"used_amount":1}]}}"#)
+        do {
+            _ = try TokenHubDirectQuotaDecoder.decode(duplicateMonthly, identity: identity, now: now)
+            check(false, "duplicate direct monthly windows reject")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .duplicateMonthly, "duplicate direct monthly windows report typed failure")
+        }
+        let invalidMonthlyLimit = json(#"{"data":{"currency":"USD","windows":[{"kind":"monthly","quota_amount":-1,"used_amount":1}]}}"#)
+        do {
+            _ = try TokenHubDirectQuotaDecoder.decode(invalidMonthlyLimit, identity: identity, now: now)
+            check(false, "invalid direct monthly limit rejects")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .malformedResponse, "invalid direct monthly limit reports malformed response")
+        }
+        let invalidPeriodEnd = json(#"{"data":{"currency":"USD","windows":[{"kind":"five_hours","quota_amount":10,"used_amount":1,"period_end":"not-a-date"}]}}"#)
+        do {
+            _ = try TokenHubDirectQuotaDecoder.decode(invalidPeriodEnd, identity: identity, now: now)
+            check(false, "invalid direct reset date rejects")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .malformedResponse, "invalid direct reset date reports malformed response")
+        }
 
         let malformed = json(#"{"data":{"currency":"USD","windows":[{"kind":"five_hours","quota_amount":10,"used_amount":11}]}}"#)
         do { _ = try TokenHubDirectQuotaDecoder.decode(malformed, identity: identity, now: now); check(false, "used above limit rejects direct quota") }
@@ -281,6 +317,10 @@ extension CoreChecks {
         let noMonthlyLimit = try TokenHubDirectQuotaDecoder.decode(response(kind: "user_month", field: "quota_amount", literal: "null"),
             identity: identity, now: now)
         check(noMonthlyLimit.monthly?.usedAmount == Decimal(0), "optional monthly null limit remains supported")
+        check(noMonthlyLimit.monthly?.limitAmount == nil
+            && noMonthlyLimit.monthly?.remainingAmount == nil
+            && noMonthlyLimit.monthly?.usedPercent == nil,
+              "used-only monthly response keeps limit-derived fields unknown")
     }
 }
 

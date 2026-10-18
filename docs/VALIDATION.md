@@ -1,5 +1,20 @@
 # 验证记录
 
+## BP37f 当前候选验证（2026-10-19）
+
+| 检查 | 结果 | 说明 |
+| --- | --- | --- |
+| Core synthetic checks | 619/619 | JSONL EOF、root 单调性、月度上限、resetAt 与解码负例 |
+| Swift/XCTest | 73/73 | 完整 Xcode 环境，包含 UI、生命周期、百分比、历史和快照 |
+| App target build | 通过 | `swift build --target TokenStatMenu`；CLT 的 linker search-path warning 仍由 Issue #52 跟踪 |
+| A01–A09 actual checks | 9/9 fixture checks | manifest `238e450708600f338887d40407fda843e9949c576f1a080fd69f098419880799`；fixture failures 0；strict-source exit 0 |
+| ATS baseline | 通过 | `NSAllowsArbitraryLoads` 已移除；远程 HTTP 与不安全重定向由合成矩阵拒绝 |
+| Source/public checks | 通过 | 仅合成输入；未访问真实 Hub、网络、凭据、Keychain、TCC 或用户记录 |
+
+`docs/FULL_SOURCE.md` 由最终白名单连续生成两次，SHA-256 均为 `32f2095533a83d3ba9d56309978477fd29f9acf62fbebbdd45d6242f2512c659`；公开白名单检查为 88 个文件。四张浅/深色快照的哈希已同步到 `check_public_content.py`，普通快照回归仍在不录制模式通过。
+
+当前候选仍不宣称企业权威实时 token/s，Issue #37 保持开放；Issue #33 的真实 AX 自动化环境也不由 SwiftUI 合成渲染关闭。完整 Xcode 测试应使用 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`，CLT-only 环境无法解析 XCTest 模块。
+
 ## 阶段 1 — 数据准确性与菜单口径（2026-10-18）
 
 本节记录阶段 PR #70 合并提交 `60cba98`，以及后续时钟一致性修正提交 `459a106` 所覆盖的阶段 1 复验。它们分别让 Dashboard 额度卡、标题和诊断报告使用 `AppModel` 的 model clock，缓存可选诊断输出参数，并为 C29 的完整/受限本机记录标签加入合成回归。这些提交是阶段证据，不代表当前工作分支；本节只记录本机证据，不表示企业服务端已提供权威瞬时 token/s。

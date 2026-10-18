@@ -13,10 +13,10 @@ from pathlib import Path
 from package_source import PUBLIC_FILES, ROOT
 
 SYNTHETIC_PNG_SHA256 = {
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "a6f5da19785b39f043e35fd6fa9e8aa020825ca3c9b4e16a1d65103d49d69c6c",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "fae572d44db34764be5c73fab64ca349b8e8bcb668a9f4a75c40535fb568e26b",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "64ea172d17a5d3be86176c4b3ede3c7b68b6f9c841709ffa92c49edfbfdfb101",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "98c5ede0f59bd9f69d064b52b3e49731b98c70447407148b1cc84a3dc1ce352b",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "ead24ba5ff05e81ddb9f042e1e601725a052e3835ca5c8b980ab70ce7f516617",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "9819e254364e4ba2bc5c60ff2e4574fa4828264aa341b05920349333b253b91d",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "00285b94a18af9ca7ac7220e0f8eb08932916868756e3de4807a6633e77611a8",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "66b9653affa7b809eaa53f2c6e16f706830c3401f5377d5b441fa208be434c53",
 }
 
 

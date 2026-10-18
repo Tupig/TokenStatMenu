@@ -100,14 +100,14 @@ extension CoreChecks {
         try writeSession(in: aggregateRoot, uuid: secondID,
             events: [tokenEvent(at: now.addingTimeInterval(-60), input: 4, output: 6)], modified: now)
         let aggregate = try LocalCodexUsageReader.scan(directory: aggregateRoot, now: now)
-        check(aggregate.input == 6 && aggregate.output == 9 && aggregate.total == 15,
-            "local Codex totals use each session's last cumulative counter, including a lower reset value")
+        check(aggregate.input == 4 && aggregate.output == 6 && aggregate.total == 10,
+            "a root counter reset is excluded instead of being reported as complete accounting")
         check(aggregate.sessionCount == 2 && aggregate.latestEventAt == now.addingTimeInterval(-60),
             "local Codex reports metadata-backed top-level count and latest event timestamp")
-        check(aggregate.knownThreadCount == 2 && aggregate.unknownThreadCount == 0
-            && aggregate.unidentifiedFileCount == 0 && aggregate.hasCompleteAccounting,
-            "two valid root metadata records produce complete accounting independently of session count")
-        check(aggregate.input == 6 && aggregate.output == 9,
+        check(aggregate.knownThreadCount == 1 && aggregate.unknownThreadCount == 1
+            && aggregate.unidentifiedFileCount == 0 && !aggregate.hasCompleteAccounting,
+            "a root reset marks only the affected thread unknown")
+        check(aggregate.input == 4 && aggregate.output == 6,
             "cached input and reasoning output subfields are not added twice")
         let rescanned = try LocalCodexUsageReader.scan(directory: aggregateRoot, now: now)
         check(rescanned.input == aggregate.input && rescanned.output == aggregate.output
@@ -127,6 +127,28 @@ extension CoreChecks {
             && exactZero.total == 0,
             "a metadata-backed known zero is distinguishable from absence of any known thread")
         try? FileManager.default.removeItem(at: exactZeroRoot.deletingLastPathComponent())
+
+        let noFinalLFRoot = try fixtureDirectory("complete-no-final-lf")
+        let noFinalLFID = "13131313-1313-4313-8313-131313131313"
+        try writeSession(in: noFinalLFRoot, uuid: noFinalLFID,
+            events: [tokenEvent(at: now.addingTimeInterval(-1), input: 7, output: 5)],
+            modified: now, finalNewline: false)
+        let noFinalLF = try LocalCodexUsageReader.scan(directory: noFinalLFRoot, now: now)
+        check(noFinalLF.input == 7 && noFinalLF.output == 5 && noFinalLF.total == 12
+            && noFinalLF.knownThreadCount == 1 && noFinalLF.hasCompleteAccounting,
+            "a complete final JSONL event is retained without a trailing LF")
+        try? FileManager.default.removeItem(at: noFinalLFRoot.deletingLastPathComponent())
+
+        let truncatedFinalRoot = try fixtureDirectory("truncated-final-no-lf")
+        let truncatedFinalID = "14141414-1414-4414-8414-141414141414"
+        try writeSession(in: truncatedFinalRoot, uuid: truncatedFinalID,
+            events: [tokenEvent(at: now.addingTimeInterval(-2), input: 3, output: 2)],
+            modified: now, suffix: Data("{\"type\":\"event_msg\"".utf8), finalNewline: false)
+        let truncatedFinal = try LocalCodexUsageReader.scan(directory: truncatedFinalRoot, now: now)
+        check(truncatedFinal.input == 0 && truncatedFinal.output == 0 && truncatedFinal.total == 0
+            && !truncatedFinal.hasCompleteAccounting,
+            "a malformed final no-LF fragment remains unknown instead of being counted")
+        try? FileManager.default.removeItem(at: truncatedFinalRoot.deletingLastPathComponent())
 
         let noEvidenceRoot = try fixtureDirectory("no-accounting-evidence")
         let noEvidence = try LocalCodexUsageReader.scan(directory: noEvidenceRoot, now: now)
@@ -385,6 +407,11 @@ extension CoreChecks {
         let originalFileSize = try Data(contentsOf: cachedPath).count
         check(sameSizeRewrite.count == originalFileSize,
             "same-size cache rewrite fixture preserves byte count")
+        if let range = sameSizeRewrite.range(of: Data("\"total_tokens\":7".utf8)) {
+            sameSizeRewrite.replaceSubrange(range, with: Data("\"total_tokens\":8".utf8))
+        } else {
+            check(false, "same-size cache rewrite fixture locates the matching total count")
+        }
         try sameSizeRewrite.write(to: cachedPath)
         try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(2)], ofItemAtPath: cachedPath.path)
         let rewrittenCache = try LocalCodexUsageReader.scan(directory: cacheRoot, now: now, cache: cache)
@@ -1105,7 +1132,8 @@ extension CoreChecks {
 
         let exactRoot = try fixtureDirectory("exact-large-integer")
         try writeSession(in: exactRoot, uuid: "14141414-1414-4414-8414-141414141414",
-            events: [rawTokenEvent(at: now, inputLiteral: "9007199254740993", outputLiteral: "0")], modified: now)
+            events: [rawTokenEvent(at: now, inputLiteral: "9007199254740993", outputLiteral: "0",
+                                   totalLiteral: "9007199254740993")], modified: now)
         let exactLarge = try LocalCodexUsageReader.scan(directory: exactRoot, now: now)
         check(exactLarge.input == 9_007_199_254_740_993,
             "large JSON integer above 2^53 is parsed without floating point rounding")
@@ -1237,7 +1265,8 @@ extension CoreChecks {
 
         let overflowRoot = try fixtureDirectory("aggregate-overflow")
         try writeSession(in: overflowRoot, uuid: "ffffffff-ffff-4fff-8fff-ffffffffffff",
-            events: [rawTokenEvent(at: now, inputLiteral: String(Int.max), outputLiteral: "0")], modified: now)
+            events: [rawTokenEvent(at: now, inputLiteral: String(Int.max), outputLiteral: "0",
+                                   totalLiteral: String(Int.max))], modified: now)
         try writeSession(in: overflowRoot, uuid: "abababab-abab-4bab-8bab-abababababab",
             events: [rawTokenEvent(at: now, inputLiteral: "1", outputLiteral: "0")], modified: now)
         do {
@@ -1467,12 +1496,16 @@ extension CoreChecks {
     private static func writeSession(in directory: URL, uuid: String, events: [Data], modified: Date,
                                      prefix: Data = Data(), suffix: Data = Data(),
                                      metadataID: String? = nil, metadataSource: Any? = "cli",
-                                     metadataFields: [String: Any] = [:], metadata: Data? = nil) throws {
+                                     metadataFields: [String: Any] = [:], metadata: Data? = nil,
+                                     finalNewline: Bool = true) throws {
         var data = metadata ?? sessionMetadata(id: metadataID ?? uuid, source: metadataSource, fields: metadataFields)
         if !data.isEmpty { data.append(10) }
-        data.append(prefix)
-        for event in events { data.append(event); data.append(10) }
-        data.append(suffix)
+        data.append(contentsOf: prefix)
+        for (index, event) in events.enumerated() {
+            data.append(contentsOf: event)
+            if finalNewline || index < events.count - 1 || !suffix.isEmpty { data.append(10) }
+        }
+        data.append(contentsOf: suffix)
         let url = sessionURL(in: directory, uuid: uuid)
         try data.write(to: url)
         try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: url.path)

@@ -368,7 +368,12 @@ public enum LocalCodexUsageReader {
         let tailLimited = size > headLimit + tailLimit
         let wholeFileRead = size <= headLimit + tailLimit
         let headComplete = wholeFileRead || size <= headLimit || head.last == 10
-        let headLines = wholeFileRead ? completeLines(Data(bytes), startsAtFileStart: true, endsAtFileEnd: size <= bytes.count && bytes.last == 10) : completeLines(Data(head), startsAtFileStart: true, endsAtFileEnd: false)
+        // `endsAtFileEnd` means the bounded read reached EOF; it does not mean
+        // that EOF was terminated by a newline. A final non-empty segment is a
+        // candidate complete record when the bytes cover the whole file. The
+        // parser below decides whether malformed JSON makes it a continuity
+        // barrier.
+        let headLines = wholeFileRead ? completeLines(Data(bytes), startsAtFileStart: true, endsAtFileEnd: size <= bytes.count) : completeLines(Data(head), startsAtFileStart: true, endsAtFileEnd: false)
         let tailLines = !wholeFileRead && tailLength > 0 ? completeLines(Data(tail), startsAtFileStart: false, endsAtFileEnd: true) : []
         let headSlots = headLines.enumerated().map { parseLine($0.element, fallbackOrdinal: $0.offset) }
         let decodedHead = headSlots.compactMap { $0 }
@@ -378,10 +383,15 @@ public enum LocalCodexUsageReader {
         let decodedTail = tailSlots.compactMap { $0 }
         var decoded = tailLength > 0 ? decodedHead + decodedTail : decodedHead
         let continuousRead = wholeFileRead
-        let incompleteTail = bytes.last != 10
-            ? Data(bytes[(bytes.lastIndex(of: 10).map { bytes.index(after: $0) } ?? bytes.startIndex)...])
-            : Data()
-        let hasIncompleteTailFragment = !incompleteTail.isEmpty
+        let finalLineWithoutLF: Data.SubSequence? = bytes.last == 10 ? nil :
+            bytes[(bytes.lastIndex(of: 10).map { bytes.index(after: $0) } ?? bytes.startIndex)...]
+        // A no-final-LF line is complete when it parsed as a valid JSON event.
+        // Keep malformed fragments as continuity barriers so they cannot make
+        // a bounded history look complete.
+        let hasIncompleteTailFragment: Bool = {
+            guard let finalLineWithoutLF else { return false }
+            return parseLine(finalLineWithoutLF, fallbackOrdinal: -1) == nil
+        }()
         let identity: String?
         let firstPhysicalLine = completeLines(Data(bytes.prefix(headLength)), startsAtFileStart: true, endsAtFileEnd: size <= headLength).first
         if let first = firstPhysicalLine, !first.isEmpty, let object = try? JSONSerialization.jsonObject(with: Data(first)),
@@ -443,12 +453,13 @@ public enum LocalCodexUsageReader {
             return observedLineSegments[segmentIndex].dropFirst(lineIndex + 1).contains(where: { $0 == nil })
         }()
         let latestCounterInTail = !wholeFileRead && !mappedTailSlots.isEmpty && mappedTailSlots.contains(where: { $0?.hasCumulativePayload == true })
-        let forkHasCompleteLines = wholeFileRead && mappedHeadSlots.allSatisfy { $0 != nil } && incompleteTail.isEmpty
+        let forkHasCompleteLines = wholeFileRead && mappedHeadSlots.allSatisfy { $0 != nil } && !hasIncompleteTailFragment
         var contribution: Record? = nil
         if lineage == .root {
             if let lastToken, let usage = lastToken.usage,
-               !cumulativeTokenEvents.contains(where: \.invalidLifecycleTimestamp), !hasFutureCounter, !hasIncompleteTailFragment,
-               !hasBadLineAfterLatestCounter, (wholeFileRead || latestCounterInTail) { contribution = usage }
+               validCumulativeSequence(cumulativeTokenEvents, now: now), !hasFutureCounter,
+               !hasIncompleteTailFragment, !hasBadLineAfterLatestCounter,
+               (wholeFileRead || latestCounterInTail) { contribution = usage }
         } else if (lineage == .subagent || lineage == .fork), !hasHistoryBase, !hasFutureCounter, headComplete, !tailLimited,
                   continuousRead, forkHasCompleteLines, let delta = forkContribution(payload: payload, events: decoded) { contribution = delta }
         let rateEvents = tokenEvents.map { ($0.date, $0.quotaUpdate) }
@@ -538,8 +549,10 @@ public enum LocalCodexUsageReader {
         guard !data.isEmpty else { return [] }
         var lines = data.split(separator: 10, omittingEmptySubsequences: false)
         if !startsAtFileStart { lines.removeFirst() }
-        lines.removeLast()
-        _ = endsAtFileEnd
+        // A trailing LF creates an empty terminator; a nonempty final segment
+        // is complete only when this read reached EOF. For head chunks that do
+        // not reach EOF, retain only newline-terminated records.
+        if let last = lines.last, last.isEmpty || !endsAtFileEnd { lines.removeLast() }
         return lines
     }
 
@@ -751,6 +764,29 @@ public enum LocalCodexUsageReader {
     }
     private static func uint(_ value: Any?) -> UInt64? {
         guard let n = integer(value), let u = UInt64(exactly: n) else { return nil }; return u
+    }
+    /// Validate one physical root's cumulative evidence before publishing its
+    /// final counter. JSONL order is authoritative when timestamps are equal;
+    /// strict reversals, future/invalid lifecycle timestamps, counter resets,
+    /// and totals smaller than input+output make the whole thread unknown.
+    private static func validCumulativeSequence(_ events: [ParsedEvent], now: Date) -> Bool {
+        guard !events.isEmpty else { return false }
+        var previousDate: Date?
+        var previous: Record?
+        for event in events {
+            guard event.hasCumulativePayload, let usage = event.usage,
+                  !event.invalidLifecycleTimestamp, usage.date <= now else { return false }
+            if let previousDate, usage.date < previousDate { return false }
+            if let previous,
+               usage.input < previous.input || usage.output < previous.output || usage.total < previous.total {
+                return false
+            }
+            let (minimumTotal, overflow) = usage.input.addingReportingOverflow(usage.output)
+            guard !overflow, usage.total >= minimumTotal else { return false }
+            previousDate = usage.date
+            previous = usage
+        }
+        return true
     }
     private static func isMonotonic(_ values: [Int]) -> Bool { zip(values, values.dropFirst()).allSatisfy { $0 <= $1 } }
     private static func integer(_ value: Any?) -> Int? {

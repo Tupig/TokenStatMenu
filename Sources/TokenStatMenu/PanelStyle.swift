@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 // Original native components inspired by compact translucent desktop dashboards.
@@ -6,6 +7,34 @@ enum PanelPalette {
     static let blue = Color(red: 0.24, green: 0.43, blue: 0.96)
     static let violet = Color(red: 0.55, green: 0.39, blue: 0.89)
     static let gradient = LinearGradient(colors: [blue, violet], startPoint: .topLeading, endPoint: .bottomTrailing)
+}
+
+enum TwoDecimalPercentFormatter {
+    static func string(_ value: Double) -> String {
+        String(format: "%.2f%%", locale: Locale(identifier: "en_US_POSIX"), value)
+    }
+
+    static func string(_ value: Decimal) -> String {
+        let number = NSDecimalNumber(decimal: value).doubleValue
+        return string(number)
+    }
+}
+
+enum HeaderActionMetrics {
+    static let actionSize: CGFloat = 30
+}
+
+/// Header actions intentionally ignore the dashboard's accent tint. This
+/// keeps the settings and quit hit targets visually neutral and symmetric,
+/// including when the popover opens with keyboard focus.
+struct NeutralHeaderActionButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.secondary)
+            .background(Color.clear)
+            .contentShape(Rectangle())
+            .opacity(configuration.isPressed ? 0.65 : 1)
+    }
 }
 
 struct PanelCardStyle: GroupBoxStyle {

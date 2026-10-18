@@ -495,7 +495,11 @@ public enum TokenHubDirectQuotaDecoder {
             throw TokenHubDirectQuotaFailure.malformedResponse
         }
         let symbol = displaySymbol(currency)
-        let fallbackReset = date(dataObject["reset_at"] ?? object["reset_at"])
+        let fallbackResetRaw = dataObject["reset_at"] ?? object["reset_at"]
+        if let fallbackResetRaw, !(fallbackResetRaw is NSNull), date(fallbackResetRaw) == nil {
+            throw TokenHubDirectQuotaFailure.malformedResponse
+        }
+        let fallbackReset = date(fallbackResetRaw)
         var five: TokenHubWindowQuota?
         var seven: TokenHubWindowQuota?
         var monthly: TokenHubMonthlyUsage?
@@ -506,12 +510,16 @@ public enum TokenHubDirectQuotaDecoder {
                     guard let used = decimal(window["used_amount"]), used >= 0 else {
                         throw TokenHubDirectQuotaFailure.malformedResponse
                     }
+                    let monthlyLimit: Decimal?
                     if let rawLimit = window["quota_amount"], !(rawLimit is NSNull) {
                         guard let limit = decimal(rawLimit), limit > 0, used <= limit else {
                             throw TokenHubDirectQuotaFailure.malformedResponse
                         }
+                        monthlyLimit = limit
+                    } else {
+                        monthlyLimit = nil
                     }
-                    monthly = TokenHubMonthlyUsage(usedAmount: used, sourceSymbol: symbol)
+                    monthly = TokenHubMonthlyUsage(usedAmount: used, sourceSymbol: symbol, limitAmount: monthlyLimit)
                 }
                 continue
             }
@@ -526,12 +534,22 @@ public enum TokenHubDirectQuotaDecoder {
             guard percent >= 0, percent <= Decimal(100) else {
                 throw TokenHubDirectQuotaFailure.malformedResponse
             }
-            if let start = date(window["period_start"]), let end = date(window["period_end"]), end <= start {
+            let rawStart = window["period_start"]
+            let rawEnd = window["period_end"]
+            if let rawStart, !(rawStart is NSNull), date(rawStart) == nil {
                 throw TokenHubDirectQuotaFailure.malformedResponse
             }
-            let reset = (date(window["period_end"]) ?? fallbackReset).map { format($0, timeZone: timeZone) } ?? "未知"
+            if let rawEnd, !(rawEnd is NSNull), date(rawEnd) == nil {
+                throw TokenHubDirectQuotaFailure.malformedResponse
+            }
+            if let start = date(rawStart), let end = date(rawEnd), end <= start {
+                throw TokenHubDirectQuotaFailure.malformedResponse
+            }
+            let resetAt = date(rawEnd) ?? fallbackReset
+            let reset = resetAt.map { format($0, timeZone: timeZone) } ?? "未知"
             let quota = TokenHubWindowQuota(kind: kind, usedAmount: used, limitAmount: limit,
-                                             sourceSymbol: symbol, usedPercent: percent, resetDisplay: reset)
+                                             sourceSymbol: symbol, usedPercent: percent, resetDisplay: reset,
+                                             resetAt: resetAt)
             if kind == .fiveHour { five = quota } else { seven = quota }
         }
         guard five != nil || seven != nil || monthly != nil else { throw TokenHubDirectQuotaFailure.noRecognizedWindows }
@@ -591,7 +609,10 @@ public enum TokenHubDirectQuotaDecoder {
         switch currency.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
         case "USD", "$": return "$"
         case "CNY", "RMB", "¥": return "¥"
-        default: return currency.trimmingCharacters(in: .whitespacesAndNewlines)
+        case "EUR", "€": return "€"
+        case "GBP", "£": return "£"
+        case "JPY", "JP¥": return "¥"
+        default: return "¤"
         }
     }
 

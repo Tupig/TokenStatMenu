@@ -55,8 +55,8 @@ struct WindowQuotaCard: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    Text(source == .localCodex ? presentation.usedPercent.map { String(format: "%.1f%%", $0) } ?? "—"
-                        : fresh ? String(format: "%.1f%%", quota!.remainingPercent) : "—")
+                    Text(source == .localCodex ? presentation.usedPercent.map { TwoDecimalPercentFormatter.string($0) } ?? "—"
+                        : fresh ? TwoDecimalPercentFormatter.string(quota!.remainingPercent) : "—")
                         .font(.system(size: 27, weight: .semibold, design: .rounded))
                         .monospacedDigit().foregroundStyle(fresh ? color : .secondary)
                         .lineLimit(1).minimumScaleFactor(0.75)
@@ -75,7 +75,7 @@ struct WindowQuotaCard: View {
                     }.frame(height: 5)
                 }
                 if let used = presentation.usedPercent {
-                    Text(String(format: "上游已用 %.1f%%", used))
+                    Text("上游已用 " + TwoDecimalPercentFormatter.string(used))
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                     if !fresh {
                         Text(presentation.statusLabel + (source == .enterprise ? " · 等待刷新" : ""))

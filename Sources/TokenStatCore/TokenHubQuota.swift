@@ -27,19 +27,35 @@ public struct TokenHubWindowQuota: Equatable, Sendable {
     public let usedPercent: Decimal
     public var remainingPercent: Decimal { Decimal(100) - usedPercent }
     public let resetDisplay: String
+    /// Source reset timestamp, when the direct endpoint supplied one. AX
+    /// display-only rows leave this nil rather than guessing a date.
+    public let resetAt: Date?
 
     public init(kind: TokenHubWindowKind, usedAmount: Decimal, limitAmount: Decimal,
-                sourceSymbol: String, usedPercent: Decimal, resetDisplay: String) {
+                sourceSymbol: String, usedPercent: Decimal, resetDisplay: String,
+                resetAt: Date? = nil) {
         self.kind = kind; self.usedAmount = usedAmount; self.limitAmount = limitAmount
         self.sourceSymbol = sourceSymbol; self.usedPercent = usedPercent; self.resetDisplay = resetDisplay
+        self.resetAt = resetAt
     }
 }
 
 public struct TokenHubMonthlyUsage: Equatable, Sendable {
     public let usedAmount: Decimal
     public let sourceSymbol: String
-    public init(usedAmount: Decimal, sourceSymbol: String) {
-        self.usedAmount = usedAmount; self.sourceSymbol = sourceSymbol
+    /// Monthly total is optional because some enterprise responses expose
+    /// usage without a quota. Derived values stay unknown in that case.
+    public let limitAmount: Decimal?
+    public var remainingAmount: Decimal? {
+        guard let limitAmount, limitAmount > 0, usedAmount >= 0, usedAmount <= limitAmount else { return nil }
+        return limitAmount - usedAmount
+    }
+    public var usedPercent: Decimal? {
+        guard let limitAmount, limitAmount > 0, usedAmount >= 0, usedAmount <= limitAmount else { return nil }
+        return (usedAmount / limitAmount) * Decimal(100)
+    }
+    public init(usedAmount: Decimal, sourceSymbol: String, limitAmount: Decimal? = nil) {
+        self.usedAmount = usedAmount; self.sourceSymbol = sourceSymbol; self.limitAmount = limitAmount
     }
 }
 
