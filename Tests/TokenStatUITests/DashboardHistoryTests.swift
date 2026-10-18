@@ -265,4 +265,38 @@ final class DashboardHistoryTests: XCTestCase {
         }
         XCTAssertEqual(f.permission.requests, 0)
     }
+
+    func testC29AccountingLabelsRenderForLimitedAndCompleteSyntheticSnapshots() async throws {
+        let f = try await fixture(); defer { f.model.shutdown() }
+
+        f.model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
+            sessionCount: 2, filesScanned: 32, isLimited: true, latestEventAt: nil,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
+            unknownThreadCount: 2)
+        XCTAssertTrue(f.model.title.contains("小计"))
+        XCTAssertTrue(f.model.title.contains("未核验"))
+        XCTAssertTrue(f.model.menuTooltip.contains("实时估算：未知"))
+        XCTAssertTrue(f.model.menuTooltip.contains("当前配置关联的本机 Codex 记录"))
+        XCTAssertTrue(f.model.menuTooltip.contains("已核验记录小计"))
+        XCTAssertTrue(f.model.menuTooltip.contains("本次达到扫描上限"))
+        XCTAssertTrue(f.model.menuTooltip.contains("未核验线程 2"))
+        for dark in [false, true] {
+            let image = try render(DashboardView(model: f.model).overviewContent, dark: dark)
+            XCTAssertGreaterThan(image.png.count, 4000)
+        }
+
+        f.model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
+            sessionCount: 2, filesScanned: 3, isLimited: false, latestEventAt: nil,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
+            unknownThreadCount: 0)
+        XCTAssertTrue(f.model.title.contains("Σ"))
+        XCTAssertTrue(f.model.title.contains("顶层对话"))
+        XCTAssertTrue(f.model.menuTooltip.contains("本次扫描记录量"))
+        XCTAssertTrue(f.model.menuTooltip.contains("本次安全检查 3 个物理文件"))
+        XCTAssertTrue(f.model.menuTooltip.contains("未核验线程 0"))
+        for dark in [false, true] {
+            let image = try render(DashboardView(model: f.model).overviewContent, dark: dark)
+            XCTAssertGreaterThan(image.png.count, 4000)
+        }
+    }
 }
