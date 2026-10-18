@@ -24,9 +24,12 @@ struct StatusBarContentFactories {
     private var lastTitle = ""
     private var lastColor: NSColor?
     private var lastDiagnostic = Date.distantPast
-    init(model: AppModel, factories: StatusBarContentFactories = .production) {
+    private let diagnosticsURL: URL?
+    init(model: AppModel, factories: StatusBarContentFactories = .production,
+         diagnosticsURL: URL? = StatusBarController.commandLineDiagnosticsURL()) {
         self.model = model
         self.factories = factories
+        self.diagnosticsURL = diagnosticsURL
         // Keep a strong reference: a local NSStatusItem vanishes when deallocated.
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
@@ -89,8 +92,7 @@ struct StatusBarContentFactories {
     func popoverDidClose(_ notification: Notification) { model.panelVisible = false }
     /// Opt-in local diagnostic output for integration tests; contains only approved booleans and resource counts.
     private func writeDiagnosticsIfRequested() {
-        let args = CommandLine.arguments
-        guard let index = args.firstIndex(of: "--diagnostics-output"), args.indices.contains(index + 1),
+        guard let url = diagnosticsURL,
               Date().timeIntervalSince(lastDiagnostic) >= 1 else { return }
         lastDiagnostic = Date()
         struct Report: Encodable {
@@ -138,8 +140,14 @@ struct StatusBarContentFactories {
             sourceStatus: model.sourceStatus,
             backgroundServiceResources: model.backgroundServiceResources)
         if let data = try? JSONEncoder().encode(report) {
-            let url = URL(fileURLWithPath: args[index + 1])
             DispatchQueue.global(qos: .utility).async { try? data.write(to: url, options: .atomic) }
         }
+    }
+
+    private nonisolated static func commandLineDiagnosticsURL() -> URL? {
+        let arguments = CommandLine.arguments
+        guard let index = arguments.firstIndex(of: "--diagnostics-output"),
+              arguments.indices.contains(index + 1) else { return nil }
+        return URL(fileURLWithPath: arguments[index + 1])
     }
 }

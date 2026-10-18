@@ -167,6 +167,56 @@ final class TokenHubQuotaStateTests: XCTestCase {
         controller.toggle()
     }
 
+    func testDiagnosticsURLIsCachedAndNilDisablesOutput() async throws {
+        _ = NSApplication.shared
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenStatMenu-diagnostics-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appendingPathComponent("report.json")
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let controller = StatusBarController(model: model, diagnosticsURL: output)
+
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: output.path) { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        let firstData = try Data(contentsOf: output)
+        let firstAttributes = try FileManager.default.attributesOfItem(atPath: output.path)
+        let firstModificationDate = try XCTUnwrap(firstAttributes[.modificationDate] as? Date)
+        let firstObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: firstData) as? [String: Any])
+        let approvedKeys: Set<String> = [
+            "seasunOnlyMode", "backgroundServicesStarted", "statusItemVisible",
+            "permissionPromptRequested", "quotaPresent", "directQuotaPresent",
+            "directQuotaStatus", "fiveHourPresent", "sevenDayPresent",
+            "fiveHourResetPresent", "sevenDayResetPresent", "resetTimePresent",
+            "monthlyUsagePresent", "liveTokenSpeedPresent", "sourceStatus",
+            "backgroundServiceResources"
+        ]
+        XCTAssertEqual(Set(firstObject.keys), approvedKeys)
+
+        controller.refreshTitle()
+        try await Task.sleep(for: .milliseconds(100))
+        let secondData = try Data(contentsOf: output)
+        let secondAttributes = try FileManager.default.attributesOfItem(atPath: output.path)
+        let secondModificationDate = try XCTUnwrap(secondAttributes[.modificationDate] as? Date)
+        XCTAssertEqual(secondData, firstData)
+        XCTAssertEqual(secondModificationDate, firstModificationDate,
+                       "the one-second diagnostic throttle should avoid a second write")
+
+        let nilOutput = directory.appendingPathComponent("nil.json")
+        let nilModel = AppModel(preview: true)
+        defer { nilModel.shutdown() }
+        let nilController = StatusBarController(model: nilModel, diagnosticsURL: nil)
+        nilController.refreshTitle()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: nilOutput.path))
+        withExtendedLifetime(controller) {}
+        withExtendedLifetime(nilController) {}
+    }
+
     func testTooltipFormattingIsReusedForIdleTicksButTracksValuesAndTimeBoundaries() throws {
         _ = NSApplication.shared
         let model = AppModel(preview: true)
