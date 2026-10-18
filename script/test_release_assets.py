@@ -652,6 +652,39 @@ class ReleaseChecks(unittest.TestCase):
                 with self.assertRaises((ValueError, RuntimeError)):
                     client.lookup(TAG)
 
+    def test_create_draft_retries_only_post_create_visibility_miss(self):
+        f = self.fixture
+        sleeps = []
+        commands = []
+        client = release.GitHubClient(f.identity, visibility_retries=2,
+                                      visibility_delay=0.25, sleep=sleeps.append)
+        draft = {"id": 77, "tag": TAG, "draft": True, "prerelease": False}
+        with mock.patch.object(client, "_command",
+                               side_effect=lambda arguments, phase: commands.append((arguments, phase))), \
+             mock.patch.object(client, "lookup", side_effect=[None, draft]) as lookup:
+            self.assertEqual(client.create_draft(f.identity), draft)
+        self.assertEqual(lookup.call_count, 2)
+        self.assertEqual(sleeps, [0.25])
+        self.assertEqual([phase for _, phase in commands], ["create-draft"])
+
+    def test_create_draft_visibility_retry_is_bounded_and_transport_errors_do_not_retry(self):
+        f = self.fixture
+        for lookup_values, expected_sleeps in [([None, None, None], [0.25, 0.25]),
+                                               ([RuntimeError("synthetic transport")], [])]:
+            with self.subTest(expected_sleeps=expected_sleeps):
+                sleeps = []
+                commands = []
+                client = release.GitHubClient(f.identity, visibility_retries=2,
+                                              visibility_delay=0.25, sleep=sleeps.append)
+                with mock.patch.object(client, "_command",
+                                       side_effect=lambda arguments, phase: commands.append((arguments, phase))), \
+                     mock.patch.object(client, "lookup", side_effect=lookup_values) as lookup:
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        client.create_draft(f.identity)
+                self.assertEqual(lookup.call_count, len(lookup_values))
+                self.assertEqual(sleeps, expected_sleeps)
+                self.assertEqual([phase for _, phase in commands], ["create-draft"])
+
     def test_publish_resumes_single_fallback_draft_without_creating_release(self):
         f = self.fixture
         f.synthetic_assets()

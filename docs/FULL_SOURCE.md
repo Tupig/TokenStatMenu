@@ -11532,6 +11532,7 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -11541,6 +11542,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 from package_source import PUBLIC_FILES
@@ -11999,8 +12001,18 @@ def publish_release(root: Path, directory: Path, identity: ReleaseIdentity, clie
 
 class GitHubClient:
     """Small fixed-repository GitHub CLI adapter; response bodies stay private."""
-    def __init__(self, identity: ReleaseIdentity):
+    def __init__(self, identity: ReleaseIdentity, *, visibility_retries: int = 2,
+                 visibility_delay: float = 0.25, sleep=time.sleep):
+        _require(type(visibility_retries) is int and 0 <= visibility_retries <= 8,
+                 "visibility retry count must be a bounded integer")
+        _require(type(visibility_delay) in (int, float) and not isinstance(visibility_delay, bool)
+                 and math.isfinite(visibility_delay) and visibility_delay >= 0,
+                 "visibility retry delay must be finite and non-negative")
+        _require(callable(sleep), "visibility retry sleep must be callable")
         self.identity = identity
+        self.visibility_retries = visibility_retries
+        self.visibility_delay = visibility_delay
+        self.sleep = sleep
         self.base = "repos/" + REPOSITORY
         self.asset_ids: dict[tuple[int, str], int] = {}
 
@@ -12090,9 +12102,14 @@ class GitHubClient:
             self._command(["release", "create", identity.tag, "--repo", "github.com/" + REPOSITORY,
                            "--verify-tag", "--draft", "--title", "TokenStatMenu " + identity.version,
                            "--notes-file", str(path)], "create-draft")
-        remote = self.lookup(identity.tag)
+        remote = None
+        for attempt in range(self.visibility_retries + 1):
+            remote = self.lookup(identity.tag)
+            if remote is not None:
+                return remote
+            if attempt < self.visibility_retries:
+                self.sleep(self.visibility_delay)
         _require(remote is not None, "created draft could not be read back")
-        return remote
 
     def upload(self, release_id: int, path: Path) -> None:
         self._command(["release", "upload", self.identity.tag, str(path), "--repo", "github.com/" + REPOSITORY],
@@ -12799,6 +12816,39 @@ class ReleaseChecks(unittest.TestCase):
                     client, "_get", side_effect=[None, releases]):
                 with self.assertRaises((ValueError, RuntimeError)):
                     client.lookup(TAG)
+
+    def test_create_draft_retries_only_post_create_visibility_miss(self):
+        f = self.fixture
+        sleeps = []
+        commands = []
+        client = release.GitHubClient(f.identity, visibility_retries=2,
+                                      visibility_delay=0.25, sleep=sleeps.append)
+        draft = {"id": 77, "tag": TAG, "draft": True, "prerelease": False}
+        with mock.patch.object(client, "_command",
+                               side_effect=lambda arguments, phase: commands.append((arguments, phase))), \
+             mock.patch.object(client, "lookup", side_effect=[None, draft]) as lookup:
+            self.assertEqual(client.create_draft(f.identity), draft)
+        self.assertEqual(lookup.call_count, 2)
+        self.assertEqual(sleeps, [0.25])
+        self.assertEqual([phase for _, phase in commands], ["create-draft"])
+
+    def test_create_draft_visibility_retry_is_bounded_and_transport_errors_do_not_retry(self):
+        f = self.fixture
+        for lookup_values, expected_sleeps in [([None, None, None], [0.25, 0.25]),
+                                               ([RuntimeError("synthetic transport")], [])]:
+            with self.subTest(expected_sleeps=expected_sleeps):
+                sleeps = []
+                commands = []
+                client = release.GitHubClient(f.identity, visibility_retries=2,
+                                              visibility_delay=0.25, sleep=sleeps.append)
+                with mock.patch.object(client, "_command",
+                                       side_effect=lambda arguments, phase: commands.append((arguments, phase))), \
+                     mock.patch.object(client, "lookup", side_effect=lookup_values) as lookup:
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        client.create_draft(f.identity)
+                self.assertEqual(lookup.call_count, len(lookup_values))
+                self.assertEqual(sleeps, expected_sleeps)
+                self.assertEqual([phase for _, phase in commands], ["create-draft"])
 
     def test_publish_resumes_single_fallback_draft_without_creating_release(self):
         f = self.fixture
