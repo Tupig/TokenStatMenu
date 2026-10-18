@@ -55,7 +55,7 @@ DashboardView / SettingsView / Quota Cards：中文 SwiftUI 展示
 | [RenderAppIcon.swift](../script/RenderAppIcon.swift)、[make_app_icon.sh](../script/make_app_icon.sh) | 从零绘制原创图标并生成原生尺寸资源，进入 SwiftPM App 与 Xcode 打包 |
 | [Tests](../Tests) | 合成核心、原生状态与 UI 检查 |
 | [script](../script) | 构建、隔离集成、离线预览、隐私检查与显式源码导出 |
-| [release_assets.py](../script/release_assets.py)、[release 工作流](../.github/workflows/release.yml) | 当前四资产历史与下一版五资产 DMG 契约、原生包装、远端一致性检查及分离权限的发布 |
+| [release_assets.py](../script/release_assets.py)、[CI 与发布工作流](../.github/workflows/ci.yml) | 当前四资产历史与下一版五资产 DMG 契约、原生包装、远端一致性检查及分离权限的发布 |
 
 SwiftPM 构建与测试使用经审阅的精确依赖锁和 `--force-resolved-versions`。锁同时保留 custom-dump 1.7.3 的工具链兼容图需要的 issue-reporting 2.1.2 与 overlay 1.13.1；SnapshotTesting 1.19.6 精确依赖和 App 仅依赖系统框架的边界不变。必要 pin 缺失或约束冲突应失败，不静默更新或事后恢复锁。1.1.3 的正式 Release 因真实 CI 锁漂移被干净源码检查拒绝，修正候选版本为 1.1.4/build6；本机实验、最终 CI、Release 和安装仍分别验收，见 [编译指南](wiki/编译指南.md#固定测试依赖与跨工具链锁) 与 [验证记录](VALIDATION.md)。
 

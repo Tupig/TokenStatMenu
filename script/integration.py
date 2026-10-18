@@ -208,7 +208,7 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     assert nested_info["TokenStatSourceState"] == "unspecified"
     assert not (nested_checkout / "pkill-called").exists()
     assert not (nested_checkout / "open-called").exists()
-    for script_name in ["script/build_and_run.sh", "script/test.sh", ".github/workflows/build.yml"]:
+    for script_name in ["script/build_and_run.sh", "script/test.sh", ".github/workflows/ci.yml"]:
         assert "--build-system native" not in (ROOT / script_name).read_text(), "published build/test/CI commands must not force deprecated native mode"
     print("PASS: --build-only invokes no global process kill; version and project-only source identity preserved (isolated fixtures)", flush=True)
 

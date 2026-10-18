@@ -8,7 +8,7 @@ from check_docs import rebase_links
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = [
-    ".gitignore", ".github/workflows/build.yml", ".github/workflows/release.yml", "Package.swift", "Package.resolved", "README.md", "LICENSE", "PRIVACY.md",
+    ".gitignore", ".github/workflows/ci.yml", "Package.swift", "Package.resolved", "README.md", "LICENSE", "PRIVACY.md",
     "Sources/TokenStatCore/Configuration.swift", "Sources/TokenStatCore/GatewayDiscovery.swift",
     "Sources/TokenStatCore/HTTPDecoder.swift", "Sources/TokenStatCore/LocalCodexUsageReader.swift", "Sources/TokenStatCore/MetricsEngine.swift",
     "Sources/TokenStatCore/ProxyServer.swift", "Sources/TokenStatCore/Quota.swift",
