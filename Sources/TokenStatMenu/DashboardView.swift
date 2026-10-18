@@ -30,9 +30,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             else {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 12) {
-                        TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: Date()), status: model.tokenHubQuotaStatusText,
-                            enabled: model.tokenHubAutomaticReadingEnabled, refreshSeconds: model.preferences.refreshSeconds,
-                            directSource: model.tokenHubQuotaIsDirect)
+                        tokenHubCard
                         Text(model.userFacingStatus)
                             .font(.system(size: 10)).foregroundStyle(.secondary)
                         localUsageCard
@@ -54,6 +52,11 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         .groupBoxStyle(PanelCardStyle())
         .tint(PanelPalette.blue)
     }
+    var tokenHubCard: TokenHubQuotaCard {
+        TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: Date()), status: model.tokenHubQuotaStatusText,
+            enabled: model.tokenHubQuotaReadingEnabled, refreshSeconds: model.preferences.refreshSeconds,
+            directSource: model.tokenHubQuotaIsDirect)
+    }
     private var header: some View {
         HStack(spacing: 10) {
             Image(systemName: "waveform.path")
@@ -62,7 +65,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 .background(PanelPalette.gradient, in: RoundedRectangle(cornerRadius: 10))
             VStack(alignment: .leading, spacing: 3) {
                 Text("TokenStatMenu").font(.system(size: 16, weight: .bold, design: .rounded))
-                Text(settings ? "Seasun Token Hub · 偏好设置" : "Seasun Token Hub · 后台直接来源未接通")
+                Text(settings ? "Seasun Token Hub · 偏好设置" : "Seasun Token Hub · \(model.tokenHubQuotaIsDirect && model.freshTokenHubQuota(at: Date()) != nil ? "后台额度已连接" : "后台额度等待连接")")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Spacer()
@@ -89,7 +92,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 metric("已识别顶层对话", "\(model.localSnapshot.sessionCount)")
                 metric("已识别子代理 / 分叉", "\(model.localSnapshot.subagentCount) / \(model.localSnapshot.forkCount)")
                 metric("最近用量事件", model.localSnapshot.latestEventAt?.formatted(date: .abbreviated, time: .shortened) ?? "未发现")
-                if let live = model.localSnapshot.liveTurn {
+                if let live = model.freshLocalLiveTurn {
                     metric("实时估算 · 输入 tok/s", String(format: "%.1f", live.inputTPS))
                     metric("实时估算 · 输出 tok/s", String(format: "%.1f", live.outputTPS))
                     metric("实时观测时间", live.observedAt.formatted(date: .abbreviated, time: .shortened))
@@ -102,7 +105,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 } else {
                     metric("上轮记录均速", "未知")
                 }
-                Text("仅汇总已证明经 Seasun Token Hub 路由且本次扫描可核算的记录，未核验项不计入小计。实时值来自活动 token_count 的短窗口估算，事件停止推进时会变为未知；上轮均速含工具、网络和等待。\(model.localSnapshot.isLimited ? "已达到扫描范围限制。" : "")")
+                Text("汇总与当前配置关联的本机 Codex 记录；历史路由未核验，无法核算的记录不计入小计。实时值来自活动 token_count 的短窗口估算，事件停止推进时会变为未知；上轮均速含工具、网络和等待。\(model.localSnapshot.isLimited ? "已达到扫描范围限制。" : "")")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
         } label: { Label("本地记录用量", systemImage: "doc.text.magnifyingglass") }

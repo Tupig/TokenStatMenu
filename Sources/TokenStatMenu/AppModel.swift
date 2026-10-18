@@ -66,6 +66,32 @@ struct AppModelStartupDependencies {
     }
 }
 
+/// Keep external process discovery and authenticated I/O outside lifecycle
+/// handling. Explicit injection also lets previews exercise the direct path
+/// using entirely synthetic identities and responses.
+struct TokenHubDirectQuotaDependencies {
+    let discoverTarget: @MainActor () throws -> TokenHubIdentity
+    let identityIsCurrent: @MainActor (TokenHubIdentity) -> Bool
+    let fetch: @MainActor (TokenHubIdentity, Date) async throws -> TokenHubQuotaSnapshot
+
+    static var production: TokenHubDirectQuotaDependencies {
+        let discover: @MainActor () throws -> TokenHubIdentity = {
+            let applications = NSRunningApplication.runningApplications(withBundleIdentifier: TokenHubTarget.bundleID)
+                .filter { !$0.isTerminated }
+            guard !applications.isEmpty else { throw TokenHubQuotaFailure.noTarget }
+            guard applications.count == 1 else { throw TokenHubQuotaFailure.multipleTargets }
+            guard let app = applications.first,
+                  let executable = app.executableURL?.standardizedFileURL.path,
+                  let bundle = app.bundleIdentifier else { throw TokenHubQuotaFailure.identityChanged }
+            return TokenHubIdentity(pid: app.processIdentifier, bundleID: bundle, executablePath: executable)
+        }
+        let client = TokenHubDirectQuotaClient()
+        return TokenHubDirectQuotaDependencies(discoverTarget: discover,
+            identityIsCurrent: { (try? discover()) == $0 },
+            fetch: { try await client.fetch(identity: $0, now: $1) })
+    }
+}
+
 struct BackgroundServiceResources: Equatable, Encodable {
     let timerCount: Int
     let workspaceObserverCount: Int
@@ -79,6 +105,8 @@ struct BackgroundServiceResources: Equatable, Encodable {
     let isTestFixture = CommandLine.arguments.contains("--test-fixture")
     private let isPreview: Bool
     private let startup: AppModelStartupDependencies
+    private let directQuota: TokenHubDirectQuotaDependencies
+    private let usesDirectQuotaSource: Bool
     private(set) var backgroundServicesStarted = false
     private(set) var permissionPromptRequested = false
     @Published private(set) var preferences = SeasunPreferences()
@@ -103,7 +131,6 @@ struct BackgroundServiceResources: Equatable, Encodable {
         set { preferences.tokenHubCompatibilityReadEnabled = newValue }
     }
     var tokenHubScanner: TokenHubQuotaScanning = TokenHubAXReader()
-    var tokenHubDirectClient = TokenHubDirectQuotaClient()
     var tokenHubPermissionProvider: TokenHubPermissionProviding = TokenHubNativePermissionProvider()
     var tokenHubNow: () -> Date = Date.init
     @Published var panelVisible = false
@@ -124,9 +151,11 @@ struct BackgroundServiceResources: Equatable, Encodable {
     private var isShuttingDown = false
     private var generation = 0
     private var tokenHubGeneration: UInt64 = 0
+    private var tokenHubAXGeneration: UInt64 = 0
     var onTick: (() -> Void)?
 
     var isSeasunOnly: Bool { true }
+    var tokenHubQuotaReadingEnabled: Bool { usesDirectQuotaSource || tokenHubAutomaticReadingEnabled }
     var userFacingStatus: String {
         if tokenHubQuotaIsDirect, tokenHubQuotaStatus == .connected {
             return "Seasun Token Hub 企业额度已自动读取；5 小时和 7 天重置时间来自后台响应。"
@@ -145,9 +174,12 @@ struct BackgroundServiceResources: Equatable, Encodable {
             axScanInFlightCount: tokenHubScanInFlight ? 1 : 0)
     }
 
-    init(preview: Bool = false, startup: AppModelStartupDependencies = .production) {
+    init(preview: Bool = false, startup: AppModelStartupDependencies = .production,
+         directQuota: TokenHubDirectQuotaDependencies? = nil) {
         isPreview = preview
         self.startup = startup
+        self.directQuota = directQuota ?? .production
+        usesDirectQuotaSource = directQuota != nil || !(preview || CommandLine.arguments.contains("--test-fixture"))
         if preview {
             sourceReadinessText = "模拟预览 · 无配置读取、无自动服务"
             return
@@ -201,16 +233,26 @@ struct BackgroundServiceResources: Equatable, Encodable {
             }
             return "企业后台直接来源尚未连接；本地 Codex 历史记录与 Token Hub 额度分别展示。"
         }
-        if config.dataSource == "localCodex" { return "仅统计已证明经 Seasun Token Hub 路由的本地 Codex；当前扫描范围记录小计，实时速度为活动事件短窗口估算" }
+        if config.dataSource == "localCodex" { return "当前配置关联的本机 Codex 记录，历史路由未核验；当前扫描范围记录小计，实时速度为活动事件短窗口估算" }
         return hasRequestData ? "本次启动 · 仅统计经过本机代理的请求" : "未采集到请求数据 · 尚未观测到客户端流量"
+    }
+    /// Presentation checks freshness on every menu update, even if the local
+    /// file scan stalls. A future or invalid observation is never called live.
+    var freshLocalLiveTurn: LocalLiveTurnSummary? {
+        let now = tokenHubNow()
+        guard let live = localSnapshot.liveTurn,
+              live.observedAt <= now, now.timeIntervalSince(live.observedAt) <= 15,
+              live.inputTPS.isFinite, live.outputTPS.isFinite,
+              live.inputTPS >= 0, live.outputTPS >= 0 else { return nil }
+        return live
     }
     var title: String {
         if config.dataSource == "localCodex" {
             let rate: String
-            if let live = localSnapshot.liveTurn {
+            if let live = freshLocalLiveTurn {
                 rate = String(format: "实时≈%.1ftok/s", live.outputTPS)
             } else if let turn = localSnapshot.lastTurn {
-                rate = String(format: "%.1ftok/s", turn.outputTPS)
+                rate = String(format: "上轮均:%.1ftok/s", turn.outputTPS)
             } else {
                 rate = "上轮均:—"
             }
@@ -219,7 +261,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
                 : localSnapshot.knownThreadCount > 0 ? "小计\(formatCompactCount(localSnapshot.total)) · 未核验\(uncertainty)" : "Σ— · 未核验\(uncertainty)"
             let sessions = localSnapshot.hasCompleteAccounting ? " · \(localSnapshot.sessionCount)顶层对话" : ""
             let quotaSuffix = tokenHubMenuSuffix
-            return (isTestFixture ? "测试 " : "") + "上轮均:\(rate) · \(total)\(sessions)\(quotaSuffix)"
+            return (isTestFixture ? "测试 " : "") + "\(rate) · \(total)\(sessions)\(quotaSuffix)"
         }
         let value = !hasRequestData ? "T:—" : stats.active > 0
             ? String(format: "T:≈%.1ftok/s", stats.outputTPS) : "T:0.0tok/s"
@@ -230,7 +272,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         if isPreview && config.dataSource != "localCodex" {
             return "\(dataNotice) · \(sourceReadinessText)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .enterprise))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .enterprise))"
         }
-        let live = localSnapshot.liveTurn.map { String(format: "实时估算：输入 %.1f · 输出 %.1f tok/s（观测于 %@）", $0.inputTPS, $0.outputTPS, $0.observedAt.formatted()) } ?? "实时估算：未知（无新鲜活动 token_count）"
+        let live = freshLocalLiveTurn.map { String(format: "实时估算：输入 %.1f · 输出 %.1f tok/s（观测于 %@）", $0.inputTPS, $0.outputTPS, $0.observedAt.formatted()) } ?? "实时估算：未知（无新鲜活动 token_count）"
         let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
         let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
         let coverage = "扫描范围最多32个物理文件；不是全部对话；每文件头64KiB与尾256KiB，总计10MiB；" + (localSnapshot.isLimited ? "本次达到扫描上限" : "本次安全检查 \(localSnapshot.filesScanned) 个物理文件")
@@ -239,7 +281,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "已核验记录小计"
         let total = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.total) : "未知"
         let hub = tokenHubTooltipDetail
-        return "\(userFacingStatus)\n本地 Seasun 路由 Codex 当前扫描范围记录：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+        return "\(userFacingStatus)\n当前配置关联的本机 Codex 记录，历史路由未核验；当前扫描范围：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
     }
     private var tokenHubMenuSuffix: String {
         guard let snapshot = freshTokenHubQuota(at: Date()) else { return "" }
@@ -354,7 +396,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         safe.refreshSeconds = preferences.refreshSeconds
         safe.tokenHubAutomaticReadingEnabled = preferences.tokenHubCompatibilityReadEnabled
         config = safe
-        tokenHubQuotaStatus = preferences.tokenHubCompatibilityReadEnabled ? .targetNotRunning : .disabled
+        tokenHubQuotaStatus = tokenHubQuotaReadingEnabled ? .targetNotRunning : .disabled
     }
 
     private func restartBackgroundServicesIfPermitted() {
@@ -374,7 +416,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
         tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
         tokenHubDirectFailure = nil; tokenHubQuotaIsDirect = false; tokenHubDirectScanInFlight = false
-        tokenHubQuotaStatus = tokenHubAutomaticReadingEnabled ? .targetNotRunning : .disabled
+        tokenHubQuotaStatus = tokenHubQuotaReadingEnabled ? .targetNotRunning : .disabled
         lastTokenHubPermissionCheck = .distantPast; cachedTokenHubPermission = false
         _ = localRefreshScheduler.invalidate()
         localCache = LocalCodexUsageReader.Cache()
@@ -385,7 +427,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
             subagentCount: 0, forkCount: 0)
         resetQuotaState()
         scheduleLocalScan(immediate: true)
-        if tokenHubAutomaticReadingEnabled { scheduleTokenHubRefresh(after: 0) }
+        if tokenHubQuotaReadingEnabled { scheduleTokenHubRefresh(after: 0) }
         installTokenHubWorkspaceObservers()
         timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
         timer?.tolerance = 0.1
@@ -407,7 +449,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         stopBackgroundResources()
         tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
         tokenHubDirectFailure = nil; tokenHubQuotaIsDirect = false; tokenHubDirectScanInFlight = false
-        tokenHubQuotaStatus = tokenHubAutomaticReadingEnabled ? .targetNotRunning : .disabled
+        tokenHubQuotaStatus = tokenHubQuotaReadingEnabled ? .targetNotRunning : .disabled
     }
     /// Clears quota values at a source transition without performing I/O.
     func resetQuotaState() {
@@ -461,9 +503,9 @@ struct BackgroundServiceResources: Equatable, Encodable {
         DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0 : 5), execute: work)
     }
 
-    /// Proves the active Codex provider is routed through this local Seasun
-    /// Token Hub before any rollout totals are accepted. Failure is represented
-    /// as `.unverified`, which makes the scanner return unknown coverage.
+    /// Associates the current Codex provider with this local Token Hub's
+    /// configured origin. Historical rollout routes are not independently
+    /// verifiable from the current provider name and configuration alone.
     private func seasunRouteContext() -> LocalCodexRouteContext {
         let configURL = LocalCodexUsageReader.defaultConfigURL()
         guard let active = GatewayDiscovery.activeCodexProvider(at: configURL),
@@ -479,52 +521,45 @@ struct BackgroundServiceResources: Equatable, Encodable {
     /// bounded AX scanner path without touching real local credentials.
     func refreshTokenHubQuota() {
         guard !isShuttingDown else { return }
-        guard config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled else {
+        guard config.dataSource == "localCodex", tokenHubQuotaReadingEnabled else {
             invalidateTokenHubQuota(status: .disabled); tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
             return
         }
-        if isPreview || isTestFixture {
+        if !usesDirectQuotaSource {
             refreshTokenHubQuotaUsingAccessibility()
             return
         }
+        if tokenHubAutomaticReadingEnabled { checkTokenHubPermissionIfDue(scheduleIfGranted: false) }
         guard !tokenHubDirectScanInFlight else { return }
-        let applications = NSRunningApplication.runningApplications(withBundleIdentifier: TokenHubTarget.bundleID)
-            .filter { !$0.isTerminated }
-        guard applications.count == 1,
-              let app = applications.first,
-              let executable = app.executableURL?.standardizedFileURL.path,
-              let bundle = app.bundleIdentifier else {
+        let identity: TokenHubIdentity
+        do { identity = try directQuota.discoverTarget() }
+        catch {
             tokenHubDirectScanInFlight = false
             tokenHubQuotaSnapshot = nil; tokenHubQuotaIsDirect = false
             tokenHubDirectFailure = nil
-            tokenHubQuotaStatus = applications.isEmpty ? .targetNotRunning : .ambiguousTarget
-            sourceReadinessText = applications.isEmpty ? "Token Hub 未运行" : "检测到多个 Token Hub 进程"
+            tokenHubQuotaStatus = (error as? TokenHubQuotaFailure) == .noTarget ? .targetNotRunning : .ambiguousTarget
+            sourceReadinessText = tokenHubQuotaStatus == .targetNotRunning ? "Token Hub 未运行" : "检测到多个 Token Hub 进程"
             scheduleTokenHubRefresh(after: config.refreshSeconds)
             return
         }
-        let identity = TokenHubIdentity(pid: app.processIdentifier, bundleID: bundle, executablePath: executable)
         let version = tokenHubGeneration
         let now = tokenHubNow()
-        let client = tokenHubDirectClient
+        let source = directQuota
         let interval = config.refreshSeconds
         tokenHubDirectScanInFlight = true
         Task { [weak self] in
             let result: Result<TokenHubQuotaSnapshot, Error>
-            do { result = .success(try await client.fetch(identity: identity, now: now)) }
+            do { result = .success(try await source.fetch(identity, now)) }
             catch { result = .failure(error) }
             guard let self else { return }
-            guard !self.isShuttingDown, self.tokenHubGeneration == version,
-                  self.config.dataSource == "localCodex", self.tokenHubAutomaticReadingEnabled else {
-                self.tokenHubDirectScanInFlight = false
-                return
-            }
+            // Invalidation already released the old generation. Its late
+            // completion must not unlock a newer generation's active request.
+            guard !self.isShuttingDown, self.tokenHubGeneration == version else { return }
             self.tokenHubDirectScanInFlight = false
+            guard self.config.dataSource == "localCodex", self.tokenHubQuotaReadingEnabled else { return }
             switch result {
             case .success(let snapshot):
-                guard let running = NSRunningApplication(processIdentifier: identity.pid),
-                      !running.isTerminated,
-                      running.bundleIdentifier == identity.bundleID,
-                      running.executableURL?.standardizedFileURL.path == identity.executablePath else {
+                guard source.identityIsCurrent(identity) else {
                     self.tokenHubQuotaSnapshot = nil
                     self.tokenHubQuotaIsDirect = false
                     self.tokenHubDirectFailure = .identityChanged
@@ -551,7 +586,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
                 self.sourceReadinessText = "企业后台直接来源：\(self.directFailureText(failure))"
                 // AX is an optional compatibility fallback only when the user
                 // has already granted trust; it never gates direct reading.
-                if self.cachedTokenHubPermission, !self.isFixtureUsingNativeTokenHubReader {
+                if self.tokenHubAutomaticReadingEnabled, self.cachedTokenHubPermission, !self.isFixtureUsingNativeTokenHubReader {
                     self.refreshTokenHubQuotaUsingAccessibility()
                 } else {
                     self.scheduleTokenHubRefresh(after: interval)
@@ -568,11 +603,17 @@ struct BackgroundServiceResources: Equatable, Encodable {
             return
         }
         checkTokenHubPermissionIfDue(scheduleIfGranted: false)
-        guard cachedTokenHubPermission else { invalidateTokenHubQuota(status: .permissionRequired); return }
+        guard cachedTokenHubPermission else {
+            invalidateAccessibilityQuota(status: .permissionRequired)
+            // Trust can be revoked while the direct request is in flight.
+            // Its optional fallback must not cancel the unattended retry loop.
+            if usesDirectQuotaSource { scheduleTokenHubRefresh(after: config.refreshSeconds) }
+            return
+        }
         guard !tokenHubScanInFlight else { return }
         tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
         tokenHubScanInFlight = true
-        let version = tokenHubGeneration, mode: TokenHubRunMode = .localCodex
+        let version = tokenHubGeneration, axVersion = tokenHubAXGeneration, mode: TokenHubRunMode = .localCodex
         let now = tokenHubNow(), interval = config.refreshSeconds
         let scanner = tokenHubScanner
         let permission = cachedTokenHubPermission
@@ -583,12 +624,12 @@ struct BackgroundServiceResources: Equatable, Encodable {
             Task { @MainActor in
                 guard let self else { return }
                 self.tokenHubScanInFlight = false
-                guard !self.isShuttingDown, self.tokenHubGeneration == version,
+                guard !self.isShuttingDown, self.tokenHubGeneration == version, self.tokenHubAXGeneration == axVersion,
                       self.config.dataSource == "localCodex", self.tokenHubAutomaticReadingEnabled,
-                      self.cachedTokenHubPermission else {
+                      self.cachedTokenHubPermission, !self.tokenHubQuotaIsDirect else {
                     if !self.isShuttingDown, self.config.dataSource == "localCodex",
-                       self.tokenHubAutomaticReadingEnabled, self.cachedTokenHubPermission {
-                        self.scheduleTokenHubRefresh(after: 0)
+                       self.tokenHubQuotaReadingEnabled {
+                        self.scheduleTokenHubRefresh(after: self.tokenHubQuotaIsDirect ? interval : 0)
                     }
                     return
                 }
@@ -601,8 +642,21 @@ struct BackgroundServiceResources: Equatable, Encodable {
     func setTokenHubAutomaticReadingEnabled(_ enabled: Bool) {
         guard tokenHubAutomaticReadingEnabled != enabled else { return }
         preferences.tokenHubCompatibilityReadEnabled = enabled
-        tokenHubGeneration &+= 1
+        tokenHubAXGeneration &+= 1
         config.tokenHubAutomaticReadingEnabled = enabled
+        if usesDirectQuotaSource {
+            // This preference controls only AX compatibility; it cannot turn
+            // off the unattended enterprise source or discard its snapshot.
+            if !tokenHubQuotaIsDirect {
+                tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
+                tokenHubQuotaStatus = .targetNotRunning
+            }
+            if config.dataSource == "localCodex", !isShuttingDown, backgroundServicesStarted || isPreview {
+                scheduleTokenHubRefresh(after: 0)
+            }
+            return
+        }
+        tokenHubGeneration &+= 1
         tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
         if enabled && config.dataSource == "localCodex" && !isShuttingDown && (backgroundServicesStarted || isPreview) {
             tokenHubQuotaStatus = .targetNotRunning; tokenHubQuotaFailure = nil
@@ -618,7 +672,19 @@ struct BackgroundServiceResources: Equatable, Encodable {
         lastTokenHubPermissionCheck = .distantPast
         checkTokenHubPermissionIfDue(scheduleIfGranted: false)
         if cachedTokenHubPermission { refreshTokenHubQuota() }
-        else { invalidateTokenHubQuota(status: .permissionRequired) }
+        else { invalidateAccessibilityQuota(status: .permissionRequired) }
+    }
+
+    private func invalidateAccessibilityQuota(status: TokenHubQuotaStatus) {
+        tokenHubAXGeneration &+= 1
+        if !usesDirectQuotaSource {
+            invalidateTokenHubQuota(status: status)
+        } else if !tokenHubQuotaIsDirect, !tokenHubDirectScanInFlight {
+            tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
+            // Keep a direct failure (if any) visible; missing AX trust is not
+            // a failure of the automatic source.
+            if tokenHubDirectFailure == nil { tokenHubQuotaStatus = .targetNotRunning }
+        }
     }
 
     func invalidateTokenHubQuota(status: TokenHubQuotaStatus) {
@@ -650,7 +716,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
     }
 
     func freshTokenHubQuota(at now: Date) -> TokenHubQuotaSnapshot? {
-        guard config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled,
+        guard config.dataSource == "localCodex", tokenHubQuotaReadingEnabled,
               tokenHubQuotaStatus == .connected, let snapshot = tokenHubQuotaSnapshot,
               snapshot.observedAt <= now,
               now.timeIntervalSince(snapshot.observedAt) <= max(120, config.refreshSeconds * 2) else { return nil }
@@ -664,7 +730,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         let old = cachedTokenHubPermission
         cachedTokenHubPermission = tokenHubPermissionProvider.isTrusted()
         lastTokenHubPermissionCheck = now
-        if old && !cachedTokenHubPermission { invalidateTokenHubQuota(status: .permissionRequired) }
+        if old && !cachedTokenHubPermission { invalidateAccessibilityQuota(status: .permissionRequired) }
         if scheduleIfGranted && !old && cachedTokenHubPermission && config.dataSource == "localCodex" && tokenHubAutomaticReadingEnabled {
             scheduleTokenHubRefresh(after: 0)
         }
@@ -677,14 +743,14 @@ struct BackgroundServiceResources: Equatable, Encodable {
     }
 
     private func scheduleTokenHubRefresh(after seconds: TimeInterval) {
-        guard (backgroundServicesStarted || isPreview), config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled,
-              !isShuttingDown, !tokenHubScanInFlight, !isFixtureUsingNativeTokenHubReader else { return }
+        guard (backgroundServicesStarted || isPreview), config.dataSource == "localCodex", tokenHubQuotaReadingEnabled,
+              !isShuttingDown, (usesDirectQuotaSource || !tokenHubScanInFlight), !isFixtureUsingNativeTokenHubReader else { return }
         tokenHubRefreshWork?.cancel()
         let version = tokenHubGeneration
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor in
                 guard let self, !self.isShuttingDown, self.tokenHubGeneration == version,
-                      self.config.dataSource == "localCodex", self.tokenHubAutomaticReadingEnabled else { return }
+                      self.config.dataSource == "localCodex", self.tokenHubQuotaReadingEnabled else { return }
                 self.refreshTokenHubQuota()
             }
         }
@@ -729,10 +795,14 @@ struct BackgroundServiceResources: Equatable, Encodable {
     func tokenHubApplicationDidLaunch(bundleIdentifier: String) {
         guard isPreview || backgroundServicesStarted else { return }
         guard bundleIdentifier == TokenHubTarget.bundleID, !isShuttingDown else { return }
-        invalidateTokenHubQuota(status: config.dataSource == "localCodex" && tokenHubAutomaticReadingEnabled
+        invalidateTokenHubQuota(status: config.dataSource == "localCodex" && tokenHubQuotaReadingEnabled
             ? .targetNotRunning : .disabled)
-        guard config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled,
+        guard config.dataSource == "localCodex", tokenHubQuotaReadingEnabled,
               !isFixtureUsingNativeTokenHubReader else { return }
+        if usesDirectQuotaSource {
+            scheduleTokenHubRefresh(after: 0)
+            return
+        }
         checkTokenHubPermissionIfDue(scheduleIfGranted: false)
         guard cachedTokenHubPermission else {
             tokenHubQuotaStatus = .permissionRequired

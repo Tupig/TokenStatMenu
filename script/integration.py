@@ -30,6 +30,10 @@ ALLOWED_REPORT_KEYS = {
     "quotaPresent",
     "directQuotaPresent",
     "directQuotaStatus",
+    "fiveHourPresent",
+    "sevenDayPresent",
+    "fiveHourResetPresent",
+    "sevenDayResetPresent",
     "resetTimePresent",
     "monthlyUsagePresent",
     "liveTokenSpeedPresent",
@@ -81,6 +85,10 @@ def verify_report(report: dict) -> None:
     assert report["quotaPresent"] is False
     assert report["directQuotaPresent"] is False
     assert isinstance(report["directQuotaStatus"], str) and report["directQuotaStatus"]
+    assert report["fiveHourPresent"] is False
+    assert report["sevenDayPresent"] is False
+    assert report["fiveHourResetPresent"] is False
+    assert report["sevenDayResetPresent"] is False
     assert report["resetTimePresent"] is False
     assert report["monthlyUsagePresent"] is False
     assert report["liveTokenSpeedPresent"] is False
@@ -120,18 +128,18 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     checkout = root / "build-script-fixture"
     (checkout / "script").mkdir(parents=True)
     (checkout / "Resources").mkdir()
-    (checkout / "Resources/Info.plist").write_bytes(b"fixture")
+    (checkout / "Resources/Info.plist").write_bytes((ROOT / "Resources/Info.plist").read_bytes())
     (checkout / "script/build_and_run.sh").write_bytes((ROOT / "script/build_and_run.sh").read_bytes())
     tools = checkout / "tools"
     tools.mkdir()
     pkill_log = checkout / "pkill-called"
     fake_bin = checkout / "fake-bin"
     fake_bin.mkdir()
+    (fake_bin / "TokenStatMenu").write_bytes(b"synthetic-executable-fixture")
 
     stubs = {
         "pkill": "#!/bin/sh\nprintf called >> \"$BP10_PKILL_LOG\"\nexit 0\n",
         "swift": "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = --show-bin-path ]; then printf '%s\\n' \"$BP10_FAKE_BIN\"; exit 0; fi; done\nexit 0\n",
-        "cp": "#!/bin/sh\nexit 0\n",
         "chmod": "#!/bin/sh\nexit 0\n",
         "codesign": "#!/bin/sh\nexit 0\n",
     }
@@ -156,7 +164,38 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     )
     assert completed.returncode == 0, "isolated --build-only control flow should complete with stubbed build tools"
     assert not pkill_log.exists(), "--build-only must not invoke a global process-name kill"
-    print("PASS: --build-only invokes no global process kill (stubbed, isolated script copy)", flush=True)
+    packaged_info = plistlib.loads((checkout / "dist/TokenStatMenu.app/Contents/Info.plist").read_bytes())
+    source_info = plistlib.loads((ROOT / "Resources/Info.plist").read_bytes())
+    assert packaged_info["CFBundleShortVersionString"] == source_info["CFBundleShortVersionString"]
+    assert packaged_info["CFBundleVersion"] == source_info["CFBundleVersion"]
+    assert packaged_info["TokenStatSourceRevision"] == "source-export", "source-only export must not acquire a machine identity"
+    assert packaged_info["TokenStatSourceState"] == "unspecified"
+    assert (checkout / "dist/TokenStatMenu.app/Contents/MacOS/TokenStatMenu").read_bytes() == b"synthetic-executable-fixture"
+    # An exported source folder may be unpacked below an unrelated Git repo.
+    # It must keep source-export rather than embed that parent repository's HEAD.
+    parent_repository = root / "synthetic-parent-repository"
+    parent_repository.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(parent_repository)], check=True,
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["git", "-C", str(parent_repository), "-c", "user.name=Synthetic Fixture",
+                    "-c", "user.email=fixture@example.test", "-c", "commit.gpgsign=false",
+                    "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--allow-empty", "-m", "Synthetic parent fixture"],
+                   check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    nested_checkout = parent_repository / "exported-source"
+    checkout.rename(nested_checkout)
+    nested_environment = environment.copy()
+    nested_environment["PATH"] = str(nested_checkout / "tools") + os.pathsep + os.environ.get("PATH", "")
+    nested_environment["BP10_PKILL_LOG"] = str(nested_checkout / "pkill-called")
+    nested_environment["BP10_FAKE_BIN"] = str(nested_checkout / "fake-bin")
+    nested = subprocess.run(["/bin/bash", str(nested_checkout / "script/build_and_run.sh"), "--build-only"],
+                            cwd=nested_checkout, env=nested_environment, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, check=False)
+    assert nested.returncode == 0, "nested exported source must build under an unrelated Git parent"
+    nested_info = plistlib.loads((nested_checkout / "dist/TokenStatMenu.app/Contents/Info.plist").read_bytes())
+    assert nested_info["TokenStatSourceRevision"] == "source-export", "export must not inherit an unrelated parent Git HEAD"
+    assert nested_info["TokenStatSourceState"] == "unspecified"
+    assert not (nested_checkout / "pkill-called").exists()
+    print("PASS: --build-only invokes no global process kill; version and project-only source identity preserved (isolated fixtures)", flush=True)
 
 
 def run_case(name: str, source: bytes | None, root: pathlib.Path) -> None:

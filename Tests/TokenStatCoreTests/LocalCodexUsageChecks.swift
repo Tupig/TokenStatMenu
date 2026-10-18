@@ -61,6 +61,8 @@ extension CoreChecks {
             "malformed cumulative usage in an active turn keeps live speed unknown")
         try? FileManager.default.removeItem(at: malformedLiveRoot.deletingLastPathComponent())
 
+        try localLiveIntegrityChecks(now: now)
+
         var refresh = LocalRefreshScheduler()
         let firstGeneration = refresh.begin(now: now)
         check(firstGeneration != nil && refresh.begin(now: now.addingTimeInterval(1)) == nil,
@@ -359,8 +361,9 @@ extension CoreChecks {
         let rollbackCache = LocalCodexUsageReader.Cache()
         _ = try LocalCodexUsageReader.scan(directory: futureOnRollbackRoot, now: futureCompletion.addingTimeInterval(1), cache: rollbackCache)
         let afterRollback = try LocalCodexUsageReader.scan(directory: futureOnRollbackRoot, now: now, cache: rollbackCache)
-        check(afterRollback.lastTurn == nil && rollbackCache.diagnostics.cacheHits == 1,
-            "warm numeric cache revalidates completion time when the scan clock moves backward")
+        check(afterRollback.lastTurn == nil && rollbackCache.diagnostics.cacheHits == 0
+            && rollbackCache.diagnostics.parsedFiles == 1,
+            "clock rollback reparses cached evidence and revalidates completion time")
         try? FileManager.default.removeItem(at: futureOnRollbackRoot.deletingLastPathComponent())
         let cachedPath = sessionURL(in: cacheRoot, uuid: "aeaeaeae-aeae-4eae-8eae-aaaaaaaaaaaa")
         var appended = try Data(contentsOf: cachedPath)
@@ -739,7 +742,7 @@ extension CoreChecks {
             tokenEvent(at: now.addingTimeInterval(1), input: 60, output: 32)
         ], modified: now, metadataID: wrongSettingsID, metadataSource: spawnSource,
             metadataFields: ["parent_thread_id": parentID])
-        let wrongSettingsFork = try LocalCodexUsageReader.scan(directory: wrongSettingsRoot, now: now)
+        let wrongSettingsFork = try LocalCodexUsageReader.scan(directory: wrongSettingsRoot, now: now.addingTimeInterval(1))
         check(wrongSettingsFork.input == 5 && wrongSettingsFork.output == 2
             && wrongSettingsFork.knownThreadCount == 1,
             "thread settings for another thread are ignored and preceding cumulative usage remains the baseline")
@@ -1344,6 +1347,110 @@ extension CoreChecks {
         let legacyData = try PropertyListSerialization.data(fromPropertyList: legacyPlist, format: .xml, options: 0)
         let legacy = try PropertyListDecoder().decode(AppConfiguration.self, from: legacyData)
         check(legacy.dataSource == "proxy", "legacy explicit proxy configuration without source preserves proxy mode")
+    }
+
+    /// Live estimates require an intact final record segment and an unambiguous,
+    /// current lifecycle. These fixtures never inspect actual local sessions.
+    private static func localLiveIntegrityChecks(now: Date) throws {
+        let id = "35353535-3535-4535-8535-353535353535"
+        func assertUnknown(_ label: String, events: [Data], suffix: Data = Data(),
+                           incompleteAccounting: Bool = false) throws {
+            let root = try fixtureDirectory("live-integrity-\(label)")
+            defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+            try writeSession(in: root, uuid: id, events: events, modified: now, suffix: suffix)
+            let cache = LocalCodexUsageReader.Cache()
+            let cold = try LocalCodexUsageReader.scan(directory: root, now: now, cache: cache)
+            let warm = try LocalCodexUsageReader.scan(directory: root, now: now, cache: cache)
+            check(cold.liveTurn == nil && warm.liveTurn == nil,
+                "live integrity rejects \(label) on cold and cached scans")
+            if incompleteAccounting {
+                check(cold.total == 0 && !cold.hasCompleteAccounting && warm.total == 0 && !warm.hasCompleteAccounting,
+                    "future counters never enter complete accounting for \(label)")
+            }
+        }
+        let start = try turnBoundary(at: now.addingTimeInterval(-5), type: "task_started", id: "A")
+        let first = try turnTokenEvent(at: now.addingTimeInterval(-3), output: 10)
+        let second = try turnTokenEvent(at: now.addingTimeInterval(-2), output: 30)
+        try assertUnknown("truncated-tail", events: [start, first, second], suffix: json("{\"type\":\"event_msg\","))
+        try assertUnknown("damaged-record-between-counters", events: [start, first, json("{BROKEN}"), second])
+        try assertUnknown("damaged-record-after-counters", events: [start, first, second, json("{BROKEN}")])
+        try assertUnknown("invalid-event-payload", events: [start, first, json("{\"type\":\"event_msg\",\"payload\":null}"), second])
+        try assertUnknown("missing-event-kind", events: [start, first, json("{\"type\":\"event_msg\",\"payload\":{}}"), second])
+        try assertUnknown("overlapping-tasks", events: [start,
+            turnBoundary(at: now.addingTimeInterval(-4), type: "task_started", id: "B"), first, second,
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_complete", id: "A")])
+        try assertUnknown("unmatched-completion", events: [start, first, second,
+            turnBoundary(at: now.addingTimeInterval(-1), type: "task_complete", id: "B")])
+        try assertUnknown("reused-task-id", events: [
+            turnBoundary(at: now.addingTimeInterval(-9), type: "task_started", id: "A"),
+            turnBoundary(at: now.addingTimeInterval(-8), type: "task_complete", id: "A"), start, first, second])
+        try assertUnknown("future-task-start", events: [
+            turnBoundary(at: now.addingTimeInterval(10), type: "task_started", id: "A"), first, second])
+        let missingStartDate = try JSONSerialization.data(withJSONObject: ["type": "event_msg",
+            "payload": ["type": "task_started", "turn_id": "A"]])
+        try assertUnknown("missing-task-start-time", events: [missingStartDate, first, second])
+        try assertUnknown("backwards-lifecycle-time", events: [
+            turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "A"), first,
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 30)])
+        try assertUnknown("earlier-counter-reset", events: [start,
+            turnTokenEvent(at: now.addingTimeInterval(-4), output: 40), first, second])
+        try assertUnknown("earlier-counter-time-reversal", events: [start,
+            turnTokenEvent(at: now.addingTimeInterval(-2), output: 5), first,
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 30)])
+        try assertUnknown("future-final-counter", events: [start, first, second,
+            turnTokenEvent(at: now.addingTimeInterval(1), output: 50)], incompleteAccounting: true)
+        try assertUnknown("future-earlier-counter", events: [start,
+            turnTokenEvent(at: now.addingTimeInterval(1), output: 5), first, second], incompleteAccounting: true)
+
+        let paddingA = try JSONSerialization.data(withJSONObject: ["type": "padding", "text": String(repeating: "a", count: 130_000)])
+        let paddingB = try JSONSerialization.data(withJSONObject: ["type": "padding", "text": String(repeating: "b", count: 300_000)])
+        try assertUnknown("unread-middle-task-completion", events: [start, paddingA,
+            turnBoundary(at: now.addingTimeInterval(-4), type: "task_complete", id: "A"), paddingB, first, second])
+
+        let recoveryRoot = try fixtureDirectory("live-integrity-final-segment-recovery")
+        defer { try? FileManager.default.removeItem(at: recoveryRoot.deletingLastPathComponent()) }
+        try writeSession(in: recoveryRoot, uuid: id, events: [start, paddingA,
+            turnBoundary(at: now.addingTimeInterval(-4), type: "task_complete", id: "A"), paddingB,
+            turnBoundary(at: now.addingTimeInterval(-4), type: "task_started", id: "B"), first, second], modified: now)
+        let recovered = try LocalCodexUsageReader.scan(directory: recoveryRoot, now: now)
+        check(recovered.isLimited && recovered.liveTurn?.outputTPS == 20,
+            "complete independent task in the retained tail can recover a live estimate after a read gap")
+
+        let futureRoot = try fixtureDirectory("live-integrity-cache-time-revalidation")
+        defer { try? FileManager.default.removeItem(at: futureRoot.deletingLastPathComponent()) }
+        try writeSession(in: futureRoot, uuid: id, events: [start, first, second,
+            turnTokenEvent(at: now.addingTimeInterval(1), output: 50)], modified: now)
+        let futureCache = LocalCodexUsageReader.Cache()
+        _ = try LocalCodexUsageReader.scan(directory: futureRoot, now: now, cache: futureCache)
+        let caughtUp = try LocalCodexUsageReader.scan(directory: futureRoot, now: now.addingTimeInterval(2), cache: futureCache)
+        let caughtUpCold = try LocalCodexUsageReader.scan(directory: futureRoot, now: now.addingTimeInterval(2))
+        check(caughtUp == caughtUpCold && caughtUp.hasCompleteAccounting && caughtUp.liveTurn != nil,
+            "unchanged cached file is rejudged when a future counter becomes current")
+        let rewound = try LocalCodexUsageReader.scan(directory: futureRoot, now: now, cache: futureCache)
+        let rewoundCold = try LocalCodexUsageReader.scan(directory: futureRoot, now: now)
+        check(rewound == rewoundCold && rewound.liveTurn == nil && !rewound.hasCompleteAccounting,
+            "clock rollback cannot reuse counters or live estimates that are now in the future")
+
+        let aggregateRoot = try fixtureDirectory("live-integrity-aggregate-expiry")
+        defer { try? FileManager.default.removeItem(at: aggregateRoot.deletingLastPathComponent()) }
+        try writeSession(in: aggregateRoot, uuid: id, events: [
+            turnBoundary(at: now.addingTimeInterval(-17), type: "task_started", id: "older"),
+            turnTokenEvent(at: now.addingTimeInterval(-16), output: 10),
+            turnTokenEvent(at: now.addingTimeInterval(-14), output: 30)], modified: now)
+        try writeSession(in: aggregateRoot, uuid: "36363636-3636-4636-8636-363636363636", events: [
+            turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "newer"),
+            turnTokenEvent(at: now.addingTimeInterval(-1), output: 10),
+            turnTokenEvent(at: now, output: 30)], modified: now)
+        let aggregateCache = LocalCodexUsageReader.Cache()
+        let coldAggregate = try LocalCodexUsageReader.scan(directory: aggregateRoot, now: now, cache: aggregateCache)
+        let warmAggregate = try LocalCodexUsageReader.scan(directory: aggregateRoot, now: now, cache: aggregateCache)
+        check(coldAggregate.liveTurn?.outputTPS == 30 && warmAggregate == coldAggregate
+            && coldAggregate.liveTurn?.observedAt == now.addingTimeInterval(-14),
+            "aggregate live freshness uses its oldest component so one newer session cannot extend an older rate")
+        let afterComponentExpiry = try LocalCodexUsageReader.scan(directory: aggregateRoot,
+            now: now.addingTimeInterval(1.001), cache: aggregateCache)
+        check(afterComponentExpiry.liveTurn?.outputTPS == 20 && afterComponentExpiry.liveTurn?.observedAt == now,
+            "next cached scan drops the expired aggregate component and restores the remaining fresh session")
     }
 
     private static func fixtureDirectory(_ label: String) throws -> URL {

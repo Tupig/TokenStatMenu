@@ -20,14 +20,19 @@ enum TokenHubDecimalFormatter {
         self.snapshot = snapshot; self.status = status; self.enabled = enabled
         self.refreshSeconds = refreshSeconds; self.directSource = directSource
     }
+    var emptyStateText: String { enabled ? status : "自动读取已关闭" }
+    static func resetLabel(_ value: String) -> String {
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty || text == "未知" ? "重置时间未知" : "重置 \(text)"
+    }
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 7) {
                 Text(directSource
-                    ? "只读 Token Hub 后台额度响应；不写入会话、不上传凭据。与本机 Token 统计和费用分开。"
+                    ? "只读后台额度；仅向 Hub 既有来源交换会话，短期令牌仅存内存。与本机 Token 统计和费用分开。"
                     : "仅读取 Token Hub 界面显示；账号与组织未核验，币种未核验。与本机 Token 统计、企业 API 配额和费用分开。")
                     .font(.system(size: 9)).foregroundStyle(.secondary)
-                Text(directSource ? "Token Hub 后台响应时间已随本次刷新记录。" : "Token Hub 后台更新时间未提供。")
+                Text(directSource ? "本次后台读取时间已记录。" : "Token Hub 后台更新时间未提供。")
                     .font(.system(size: 9)).foregroundStyle(.secondary)
                 if let snapshot {
                     if let window = snapshot.fiveHour { row("5 小时", window.usedPercent, window.usedAmount, window.limitAmount, window.sourceSymbol, window.resetDisplay) }
@@ -39,7 +44,7 @@ enum TokenHubDecimalFormatter {
                     Text("\(directSource ? "后台读取" : "界面读取")于 \(snapshot.observedAt.formatted(.dateTime.hour().minute()))；快照有效期 \(Int(max(120, refreshSeconds * 2))) 秒")
                         .font(.system(size: 9)).foregroundStyle(.secondary)
                 } else {
-                    Text(enabled ? status : "自动读取已关闭").font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text(emptyStateText).font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }.frame(maxWidth: .infinity, alignment: .leading)
         } label: { Label(directSource ? "Token Hub 企业额度" : "Token Hub 界面额度快照", systemImage: "window.ceiling") }
@@ -54,10 +59,10 @@ enum TokenHubDecimalFormatter {
                 .fontWeight(.semibold).monospacedDigit()
             }
             HStack {
-                Text("界面已用 \(TokenHubDecimalFormatter.string(usedPercent))% · \(symbol)\(amount(used)) / \(symbol)\(amount(limit))")
+                Text("\(directSource ? "后台已用" : "界面已用") \(TokenHubDecimalFormatter.string(usedPercent))% · \(symbol)\(amount(used)) / \(symbol)\(amount(limit))")
                     .monospacedDigit()
                 Spacer(minLength: 0)
-                Text("重置 \(reset)").foregroundStyle(.secondary)
+                Text(Self.resetLabel(reset)).foregroundStyle(.secondary)
             }
         }.font(.system(size: 10))
     }

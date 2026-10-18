@@ -43,10 +43,297 @@ private final class HubManualClock {
     init(_ now: Date) { self.now = now }
 }
 
+/// Replaces only process discovery and the external direct fetch. All source
+/// selection, lifecycle, freshness and late-result handling remain in AppModel.
+@MainActor
+private final class HubDirectHarness {
+    let identity = TokenHubIdentity(pid: 925, bundleID: TokenHubTarget.bundleID,
+        executablePath: "/Applications/Synthetic Direct Hub.app/Contents/MacOS/Hub")
+    var running = true
+    private(set) var requestCount = 0
+    private var pending: [Int: (Date, CheckedContinuation<TokenHubQuotaSnapshot, Error>)] = [:]
+
+    var dependencies: TokenHubDirectQuotaDependencies {
+        TokenHubDirectQuotaDependencies(discoverTarget: {
+            guard self.running else { throw TokenHubQuotaFailure.noTarget }
+            return self.identity
+        }, identityIsCurrent: { self.running && $0 == self.identity }, fetch: { identity, now in
+            guard identity == self.identity else { throw TokenHubDirectQuotaFailure.identityChanged }
+            self.requestCount += 1
+            let request = self.requestCount
+            return try await withCheckedThrowingContinuation { self.pending[request] = (now, $0) }
+        })
+    }
+
+    func complete(_ request: Int, failure: TokenHubDirectQuotaFailure? = nil) {
+        guard let (now, continuation) = pending.removeValue(forKey: request) else { return }
+        if let failure { continuation.resume(throwing: failure); return }
+        continuation.resume(returning: TokenHubQuotaSnapshot(identity: identity,
+            fiveHour: TokenHubWindowQuota(kind: .fiveHour, usedAmount: 3, limitAmount: 10,
+                sourceSymbol: "$", usedPercent: 30, resetDisplay: "synthetic reset"),
+            sevenDay: TokenHubWindowQuota(kind: .sevenDay, usedAmount: 4, limitAmount: 10,
+                sourceSymbol: "$", usedPercent: 40, resetDisplay: "synthetic reset"),
+            monthly: TokenHubMonthlyUsage(usedAmount: 12, sourceSymbol: "$"), observedAt: now))
+    }
+
+    func finishPending() { for request in Array(pending.keys) { complete(request) } }
+}
+
 @MainActor
 final class TokenHubQuotaStateTests: XCTestCase {
     private let identity = TokenHubIdentity(pid: 924, bundleID: TokenHubTarget.bundleID,
         executablePath: "/Applications/Synthetic Hub.app/Contents/MacOS/Hub")
+
+    func testProductionCompatibilityPreferenceCannotDisableAutomaticDirectSource() {
+        let startup = AppModelStartupDependencies(loadPreferences: { nil }, savePreferences: { _ in },
+                                                  shouldStartBackgroundServices: { false })
+        let model = AppModel(startup: startup)
+        defer { model.shutdown() }
+
+        model.setTokenHubAutomaticReadingEnabled(false)
+
+        XCTAssertFalse(model.preferences.tokenHubCompatibilityReadEnabled)
+        XCTAssertNotEqual(model.tokenHubQuotaStatus, .disabled,
+                          "disabling optional AX compatibility must leave the automatic direct source available")
+    }
+
+    func testLiveMenuSpeedUsesOneLabelAndExpiresWithoutAnotherLocalScan() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        var now = observedAt
+        model.tokenHubNow = { now }
+        model.localSnapshot = LocalCodexSnapshot(input: 100, output: 50, total: 150,
+            sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: observedAt,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 1,
+            lastTurn: LocalTurnSummary(outputTokens: 50, durationSeconds: 2, completedAt: observedAt),
+            liveTurn: LocalLiveTurnSummary(inputTPS: 10, outputTPS: 24.5, observedAt: observedAt))
+
+        XCTAssertTrue(model.title.hasPrefix("实时≈24.5tok/s ·"), "a live rate must not be prefixed with the completed-turn label")
+        XCTAssertTrue(model.menuTooltip.contains("实时估算：输入 10.0 · 输出 24.5 tok/s"))
+        now = observedAt.addingTimeInterval(15)
+        XCTAssertTrue(model.title.hasPrefix("实时≈24.5tok/s ·"), "the 15-second boundary is still fresh")
+        now = observedAt.addingTimeInterval(15.001)
+        XCTAssertTrue(model.title.hasPrefix("上轮均:25.0tok/s ·"), "a stalled scan cannot keep an old estimate live indefinitely")
+        XCTAssertTrue(model.menuTooltip.contains("实时估算：未知"), "tooltip freshness must match menu freshness")
+        now = observedAt.addingTimeInterval(-0.001)
+        XCTAssertTrue(model.title.hasPrefix("上轮均:25.0tok/s ·"), "a future observation is not fresh")
+        XCTAssertTrue(model.menuTooltip.contains("实时估算：未知"))
+    }
+
+    func testUnknownMenuSpeedUsesOneCompletedTurnLabel() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        XCTAssertTrue(model.title.hasPrefix("上轮均:— ·"), "unknown speed must not duplicate its label")
+    }
+
+    private func directModel(_ harness: HubDirectHarness, clock: HubManualClock,
+                             permission: HubTestPermission) -> AppModel {
+        let model = AppModel(preview: true, directQuota: harness.dependencies)
+        model.config.dataSource = "localCodex"
+        model.config.refreshSeconds = 60
+        model.tokenHubNow = { clock.now }
+        model.tokenHubPermissionProvider = permission
+        return model
+    }
+
+    private func waitForDirectRequests(_ count: Int, harness: HubDirectHarness) async -> Bool {
+        for _ in 0..<100 {
+            if harness.requestCount >= count { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("automatic direct source did not start request \(count)")
+        return false
+    }
+
+    private func waitForDirectObservation(_ model: AppModel, at now: Date) async {
+        for _ in 0..<100 {
+            if model.tokenHubQuotaSnapshot?.observedAt == now, model.tokenHubQuotaIsDirect { return }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("AppModel did not accept the current synthetic direct observation")
+    }
+
+    func testDirectSourceAutomaticallyReadsOnTargetLaunchWithoutAXPermission() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let model = directModel(harness, clock: HubManualClock(now), permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+
+        model.tokenHubApplicationDidLaunch(bundleIdentifier: TokenHubTarget.bundleID)
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1)
+        await settle(model, status: .connected)
+
+        XCTAssertTrue(model.tokenHubQuotaIsDirect)
+        XCTAssertNotNil(model.freshTokenHubQuota(at: now))
+        XCTAssertFalse(model.tokenHubPermissionGrantedForDiagnostics)
+        XCTAssertEqual(permission.requests, 0, "unattended direct reading never prompts for OS permission")
+    }
+
+    func testDisablingAXCompatibilityPreservesDirectSnapshotAndAutomaticRelaunch() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1)
+        await settle(model, status: .connected)
+        let snapshot = model.tokenHubQuotaSnapshot
+
+        model.setTokenHubAutomaticReadingEnabled(false)
+        XCTAssertEqual(model.tokenHubQuotaSnapshot, snapshot, "the AX-only switch must not clear direct enterprise data")
+        XCTAssertEqual(model.freshTokenHubQuota(at: clock.now), snapshot, "direct data remains selected with AX compatibility off")
+        model.tokenHubApplicationDidTerminate(bundleIdentifier: TokenHubTarget.bundleID)
+        XCTAssertNil(model.tokenHubQuotaSnapshot)
+        model.tokenHubApplicationDidLaunch(bundleIdentifier: TokenHubTarget.bundleID)
+        guard await waitForDirectRequests(2, harness: harness) else { return }
+        harness.complete(2)
+        await settle(model, status: .connected)
+        XCTAssertTrue(model.tokenHubQuotaIsDirect)
+        XCTAssertEqual(permission.requests, 0)
+    }
+
+    func testAXPermissionRevocationDoesNotClearOrInvalidateDirectRead() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission()
+        let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1)
+        await settle(model, status: .connected)
+        let snapshot = model.tokenHubQuotaSnapshot
+        XCTAssertTrue(model.tokenHubPermissionGrantedForDiagnostics)
+
+        clock.now = clock.now.addingTimeInterval(2.1)
+        permission.trusted = false
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(2, harness: harness) else { return }
+        XCTAssertFalse(model.tokenHubPermissionGrantedForDiagnostics)
+        XCTAssertEqual(model.tokenHubQuotaSnapshot, snapshot, "revoking optional AX trust cannot remove direct data")
+        harness.complete(2)
+        await waitForDirectObservation(model, at: clock.now)
+        XCTAssertEqual(model.tokenHubQuotaSnapshot?.observedAt, clock.now)
+        XCTAssertTrue(model.tokenHubQuotaIsDirect)
+    }
+
+    func testDirectTargetExitRejectsLateResultWithoutUnlockingRelaunchedRequest() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+
+        model.tokenHubApplicationDidTerminate(bundleIdentifier: TokenHubTarget.bundleID)
+        XCTAssertNil(model.tokenHubQuotaSnapshot)
+        XCTAssertEqual(model.tokenHubQuotaStatus, .targetNotRunning)
+        clock.now = clock.now.addingTimeInterval(1)
+        model.tokenHubApplicationDidLaunch(bundleIdentifier: TokenHubTarget.bundleID)
+        guard await waitForDirectRequests(2, harness: harness) else { return }
+        harness.complete(1)
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertNil(model.tokenHubQuotaSnapshot, "a pre-exit result cannot become current after relaunch")
+        model.refreshTokenHubQuota()
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(harness.requestCount, 2, "an old completion cannot unlock a different generation's in-flight request")
+        harness.complete(2)
+        await settle(model, status: .connected)
+        XCTAssertEqual(model.tokenHubQuotaSnapshot?.observedAt, clock.now)
+
+        model.tokenHubApplicationDidTerminate(bundleIdentifier: TokenHubTarget.bundleID)
+        XCTAssertNil(model.tokenHubQuotaSnapshot, "exit clears a previously accepted direct snapshot synchronously")
+        XCTAssertFalse(model.tokenHubQuotaIsDirect)
+    }
+
+    func testDisabledAXCompatibilityCannotFallbackAfterDirectFailure() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let model = directModel(harness, clock: HubManualClock(now), permission: permission)
+        let scanner = HubTestScanner(result: result(now: now))
+        model.tokenHubScanner = scanner
+        defer { model.shutdown(); harness.finishPending() }
+        model.setTokenHubAutomaticReadingEnabled(false)
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1, failure: .transportFailed)
+        await settle(model, status: .accessFailed)
+        XCTAssertEqual(model.tokenHubDirectFailure, .transportFailed)
+        XCTAssertNil(model.tokenHubQuotaSnapshot)
+        XCTAssertEqual(scanner.calls, 0, "the compatibility preference controls only the optional AX fallback")
+    }
+
+    func testRevokedAXFallbackKeepsDirectFailureAndAutomaticallyRetriesDirectSource() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission()
+        let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let model = directModel(harness, clock: clock, permission: permission)
+        model.config.refreshSeconds = 0.05
+        let scanner = HubTestScanner(result: result(now: clock.now))
+        model.tokenHubScanner = scanner
+        defer { model.shutdown(); harness.finishPending() }
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        XCTAssertTrue(model.tokenHubPermissionGrantedForDiagnostics)
+
+        clock.now = clock.now.addingTimeInterval(2.1)
+        permission.trusted = false
+        harness.complete(1, failure: .transportFailed)
+        guard await waitForDirectRequests(2, harness: harness) else { return }
+        XCTAssertEqual(model.tokenHubDirectFailure, .transportFailed,
+                       "AX revocation during a direct failure must not erase the direct error")
+        XCTAssertNotEqual(model.tokenHubQuotaStatus, .permissionRequired,
+                          "missing optional trust cannot stop the unattended direct source")
+        XCTAssertEqual(scanner.calls, 0)
+        harness.complete(2)
+        await waitForDirectObservation(model, at: clock.now)
+        XCTAssertEqual(permission.requests, 0)
+    }
+
+    func testLateAXFallbackCannotOverwriteNewerDirectObservation() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission()
+        let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let model = directModel(harness, clock: clock, permission: permission)
+        let scanner = HubTestScanner(result: result(now: clock.now))
+        model.tokenHubScanner = scanner
+        let axStarted = expectation(description: "synthetic AX fallback started")
+        let releaseAX = DispatchSemaphore(value: 0)
+        scanner.started = { axStarted.fulfill() }
+        scanner.beforeReturn = { releaseAX.wait() }
+        defer { model.shutdown(); harness.finishPending(); releaseAX.signal() }
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1, failure: .transportFailed)
+        await fulfillment(of: [axStarted], timeout: 2)
+
+        clock.now = clock.now.addingTimeInterval(1)
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(2, harness: harness) else { return }
+        harness.complete(2)
+        await waitForDirectObservation(model, at: clock.now)
+        let directSnapshot = model.tokenHubQuotaSnapshot
+        releaseAX.signal()
+        for _ in 0..<100 {
+            if model.backgroundServiceResources.axScanInFlightCount == 0 { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(model.backgroundServiceResources.axScanInFlightCount, 0)
+        XCTAssertEqual(model.tokenHubQuotaSnapshot, directSnapshot,
+                       "a slow compatibility response cannot replace a newer enterprise response")
+        XCTAssertTrue(model.tokenHubQuotaIsDirect)
+        XCTAssertEqual(model.tokenHubQuotaStatus, .connected)
+        XCTAssertNil(model.tokenHubDirectFailure)
+    }
 
     private func result(now: Date) -> TokenHubQuotaResult {
         let window = TokenHubWindowObservation(titleSeen: true,
@@ -386,5 +673,41 @@ final class TokenHubQuotaStateTests: XCTestCase {
         print("Synthetic full-card renders: \(output.path)/synthetic-tokenhub-full-card-light.png and synthetic-tokenhub-full-card-dark.png")
         XCTAssertTrue(model.menuTooltip.contains("界面显示剩余"))
         XCTAssertTrue(model.menuTooltip.contains("币种未核验"))
+    }
+}
+
+
+extension TokenHubQuotaStateTests {
+    func testDashboardDirectFailureIsVisibleWhenAXCompatibilityIsDisabled() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+        model.setTokenHubAutomaticReadingEnabled(false)
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1, failure: .transportFailed)
+        await settle(model, status: .accessFailed)
+        let card = DashboardView(model: model).tokenHubCard
+        XCTAssertTrue(card.enabled, "optional AX compatibility cannot hide the automatic direct reader's status")
+        XCTAssertEqual(card.emptyStateText, "Token Hub 网络请求失败")
+        XCTAssertEqual(permission.requests, 0)
+    }
+
+    func testDashboardAXPreviewKeepsDisabledCompatibilityPresentation() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.setTokenHubAutomaticReadingEnabled(false)
+        let card = DashboardView(model: model).tokenHubCard
+        XCTAssertFalse(card.enabled, "AX-only preview has no injected or production direct source")
+        XCTAssertEqual(card.emptyStateText, "自动读取已关闭")
+    }
+
+    func testMissingHubResetTextIsExplicitlyUnknown() {
+        XCTAssertEqual(TokenHubQuotaCard.resetLabel(""), "重置时间未知")
+        XCTAssertEqual(TokenHubQuotaCard.resetLabel("  "), "重置时间未知")
+        XCTAssertEqual(TokenHubQuotaCard.resetLabel("未知"), "重置时间未知")
+        XCTAssertEqual(TokenHubQuotaCard.resetLabel("01-15 08:00"), "重置 01-15 08:00")
     }
 }

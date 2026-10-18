@@ -1,5 +1,7 @@
 import Foundation
 import TokenStatCore
+import SQLite3
+import Darwin
 
 private final class DirectQuotaCounter: @unchecked Sendable {
     private let lock = NSLock()
@@ -8,16 +10,20 @@ private final class DirectQuotaCounter: @unchecked Sendable {
     private var callbackShape = false
     private var quotaShape = false
     private var succeeded = false
-    func noteCallback(_ shape: Bool) { lock.lock(); callbacks += 1; callbackShape = shape; lock.unlock() }
+    private var failure: TokenHubDirectQuotaFailure?
+    @discardableResult func noteCallback(_ shape: Bool) -> Int { lock.lock(); callbacks += 1; callbackShape = shape; let value = callbacks; lock.unlock(); return value }
     func noteQuota(_ shape: Bool) -> Int { lock.lock(); quotas += 1; quotaShape = shape; let value = quotas; lock.unlock(); return value }
     func noteSuccess(_ value: Bool) { lock.lock(); succeeded = value; lock.unlock() }
-    func snapshot() -> (Int, Int, Bool, Bool, Bool) {
-        lock.lock(); defer { lock.unlock() }; return (callbacks, quotas, callbackShape, quotaShape, succeeded)
+    func noteFailure(_ value: TokenHubDirectQuotaFailure?) { lock.lock(); failure = value; lock.unlock() }
+    func snapshot() -> (Int, Int, Bool, Bool, Bool, TokenHubDirectQuotaFailure?) {
+        lock.lock(); defer { lock.unlock() }; return (callbacks, quotas, callbackShape, quotaShape, succeeded, failure)
     }
 }
 
 extension CoreChecks {
     static func directQuotaChecks() throws {
+        try directCallbackLocationChecks()
+        try directDatabaseReplacementChecks()
         let identity = TokenHubIdentity(pid: 47816,
             bundleID: TokenHubTarget.bundleID,
             executablePath: "/Applications/Seasun Token Hub.app/Contents/MacOS/seasun-token-hub")
@@ -115,19 +121,24 @@ extension CoreChecks {
         catch let error as TokenHubDirectQuotaFailure { check(error == .endpointRejected, "untrusted endpoint reports typed failure") }
 
 
-        // On a machine with Token Hub installed, exercise the real local DB
-        // discovery while replacing both network legs with in-memory fixtures.
-        // No session values or URLs are printed or persisted.
-        let localDB = TokenHubConnectionDiscovery.defaultDatabaseURL()
-        if FileManager.default.fileExists(atPath: localDB.path) {
+        // All connection/session values are synthetic; tests never inspect the
+        // current user's Hub database or make a network request.
+        let temporaryHome = FileManager.default.temporaryDirectory.appendingPathComponent("tokenstat-direct-fixture-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temporaryHome) }
+        let database = TokenHubConnectionDiscovery.defaultDatabaseURL(home: temporaryHome)
+        for scenario in 0..<3 {
+            try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-session")
             let counter = DirectQuotaCounter()
             let client = TokenHubDirectQuotaClient(request: { url, bearer in
-                let call = counter.noteQuota(url.path.contains("/api/v1/auth/me/quota-usage") && bearer == "fixture-access")
-                return call == 1 ? TokenHubDirectQuotaHTTPResponse(statusCode: 401, data: Data())
+                let call = counter.noteQuota(url.path == "/api/v1/auth/me/quota-usage" && bearer == "fixture-access")
+                if scenario == 2 && call == 1 {
+                    try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-replaced-session")
+                }
+                return call == 1 || scenario == 1 ? TokenHubDirectQuotaHTTPResponse(statusCode: 401, data: Data())
                     : TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: valid)
             }, callbackRequest: { url in
                 let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-                let shape = components?.path.contains("/api/v1/auth/it-sso/callback") == true
+                let shape = components?.path == "/api/v1/auth/it-sso/callback"
                     && Set(components?.queryItems?.map(\.name) ?? []).isSuperset(of: ["token", "verifySign", "redirect", "sourceChannel", "sourceTokenType"])
                 counter.noteCallback(shape)
                 return "fixture-access"
@@ -135,13 +146,173 @@ extension CoreChecks {
             let done = DispatchSemaphore(value: 0)
             Task {
                 defer { done.signal() }
-                do { _ = try await client.fetch(identity: identity, now: Date()); counter.noteSuccess(true) }
-                catch { counter.noteSuccess(false) }
+                do { _ = try await client.fetch(identity: identity, now: now, home: temporaryHome); counter.noteSuccess(true) }
+                catch { counter.noteFailure(error as? TokenHubDirectQuotaFailure) }
             }
-            _ = done.wait(timeout: .now() + 3)
+            check(done.wait(timeout: .now() + 3) == .success, "direct client fixture completes within its bounded wait")
             let state = counter.snapshot()
-            check(state.4 && state.0 == 2 && state.1 == 2 && state.2 && state.3,
-                  "direct client exchanges local SSO session and retries quota once after 401")
+            switch scenario {
+            case 0:
+                check(state.4 && state.0 == 2 && state.1 == 2 && state.2 && state.3,
+                      "direct client exchanges synthetic session and retries quota once after 401")
+            case 1:
+                check(!state.4 && state.0 == 2 && state.1 == 2 && state.5 == .httpStatus(401),
+                      "direct client stops after a repeated 401 instead of retrying again")
+            default:
+                check(!state.4 && state.0 == 1 && state.1 == 1 && state.5 == .identityChanged,
+                      "direct client re-reads session after 401 and rejects changes before exchanging again")
+            }
         }
+    }
+}
+
+
+extension CoreChecks {
+    static func directCallbackLocationChecks() throws {
+        var callbackComponents = URLComponents(string: "https://aihub.example.test/api/v1/auth/it-sso/callback")!
+        callbackComponents.queryItems = [URLQueryItem(name: "token", value: "fixture")]
+        let callback = callbackComponents.url!
+        let token = try TokenHubDirectQuotaClient.accessToken(
+            fromCallbackLocation: "https://aihub.example.test/auth/it/callback#access_token=fixture-access&redirect=%2Fme%2Fapi-key",
+            callbackURL: callback)
+        check(token == "fixture-access", "callback accepts its original HTTPS origin and fixed landing path")
+        callbackComponents.path = "/aimanager/api/v1/auth/it-sso/callback"
+        let prefixed = callbackComponents.url!
+        let prefixedToken = try TokenHubDirectQuotaClient.accessToken(
+            fromCallbackLocation: "https://aihub.example.test/aimanager/auth/it/callback#access_token=fixture-access",
+            callbackURL: prefixed)
+        check(prefixedToken == "fixture-access", "callback keeps the verified manager path prefix")
+        var duplicateFragment = URLComponents()
+        duplicateFragment.queryItems = [URLQueryItem(name: "access_token", value: "fixture-access"),
+                                        URLQueryItem(name: "access_token", value: "other")]
+        let duplicateTokenLocation = "https://aihub.example.test/auth/it/callback#" + duplicateFragment.percentEncodedQuery!
+        let rejected = [
+            ("https://sibling.example.test/auth/it/callback#access_token=fixture-access", "sibling host"),
+            ("https://other.example.test:8443/auth/it/callback#access_token=fixture-access", "sibling host and port"),
+            ("https://aihub.example.test:8443/auth/it/callback#access_token=fixture-access", "nondefault port"),
+            ("https://user:password@aihub.example.test/auth/it/callback#access_token=fixture-access", "userinfo"),
+            ("https://aihub.example.test/auth/it/callback?ignored=1#access_token=fixture-access", "query"),
+            ("http://aihub.example.test/auth/it/callback#access_token=fixture-access", "plaintext"),
+            ("https://aihub.example.test/unexpected#access_token=fixture-access", "unexpected path"),
+            ("https://aihub.example.test/auth/it/callback#access_token=fixture-access&redirect=%2Funexpected", "unexpected fragment redirect"),
+            (duplicateTokenLocation, "duplicate access token"),
+            ("https://aihub.example.test/auth/it/callback#access_token=fixture-access&redirect=%2Fme%2Fapi-key&redirect=%2Funexpected", "duplicate redirect"),
+            ("https://aihub.example.test/auth/it/callback#access_token=fixture%0Aaccess", "control character in token")
+        ]
+        for (location, label) in rejected {
+            do {
+                _ = try TokenHubDirectQuotaClient.accessToken(fromCallbackLocation: location, callbackURL: callback)
+                check(false, "callback rejects \(label)")
+            } catch let error as TokenHubDirectQuotaFailure {
+                check(error == .accessTokenMissing, "callback rejects \(label) without exposing credential data")
+            }
+        }
+        let defaultPort = try TokenHubDirectQuotaClient.accessToken(
+            fromCallbackLocation: "https://aihub.example.test:443/auth/it/callback#access_token=fixture-access",
+            callbackURL: callback)
+        check(defaultPort == "fixture-access", "callback permits an explicit default HTTPS port on the same origin")
+        let encodedToken = try TokenHubDirectQuotaClient.accessToken(
+            fromCallbackLocation: "https://aihub.example.test/auth/it/callback#access_token=fixture%252Daccess",
+            callbackURL: callback)
+        check(encodedToken == "fixture%2Daccess", "callback decodes token percent escapes exactly once")
+        // This suffix is intentionally absent from the compatibility domain
+        // list. Redirect security must never depend on a guessed public suffix.
+        let nested = URL(string: "https://manager.organization.co.id/api/v1/auth/it-sso/callback")!
+        do {
+            _ = try TokenHubDirectQuotaClient.accessToken(
+                fromCallbackLocation: "https://other.co.id/auth/it/callback#access_token=fixture-access", callbackURL: nested)
+            check(false, "callback rejects unrelated registrant under an unlisted suffix")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .accessTokenMissing, "callback exact origin rejects unlisted public suffix ambiguity")
+        }
+    }
+}
+
+
+private func writeDirectQuotaFixture(at database: URL, now: Date, sessionToken: String) throws {
+    try FileManager.default.createDirectory(at: database.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                           attributes: [.posixPermissions: 0o700])
+    var db: OpaquePointer?
+    guard sqlite3_open(database.path, &db) == SQLITE_OK, let db else {
+        if let db { sqlite3_close(db) }
+        throw NSError(domain: "SyntheticDirectQuotaFixture", code: 1)
+    }
+    defer { sqlite3_close(db) }
+    let connection = "{\"aiManagerBaseUrl\":\"https://aihub.example.test\",\"ssoBaseUrl\":\"https://sso.example.test\"}"
+    let session = try JSONSerialization.data(withJSONObject: [
+        "token": sessionToken, "verifySign": "fixture-signature", "channel": "fixture-channel",
+        "tokenType": "fixture-type", "expiresAt": (now.timeIntervalSince1970 + 3600) * 1000
+    ])
+    let sessionJSON = String(decoding: session, as: UTF8.self).replacingOccurrences(of: "'", with: "''")
+    let sql = "CREATE TABLE IF NOT EXISTS client_settings (key TEXT PRIMARY KEY, value_json TEXT);"
+        + "INSERT OR REPLACE INTO client_settings VALUES ('client.connection', '\(connection)');"
+        + "INSERT OR REPLACE INTO client_settings VALUES ('seasun_sso_session', '\(sessionJSON)');"
+    guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+        throw NSError(domain: "SyntheticDirectQuotaFixture", code: 2)
+    }
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: database.path)
+}
+
+
+extension CoreChecks {
+    static func directDatabaseReplacementChecks() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let identity = TokenHubIdentity(pid: 47817, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic Hub.app/Contents/MacOS/Hub")
+        let valid = json(#"{"data":{"currency":"USD","windows":[{"kind":"fixed_5h","quota_amount":10,"used_amount":1}]}}"#)
+        for scenario in 0..<5 {
+            let home = FileManager.default.temporaryDirectory.appendingPathComponent("tokenstat-db-replacement-fixture-" + UUID().uuidString, isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: home) }
+            let database = TokenHubConnectionDiscovery.defaultDatabaseURL(home: home)
+            try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-session")
+            let counter = DirectQuotaCounter()
+            let client = TokenHubDirectQuotaClient(request: { _, _ in
+                let call = counter.noteQuota(true)
+                if (scenario == 2 || scenario == 3) && call == 1 {
+                    try replaceDirectQuotaFixture(at: database, now: now)
+                }
+                let status = (scenario == 3 || scenario == 4) && call == 1 ? 401 : 200
+                return TokenHubDirectQuotaHTTPResponse(statusCode: status, data: valid)
+            }, callbackRequest: { _ in
+                let call = counter.noteCallback(true)
+                if (scenario == 1 && call == 1) || (scenario == 4 && call == 2) {
+                    try replaceDirectQuotaFixture(at: database, now: now)
+                }
+                return "fixture-access"
+            })
+            let done = DispatchSemaphore(value: 0)
+            Task {
+                defer { done.signal() }
+                do { _ = try await client.fetch(identity: identity, now: now, home: home); counter.noteSuccess(true) }
+                catch { counter.noteFailure(error as? TokenHubDirectQuotaFailure) }
+            }
+            check(done.wait(timeout: .now() + 3) == .success, "database replacement fixture completes within its bounded wait")
+            let state = counter.snapshot()
+            if scenario == 0 {
+                check(state.4 && state.0 == 1 && state.1 == 1,
+                      "unchanged synthetic database accepts a normal 200 quota response")
+            } else {
+                check(!state.4 && (state.5 == .identityChanged || state.5 == .databaseUnsafe),
+                      "same-field database replacement at stage \(scenario) cannot publish a quota snapshot")
+                let expectedCallbacks = scenario == 4 ? 2 : 1
+                let expectedQuotas = scenario == 1 ? 0 : 1
+                check(state.0 == expectedCallbacks && state.1 == expectedQuotas,
+                      "database replacement at stage \(scenario) rejects before the next external request")
+            }
+        }
+    }
+}
+
+/// Atomically replace only a synthetic fixture. The contents intentionally
+/// remain identical while the opened file identity changes.
+private func replaceDirectQuotaFixture(at database: URL, now: Date) throws {
+    var before = stat()
+    guard stat(database.path, &before) == 0 else { throw NSError(domain: "SyntheticDirectQuotaFixture", code: 3) }
+    let replacement = database.deletingLastPathComponent().appendingPathComponent("replacement-" + UUID().uuidString + ".db")
+    try writeDirectQuotaFixture(at: replacement, now: now, sessionToken: "fixture-session")
+    guard rename(replacement.path, database.path) == 0 else { throw NSError(domain: "SyntheticDirectQuotaFixture", code: 4) }
+    var after = stat()
+    guard stat(database.path, &after) == 0, before.st_dev != after.st_dev || before.st_ino != after.st_ino else {
+        throw NSError(domain: "SyntheticDirectQuotaFixture", code: 5)
     }
 }

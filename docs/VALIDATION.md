@@ -1,5 +1,28 @@
 # 验证记录
 
+## BP19 — 自动恢复、数值边界与固定安装验收（2026-10-18）
+
+本节记录本轮最终源码与本机候选安装产物的实际验证。BP17/BP18 的诊断来自当时启动的开发产物，只证明那些进程的就绪状态，不能代替固定路径安装或退出、重新启动后的生命周期验收。当前 provider 配置与 Hub origin 匹配也不证明相同 provider 名称的全部历史记录经过同一网关。
+
+- 最终核心检查：416/416 通过；原生 XCTest：44/44 通过。
+- 隔离启动：无配置、旧代理配置、无效旧 endpoint、损坏 plist、非字典根节点五种场景全部通过；后台服务关闭、未请求权限，启动前后配置字节保持一致。build-only 隔离检查通过，包含普通源码导出及嵌在无关父 Git 仓库下的导出，确认不调用全局进程名终止、保留版本信息且不继承父仓库 HEAD。
+- 原生构建：Xcode arm64 Release 通过；Universal Release 同时包含 arm64 与 x86_64；`codesign --verify --deep --strict` 通过。产物使用本机 ad hoc 签名，未进行 Developer ID 签名或公证。Intel 仅完成构建，没有 Intel 硬件验收。
+- 固定安装：候选已安装到 `~/Applications/TokenStatMenu.app`，独立比较构建候选与安装副本的完整文件 manifest，结果相等。默认启动通过 `NSWorkspace` 辅助程序启动并核验目标应用归属，避免把另一份开发产物或同名进程误当成安装验收；该辅助程序本次 `--test-only` 运行退出码为 0，`exactInstalledProcess=true`。
+- 该安装副本本次真实默认启动的脱敏布尔结果为：`directQuotaPresent=true`、`fiveHourPresent=true`、`sevenDayPresent=true`、`fiveHourResetPresent=true`、`sevenDayResetPresent=true`、`monthlyUsagePresent=true`、`statusItemVisible=true`、`defaultReadinessPassed=true`、`permissionPromptRequested=false`。
+- 同次诊断的 `liveTokenSpeedPresent=false`：当时没有新鲜的双计数活动事件，不能声称本次实机已验证实时 token/s。服务端权威吞吐仍由 [Issue #37](https://github.com/Tupig/TokenStatMenu/issues/37) 跟踪，保持未完成；本地估算与上轮均速保留各自标识，缺少依据时显示未知。
+
+本轮合成回归覆盖以下边界：
+
+- 无 AX 权限时自动直接读取；Hub 退出、重启、身份变化和迟到结果丢弃；关闭 AX 兼容或撤销权限后，直接来源继续恢复与调度。这里的 Hub 重启和权限变更是注入的生命周期回归，不替代额外的真实 Hub 重启验收。
+- 当前 provider/origin 匹配筛选、累计计数基线、缺口、乱序和重叠轮次；暖缓存及扫描时钟变化；活动估算超过 15 秒、未来时间、非有限或负速率失效。菜单栏、详情和诊断共用新鲜度判断。
+- 回调 Location 的精确 HTTPS 同源、固定路径及默认端口；拒绝 userinfo、query、重复令牌或 redirect，片段只解码一次，不跟随重定向。AI Manager/SSO sibling 来源关联仍是有限域后缀兼容规则，不是完整 PSL 或任意组织归属证明。
+- 200 正常响应、401 最多一次重试、会话字段变化，以及字段相同但 dev/inode 改变的原子数据库替换。首次回调、额度 200、额度 401、重试回调四个替换阶段均拒绝发布快照，并在需要时阻止下一次外部请求。上述测试只使用合成 SQLite、会话值和响应，不读取真实 Hub 数据库。
+- 关闭 AX 兼容时仍显示直接来源的失败状态，AX-only preview 保留关闭状态；空重置文本明确显示未知。浅色和深色 Dashboard header 的两张合成候选经独立视觉审查后更新基线，再以普通模式通过；Settings 基线保持原样。这两张 header 快照不代表完整面板或系统交互验收。
+
+公开内容工作树扫描检查了 61 个白名单文件；源码历史中的 201 个历史 blob 及最终候选二进制使用常见 token、key 和个人 home 路径模式检查，均未发现命中。扫描与构建身份信息没有包含实际账号、企业地址、额度、会话或个人绝对路径。这类模式检查不能保证发现任意敏感信息或 PII，仍需审查实际发布差异；本节不把扫描无命中等同于全面隐私证明。
+
+本节对应当前已验证的候选。后续干净提交会改变公开 source revision，需重新写入 bundle 并再次验证安装产物；本记录不预称该后续步骤已经执行。
+
 ## BP18 — Seasun 路由归属与活动速度回归（2026-10-18）
 
 - 核心检查：358/358 通过。新增合成 rollout 覆盖当前 `model_provider` 与 Token Hub connection origin 匹配/不匹配两种情况；未验证路由的文件保持未知，不会混入 Token 总量。
@@ -13,7 +36,7 @@
 - 在本机已运行的 Seasun Token Hub 环境中，使用一个不存在的临时配置文件路径启动当前构建；应用没有创建该配置文件，也没有请求辅助功能授权。
 - 菜单栏 App 的脱敏布尔诊断在等待后台刷新后为：`seasunOnlyMode=true`、`backgroundServicesStarted=true`、`permissionPromptRequested=false`、`directQuotaPresent=true`、`monthlyUsagePresent=true`、`resetTimePresent=true`、`liveTokenSpeedPresent=false`。
 - 本次只读取诊断布尔值和状态文本，没有输出或保存真实额度、账号、网关 URL、会话值、令牌或会话正文；测试结束后只终止本次启动的 TokenStatMenu 进程。
-- 该证据证明当前本机的安装后零配置自动读取路径已连通；不同 Token Hub 版本、未登录状态、过期会话或企业网络策略仍可能安全地显示未知/不可用。
+- 该历史证据仅证明当时开发产物的零配置自动读取路径已连通，不能证明固定安装副本或重启恢复；本轮固定安装证据见 BP19。不同 Token Hub 版本、未登录状态、过期会话或企业网络策略仍可能安全地显示未知/不可用。
 
 ## BP16 — 直接额度来源实机核验（2026-10-18）
 

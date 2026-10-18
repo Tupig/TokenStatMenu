@@ -11,8 +11,8 @@ from pathlib import Path
 from package_source import PUBLIC_FILES, ROOT
 
 SYNTHETIC_PNG_SHA256 = {
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "9e7211478398860b90f2d62fca4c84b7cc590d38a1deb001cc636ba0355e0afe",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "5bd230f17acb18e7d6eeda0a1dbe2c8f369afbae92064ab9f5d3f9c512b0bac2",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "a6f5da19785b39f043e35fd6fa9e8aa020825ca3c9b4e16a1d65103d49d69c6c",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "fae572d44db34764be5c73fab64ca349b8e8bcb668a9f4a75c40535fb568e26b",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "64ea172d17a5d3be86176c4b3ede3c7b68b6f9c841709ffa92c49edfbfdfb101",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "98c5ede0f59bd9f69d064b52b3e49731b98c70447407148b1cc84a3dc1ce352b",
 }
@@ -34,7 +34,7 @@ def main():
         "sensitive query value": r"[?&](?:api_key|access_token|token|password|secret)=[^\s\"'<>]+",
     }
     # Synthetic fixtures intentionally include invalid credential URLs to test rejection.
-    fixture_files = {"Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "docs/FULL_SOURCE.md"}
+    fixture_files = {"Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/DirectQuotaChecks.swift", "docs/FULL_SOURCE.md"}
     failures = []
     for name in names:
         if name not in PUBLIC_FILES:
