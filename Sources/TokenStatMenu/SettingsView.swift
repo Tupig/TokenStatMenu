@@ -9,18 +9,30 @@ import SwiftUI
         _draft = State(initialValue: model.preferences)
     }
 
+    /// The Settings status follows the same fresh direct observation as the
+    /// dashboard; optional AX compatibility cannot declare a backend connected.
+    var sourceStatusText: String {
+        if model.tokenHubQuotaIsDirect {
+            return model.freshTokenHubQuota(at: model.tokenHubNow()) != nil
+                ? "企业后台直接来源：已直接读取"
+                : "企业后台直接来源：快照已过期，等待自动刷新"
+        }
+        if model.tokenHubDirectFailure != nil { return model.userFacingStatus }
+        return "企业后台直接来源：尚未连接，等待自动读取"
+    }
+
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 14) {
                 GroupBox("Seasun Token Hub") {
                     VStack(alignment: .leading, spacing: 8) {
-                Text(model.userFacingStatus)
+                Text("自动复用本机已登录 Hub 的现有会话，只读获取企业额度，无需填写接口或密钥。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("本地 Codex 历史记录与 Token Hub 界面兼容快照各自按实际观测单独展示，不代表企业后台直连。")
+                Text("企业后台额度、本地 Codex 记录和可选界面快照分开标明来源；本地记录与界面快照不能代替后台额度。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                Text("企业后台直接来源：尚不可用")
+                Text(sourceStatusText)
                     .font(.caption)
                     .accessibilityIdentifier("seasun-source-status")
                     }
@@ -43,7 +55,7 @@ import SwiftUI
                 Toggle("Token Hub 界面兼容读取（可选）", isOn: $draft.tokenHubCompatibilityReadEnabled)
                     .accessibilityIdentifier("token-hub-compatibility-toggle")
                     .accessibilityLabel("Token Hub 界面兼容读取（可选）")
-                Text("只读取 Token Hub 当前界面的兼容快照，不代表 Seasun 数据连接完成。默认启用，不会自动请求辅助功能授权。")
+                Text("此开关只控制界面快照；关闭后仍自动读取企业后台。兼容读取默认启用，不会自动请求辅助功能授权。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 

@@ -4,14 +4,17 @@
 
 ```text
 AppKit NSStatusItem + NSPopover
-  └─ AppModel：固定专用入口、可选偏好、来源状态与刷新
-      ├─ 当前 Seasun origin 配置匹配 + 本地 Codex 有界记录扫描 → 小计、分类、实时估算/上轮均速
-      ├─ Token Hub 只读会话交换 → 企业 5 小时/7 天/月度额度
-      ├─ Token Hub 兼容界面扫描 → 无直连时的可选独立金额/窗口快照
-SwiftUI：概览、来源说明、可选偏好
+  └─ AppModel：专用启动、来源状态、可选偏好与后台调度
+      ├─ Token Hub 只读会话交换 → 5 小时／7 天／月度后台额度
+      ├─ 当前 provider 与 Hub origin 匹配 → 有界本地 Codex 记录扫描
+      │   └─ Token 小计、线程分类、活动速率估算、完整轮次均速
+      └─ 已有系统信任下的可选 AX 兼容读取 → 独立界面快照
+SwiftUI：概览、数据来源、偏好设置
 ```
 
-菜单标题由主线程低频刷新，仅在内容或颜色变化时更新；标题、详情与诊断共用实时值的 15 秒时效判断。后台扫描串行、有界、可取消，目标退出或来源身份变化使旧结果失效；目标重新启动后自动重试直接来源。正式运行不启动本机代理，不调用任意企业 URL，不解析保存的 API 密钥。历史协议实现保留在核心库中供回归测试，不属于正式 App 的接入功能。
+后台额度、界面快照与本地记录各自保留来源语义。后台直接读取不受可选 AX 开关影响；目标退出或身份变化会失效旧结果，重新运行后再识别并读取。正式运行不启动旧代理、不改 Hub／Codex 连接配置，也不调用任意用户填写的企业 URL。
+
+来源流程、计量边界、刷新时效与安全失败条件见 [设计说明](DESIGN.md)。
 
 
 ## 分文件完整源码
@@ -33,6 +36,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Documentation links and synthetic checker fixtures
+        run: python3 script/check_docs.py --self-test
       - name: Public content guardrail
         run: python3 script/check_public_content.py --git-index
       - name: Core and gateway discovery checks
@@ -3302,6 +3307,22 @@ struct BackgroundServiceResources: Equatable, Encodable {
     let axScanInFlightCount: Int
 }
 
+/// Clock-derived presentation changes are distinct from new measurements.
+/// Comparing these cheap booleans keeps the half-second menu cadence without
+/// formatting dates or invalidating every SwiftUI view when nothing changed.
+struct PresentationTimeState: Equatable {
+    struct Window: Equatable {
+        let futureObservation: Bool
+        let fresh: Bool
+        let resetPassed: Bool
+    }
+    let localLive: Bool
+    let tokenHubFresh: Bool
+    let monthlyFresh: Bool
+    let fiveHour: Window?
+    let sevenDay: Window?
+}
+
 @MainActor final class AppModel: ObservableObject {
     // Explicit launch-only flag: fixtures never masquerade as enterprise measurements.
     let isTestFixture = CommandLine.arguments.contains("--test-fixture")
@@ -3311,20 +3332,36 @@ struct BackgroundServiceResources: Equatable, Encodable {
     private let usesDirectQuotaSource: Bool
     private(set) var backgroundServicesStarted = false
     private(set) var permissionPromptRequested = false
-    @Published private(set) var preferences = SeasunPreferences()
-    @Published var config = AppConfiguration()
+    @Published private(set) var preferences = SeasunPreferences() {
+        didSet { capturePresentationTimeBaseline() }
+    }
+    @Published var config = AppConfiguration() {
+        didSet { capturePresentationTimeBaseline() }
+    }
     @Published var stats = MetricsSnapshot()
-    @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
-    @Published var quota: QuotaSnapshot?
-    @Published var fiveHourQuota: WindowQuota?
-    @Published var sevenDayQuota: WindowQuota?
+    @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0) {
+        didSet { capturePresentationTimeBaseline() }
+    }
+    @Published var quota: QuotaSnapshot? {
+        didSet { capturePresentationTimeBaseline() }
+    }
+    @Published var fiveHourQuota: WindowQuota? {
+        didSet { capturePresentationTimeBaseline() }
+    }
+    @Published var sevenDayQuota: WindowQuota? {
+        didSet { capturePresentationTimeBaseline() }
+    }
     @Published var quotaError = "Token Hub 界面快照数据未知"
     @Published var sourceReadinessText = "企业后台直接来源未接通"
     @Published var message = ""
     @Published var history: [SpeedPoint] = []
     @Published var quotaLoading = false
-    @Published private(set) var tokenHubQuotaSnapshot: TokenHubQuotaSnapshot?
-    @Published private(set) var tokenHubQuotaStatus: TokenHubQuotaStatus = .targetNotRunning
+    @Published private(set) var tokenHubQuotaSnapshot: TokenHubQuotaSnapshot? {
+        didSet { capturePresentationTimeBaseline() }
+    }
+    @Published private(set) var tokenHubQuotaStatus: TokenHubQuotaStatus = .targetNotRunning {
+        didSet { capturePresentationTimeBaseline() }
+    }
     @Published private(set) var tokenHubQuotaFailure: TokenHubQuotaFailure?
     @Published private(set) var tokenHubDirectFailure: TokenHubDirectQuotaFailure?
     private(set) var tokenHubQuotaIsDirect = false
@@ -3354,6 +3391,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
     private var generation = 0
     private var tokenHubGeneration: UInt64 = 0
     private var tokenHubAXGeneration: UInt64 = 0
+    private var lastPresentationTimeState: PresentationTimeState?
     var onTick: (() -> Void)?
 
     var isSeasunOnly: Bool { true }
@@ -3409,16 +3447,53 @@ struct BackgroundServiceResources: Equatable, Encodable {
         tokenHubDirectFailure = nil; tokenHubQuotaIsDirect = false; tokenHubDirectScanInFlight = false
     }
     func tick() {
-        stats = engine.snapshot()
-        let now = Date()
-        if quota?.month != QuotaSnapshot.currentMonth(), quota != nil { quota = nil; quotaError = "已跨月，等待本月用量" }
-        if tokenHubQuotaStatus == .connected, freshTokenHubQuota(at: now) == nil { tokenHubQuotaStatus = .stale }
+        // The formal local-history mode never consumes proxy engine metrics.
+        // Publishing its identical empty snapshot would redraw a hidden or
+        // open dashboard twice a second. Legacy proxy previews keep sampling.
+        if config.dataSource != "localCodex" { stats = engine.snapshot() }
+        let now = tokenHubNow()
+        var publishedTransition = false
+        // Check presence first: creating a date formatter for an absent quota
+        // was otherwise part of every idle menu tick.
+        if let quota, quota.month != QuotaSnapshot.currentMonth(at: now) {
+            self.quota = nil; quotaError = "已跨月，等待本月用量"
+            publishedTransition = true
+        }
+        if tokenHubQuotaStatus == .connected, freshTokenHubQuota(at: now) == nil {
+            tokenHubQuotaStatus = .stale
+            publishedTransition = true
+        }
         if backgroundServicesStarted { pollTokenHubPermissionIfDue() }
+        let timeState = presentationTimeState
+        if let previous = lastPresentationTimeState, previous != timeState, !publishedTransition {
+            objectWillChange.send()
+        }
+        lastPresentationTimeState = timeState
         onTick?()
     }
     var freshQuota: QuotaSnapshot? {
-        guard let quota, quota.month == QuotaSnapshot.currentMonth(), Date().timeIntervalSince(quota.fetchedAt) < max(120, config.refreshSeconds * 2) else { return nil }
+        let now = tokenHubNow()
+        guard let quota, quota.month == QuotaSnapshot.currentMonth(at: now),
+              quota.fetchedAt <= now,
+              now.timeIntervalSince(quota.fetchedAt) < max(120, config.refreshSeconds * 2) else { return nil }
         return quota
+    }
+    /// A measurement can arrive and expire between timer ticks. Remember
+    /// its time state after the input mutation, since SwiftUI may render that
+    /// intervening published value even if the previous tick had no live data.
+    private func capturePresentationTimeBaseline() {
+        lastPresentationTimeState = presentationTimeState
+    }
+    var presentationTimeState: PresentationTimeState {
+        let now = tokenHubNow()
+        func window(_ value: WindowQuota?) -> PresentationTimeState.Window? {
+            value.map { PresentationTimeState.Window(futureObservation: $0.fetchedAt > now,
+                fresh: $0.isFresh(at: now, refreshSeconds: config.refreshSeconds),
+                resetPassed: $0.resetsAt.map { $0 <= now } ?? false) }
+        }
+        return PresentationTimeState(localLive: freshLocalLiveTurn != nil,
+            tokenHubFresh: freshTokenHubQuota(at: now) != nil, monthlyFresh: freshQuota != nil,
+            fiveHour: window(fiveHourQuota), sevenDay: window(sevenDayQuota))
     }
     var currencyFactor: Double { config.currency == "CNY" ? config.usdToCNY : 1 }
     var currencySymbol: String { config.currency == "CNY" ? "¥" : "$" }
@@ -3486,7 +3561,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         return "\(userFacingStatus)\n当前配置关联的本机 Codex 记录，历史路由未核验；当前扫描范围：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
     }
     private var tokenHubMenuSuffix: String {
-        guard let snapshot = freshTokenHubQuota(at: Date()) else { return "" }
+        guard let snapshot = freshTokenHubQuota(at: tokenHubNow()) else { return "" }
         let windows = [snapshot.fiveHour.map { "5h剩 \(percentText($0.remainingPercent))%" },
                        snapshot.sevenDay.map { "7d剩 \(percentText($0.remainingPercent))%" }].compactMap { $0 }
         return windows.isEmpty ? "" : " · Hub \(windows.joined(separator: " / "))"
@@ -3495,7 +3570,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
     var tokenHubPermissionGrantedForDiagnostics: Bool { cachedTokenHubPermission }
     var tokenHubPermissionRequiredForDiagnostics: Bool { tokenHubQuotaStatus == .permissionRequired }
     private var tokenHubTooltipDetail: String {
-        let snapshot = freshTokenHubQuota(at: Date())
+        let snapshot = freshTokenHubQuota(at: tokenHubNow())
         let five = snapshot?.fiveHour.map { "界面显示剩余 \(percentText($0.remainingPercent))%（5 小时）" } ?? "5 小时未知"
         let seven = snapshot?.sevenDay.map { "界面显示剩余 \(percentText($0.remainingPercent))%（7 天）" } ?? "7 天未知"
         let source = tokenHubQuotaIsDirect ? "Token Hub 后台直接响应" : "Token Hub 界面快照"
@@ -3540,7 +3615,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
         "已核验线程 \(localSnapshot.knownThreadCount) · 未核验线程 \(localSnapshot.unknownThreadCount) · 未识别文件 \(localSnapshot.unidentifiedFileCount) · 子代理 \(localSnapshot.subagentCount) · 分叉 \(localSnapshot.forkCount) · 顶层对话 \(localSnapshot.sessionCount)"
     }
     private func quotaDescription(_ quota: WindowQuota?, source: QuotaSource) -> String {
-        let presentation = WindowQuotaCard.presentation(for: quota, refreshSeconds: config.refreshSeconds, source: source)
+        let presentation = WindowQuotaCard.presentation(for: quota, at: tokenHubNow(), refreshSeconds: config.refreshSeconds, source: source)
         guard let usedPercent = presentation.usedPercent else { return "\(presentation.sourceLabel) · \(presentation.statusLabel)" }
         let resetLabel = source == .localCodex || !presentation.isFresh ? "原重置时间" : "重置时间"
         let reset = presentation.resetsAt.map { "，\(resetLabel) \($0.formatted())" } ?? "，重置时间未知"
@@ -3552,7 +3627,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
     var alertColor: NSColor {
         guard quotaSource == .enterprise else { return .labelColor }
         let windows = (quotaSource == .enterprise ? [fiveHourQuota, sevenDayQuota].compactMap { $0 } : [])
-            .filter { $0.isFresh(refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
+            .filter { $0.isFresh(at: tokenHubNow(), refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
         guard let ratio = (windows + [freshQuota?.fraction].compactMap { $0 }).max() else { return .labelColor }
         return ratio >= 0.95 ? .systemRed : ratio >= 0.8 ? .systemYellow : .labelColor
     }
@@ -4180,18 +4255,30 @@ import SwiftUI
         _draft = State(initialValue: model.preferences)
     }
 
+    /// The Settings status follows the same fresh direct observation as the
+    /// dashboard; optional AX compatibility cannot declare a backend connected.
+    var sourceStatusText: String {
+        if model.tokenHubQuotaIsDirect {
+            return model.freshTokenHubQuota(at: model.tokenHubNow()) != nil
+                ? "企业后台直接来源：已直接读取"
+                : "企业后台直接来源：快照已过期，等待自动刷新"
+        }
+        if model.tokenHubDirectFailure != nil { return model.userFacingStatus }
+        return "企业后台直接来源：尚未连接，等待自动读取"
+    }
+
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 14) {
                 GroupBox("Seasun Token Hub") {
                     VStack(alignment: .leading, spacing: 8) {
-                Text(model.userFacingStatus)
+                Text("自动复用本机已登录 Hub 的现有会话，只读获取企业额度，无需填写接口或密钥。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("本地 Codex 历史记录与 Token Hub 界面兼容快照各自按实际观测单独展示，不代表企业后台直连。")
+                Text("企业后台额度、本地 Codex 记录和可选界面快照分开标明来源；本地记录与界面快照不能代替后台额度。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                Text("企业后台直接来源：尚不可用")
+                Text(sourceStatusText)
                     .font(.caption)
                     .accessibilityIdentifier("seasun-source-status")
                     }
@@ -4214,7 +4301,7 @@ import SwiftUI
                 Toggle("Token Hub 界面兼容读取（可选）", isOn: $draft.tokenHubCompatibilityReadEnabled)
                     .accessibilityIdentifier("token-hub-compatibility-toggle")
                     .accessibilityLabel("Token Hub 界面兼容读取（可选）")
-                Text("只读取 Token Hub 当前界面的兼容快照，不代表 Seasun 数据连接完成。默认启用，不会自动请求辅助功能授权。")
+                Text("此开关只控制界面快照；关闭后仍自动读取企业后台。兼容读取默认启用，不会自动请求辅助功能授权。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
@@ -4260,29 +4347,54 @@ import SwiftUI
 
 ```swift
 import AppKit
+import Combine
 import SwiftUI
+
+/// Native content factories keep expensive view construction at the UI
+/// boundary; tests can wrap the real builders using synthetic models.
+struct StatusBarContentFactories {
+    let dashboard: @MainActor (AppModel) -> NSViewController
+    let tooltip: @MainActor (AppModel) -> String
+    static var production: StatusBarContentFactories {
+        StatusBarContentFactories(dashboard: { NSHostingController(rootView: DashboardView(model: $0)) },
+                                  tooltip: { $0.menuTooltip })
+    }
+}
 
 @MainActor final class StatusBarController: NSObject, NSPopoverDelegate {
     private let item: NSStatusItem
     private let popover = NSPopover()
     private let model: AppModel
+    private let factories: StatusBarContentFactories
+    private var tooltipNeedsRefresh = true
+    private var lastTooltipTimeState: PresentationTimeState?
+    private var presentationObservers = Set<AnyCancellable>()
     private var lastTitle = ""
     private var lastColor: NSColor?
     private var lastDiagnostic = Date.distantPast
-    init(model: AppModel) {
+    init(model: AppModel, factories: StatusBarContentFactories = .production) {
         self.model = model
+        self.factories = factories
         // Keep a strong reference: a local NSStatusItem vanishes when deallocated.
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
         item.autosaveName = "TokenStatMenu.Metrics"
         popover.behavior = .transient; popover.animates = false; popover.delegate = self
         popover.contentSize = NSSize(width: 460, height: 700)
-        popover.contentViewController = NSHostingController(rootView: DashboardView(model: model))
         if let button = item.button {
             button.target = self; button.action = #selector(toggle)
             button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
             button.setAccessibilityLabel("TokenStatMenu 实时 Token 速度")
         }
+        // Published measurements/preferences invalidate the expensive tooltip;
+        // the half-second timer separately checks cheap freshness boundaries.
+        model.objectWillChange.sink { [weak self] in self?.tooltipNeedsRefresh = true }
+            .store(in: &presentationObservers)
+        NotificationCenter.default.publisher(for: NSLocale.currentLocaleDidChangeNotification)
+            .merge(with: NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange))
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.tooltipNeedsRefresh = true }
+            .store(in: &presentationObservers)
         model.onTick = { [weak self] in self?.refreshTitle() }
         refreshTitle()
     }
@@ -4294,7 +4406,12 @@ import SwiftUI
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: color
             ])
         }
-        item.button?.toolTip = model.menuTooltip
+        let timeState = model.presentationTimeState
+        if tooltipNeedsRefresh || lastTooltipTimeState != timeState {
+            item.button?.toolTip = factories.tooltip(model)
+            tooltipNeedsRefresh = false
+            lastTooltipTimeState = timeState
+        }
         writeDiagnosticsIfRequested()
     }
     @objc func toggle() {
@@ -4302,6 +4419,11 @@ import SwiftUI
     }
     func show() {
         guard let button = item.button else { return }
+        // Do not allocate SwiftUI's dashboard/layout graph for users who only
+        // need the menu title. Keep it after first open so settings state lives.
+        if popover.contentViewController == nil {
+            popover.contentViewController = factories.dashboard(model)
+        }
         model.panelVisible = true
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -4911,8 +5033,9 @@ enum TokenHubDecimalFormatter {
 <key>CFBundleName</key><string>TokenStatMenu</string>
 <key>CFBundleDisplayName</key><string>TokenStatMenu</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.1.0</string>
-<key>CFBundleVersion</key><string>2</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
+<key>CFBundleShortVersionString</key><string>1.1.1</string>
+<key>CFBundleVersion</key><string>3</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -4995,10 +5118,12 @@ A8792157CB4F27FB949C035F = { isa = PBXFileReference; explicitFileType = wrapper.
 0A3E27B8CA818264D75C8D81 = { isa = PBXGroup; children = (A8792157CB4F27FB949C035F,); name = Products; sourceTree = "<group>"; };
 9B987D631012EC23CDD96B6A = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Resources/Info.plist"; sourceTree = "<group>"; };
 652E7FD0652728D9B3EF13DF = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Resources/config.example.plist"; sourceTree = "<group>"; };
-0D6E4079E36703EBD37C0072 = { isa = PBXGroup; children = (AF7F4C7B765701F258FB7F4D, 96BD6B98AF8DAF812B21484D, 9B987D631012EC23CDD96B6A, 652E7FD0652728D9B3EF13DF, 0A3E27B8CA818264D75C8D81,); sourceTree = "<group>"; };
+237F74AE00B061E8017BA06F = { isa = PBXFileReference; lastKnownFileType = image.icns; path = "Resources/AppIcon.icns"; sourceTree = "<group>"; };
+E24DE23ACEDF31B2061282C1 = { isa = PBXBuildFile; fileRef = 237F74AE00B061E8017BA06F; };
+0D6E4079E36703EBD37C0072 = { isa = PBXGroup; children = (AF7F4C7B765701F258FB7F4D, 96BD6B98AF8DAF812B21484D, 9B987D631012EC23CDD96B6A, 652E7FD0652728D9B3EF13DF, 237F74AE00B061E8017BA06F, 0A3E27B8CA818264D75C8D81,); sourceTree = "<group>"; };
 878A52FC5FF6A57D50B7B870 = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (6A3864C6E6DB561D02F46C35, 08BC9043587CC788D01C24E7, C6D71C6FAB45AC1E6B57A569, 2D299820E6AC3A52FFC40FC8, BACF14F65A3D26C56E4559AC, DDA47B3DEE61C34C2F297CF7, 49E56DE5EE1D3357BC99E0B5, E51281927C6E41F6B2F2A59B, 06CC516465ECBFB9656FCFE3, FE8BDDD173656D12A732897D, 3D0FB2D7E3115DC2E870C0E0, EE000FBD14AA318AC3D38D79, D495B366C1D0E1A6672A9637, 60476D6C0F010F89CDCF9332, BBE06DCD34D248AEC63DEFB1, 1C6C1E79E7D0D3008EFA0C51, DF47DB83567E12D94C90C186, 775730CD86C47FBDC9419E49, F2E25F94650242E3A64878B7, 4BE492A2D95B99D7EAB5E1B2, 3263F0161C5BC399111E323B, B71BD30B9E5D41A06B13B456, 164B1DA057D49AA2DDF2EB36,); runOnlyForDeploymentPostprocessing = 0; };
 E2AA269EB967A8853A258BFA = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
-41D311A605520FC7B8B9A980 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+41D311A605520FC7B8B9A980 = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (E24DE23ACEDF31B2061282C1,); runOnlyForDeploymentPostprocessing = 0; };
 5DF0EAF287A59303D4EFEAF3 = { isa = XCBuildConfiguration; name = Debug; buildSettings = { MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 5.0; }; };
 B8EB4DC6EE71CC2FBFD201B8 = { isa = XCBuildConfiguration; name = Debug; buildSettings = {
         PRODUCT_NAME = TokenStatMenu;
@@ -8502,6 +8627,7 @@ extension CoreChecks {
 
 ```swift
 import AppKit
+import Combine
 import SwiftUI
 import XCTest
 import TokenStatCore
@@ -8586,6 +8712,281 @@ private final class HubDirectHarness {
 final class TokenHubQuotaStateTests: XCTestCase {
     private let identity = TokenHubIdentity(pid: 924, bundleID: TokenHubTarget.bundleID,
         executablePath: "/Applications/Synthetic Hub.app/Contents/MacOS/Hub")
+
+    /// A hidden local dashboard must not be invalidated by an unchanged
+    /// legacy proxy snapshot at the 0.5-second menu cadence.
+    func testIdleLocalTicksDoNotRepublishUnchangedMetrics() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        model.tick()
+        var publications = 0
+        let observer = model.objectWillChange.sink { publications += 1 }
+        for _ in 0..<100 { model.tick() }
+        XCTAssertEqual(publications, 0, "idle menu checks must not redraw the dashboard")
+        withExtendedLifetime(observer) {}
+    }
+
+    func testLiveExpiryPublishesOnceAndStillRefreshesMenuEveryTick() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        var now = observedAt
+        model.tokenHubNow = { now }
+        model.config.dataSource = "localCodex"
+        model.localSnapshot = LocalCodexSnapshot(input: 100, output: 50, total: 150,
+            sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: observedAt,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 1,
+            liveTurn: LocalLiveTurnSummary(inputTPS: 10, outputTPS: 24.5, observedAt: observedAt))
+        model.tick()
+        var publications = 0, menuChecks = 0
+        let observer = model.objectWillChange.sink { publications += 1 }
+        model.onTick = { menuChecks += 1 }
+        now = observedAt.addingTimeInterval(15)
+        model.tick()
+        XCTAssertEqual(publications, 0, "the exact freshness boundary remains live")
+        now = observedAt.addingTimeInterval(15.001)
+        model.tick()
+        XCTAssertEqual(publications, 1, "expiry must notify an open dashboard once")
+        XCTAssertTrue(model.title.hasPrefix("上轮均:—"))
+        for _ in 0..<100 { model.tick() }
+        XCTAssertEqual(publications, 1)
+        XCTAssertEqual(menuChecks, 102, "the menu cadence is independent of dashboard notifications")
+        now = observedAt
+        model.tick()
+        XCTAssertEqual(publications, 2, "clock rollback must recompute time-dependent presentation")
+        XCTAssertTrue(model.title.hasPrefix("实时≈24.5tok/s"))
+        withExtendedLifetime(observer) {}
+    }
+
+    func testDashboardHostingIsDeferredUntilFirstOpenAndReused() {
+        _ = NSApplication.shared
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        var dashboardCreations = 0
+        let factories = StatusBarContentFactories(dashboard: { model in
+            dashboardCreations += 1
+            return NSHostingController(rootView: DashboardView(model: model))
+        }, tooltip: { $0.menuTooltip })
+        let controller = StatusBarController(model: model, factories: factories)
+        XCTAssertEqual(dashboardCreations, 0, "menu-only startup must not allocate the SwiftUI dashboard")
+        controller.show()
+        XCTAssertEqual(dashboardCreations, 1)
+        XCTAssertTrue(model.panelVisible)
+        controller.toggle()
+        controller.show()
+        XCTAssertEqual(dashboardCreations, 1, "reopening reuses native hosting and its settings-page state")
+        controller.toggle()
+    }
+
+    func testTooltipFormattingIsReusedForIdleTicksButTracksValuesAndTimeBoundaries() throws {
+        _ = NSApplication.shared
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        var now = observedAt
+        model.tokenHubNow = { now }
+        model.localSnapshot = LocalCodexSnapshot(input: 100, output: 50, total: 150,
+            sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: observedAt,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 1,
+            liveTurn: LocalLiveTurnSummary(inputTPS: 10, outputTPS: 24.5, observedAt: observedAt))
+        var tooltipBuilds = 0
+        var displayedTooltip = ""
+        let factories = StatusBarContentFactories(dashboard: { NSHostingController(rootView: DashboardView(model: $0)) },
+            tooltip: { model in
+                tooltipBuilds += 1
+                displayedTooltip = model.menuTooltip
+                return displayedTooltip
+            })
+        let controller = StatusBarController(model: model, factories: factories)
+        model.tick()
+        XCTAssertEqual(tooltipBuilds, 1)
+        XCTAssertTrue(displayedTooltip.contains("输出 24.5 tok/s"))
+        for _ in 0..<100 { model.tick() }
+        XCTAssertEqual(tooltipBuilds, 1, "unchanged half-second menu checks reuse the formatted tooltip")
+        now = observedAt.addingTimeInterval(15.001)
+        model.tick()
+        XCTAssertEqual(tooltipBuilds, 2)
+        XCTAssertTrue(displayedTooltip.contains("实时估算：未知"))
+        now = observedAt
+        controller.refreshTitle()
+        XCTAssertTrue(displayedTooltip.contains("输出 24.5 tok/s"), "clock rollback updates even without another file scan")
+
+        model.localSnapshot = LocalCodexSnapshot(input: 200, output: 75, total: 275,
+            sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: observedAt,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 1)
+        model.tick()
+        XCTAssertTrue(displayedTooltip.contains("总计 275"), "new measurements invalidate the tooltip")
+        let quotaData = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": [
+            "primary": ["usedPercent": 22, "windowDurationMins": 300,
+                        "resetsAt": observedAt.addingTimeInterval(10).timeIntervalSince1970]
+        ]]])
+        model.fiveHourQuota = try QuotaReport.parse(quotaData, config: AppConfiguration(),
+            now: observedAt.addingTimeInterval(2)).fiveHour
+        model.tick()
+        XCTAssertTrue(displayedTooltip.contains("异常时间戳"))
+        now = observedAt.addingTimeInterval(2)
+        model.tick()
+        XCTAssertFalse(displayedTooltip.contains("异常时间戳"))
+        now = observedAt.addingTimeInterval(10)
+        model.tick()
+        XCTAssertTrue(displayedTooltip.contains("重置已过期"), "a cached historical reset label must still expire")
+        model.config.dataSource = "proxy"
+        controller.refreshTitle()
+        XCTAssertTrue(displayedTooltip.contains("已配置企业用量接口数据"), "configuration and source changes invalidate the cache")
+    }
+
+    func testCachedTooltipDropsExpiredHubSnapshotAtBoundary() async {
+        _ = NSApplication.shared
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = HubManualClock(observedAt)
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+        var tooltipBuilds = 0
+        var displayedTooltip = ""
+        let controller = StatusBarController(model: model, factories: StatusBarContentFactories(
+            dashboard: { NSHostingController(rootView: DashboardView(model: $0)) }, tooltip: { model in
+                tooltipBuilds += 1
+                displayedTooltip = model.menuTooltip
+                return displayedTooltip
+            }))
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1)
+        await settle(model, status: .connected)
+        model.tick()
+        XCTAssertTrue(model.title.contains("Hub 5h剩 70% / 7d剩 60%"))
+        XCTAssertTrue(displayedTooltip.contains("5 小时）"))
+        let beforeBoundary = tooltipBuilds
+        clock.now = observedAt.addingTimeInterval(120)
+        model.tick()
+        XCTAssertEqual(tooltipBuilds, beforeBoundary, "the inclusive Hub freshness boundary does not rebuild")
+        clock.now = observedAt.addingTimeInterval(120.001)
+        model.tick()
+        XCTAssertFalse(model.title.contains("Hub 5h剩"))
+        XCTAssertTrue(displayedTooltip.contains("5 小时未知"))
+        XCTAssertEqual(model.tokenHubQuotaStatus, .stale)
+        let afterExpiry = tooltipBuilds
+        for _ in 0..<100 { model.tick() }
+        XCTAssertEqual(tooltipBuilds, afterExpiry, "an expired snapshot must not cause endless redraws")
+        withExtendedLifetime(controller) {}
+    }
+
+    func testLiveObservationBetweenTicksStillInvalidatesAtItsNextExpiry() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let initial = Date(timeIntervalSince1970: 1_800_000_000)
+        var now = initial
+        model.tokenHubNow = { now }
+        model.config.dataSource = "localCodex"
+        model.tick() // Previous timer state has no fresh live observation.
+        model.localSnapshot = LocalCodexSnapshot(input: 100, output: 50, total: 150,
+            sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: initial,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 1,
+            liveTurn: LocalLiveTurnSummary(inputTPS: 10, outputTPS: 24.5,
+                observedAt: initial.addingTimeInterval(-14.9)))
+        XCTAssertTrue(model.title.hasPrefix("实时≈24.5tok/s"), "the intervening data publication can render live")
+        var publicationsAfterData = 0
+        let observer = model.objectWillChange.sink { publicationsAfterData += 1 }
+        now = initial.addingTimeInterval(0.2)
+        model.tick()
+        XCTAssertEqual(publicationsAfterData, 1,
+                       "expiry must compare against the presented new input, not only the last timer tick")
+        XCTAssertTrue(model.title.hasPrefix("上轮均:—"))
+        for _ in 0..<100 { model.tick() }
+        XCTAssertEqual(publicationsAfterData, 1, "expired input must not restore blanket redraws")
+        withExtendedLifetime(observer) {}
+    }
+
+    func testBackgroundLocaleAndTimezoneNotificationsInvalidateTooltipOnMainActor() async {
+        _ = NSApplication.shared
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        var builds = 0
+        let controller = StatusBarController(model: model, factories: StatusBarContentFactories(
+            dashboard: { NSHostingController(rootView: DashboardView(model: $0)) }, tooltip: { model in
+                XCTAssertTrue(Thread.isMainThread, "native formatting stays on the main actor")
+                builds += 1
+                return model.menuTooltip
+            }))
+        XCTAssertEqual(builds, 1)
+        for name in [NSLocale.currentLocaleDidChangeNotification, .NSSystemTimeZoneDidChange] {
+            let posted = expectation(description: "synthetic background formatting notification")
+            DispatchQueue.global(qos: .utility).async {
+                NotificationCenter.default.post(name: name, object: nil)
+                posted.fulfill()
+            }
+            await fulfillment(of: [posted], timeout: 2)
+            let before = builds
+            for _ in 0..<100 where builds == before {
+                try? await Task.sleep(for: .milliseconds(1))
+                controller.refreshTitle()
+            }
+            XCTAssertEqual(builds, before + 1, "a formatting notification must invalidate the cached tooltip")
+            for _ in 0..<100 { controller.refreshTitle() }
+            XCTAssertEqual(builds, before + 1, "one notification cannot turn into repeated tooltip rebuilds")
+        }
+        withExtendedLifetime(controller) {}
+    }
+
+    func testHistoricalWindowUpdatedBetweenTicksStillPublishesItsResetExpiry() throws {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let initial = Date(timeIntervalSince1970: 1_800_000_000)
+        var now = initial
+        model.tokenHubNow = { now }
+        model.config.dataSource = "localCodex"
+        func window(reset: Date, fetchedAt: Date) throws -> WindowQuota? {
+            let bytes = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": [
+                "primary": ["usedPercent": 22, "windowDurationMins": 300,
+                            "resetsAt": reset.timeIntervalSince1970]
+            ]]])
+            return try QuotaReport.parse(bytes, config: AppConfiguration(), now: fetchedAt).fiveHour
+        }
+        model.fiveHourQuota = try window(reset: initial.addingTimeInterval(-1),
+                                         fetchedAt: initial.addingTimeInterval(-1000))
+        model.tick() // Old historical window was already expired.
+        model.fiveHourQuota = try window(reset: initial.addingTimeInterval(0.1), fetchedAt: initial)
+        XCTAssertFalse(model.menuTooltip.contains("重置已过期"))
+        var publicationsAfterData = 0
+        let observer = model.objectWillChange.sink { publicationsAfterData += 1 }
+        now = initial.addingTimeInterval(0.2)
+        model.tick()
+        XCTAssertEqual(publicationsAfterData, 1, "a new window reset can also cross between timer ticks")
+        XCTAssertTrue(model.menuTooltip.contains("重置已过期"))
+        model.tick()
+        XCTAssertEqual(publicationsAfterData, 1)
+        withExtendedLifetime(observer) {}
+    }
+
+    func testHubObservationArrivingNearExpiryStillPublishesItsInvalidation() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let initial = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = HubManualClock(initial)
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+        model.tick() // No Hub observation at the old timer tick.
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        clock.now = initial.addingTimeInterval(119.9)
+        harness.complete(1)
+        await settle(model, status: .connected)
+        XCTAssertNotNil(model.freshTokenHubQuota(at: clock.now))
+        var publicationsAfterData = 0
+        let observer = model.objectWillChange.sink { publicationsAfterData += 1 }
+        clock.now = initial.addingTimeInterval(120.1)
+        model.tick()
+        XCTAssertEqual(publicationsAfterData, 1)
+        XCTAssertNil(model.freshTokenHubQuota(at: clock.now))
+        XCTAssertEqual(model.tokenHubQuotaStatus, .stale)
+        model.tick()
+        XCTAssertEqual(publicationsAfterData, 1)
+        withExtendedLifetime(observer) {}
+    }
 
     func testProductionCompatibilityPreferenceCannotDisableAutomaticDirectSource() {
         let startup = AppModelStartupDependencies(loadPreferences: { nil }, savePreferences: { _ in },
@@ -9638,6 +10039,51 @@ final class SeasunStartupContractTests: XCTestCase {
                        "Settings must not imply that a generic endpoint or credential connects the Seasun source")
     }
 
+    func testSettingsSourceStatusFollowsFreshDirectObservationAndFailure() async throws {
+        let now = Date(timeIntervalSince1970: 1_797_000_000)
+        let identity = TokenHubIdentity(pid: 944, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic Settings Hub.app/Contents/MacOS/Hub")
+        let snapshot = TokenHubQuotaSnapshot(identity: identity,
+            fiveHour: TokenHubWindowQuota(kind: .fiveHour, usedAmount: 25, limitAmount: 100,
+                sourceSymbol: "$", usedPercent: 25, resetDisplay: "合成重置时间"),
+            sevenDay: nil, monthly: nil, observedAt: now)
+        var failure: TokenHubDirectQuotaFailure?
+        var clock = now
+        let direct = TokenHubDirectQuotaDependencies(discoverTarget: { identity },
+            identityIsCurrent: { $0 == identity }, fetch: { _, _ in
+                if let failure { throw failure }
+                return snapshot
+            })
+        let model = AppModel(preview: true, directQuota: direct)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        model.tokenHubAutomaticReadingEnabled = false
+        model.tokenHubNow = { clock }
+        let settings = SettingsView(model: model)
+
+        XCTAssertTrue(settings.sourceStatusText.contains("尚未连接"),
+                      "unobserved source cannot claim a connected enterprise backend")
+        model.refreshTokenHubQuota()
+        for _ in 0..<100 where !model.tokenHubQuotaIsDirect { await Task.yield() }
+        XCTAssertTrue(model.tokenHubQuotaIsDirect, "synthetic direct observation must be accepted")
+        XCTAssertTrue(settings.sourceStatusText.contains("已直接读取"),
+                      "Settings must reflect the same direct observation as the dashboard")
+        XCTAssertFalse(settings.sourceStatusText.contains("尚不可用"))
+        XCTAssertFalse(model.tokenHubAutomaticReadingEnabled,
+                       "optional AX compatibility is disabled throughout this direct-only check")
+
+        clock = now.addingTimeInterval(121)
+        XCTAssertTrue(settings.sourceStatusText.contains("过期"),
+                      "Settings cannot describe an expired direct snapshot as connected")
+        failure = .credentialExpired
+        model.refreshTokenHubQuota()
+        for _ in 0..<100 where model.tokenHubDirectFailure == nil { await Task.yield() }
+        XCTAssertEqual(model.tokenHubDirectFailure, .credentialExpired)
+        XCTAssertTrue(settings.sourceStatusText.contains("会话已过期"),
+                      "Settings must preserve the actual sanitized direct failure")
+        XCTAssertFalse(settings.sourceStatusText.contains("已直接读取"))
+    }
+
     func testSettingsLightAndDarkRendersAreAvailableForIndependentVisualReview() throws {
         let isolated = try IsolatedConfig()
         defer { isolated.tearDown() }
@@ -9710,7 +10156,7 @@ cd "$ROOT"
 MODE="${1:-run}"
 APP="$ROOT/dist/TokenStatMenu.app"
 case "$MODE" in run|--build-only|--verify|--release|--universal|--logs|--telemetry|--debug) ;; *) echo "Usage: $0 [--build-only|--verify|--release|--universal|--logs|--telemetry|--debug]"; exit 2 ;; esac
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # Native SwiftPM also works with Command Line Tools; no global xcode-select changes.
 if [ "$MODE" = "--universal" ]; then
     for ARCH in arm64 x86_64; do
@@ -9727,6 +10173,7 @@ else
     cp "$BIN_DIR/TokenStatMenu" "$APP/Contents/MacOS/TokenStatMenu"
 fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 # Only public source identity enters the bundle: never include a machine path,
 # hostname, account, configuration, or session. Exported source has no Git ID.
 SOURCE_REVISION="source-export"
@@ -10000,6 +10447,7 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     (checkout / "script").mkdir(parents=True)
     (checkout / "Resources").mkdir()
     (checkout / "Resources/Info.plist").write_bytes((ROOT / "Resources/Info.plist").read_bytes())
+    (checkout / "Resources/AppIcon.icns").write_bytes((ROOT / "Resources/AppIcon.icns").read_bytes())
     (checkout / "script/build_and_run.sh").write_bytes((ROOT / "script/build_and_run.sh").read_bytes())
     tools = checkout / "tools"
     tools.mkdir()
@@ -10039,6 +10487,8 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     source_info = plistlib.loads((ROOT / "Resources/Info.plist").read_bytes())
     assert packaged_info["CFBundleShortVersionString"] == source_info["CFBundleShortVersionString"]
     assert packaged_info["CFBundleVersion"] == source_info["CFBundleVersion"]
+    assert packaged_info["CFBundleIconFile"] == "AppIcon"
+    assert (checkout / "dist/TokenStatMenu.app/Contents/Resources/AppIcon.icns").read_bytes() == (ROOT / "Resources/AppIcon.icns").read_bytes()
     assert packaged_info["TokenStatSourceRevision"] == "source-export", "source-only export must not acquire a machine identity"
     assert packaged_info["TokenStatSourceState"] == "unspecified"
     assert (checkout / "dist/TokenStatMenu.app/Contents/MacOS/TokenStatMenu").read_bytes() == b"synthetic-executable-fixture"
@@ -10114,6 +10564,542 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
+### script/BenchmarkMenu.swift
+
+```swift
+import AppKit
+import Combine
+import Foundation
+import TokenStatCore
+@testable import TokenStatMenu
+
+/// An isolated menu-update workload, never an application launch. Preview mode
+/// disables configuration loading, Hub discovery and every background service.
+/// The wrapper links this same harness against both source variants.
+@main
+struct BenchmarkMenu {
+    @MainActor static func main() throws {
+        guard CommandLine.arguments.count == 2,
+              let iterations = Int(CommandLine.arguments[1]),
+              (1...1_000_000).contains(iterations) else { exit(2) }
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let model = AppModel(preview: true)
+        model.config.dataSource = "localCodex"
+        let syntheticDate = Date(timeIntervalSince1970: 1_800_000_000)
+        model.tokenHubNow = { syntheticDate }
+        model.localSnapshot = LocalCodexSnapshot(input: 125, output: 300, total: 425,
+            sessionCount: 2, filesScanned: 2, isLimited: false, latestEventAt: syntheticDate,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 2,
+            lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5, completedAt: syntheticDate))
+        let controller = StatusBarController(model: model)
+        var publications = 0
+        let subscription = model.objectWillChange.sink { publications += 1 }
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<iterations { autoreleasepool { model.tick() } }
+        let elapsedMS = (ProcessInfo.processInfo.systemUptime - startedAt) * 1000
+        let tickPublications = publications // Exclude shutdown notifications.
+        withExtendedLifetime(controller) {}
+        withExtendedLifetime(subscription) {}
+        model.shutdown()
+        let report: [String: Any] = ["iterations": iterations, "elapsedMS": elapsedMS,
+                                     "objectWillChange": tickPublications]
+        let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data([10]))
+    }
+}
+```
+
+### script/benchmark_menu.py
+
+```python
+#!/usr/bin/env python3
+"""Compare a pure-synthetic menu workload using isolated, matching Swift builds.
+
+Only AppModel.swift and StatusBarController.swift differ between variants:
+by default the baseline comes from the published 1.1.0 commit and the candidate
+comes from the working tree. Current Core and other App sources are shared.
+No SwiftPM cache, installed app, external request or local business data is used.
+Run from any directory: python3 script/benchmark_menu.py [--rounds 1].
+"""
+import argparse
+import json
+import math
+import platform
+import statistics
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASELINE = "4713f1ae465675056b18dbbb40c09c717bb171d1"
+MENU_FILES = ("AppModel.swift", "StatusBarController.swift")
+CORE_FILES = (
+    "Configuration.swift", "GatewayDiscovery.swift", "HTTPDecoder.swift",
+    "LocalCodexUsageReader.swift", "MetricsEngine.swift", "ProxyServer.swift",
+    "Quota.swift", "RateWindow.swift", "StreamParser.swift", "TokenHubAXScanning.swift",
+    "TokenHubDirectQuota.swift", "TokenHubQuota.swift", "WindowQuota.swift",
+)
+APP_FILES = (
+    "AppModel.swift", "DashboardView.swift", "PanelStyle.swift", "SettingsView.swift",
+    "StatusBarController.swift", "Storage.swift", "TokenHubAXReader.swift",
+    "TokenHubQuotaCard.swift", "WindowQuotaCard.swift",
+)
+
+
+def command(arguments, stage):
+    """Capture compiler output so normal reports contain no temporary paths."""
+    result = subprocess.run(arguments, cwd=ROOT, capture_output=True, timeout=120)
+    if result.returncode:
+        raise RuntimeError(f"{stage} failed; check the selected full Xcode toolchain and source compatibility")
+    return result.stdout
+
+
+def checked_source(directory, name):
+    path = ROOT / "Sources" / directory / name
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("a required regular source file is unavailable")
+    return path
+
+
+def bounded_integer(value, upper):
+    number = int(value)
+    if not 1 <= number <= upper:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {upper}")
+    return number
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--baseline", default=BASELINE, help="local baseline commit; changes only the two menu source files")
+    parser.add_argument("--rounds", type=lambda value: bounded_integer(value, 10), default=3)
+    parser.add_argument("--iterations", type=lambda value: bounded_integer(value, 1_000_000), default=10_000)
+    args = parser.parse_args()
+    architecture = platform.machine()
+    if sys.platform != "darwin" or architecture not in ("arm64", "x86_64"):
+        raise RuntimeError("this native AppKit benchmark requires an Apple Silicon or Intel Mac")
+    revision = command(["git", "rev-parse", "--verify", "--end-of-options", args.baseline + "^{commit}"],
+                       "baseline resolution").decode().strip()
+    swiftc = command(["xcrun", "--find", "swiftc"], "Swift discovery").decode().strip()
+    sdk = command(["xcrun", "--sdk", "macosx", "--show-sdk-path"], "SDK discovery").decode().strip()
+    # Identical SDK, target, optimization and module flags for both variants.
+    flags = ["-target", architecture + "-apple-macosx13.0", "-sdk", sdk, "-Onone", "-parse-as-library"]
+    with tempfile.TemporaryDirectory(prefix="TokenStatMenu-synthetic-benchmark-") as temporary:
+        workspace = Path(temporary)
+        core = workspace / "core"
+        core.mkdir()
+        command([swiftc, *flags, "-module-name", "TokenStatCore", "-emit-module",
+                 "-emit-module-path", str(core / "TokenStatCore.swiftmodule"), "-emit-library",
+                 *(str(checked_source("TokenStatCore", name)) for name in CORE_FILES),
+                 "-lsqlite3", "-o", str(core / "libTokenStatCore.dylib")], "isolated Core compilation")
+        reports = {}
+        for variant in ("baseline", "current"):
+            directory = workspace / variant
+            directory.mkdir()
+            sources = []
+            for name in APP_FILES:
+                if variant == "baseline" and name in MENU_FILES:
+                    path = directory / name
+                    path.write_bytes(command(["git", "show", revision + ":Sources/TokenStatMenu/" + name],
+                                             "baseline source extraction"))
+                else:
+                    path = checked_source("TokenStatMenu", name)
+                sources.append(str(path))
+            linkage = ["-I", str(core), "-L", str(core), "-lTokenStatCore",
+                       "-Xlinker", "-rpath", "-Xlinker", str(core)]
+            command([swiftc, *flags, "-enable-testing", "-D", "SWIFT_PACKAGE", "-module-name", "TokenStatMenu",
+                     "-emit-module", "-emit-module-path", str(directory / "TokenStatMenu.swiftmodule"),
+                     "-emit-library", *linkage, *sources, "-lsqlite3", "-o", str(directory / "libTokenStatMenu.dylib")],
+                    "isolated menu compilation")
+            binary = directory / "benchmark-menu"
+            command([swiftc, *flags, "-I", str(directory), *linkage, str(ROOT / "script/BenchmarkMenu.swift"),
+                     "-L", str(directory), "-lTokenStatMenu", "-Xlinker", "-rpath", "-Xlinker", str(directory),
+                     "-o", str(binary)], "synthetic harness compilation")
+            reports[variant] = []
+            for round_index in range(args.rounds):
+                output = command([str(binary), str(args.iterations)], "synthetic workload")
+                if len(output) > 4096:
+                    raise RuntimeError("unexpected synthetic workload output")
+                report = json.loads(output)
+                if (set(report) != {"iterations", "elapsedMS", "objectWillChange"}
+                        or report["iterations"] != args.iterations
+                        or type(report["objectWillChange"]) is not int
+                        or not 0 <= report["objectWillChange"] <= args.iterations * 10
+                        or type(report["elapsedMS"]) not in (int, float)
+                        or not math.isfinite(report["elapsedMS"]) or report["elapsedMS"] < 0):
+                    raise RuntimeError("unexpected synthetic measurement schema")
+                reports[variant].append(report["elapsedMS"])
+                print(json.dumps({"variant": variant, "round": round_index + 1, **report}, sort_keys=True), flush=True)
+        print(json.dumps({"baselineMedianMS": statistics.median(reports["baseline"]),
+                          "currentMedianMS": statistics.median(reports["current"])}, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+        print("Synthetic menu benchmark could not complete; verify local Git sources and the selected full Xcode toolchain.", file=sys.stderr)
+        raise SystemExit(1) from None
+```
+
+### script/RenderAppIcon.swift
+
+```swift
+// Original code-native geometry. This renderer reads no images or user data.
+// The reviewed PNG and native .icns are reproducible build-time assets only.
+import AppKit
+import Foundation
+
+let output = CommandLine.arguments.dropFirst().first.map { URL(fileURLWithPath: $0) }
+    ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("Resources/AppIcon.png")
+let dimension = 1024
+let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: dimension, pixelsHigh: dimension,
+    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+    colorSpaceName: .deviceRGB, bytesPerRow: dimension * 4, bitsPerPixel: 32)!
+bitmap.bitmapData!.initialize(repeating: 0, count: bitmap.bytesPerRow * dimension)
+let context = NSGraphicsContext(bitmapImageRep: bitmap)!
+NSGraphicsContext.saveGraphicsState()
+NSGraphicsContext.current = context
+context.shouldAntialias = true
+
+// All colored pixels are clipped to this one native rounded rectangle.
+let tile = NSBezierPath(roundedRect: NSRect(x: 96, y: 96, width: 832, height: 832),
+                        xRadius: 190, yRadius: 190)
+tile.addClip()
+let blue = NSColor(srgbRed: 0.20, green: 0.38, blue: 0.98, alpha: 1)
+let violet = NSColor(srgbRed: 0.52, green: 0.27, blue: 0.95, alpha: 1)
+NSGradient(starting: blue, ending: violet)!.draw(in: tile, angle: -45)
+
+// A single opaque pulse and two token dots stay clear at small icon sizes.
+NSColor.white.setStroke()
+NSColor.white.setFill()
+let pulse = NSBezierPath()
+pulse.move(to: NSPoint(x: 320, y: 512))
+pulse.curve(to: NSPoint(x: 450, y: 650), controlPoint1: NSPoint(x: 388, y: 512),
+            controlPoint2: NSPoint(x: 396, y: 650))
+pulse.curve(to: NSPoint(x: 562, y: 374), controlPoint1: NSPoint(x: 508, y: 650),
+            controlPoint2: NSPoint(x: 504, y: 374))
+pulse.curve(to: NSPoint(x: 704, y: 512), controlPoint1: NSPoint(x: 620, y: 374),
+            controlPoint2: NSPoint(x: 632, y: 512))
+pulse.lineWidth = 50
+pulse.lineCapStyle = .round
+pulse.lineJoinStyle = .round
+pulse.stroke()
+for centerX in [220.0, 804.0] {
+    NSBezierPath(ovalIn: NSRect(x: centerX - 31, y: 481, width: 62, height: 62)).fill()
+}
+NSGraphicsContext.restoreGraphicsState()
+
+// Guard the transparent margin without modifying any rendered pixels.
+for y in 0..<dimension {
+    for x in 0..<dimension where x < 95 || x > 929 || y < 95 || y > 929 {
+        precondition(bitmap.colorAt(x: x, y: y)!.alphaComponent == 0, "Icon margin must stay transparent")
+    }
+}
+guard let png = bitmap.representation(using: .png, properties: [:]) else {
+    fatalError("Unable to encode original icon geometry")
+}
+try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
+try png.write(to: output, options: .atomic)
+print("Rendered original 1024px TokenStatMenu icon.")
+```
+
+### script/make_app_icon.sh
+
+```bash
+#!/bin/bash
+# Render original native geometry, then build every native icon size.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+SOURCE="$ROOT/Resources/AppIcon.png"
+ICONSET="$ROOT/.build/AppIcon.iconset"
+xcrun swift "$ROOT/script/RenderAppIcon.swift" "$SOURCE"
+if [ "$(sips -g pixelWidth "$SOURCE" | awk '/pixelWidth/ {print $2}')" != "1024" ] || \
+   [ "$(sips -g pixelHeight "$SOURCE" | awk '/pixelHeight/ {print $2}')" != "1024" ]; then
+    echo "AppIcon.png must be the reviewed 1024 by 1024 PNG master." >&2
+    exit 1
+fi
+mkdir -p "$ICONSET"
+for SIZE in 16 32 128 256 512; do
+    sips -z "$SIZE" "$SIZE" "$SOURCE" --out "$ICONSET/icon_${SIZE}x${SIZE}.png" >/dev/null
+    DOUBLE=$((SIZE * 2))
+    sips -z "$DOUBLE" "$DOUBLE" "$SOURCE" --out "$ICONSET/icon_${SIZE}x${SIZE}@2x.png" >/dev/null
+done
+iconutil --convert icns "$ICONSET" --output "$ROOT/Resources/AppIcon.icns"
+echo "Built Resources/AppIcon.icns with macOS sips and iconutil."
+```
+
+### script/check_docs.py
+
+```python
+#!/usr/bin/env python3
+"""Check only publication Markdown links; no network or third-party packages.
+
+Supports inline/reference links, HTML img src, GitHub-style heading suffixes,
+and explicit HTML ids. Fenced and inline code are excluded from link parsing.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import html
+import posixpath
+from pathlib import Path
+import re
+import tempfile
+import unicodedata
+from urllib.parse import unquote, urlsplit, urlunsplit
+
+
+@dataclass(frozen=True)
+class Link:
+    destination: str
+    start: int
+    end: int
+    line: int
+
+
+def mask_fences(text: str) -> str:
+    result = []
+    fence = None
+    for line in text.splitlines(keepends=True):
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\r\n"))
+        if fence:
+            result.append(re.sub(r"[^\r\n]", " ", line))
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= fence[1] and not marker[2].strip():
+                fence = None
+        elif marker:
+            fence = (marker[1][0], len(marker[1]))
+            result.append(re.sub(r"[^\r\n]", " ", line))
+        else:
+            result.append(line)
+    return "".join(result)
+
+
+def mask_inline_code(text: str) -> str:
+    # Equal-length backtick runs are paired; length and line numbers survive.
+    chars = list(text)
+    runs = list(re.finditer(r"`+", text))
+    index = 0
+    while index < len(runs):
+        opening = runs[index]
+        closing = next((j for j in range(index + 1, len(runs)) if len(runs[j][0]) == len(opening[0])), None)
+        if closing is None:
+            index += 1
+            continue
+        for position in range(opening.start(), runs[closing].end()):
+            if chars[position] not in "\r\n":
+                chars[position] = " "
+        index = closing + 1
+    return "".join(chars)
+
+
+def normalized_label(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def links_in(text: str) -> tuple[list[Link], list[tuple[int, str]]]:
+    masked = mask_inline_code(mask_fences(text))
+    links: list[Link] = []
+    failures = []
+    definitions = {}
+    definition_spans = []
+    pattern = r"(?m)^ {0,3}\[([^\]\n]+)\]:[ \t]*(?:<([^>\n]+)>|(\S+))"
+    for match in re.finditer(pattern, masked):
+        group = 2 if match[2] is not None else 3
+        definitions.setdefault(normalized_label(match[1]), match[group])
+        definition_spans.append((match.start(), match.end()))
+        links.append(Link(match[group], match.start(group), match.end(group), text.count("\n", 0, match.start()) + 1))
+    for match in re.finditer(r"!?\[([^\]\n]*)\]\(", masked):
+        position = match.end()
+        while position < len(masked) and masked[position].isspace():
+            position += 1
+        if position >= len(masked):
+            continue
+        start = position
+        if masked[position] == "<":
+            start += 1
+            end = masked.find(">", start)
+            if end < 0:
+                continue
+        else:
+            depth = 0
+            while position < len(masked):
+                char = masked[position]
+                if char == "\\" and position + 1 < len(masked):
+                    position += 2
+                    continue
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif char.isspace() and depth == 0:
+                    break
+                position += 1
+            end = position
+        if end > start:
+            links.append(Link(text[start:end], start, end, text.count("\n", 0, start) + 1))
+    # Definitions themselves are checked above. Explicit unresolved references
+    # are errors; bracketed prose without a reference definition is ordinary text.
+    for match in re.finditer(r"!?\[([^\]\n]+)\](?:\[([^\]\n]*)\])?", masked):
+        if any(a <= match.start() < b for a, b in definition_spans):
+            continue
+        if masked[match.end():].startswith("("):
+            continue
+        label = normalized_label(match[2] or match[1])
+        if match[2] is not None and label not in definitions:
+            failures.append((text.count("\n", 0, match.start()) + 1, "undefined reference link"))
+    for match in re.finditer(r"(?is)<img\b[^>]*?\bsrc\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", masked):
+        group = next(i for i in (1, 2, 3) if match[i] is not None)
+        links.append(Link(text[match.start(group):match.end(group)], match.start(group), match.end(group), text.count("\n", 0, match.start()) + 1))
+    return sorted(set(links), key=lambda link: link.start), failures
+
+
+def heading_anchors(text: str) -> set[str]:
+    masked = mask_fences(text)
+    used: set[str] = set()
+    lines = masked.splitlines()
+    for index, line in enumerate(lines):
+        atx = re.match(r"^ {0,3}#{1,6}(?:[ \t]+|$)(.*)$", line)
+        if atx:
+            title = re.sub(r"[ \t]+#+[ \t]*$", "", atx[1])
+        elif index + 1 < len(lines) and line.strip() and re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", lines[index + 1]):
+            title = line.strip()
+        else:
+            continue
+        title = html.unescape(re.sub(r"<[^>]*>", "", title))
+        title = re.sub(r"!?\[([^]]*)\]\([^)]*\)", r"\1", title)
+        title = re.sub(r"(?<!\w)(_{1,3}|\*{1,3})(.*?)\1(?!\w)", r"\2", title)
+        title = title.replace("`", "").lower()
+        base = "".join(char for char in title if char in " _-" or unicodedata.category(char)[0] in "LNM").replace(" ", "-")
+        slug = base
+        suffix = 0
+        while slug in used:
+            suffix += 1
+            slug = f"{base}-{suffix}"
+        used.add(slug)
+    used.update(html.unescape(match[2]) for match in re.finditer(r"\b(?:id|name)\s*=\s*([\"'])(.*?)\1", masked, re.IGNORECASE))
+    return used
+
+
+def local_parts(destination: str):
+    value = html.unescape(re.sub(r"\\([\\()<> #])", r"\1", destination))
+    if value.startswith("//"):
+        return None
+    parts = urlsplit(value)
+    return None if parts.scheme or parts.netloc else parts
+
+
+def rebase_links(text: str, source: str, destination: str) -> str:
+    """Rebase copied prose without editing code fences or external URLs."""
+    links, _ = links_in(text)
+    for link in reversed(links):
+        parts = local_parts(link.destination)
+        if parts is None:
+            continue
+        target = posixpath.normpath(posixpath.join(posixpath.dirname(source), parts.path or posixpath.basename(source)))
+        path = posixpath.relpath(target, posixpath.dirname(destination) or ".")
+        replacement = urlunsplit(("", "", path, parts.query, parts.fragment))
+        text = text[:link.start] + replacement + text[link.end:]
+    return text
+
+
+def check_documents(root: Path, names: list[str], allowed: set[str]) -> list[tuple[str, int, str]]:
+    root = root.resolve()
+    failures = []
+    cache = {}
+    for name in names:
+        path = root / name
+        if path.is_symlink() or not path.resolve().is_relative_to(root) or not path.is_file():
+            failures.append((name, 0, "missing or unsafe documentation file"))
+            continue
+        text = path.read_text(encoding="utf-8")
+        links, parsing_failures = links_in(text)
+        failures.extend((name, line, error) for line, error in parsing_failures)
+        for link in links:
+            try:
+                parts = local_parts(link.destination)
+            except ValueError:
+                failures.append((name, link.line, "malformed link destination"))
+                continue
+            if parts is None:
+                continue
+            local_path = unquote(parts.path)
+            target = (path.parent / local_path if local_path else path).resolve()
+            if local_path.startswith("/") or not target.is_relative_to(root):
+                failures.append((name, link.line, "local link escapes publication root"))
+                continue
+            if not target.exists():
+                failures.append((name, link.line, "missing local link target"))
+                continue
+            if target.is_dir():
+                if parts.fragment:
+                    failures.append((name, link.line, "directory link cannot have a heading anchor"))
+                continue
+            target_name = target.relative_to(root).as_posix()
+            if target_name not in allowed:
+                failures.append((name, link.line, "link target is not on publication allowlist"))
+                continue
+            if parts.fragment and target.suffix.lower() == ".md":
+                if target not in cache:
+                    cache[target] = heading_anchors(target.read_text(encoding="utf-8"))
+                if unquote(parts.fragment) not in cache[target]:
+                    failures.append((name, link.line, "missing local heading anchor"))
+    return failures
+
+
+def self_test() -> None:
+    with tempfile.TemporaryDirectory(prefix="tokenstat-doc-links-fixture-") as temporary:
+        root = Path(temporary)
+        (root / "docs").mkdir()
+        (root / "Assets").mkdir()
+        (root / "Assets/icon.png").write_bytes(b"synthetic-file-fixture")
+        (root / "docs/Guide.md").write_text("# Repeated\n# Repeated\n# Repeated-1\n# 中文标题\n", encoding="utf-8")
+        allowed = {"README.md", "docs/Guide.md", "Assets/icon.png"}
+        good = '# Home\n[guide](docs/Guide.md#repeated-1)\n[ref][guide]\n[guide]: docs/Guide.md#中文标题\n<img src="Assets/icon.png">\n`[literal](missing.md)`\n```md\n[ignored](../../outside)\n```\n'
+        (root / "README.md").write_text(good, encoding="utf-8")
+        assert not check_documents(root, ["README.md", "docs/Guide.md"], allowed)
+        assert heading_anchors((root / "docs/Guide.md").read_text()) == {"repeated", "repeated-1", "repeated-1-1", "中文标题"}
+        for link, expected in [("missing.md", "missing local link target"), ("docs/Guide.md#absent", "missing local heading anchor"), ("../../outside.md", "local link escapes publication root")]:
+            (root / "README.md").write_text(f"[bad]({link})\n", encoding="utf-8")
+            assert any(error == expected for _, _, error in check_documents(root, ["README.md"], allowed)), expected
+        copied = rebase_links(good, "README.md", "docs/FULL_SOURCE.md")
+        assert "[guide](Guide.md#repeated-1)" in copied and '<img src="../Assets/icon.png">' in copied
+        assert "[guide]: Guide.md#中文标题" in copied
+        assert "```md\n[ignored](../../outside)\n```" in copied
+        self_link = "[home](#home) and [web](https://example.test/page#anchor)"
+        rebased = rebase_links(self_link, "README.md", "docs/FULL_SOURCE.md")
+        assert rebased == "[home](../README.md#home) and [web](https://example.test/page#anchor)"
+        assert "`[literal](missing.md)`" in copied
+    print("PASS: synthetic Markdown link, reference, HTML image, fence, duplicate-heading, missing-target, missing-anchor and escape fixtures")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--self-test", action="store_true", help="Run synthetic positive/negative fixtures before checking publication docs")
+    args = parser.parse_args()
+    if args.self_test:
+        self_test()
+    from package_source import PUBLIC_FILES, ROOT
+    names = [name for name in PUBLIC_FILES if name.lower().endswith(".md")]
+    failures = check_documents(ROOT, names, set(PUBLIC_FILES))
+    for name, line, reason in failures:
+        print(f"FAIL {name}:{line}: {reason}")
+    if failures:
+        return 1
+    print(f"PASS: local links and anchors in {len(names)} publication Markdown files")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
 ### script/generate_xcode_project.py
 
 ```python
@@ -10152,10 +11138,13 @@ for folder in ["TokenStatCore", "TokenStatMenu"]:
 product = obj("product", 'isa = PBXFileReference; explicitFileType = wrapper.application; path = TokenStatMenu.app; sourceTree = BUILT_PRODUCTS_DIR;')
 products = obj("products", f'isa = PBXGroup; children = ({product},); name = Products; sourceTree = "<group>";')
 resource_files = [obj("resource:" + n, f'isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Resources/{n}"; sourceTree = "<group>";') for n in ["Info.plist", "config.example.plist"]]
+icon_ref = obj("resource:AppIcon.icns", 'isa = PBXFileReference; lastKnownFileType = image.icns; path = "Resources/AppIcon.icns"; sourceTree = "<group>";')
+resource_files.append(icon_ref)
+icon_build = obj("resource-build:AppIcon.icns", f"isa = PBXBuildFile; fileRef = {icon_ref};")
 main = obj("main", f'isa = PBXGroup; children = {refs(groups + resource_files + [products])}; sourceTree = "<group>";')
 source_phase = obj("sources", f"isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = {refs(sources)}; runOnlyForDeploymentPostprocessing = 0;")
 framework_phase = obj("frameworks", "isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0;")
-resource_phase = obj("resources", "isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0;")
+resource_phase = obj("resources", f"isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = ({icon_build},); runOnlyForDeploymentPostprocessing = 0;")
 project_configs, target_configs = [], []
 for mode in ["Debug", "Release"]:
     project_configs.append(obj("project-config:" + mode, f'isa = XCBuildConfiguration; name = {mode}; buildSettings = {{ MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 5.0; }};'))
@@ -10425,6 +11414,7 @@ import argparse
 import shutil
 import zipfile
 from pathlib import Path
+from check_docs import rebase_links
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = [
@@ -10438,7 +11428,7 @@ PUBLIC_FILES = [
     "Sources/TokenStatMenu/SettingsView.swift",
     "Sources/TokenStatMenu/StatusBarController.swift", "Sources/TokenStatMenu/Storage.swift",
     "Sources/TokenStatMenu/TokenStatMenuApp.swift", "Sources/TokenStatMenu/PanelStyle.swift", "Sources/TokenStatMenu/WindowQuotaCard.swift", "Sources/TokenStatMenu/TokenHubAXReader.swift", "Sources/TokenStatMenu/TokenHubQuotaCard.swift",
-    "Resources/Info.plist", "Resources/config.example.plist", "TokenStatMenu.xcodeproj/project.pbxproj",
+    "Resources/Info.plist", "Resources/config.example.plist", "Resources/AppIcon.png", "Resources/AppIcon.icns", "TokenStatMenu.xcodeproj/project.pbxproj",
     "Tests/TokenStatCoreTests/CoreChecks.swift", "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/WindowQuotaChecks.swift", "Tests/TokenStatCoreTests/LocalCodexUsageChecks.swift", "Tests/TokenStatCoreTests/DirectQuotaChecks.swift",
     "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift", "Tests/TokenStatCoreTests/TokenHubQuotaChecks.swift", "Tests/TokenStatUITests/TokenHubQuotaStateTests.swift", "Tests/TokenStatUITests/SeasunStartupContractTests.swift",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png",
@@ -10446,14 +11436,18 @@ PUBLIC_FILES = [
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png",
     "script/build_and_run.sh", "script/test.sh", "script/mock_server.py", "script/integration.py",
-    "script/generate_xcode_project.py", "script/render_preview.py", "script/RenderPreview.swift", "script/package_source.py", "script/check_public_content.py",
-    "docs/DESIGN.md", "docs/IMPLEMENTATION.md", "docs/CONFIGURATION.md", "docs/VALIDATION.md", "docs/UI_TESTING.md", "docs/FULL_SOURCE.md",
+    "script/BenchmarkMenu.swift", "script/benchmark_menu.py", "script/RenderAppIcon.swift", "script/make_app_icon.sh", "script/check_docs.py", "script/generate_xcode_project.py", "script/render_preview.py", "script/RenderPreview.swift", "script/package_source.py", "script/check_public_content.py",
+    "docs/README.md", "docs/wiki/Home.md", "docs/wiki/安装与使用.md", "docs/wiki/统计口径.md",
+    "docs/wiki/常见问题.md", "docs/wiki/编译指南.md", "docs/wiki/测试指南.md", "docs/wiki/命令行参数.md",
+    "docs/wiki/CI-CD.md", "docs/wiki/贡献指南.md",
+    "docs/PERFORMANCE.md", "docs/DESIGN.md", "docs/IMPLEMENTATION.md", "docs/CONFIGURATION.md", "docs/VALIDATION.md", "docs/UI_TESTING.md", "docs/FULL_SOURCE.md",
 ]
 
 
 def source_document():
     readme = (ROOT / "README.md").read_text()
     architecture = readme.split("## 整体架构\n", 1)[1].split("## 文件与职责", 1)[0]
+    architecture = rebase_links(architecture, "README.md", "docs/FULL_SOURCE.md")
     parts = ["# TokenStatMenu 完整源码\n\n## 项目整体架构\n", architecture, "\n## 分文件完整源码\n"]
     languages = {".swift": "swift", ".plist": "xml", ".pbxproj": "text", ".py": "python", ".sh": "bash", ".yml": "yaml"}
     for name in PUBLIC_FILES:
@@ -10461,7 +11455,8 @@ def source_document():
         if path.suffix not in languages:
             continue
         parts += [f"\n### {name}\n\n```{languages[path.suffix]}\n", path.read_text().rstrip(), "\n```\n"]
-    parts += ["\n## 编译与使用\n\n", readme.split("## 构建与运行\n", 1)[1]]
+    usage = rebase_links(readme.split("## 构建与运行\n", 1)[1], "README.md", "docs/FULL_SOURCE.md")
+    parts += ["\n## 编译与使用\n\n", usage]
     (ROOT / "docs/FULL_SOURCE.md").write_text("".join(parts))
 
 
@@ -10503,6 +11498,8 @@ This is a guardrail, not a substitute for reviewing the exact diff. Reports
 locations/categories only, never the matched secret value. No network calls.
 """
 import argparse
+import hashlib
+import struct
 import re
 import subprocess
 from pathlib import Path
@@ -10514,6 +11511,32 @@ SYNTHETIC_PNG_SHA256 = {
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "64ea172d17a5d3be86176c4b3ede3c7b68b6f9c841709ffa92c49edfbfdfb101",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "98c5ede0f59bd9f69d064b52b3e49731b98c70447407148b1cc84a3dc1ce352b",
 }
+
+
+# Original code-native assets, independently reviewed at 1024/64/32px.
+# No wildcard, file extension, or directory grants a binary exception.
+REVIEWED_ICON_ASSETS = {
+    "Resources/AppIcon.png": ("png-rgba-1024", "664e54034f49380b3dc60d72841ec8c7d9bae142e5e20f154c8e5dfcbae1e16f"),
+    "Resources/AppIcon.icns": ("icns", "edfc3aa520be04f987cc6c8a273995f57bafca68603d89f8265c640d0009e980"),
+}
+
+
+def reviewed_icon_failure(name: str, data: bytes):
+    format_name, digest = REVIEWED_ICON_ASSETS[name]
+    if format_name == "png-rgba-1024":
+        if (len(data) < 33 or not data.startswith(b"\x89PNG\r\n\x1a\n")
+                or data[8:16] != b"\x00\x00\x00\rIHDR"
+                or struct.unpack(">II", data[16:24]) != (1024, 1024)
+                or data[24:26] != b"\x08\x06"):
+            return "reviewed icon PNG format/dimensions/alpha mismatch"
+    elif format_name == "icns":
+        if len(data) < 8 or data[:4] != b"icns" or struct.unpack(">I", data[4:8])[0] != len(data):
+            return "reviewed icon ICNS signature/length mismatch"
+    else:
+        return "unsupported reviewed icon format"
+    if hashlib.sha256(data).hexdigest() != digest:
+        return "reviewed icon hash mismatch"
+    return None
 
 
 def main():
@@ -10547,8 +11570,12 @@ def main():
             if path.is_symlink() or not path.is_file():
                 failures.append((name, 0, "missing or symbolic-link file")); continue
             data = path.read_bytes()
+        if name in REVIEWED_ICON_ASSETS:
+            reason = reviewed_icon_failure(name, data)
+            if reason:
+                failures.append((name, 0, reason))
+            continue
         if name in SYNTHETIC_PNG_SHA256:
-            import hashlib
             if not data.startswith(b"\x89PNG\r\n\x1a\n"):
                 failures.append((name, 0, "reviewed synthetic PNG signature mismatch")); continue
             if hashlib.sha256(data).hexdigest() != SYNTHETIC_PNG_SHA256[name]:
@@ -10579,56 +11606,53 @@ if __name__ == "__main__":
 ## 编译与使用
 
 
-需要 macOS 13 或更新版本，以及支持 Swift 5.9 的 Xcode/命令行工具。项目运行时只使用系统框架；UI 截图测试依赖精确版本的 swift-snapshot-testing，正式 App 不链接它。
+在仓库根目录执行。构建不会按进程名关闭其他应用，打开新实例前应先退出旧版，避免误看另一份构建。
 
-```bash
-# 在项目目录内只构建，不关闭已运行的 App
-./script/build_and_run.sh --build-only
+| 命令 | 结果 |
+| --- | --- |
+| `./script/build_and_run.sh --build-only` | 构建本机架构 Debug `.app`，不启动应用 |
+| `./script/build_and_run.sh --universal` | 构建 arm64 与 x86_64 Release 通用 `.app`，不启动应用 |
+| `./script/build_and_run.sh` | 构建并运行本机架构 Debug `.app` |
+| `./script/build_and_run.sh --release` | 构建后运行本机架构 Release `.app`，不是只编译模式 |
+| `swift build -c release --product TokenStatMenu` | 编译 SwiftPM 可执行目标；不会单独完成 `.app` 资源打包 |
 
-# 打开构建产物
-open dist/TokenStatMenu.app
-
-# 仅编译 Release，不启动应用
-swift build -c release --product TokenStatMenu
-
-# 同时构建 Apple Silicon 与 Intel
-./script/build_and_run.sh --universal
-```
-
-也可打开 `TokenStatMenu.xcodeproj`，选择 TokenStatMenu Scheme 和 My Mac 后编译运行。若默认开发目录指向 Command Line Tools，可仅为当前命令设置：
+也可打开 `TokenStatMenu.xcodeproj`，选择 TokenStatMenu Scheme 和 My Mac 编译。若默认开发目录仍指向 Command Line Tools，可只为当前命令选择完整 Xcode：
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
-  -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release build
+  -project TokenStatMenu.xcodeproj \
+  -scheme TokenStatMenu \
+  -configuration Release build
 ```
 
-`--release` 是构建后运行模式，验证时不要把它当作只构建选项；需要隔离检查请使用测试脚本。
+更多环境准备、图标资源、双架构、构建身份和常见错误见 [编译指南](wiki/编译指南.md)；发布前检查与签名限制见 [CI/CD](wiki/CI-CD.md)。
 
-构建脚本的本地 ad hoc 签名不是 Developer ID 签名或公证。对外分发应另行使用开发者证书、公证并验证下载后的 Gatekeeper 行为。辅助功能授权也可能因本地开发构建身份变化而失效。
-
-## 使用与偏好
-
-应用版本为 1.1.0（build 2），便于区分早期构建。运行后从右上角菜单栏打开面板，无主窗口。设置只包含可选的刷新与界面快照兼容偏好；不需要创建配置文件。详情见 [偏好说明](docs/CONFIGURATION.md)。应用会读取 Token Hub 自有数据库中的必要连接/登录材料到内存，拦截 SSO 回调重定向并用短期令牌请求只读额度；不会把会话或额度写入日志、配置或仓库。会话过期、变化、多实例或入口不可用时，界面显示具体不可用状态。
-
-旧配置在启动和重新加载时保持原文件不变，仅读取允许的偏好。用户主动保存偏好时，原子写入两项偏好并去除旧的通用接入字段。读取或保存失败不会回退到代理或发出企业请求。
-
-## 验证与限制
+## 验证与维护
 
 ```bash
-# 核心检查
+# 纯合成核心检查
 swift run TokenStatCoreChecks
 
-# 原生 XCTest，使用合成数据与隔离偏好
+# 原生 XCTest 与界面回归
 swift test
 
-# 核心、构建及独立子进程的专用启动集成
+# 核心、只构建及隔离启动集成
 ./script/test.sh
+
+# 更新完整源码文档，并按白名单打包源码
+python3 script/package_source.py
+
+# 检查文档链接与公开内容
+python3 script/check_docs.py
+python3 script/check_public_content.py
 ```
 
-集成测试使用临时配置和禁用后台服务的独立子进程，只清理自己持有的进程句柄。合成测试不会调用企业网关或读取真实会话；真实本机核验只记录 HTTP 状态、字段结构和布尔就绪信息。截图测试使用真实 SwiftUI/NSHostingView 与合成数据；新的参考图需独立视觉审查，录制本身不算通过。最新验证范围见 [验证记录](docs/VALIDATION.md)。
+真实机器核验与合成测试分开记录；后者不能证明企业账号、完整账单或真实服务器吞吐正确。视觉参考图只使用合成数据，录制图像本身不算通过。详细方法见 [测试指南](wiki/测试指南.md) 和 [UI 测试说明](UI_TESTING.md)，最近的结果与限制见 [验证记录](VALIDATION.md)。
 
-扫描有覆盖上限；身份与继承证据不足时单独标记未核算，不把未知贡献当零。损坏 JSON、读取缺口、不完整尾行、重叠轮次、未来或倒序时间都不能跨过去继续生成实时估算。当前配置匹配不能回溯认证历史路由，真实服务端瞬时吞吐仍由 [Issue #37](https://github.com/Tupig/TokenStatMenu/issues/37) 跟踪。金额与 Token 不互换；界面快照的 `$` 不自动认定为某一币种。不根据重置短文本猜测年份或时区。更多处理边界见 [隐私说明](PRIVACY.md) 和 [设计说明](docs/DESIGN.md)。
+## 隐私与开源
 
-## 开源
+应用只读获取 Token Hub 必要的连接与现有登录材料，在内存中向其既有 HTTPS 来源交换短期会话并读取额度。它不会把令牌、账号、实际额度或响应正文写入正常日志、配置或源码仓库；本地会话文件在解析时可能短暂接触正文，但仅提取允许的计量和身份字段，不保存或上传正文。完整读取边界与开源检查方法见 [隐私说明](../PRIVACY.md)。
 
-采用 [MIT 许可证](LICENSE)。请在 GitHub Issue 中使用合成示例报告问题，不提交真实凭据、企业地址、账户信息、会话正文、截图或运行日志。界面布局参考 codexU 的紧凑分组思路，采用原生系统颜色适配深浅外观；未复制其实现代码。
+采用 [MIT 许可证](../LICENSE)。报告问题时只提交版本、状态描述、操作步骤和合成示例，不提交凭据、企业地址、账户数据库、会话正文或原始运行截图。贡献流程见 [贡献指南](wiki/贡献指南.md)。
+
+界面布局参考 codexU 的紧凑分组思路；文档组织参考 [TuPigGHD2Chinese](https://github.com/Tupig/TuPigGHD2Chinese) 的文档中心与专题导航，内容依据本项目的实际实现编写。

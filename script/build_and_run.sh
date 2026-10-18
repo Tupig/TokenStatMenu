@@ -5,7 +5,7 @@ cd "$ROOT"
 MODE="${1:-run}"
 APP="$ROOT/dist/TokenStatMenu.app"
 case "$MODE" in run|--build-only|--verify|--release|--universal|--logs|--telemetry|--debug) ;; *) echo "Usage: $0 [--build-only|--verify|--release|--universal|--logs|--telemetry|--debug]"; exit 2 ;; esac
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # Native SwiftPM also works with Command Line Tools; no global xcode-select changes.
 if [ "$MODE" = "--universal" ]; then
     for ARCH in arm64 x86_64; do
@@ -22,6 +22,7 @@ else
     cp "$BIN_DIR/TokenStatMenu" "$APP/Contents/MacOS/TokenStatMenu"
 fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 # Only public source identity enters the bundle: never include a machine path,
 # hostname, account, configuration, or session. Exported source has no Git ID.
 SOURCE_REVISION="source-export"

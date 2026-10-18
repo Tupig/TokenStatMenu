@@ -129,6 +129,7 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     (checkout / "script").mkdir(parents=True)
     (checkout / "Resources").mkdir()
     (checkout / "Resources/Info.plist").write_bytes((ROOT / "Resources/Info.plist").read_bytes())
+    (checkout / "Resources/AppIcon.icns").write_bytes((ROOT / "Resources/AppIcon.icns").read_bytes())
     (checkout / "script/build_and_run.sh").write_bytes((ROOT / "script/build_and_run.sh").read_bytes())
     tools = checkout / "tools"
     tools.mkdir()
@@ -168,6 +169,8 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     source_info = plistlib.loads((ROOT / "Resources/Info.plist").read_bytes())
     assert packaged_info["CFBundleShortVersionString"] == source_info["CFBundleShortVersionString"]
     assert packaged_info["CFBundleVersion"] == source_info["CFBundleVersion"]
+    assert packaged_info["CFBundleIconFile"] == "AppIcon"
+    assert (checkout / "dist/TokenStatMenu.app/Contents/Resources/AppIcon.icns").read_bytes() == (ROOT / "Resources/AppIcon.icns").read_bytes()
     assert packaged_info["TokenStatSourceRevision"] == "source-export", "source-only export must not acquire a machine identity"
     assert packaged_info["TokenStatSourceState"] == "unspecified"
     assert (checkout / "dist/TokenStatMenu.app/Contents/MacOS/TokenStatMenu").read_bytes() == b"synthetic-executable-fixture"

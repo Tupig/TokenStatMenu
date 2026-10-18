@@ -1,5 +1,28 @@
 # 验证记录
 
+## 1.1.1 — 文档、原生图标与空闲展示路径（2026-10-18）
+
+本节区分最终候选的合成验证与既有安装记录。后续各节保留历史；它们不能替代本次候选的重新检查。
+
+- 文档中心采用仓库内 `docs/README.md` → `docs/wiki/Home.md` → 使用、统计口径、排障、编译、测试、CLI、CI/CD 和贡献专题的结构。文档事实已逐项对照当前源码、脚本与 workflow；没有声称同步 GitHub Wiki 或存在尚未发布的 Release。
+- 文档检查器的合成自测及 19 个公开 Markdown 文件的本地链接/锚点检查通过，`git diff --check` 通过。链接检查不能证明产品行为，参数与数值口径另以源码核对。
+- 设置页状态先用合成直接来源重现：静态“尚不可用”导致未知、成功、过期和会话失败相关的 5 个断言失败；绑定实际新鲜来源后通过。专用启动测试曾完成 12/12，包括设置完整浅/深渲染与 OCR；视觉查看只使用合成材料，不读取真实账号或 Hub 界面。
+- 最终核心与隔离集成：`./script/test.sh` 退出码 0，核心 416/416 通过，临时偏好、专用启动、后台禁用及源码构建身份隔离场景通过；测试没有调用全局进程名终止用户应用。
+- 最终完整原生测试：`swift test` 54/54 通过，0 失败；不是只执行筛选的状态子集。Xcode arm64 Release 返回 `BUILD SUCCEEDED`。
+- Universal Release 构建退出码 0，`lipo` 确认同时包含 `arm64` 与 `x86_64`，`codesign --verify --deep --strict` 通过。本地 ad hoc 签名不等于 Developer ID 签名或公证；Intel 仅完成架构构建，没有 Intel 硬件验收。
+- 最终性能候选在独立 scratch 目录执行 `swift test --filter TokenHubQuotaStateTests`，31/31 通过。覆盖原有权限/生命周期/来源隔离回归，以及空闲不重复发布、Tooltip 失效、lazy hosting、15/15.001 秒、120/120.001 秒、时间回拨、两次 tick 间活动/窗口更新后跨边界、近过期 Hub 返回、后台区域/时区通知。
+- 性能修正保存每次相关 Published 输入更新后的时效基线，而不是只比较上个 tick，以免漏掉两次 tick 之间已呈现的新鲜值随后过期。原问题已用合成回归重现，最终候选的回归通过；不是通过延长时效或降低采集频率规避。
+- 公开基准脚本的最终三轮结果为：旧路径 `562.007 / 564.312 / 560.957 ms`，候选 `80.558 / 81.818 / 81.210 ms`；中位 `562.007 → 81.210 ms`，指定 10,000 次合成循环耗时减少约 85.6%，每轮 `objectWillChange` 为 `10,000 → 0`。两组隔离重编、同编译器/SDK/`-Onone`、共用当前 Core 与其余 App 源码，只替换两个菜单文件。该比例不是整 App CPU、RSS、能耗或启动时间改善；方法见 [性能与基准](PERFORMANCE.md)。
+- 图标以项目原创 Swift 几何绘制为最终来源，PNG / `.icns` 通过系统工具生成，进入 SwiftPM App 与 Xcode 的资源链；候选元数据为 1.1.1（build 3）。
+- 固定安装候选已完成：安装副本与构建产物的完整 4 文件 manifest 相等，保留旧版供回退；旧进程停止前精确核对 PID、可执行路径、UID 和微秒级启动时间，没有按全局名称终止其他实例。默认启动通过 `NSWorkspace` 归属校验，验证程序退出码 0，正常无参数实例保留运行。
+- 同次候选安装验收的脱敏就绪结果为：`directQuotaPresent=true`、`fiveHourPresent=true`、`sevenDayPresent=true`、`fiveHourResetPresent=true`、`sevenDayResetPresent=true`、`monthlyUsagePresent=true`、`statusItemVisible=true`、`defaultReadinessPassed=true`、`permissionPromptRequested=false`。只记录布尔就绪状态，不公开真实额度、Token 数量、账号、企业地址或个人路径。
+- 同次 `liveTokenSpeedPresent=false`：没有新鲜活动事件，不能声称本轮真实运行已验证实时 token/s。服务端权威吞吐继续由 [Issue #37](https://github.com/Tupig/TokenStatMenu/issues/37) 跟踪，本地活动估算与上轮均速保留独立标识。
+- 正常安装候选完成只读菜单栏空闲采样：20.162 秒内进程 CPU 时间增量 0.0044 秒，折合单核平均约 0.022%；RSS 样本最小/最大均为 67.98 MiB，进程身份全程匹配。旧 1.1.0 的另一个 20.079 秒窗口为 CPU 增量 0.0069 秒、单核约 0.034%、RSS 112.08–112.25 MiB。两个实例年龄及首次面板状态等生命周期条件未完全控制，不能作为整 App 节省百分比；与合成循环证据分开，详见 [性能与基准](PERFORMANCE.md)。
+
+上述合成菜单基准与自动状态检查使用合成输入和手动时钟，不执行真实 SSO、企业请求、AX 读取或新系统授权；真实进程资源采样不属于这组合成检查。候选固定安装验收另行执行正常真实来源读取，仅保留上述布尔结果。当前结论限于本机候选，不能推广到全新机器、所有企业部署或 Intel 硬件。CI 尚未记录为已执行，Developer ID 与公证未做。
+
+本节是候选安装验收。后续干净提交会改变公开源码 revision，必须重新写入 bundle 并核对 provenance 与安装产物一致性，不能将此候选记录套用于尚未构建的后续提交。以下 BP19 安装证据属于 1.1.0 历史。
+
 ## BP19 — 自动恢复、数值边界与固定安装验收（2026-10-18）
 
 本节记录本轮最终源码与本机候选安装产物的实际验证。BP17/BP18 的诊断来自当时启动的开发产物，只证明那些进程的就绪状态，不能代替固定路径安装或退出、重新启动后的生命周期验收。当前 provider 配置与 Hub origin 匹配也不证明相同 provider 名称的全部历史记录经过同一网关。

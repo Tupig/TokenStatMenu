@@ -1,27 +1,52 @@
 import AppKit
+import Combine
 import SwiftUI
+
+/// Native content factories keep expensive view construction at the UI
+/// boundary; tests can wrap the real builders using synthetic models.
+struct StatusBarContentFactories {
+    let dashboard: @MainActor (AppModel) -> NSViewController
+    let tooltip: @MainActor (AppModel) -> String
+    static var production: StatusBarContentFactories {
+        StatusBarContentFactories(dashboard: { NSHostingController(rootView: DashboardView(model: $0)) },
+                                  tooltip: { $0.menuTooltip })
+    }
+}
 
 @MainActor final class StatusBarController: NSObject, NSPopoverDelegate {
     private let item: NSStatusItem
     private let popover = NSPopover()
     private let model: AppModel
+    private let factories: StatusBarContentFactories
+    private var tooltipNeedsRefresh = true
+    private var lastTooltipTimeState: PresentationTimeState?
+    private var presentationObservers = Set<AnyCancellable>()
     private var lastTitle = ""
     private var lastColor: NSColor?
     private var lastDiagnostic = Date.distantPast
-    init(model: AppModel) {
+    init(model: AppModel, factories: StatusBarContentFactories = .production) {
         self.model = model
+        self.factories = factories
         // Keep a strong reference: a local NSStatusItem vanishes when deallocated.
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
         item.autosaveName = "TokenStatMenu.Metrics"
         popover.behavior = .transient; popover.animates = false; popover.delegate = self
         popover.contentSize = NSSize(width: 460, height: 700)
-        popover.contentViewController = NSHostingController(rootView: DashboardView(model: model))
         if let button = item.button {
             button.target = self; button.action = #selector(toggle)
             button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
             button.setAccessibilityLabel("TokenStatMenu 实时 Token 速度")
         }
+        // Published measurements/preferences invalidate the expensive tooltip;
+        // the half-second timer separately checks cheap freshness boundaries.
+        model.objectWillChange.sink { [weak self] in self?.tooltipNeedsRefresh = true }
+            .store(in: &presentationObservers)
+        NotificationCenter.default.publisher(for: NSLocale.currentLocaleDidChangeNotification)
+            .merge(with: NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange))
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.tooltipNeedsRefresh = true }
+            .store(in: &presentationObservers)
         model.onTick = { [weak self] in self?.refreshTitle() }
         refreshTitle()
     }
@@ -33,7 +58,12 @@ import SwiftUI
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: color
             ])
         }
-        item.button?.toolTip = model.menuTooltip
+        let timeState = model.presentationTimeState
+        if tooltipNeedsRefresh || lastTooltipTimeState != timeState {
+            item.button?.toolTip = factories.tooltip(model)
+            tooltipNeedsRefresh = false
+            lastTooltipTimeState = timeState
+        }
         writeDiagnosticsIfRequested()
     }
     @objc func toggle() {
@@ -41,6 +71,11 @@ import SwiftUI
     }
     func show() {
         guard let button = item.button else { return }
+        // Do not allocate SwiftUI's dashboard/layout graph for users who only
+        // need the menu title. Keep it after first open so settings state lives.
+        if popover.contentViewController == nil {
+            popover.contentViewController = factories.dashboard(model)
+        }
         model.panelVisible = true
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)

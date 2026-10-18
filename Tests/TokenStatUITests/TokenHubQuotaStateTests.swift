@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import XCTest
 import TokenStatCore
@@ -83,6 +84,281 @@ private final class HubDirectHarness {
 final class TokenHubQuotaStateTests: XCTestCase {
     private let identity = TokenHubIdentity(pid: 924, bundleID: TokenHubTarget.bundleID,
         executablePath: "/Applications/Synthetic Hub.app/Contents/MacOS/Hub")
+
+    /// A hidden local dashboard must not be invalidated by an unchanged
+    /// legacy proxy snapshot at the 0.5-second menu cadence.
+    func testIdleLocalTicksDoNotRepublishUnchangedMetrics() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        model.tick()
+        var publications = 0
+        let observer = model.objectWillChange.sink { publications += 1 }
+        for _ in 0..<100 { model.tick() }
+        XCTAssertEqual(publications, 0, "idle menu checks must not redraw the dashboard")
+        withExtendedLifetime(observer) {}
+    }
+
+    func testLiveExpiryPublishesOnceAndStillRefreshesMenuEveryTick() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        var now = observedAt
+        model.tokenHubNow = { now }
+        model.config.dataSource = "localCodex"
+        model.localSnapshot = LocalCodexSnapshot(input: 100, output: 50, total: 150,
+            sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: observedAt,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 1,
+            liveTurn: LocalLiveTurnSummary(inputTPS: 10, outputTPS: 24.5, observedAt: observedAt))
+        model.tick()
+        var publications = 0, menuChecks = 0
+        let observer = model.objectWillChange.sink { publications += 1 }
+        model.onTick = { menuChecks += 1 }
+        now = observedAt.addingTimeInterval(15)
+        model.tick()
+        XCTAssertEqual(publications, 0, "the exact freshness boundary remains live")
+        now = observedAt.addingTimeInterval(15.001)
+        model.tick()
+        XCTAssertEqual(publications, 1, "expiry must notify an open dashboard once")
+        XCTAssertTrue(model.title.hasPrefix("上轮均:—"))
+        for _ in 0..<100 { model.tick() }
+        XCTAssertEqual(publications, 1)
+        XCTAssertEqual(menuChecks, 102, "the menu cadence is independent of dashboard notifications")
+        now = observedAt
+        model.tick()
+        XCTAssertEqual(publications, 2, "clock rollback must recompute time-dependent presentation")
+        XCTAssertTrue(model.title.hasPrefix("实时≈24.5tok/s"))
+        withExtendedLifetime(observer) {}
+    }
+
+    func testDashboardHostingIsDeferredUntilFirstOpenAndReused() {
+        _ = NSApplication.shared
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        var dashboardCreations = 0
+        let factories = StatusBarContentFactories(dashboard: { model in
+            dashboardCreations += 1
+            return NSHostingController(rootView: DashboardView(model: model))
+        }, tooltip: { $0.menuTooltip })
+        let controller = StatusBarController(model: model, factories: factories)
+        XCTAssertEqual(dashboardCreations, 0, "menu-only startup must not allocate the SwiftUI dashboard")
+        controller.show()
+        XCTAssertEqual(dashboardCreations, 1)
+        XCTAssertTrue(model.panelVisible)
+        controller.toggle()
+        controller.show()
+        XCTAssertEqual(dashboardCreations, 1, "reopening reuses native hosting and its settings-page state")
+        controller.toggle()
+    }
+
+    func testTooltipFormattingIsReusedForIdleTicksButTracksValuesAndTimeBoundaries() throws {
+        _ = NSApplication.shared
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        var now = observedAt
+        model.tokenHubNow = { now }
+        model.localSnapshot = LocalCodexSnapshot(input: 100, output: 50, total: 150,
+            sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: observedAt,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 1,
+            liveTurn: LocalLiveTurnSummary(inputTPS: 10, outputTPS: 24.5, observedAt: observedAt))
+        var tooltipBuilds = 0
+        var displayedTooltip = ""
+        let factories = StatusBarContentFactories(dashboard: { NSHostingController(rootView: DashboardView(model: $0)) },
+            tooltip: { model in
+                tooltipBuilds += 1
+                displayedTooltip = model.menuTooltip
+                return displayedTooltip
+            })
+        let controller = StatusBarController(model: model, factories: factories)
+        model.tick()
+        XCTAssertEqual(tooltipBuilds, 1)
+        XCTAssertTrue(displayedTooltip.contains("输出 24.5 tok/s"))
+        for _ in 0..<100 { model.tick() }
+        XCTAssertEqual(tooltipBuilds, 1, "unchanged half-second menu checks reuse the formatted tooltip")
+        now = observedAt.addingTimeInterval(15.001)
+        model.tick()
+        XCTAssertEqual(tooltipBuilds, 2)
+        XCTAssertTrue(displayedTooltip.contains("实时估算：未知"))
+        now = observedAt
+        controller.refreshTitle()
+        XCTAssertTrue(displayedTooltip.contains("输出 24.5 tok/s"), "clock rollback updates even without another file scan")
+
+        model.localSnapshot = LocalCodexSnapshot(input: 200, output: 75, total: 275,
+            sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: observedAt,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 1)
+        model.tick()
+        XCTAssertTrue(displayedTooltip.contains("总计 275"), "new measurements invalidate the tooltip")
+        let quotaData = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": [
+            "primary": ["usedPercent": 22, "windowDurationMins": 300,
+                        "resetsAt": observedAt.addingTimeInterval(10).timeIntervalSince1970]
+        ]]])
+        model.fiveHourQuota = try QuotaReport.parse(quotaData, config: AppConfiguration(),
+            now: observedAt.addingTimeInterval(2)).fiveHour
+        model.tick()
+        XCTAssertTrue(displayedTooltip.contains("异常时间戳"))
+        now = observedAt.addingTimeInterval(2)
+        model.tick()
+        XCTAssertFalse(displayedTooltip.contains("异常时间戳"))
+        now = observedAt.addingTimeInterval(10)
+        model.tick()
+        XCTAssertTrue(displayedTooltip.contains("重置已过期"), "a cached historical reset label must still expire")
+        model.config.dataSource = "proxy"
+        controller.refreshTitle()
+        XCTAssertTrue(displayedTooltip.contains("已配置企业用量接口数据"), "configuration and source changes invalidate the cache")
+    }
+
+    func testCachedTooltipDropsExpiredHubSnapshotAtBoundary() async {
+        _ = NSApplication.shared
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = HubManualClock(observedAt)
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+        var tooltipBuilds = 0
+        var displayedTooltip = ""
+        let controller = StatusBarController(model: model, factories: StatusBarContentFactories(
+            dashboard: { NSHostingController(rootView: DashboardView(model: $0)) }, tooltip: { model in
+                tooltipBuilds += 1
+                displayedTooltip = model.menuTooltip
+                return displayedTooltip
+            }))
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1)
+        await settle(model, status: .connected)
+        model.tick()
+        XCTAssertTrue(model.title.contains("Hub 5h剩 70% / 7d剩 60%"))
+        XCTAssertTrue(displayedTooltip.contains("5 小时）"))
+        let beforeBoundary = tooltipBuilds
+        clock.now = observedAt.addingTimeInterval(120)
+        model.tick()
+        XCTAssertEqual(tooltipBuilds, beforeBoundary, "the inclusive Hub freshness boundary does not rebuild")
+        clock.now = observedAt.addingTimeInterval(120.001)
+        model.tick()
+        XCTAssertFalse(model.title.contains("Hub 5h剩"))
+        XCTAssertTrue(displayedTooltip.contains("5 小时未知"))
+        XCTAssertEqual(model.tokenHubQuotaStatus, .stale)
+        let afterExpiry = tooltipBuilds
+        for _ in 0..<100 { model.tick() }
+        XCTAssertEqual(tooltipBuilds, afterExpiry, "an expired snapshot must not cause endless redraws")
+        withExtendedLifetime(controller) {}
+    }
+
+    func testLiveObservationBetweenTicksStillInvalidatesAtItsNextExpiry() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let initial = Date(timeIntervalSince1970: 1_800_000_000)
+        var now = initial
+        model.tokenHubNow = { now }
+        model.config.dataSource = "localCodex"
+        model.tick() // Previous timer state has no fresh live observation.
+        model.localSnapshot = LocalCodexSnapshot(input: 100, output: 50, total: 150,
+            sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: initial,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 1,
+            liveTurn: LocalLiveTurnSummary(inputTPS: 10, outputTPS: 24.5,
+                observedAt: initial.addingTimeInterval(-14.9)))
+        XCTAssertTrue(model.title.hasPrefix("实时≈24.5tok/s"), "the intervening data publication can render live")
+        var publicationsAfterData = 0
+        let observer = model.objectWillChange.sink { publicationsAfterData += 1 }
+        now = initial.addingTimeInterval(0.2)
+        model.tick()
+        XCTAssertEqual(publicationsAfterData, 1,
+                       "expiry must compare against the presented new input, not only the last timer tick")
+        XCTAssertTrue(model.title.hasPrefix("上轮均:—"))
+        for _ in 0..<100 { model.tick() }
+        XCTAssertEqual(publicationsAfterData, 1, "expired input must not restore blanket redraws")
+        withExtendedLifetime(observer) {}
+    }
+
+    func testBackgroundLocaleAndTimezoneNotificationsInvalidateTooltipOnMainActor() async {
+        _ = NSApplication.shared
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        var builds = 0
+        let controller = StatusBarController(model: model, factories: StatusBarContentFactories(
+            dashboard: { NSHostingController(rootView: DashboardView(model: $0)) }, tooltip: { model in
+                XCTAssertTrue(Thread.isMainThread, "native formatting stays on the main actor")
+                builds += 1
+                return model.menuTooltip
+            }))
+        XCTAssertEqual(builds, 1)
+        for name in [NSLocale.currentLocaleDidChangeNotification, .NSSystemTimeZoneDidChange] {
+            let posted = expectation(description: "synthetic background formatting notification")
+            DispatchQueue.global(qos: .utility).async {
+                NotificationCenter.default.post(name: name, object: nil)
+                posted.fulfill()
+            }
+            await fulfillment(of: [posted], timeout: 2)
+            let before = builds
+            for _ in 0..<100 where builds == before {
+                try? await Task.sleep(for: .milliseconds(1))
+                controller.refreshTitle()
+            }
+            XCTAssertEqual(builds, before + 1, "a formatting notification must invalidate the cached tooltip")
+            for _ in 0..<100 { controller.refreshTitle() }
+            XCTAssertEqual(builds, before + 1, "one notification cannot turn into repeated tooltip rebuilds")
+        }
+        withExtendedLifetime(controller) {}
+    }
+
+    func testHistoricalWindowUpdatedBetweenTicksStillPublishesItsResetExpiry() throws {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let initial = Date(timeIntervalSince1970: 1_800_000_000)
+        var now = initial
+        model.tokenHubNow = { now }
+        model.config.dataSource = "localCodex"
+        func window(reset: Date, fetchedAt: Date) throws -> WindowQuota? {
+            let bytes = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": [
+                "primary": ["usedPercent": 22, "windowDurationMins": 300,
+                            "resetsAt": reset.timeIntervalSince1970]
+            ]]])
+            return try QuotaReport.parse(bytes, config: AppConfiguration(), now: fetchedAt).fiveHour
+        }
+        model.fiveHourQuota = try window(reset: initial.addingTimeInterval(-1),
+                                         fetchedAt: initial.addingTimeInterval(-1000))
+        model.tick() // Old historical window was already expired.
+        model.fiveHourQuota = try window(reset: initial.addingTimeInterval(0.1), fetchedAt: initial)
+        XCTAssertFalse(model.menuTooltip.contains("重置已过期"))
+        var publicationsAfterData = 0
+        let observer = model.objectWillChange.sink { publicationsAfterData += 1 }
+        now = initial.addingTimeInterval(0.2)
+        model.tick()
+        XCTAssertEqual(publicationsAfterData, 1, "a new window reset can also cross between timer ticks")
+        XCTAssertTrue(model.menuTooltip.contains("重置已过期"))
+        model.tick()
+        XCTAssertEqual(publicationsAfterData, 1)
+        withExtendedLifetime(observer) {}
+    }
+
+    func testHubObservationArrivingNearExpiryStillPublishesItsInvalidation() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let initial = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = HubManualClock(initial)
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+        model.tick() // No Hub observation at the old timer tick.
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        clock.now = initial.addingTimeInterval(119.9)
+        harness.complete(1)
+        await settle(model, status: .connected)
+        XCTAssertNotNil(model.freshTokenHubQuota(at: clock.now))
+        var publicationsAfterData = 0
+        let observer = model.objectWillChange.sink { publicationsAfterData += 1 }
+        clock.now = initial.addingTimeInterval(120.1)
+        model.tick()
+        XCTAssertEqual(publicationsAfterData, 1)
+        XCTAssertNil(model.freshTokenHubQuota(at: clock.now))
+        XCTAssertEqual(model.tokenHubQuotaStatus, .stale)
+        model.tick()
+        XCTAssertEqual(publicationsAfterData, 1)
+        withExtendedLifetime(observer) {}
+    }
 
     func testProductionCompatibilityPreferenceCannotDisableAutomaticDirectSource() {
         let startup = AppModelStartupDependencies(loadPreferences: { nil }, savePreferences: { _ in },
