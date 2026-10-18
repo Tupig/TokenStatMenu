@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
         with:
           persist-credentials: false
       - name: Documentation links and synthetic checker fixtures
@@ -17,7 +17,7 @@ jobs:
       - name: Public content guardrail
         run: python3 script/check_public_content.py --git-index
       - name: Core and gateway discovery checks
-        run: swift run --build-system native TokenStatCoreChecks
+        run: swift run TokenStatCoreChecks
       - name: Compile UI test target and run OS-independent checks
         run: |
           swift test --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO

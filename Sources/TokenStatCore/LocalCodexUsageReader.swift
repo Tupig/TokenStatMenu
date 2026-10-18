@@ -3,7 +3,7 @@ import CoreFoundation
 import Darwin
 import CryptoKit
 
-public struct LocalCodexSnapshot: Equatable {
+public struct LocalCodexSnapshot: Equatable, Sendable {
     public let input: Int
     public let output: Int
     public let total: Int
@@ -37,7 +37,7 @@ public struct LocalCodexSnapshot: Equatable {
     }
 }
 
-public struct LocalTurnSummary: Equatable {
+public struct LocalTurnSummary: Equatable, Sendable {
     public let outputTokens: Int
     public let durationSeconds: Double
     public let completedAt: Date
@@ -50,7 +50,7 @@ public struct LocalTurnSummary: Equatable {
 /// A short-lived estimate derived from two recent cumulative `token_count`
 /// events while a Codex task is still active. It expires quickly when the
 /// rollout stops advancing and is kept separate from completed-turn averages.
-public struct LocalLiveTurnSummary: Equatable {
+public struct LocalLiveTurnSummary: Equatable, Sendable {
     public let inputTPS: Double
     public let outputTPS: Double
     public let observedAt: Date
@@ -154,7 +154,7 @@ public enum LocalCodexUsageReader {
     }
     fileprivate struct CachedFileSummary { let summary: FileSummary; let evaluatedAt: Date }
     public final class Cache {
-        public struct Diagnostics: Equatable {
+        public struct Diagnostics: Equatable, Sendable {
             public fileprivate(set) var bytesRead = 0; public fileprivate(set) var parsedFiles = 0
             public fileprivate(set) var cacheHits = 0; public fileprivate(set) var safeOpens = 0
         }

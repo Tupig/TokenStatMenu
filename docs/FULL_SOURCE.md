@@ -33,7 +33,7 @@ jobs:
   build:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
         with:
           persist-credentials: false
       - name: Documentation links and synthetic checker fixtures
@@ -41,7 +41,7 @@ jobs:
       - name: Public content guardrail
         run: python3 script/check_public_content.py --git-index
       - name: Core and gateway discovery checks
-        run: swift run --build-system native TokenStatCoreChecks
+        run: swift run TokenStatCoreChecks
       - name: Compile UI test target and run OS-independent checks
         run: |
           swift test --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
@@ -438,7 +438,7 @@ import CoreFoundation
 import Darwin
 import CryptoKit
 
-public struct LocalCodexSnapshot: Equatable {
+public struct LocalCodexSnapshot: Equatable, Sendable {
     public let input: Int
     public let output: Int
     public let total: Int
@@ -472,7 +472,7 @@ public struct LocalCodexSnapshot: Equatable {
     }
 }
 
-public struct LocalTurnSummary: Equatable {
+public struct LocalTurnSummary: Equatable, Sendable {
     public let outputTokens: Int
     public let durationSeconds: Double
     public let completedAt: Date
@@ -485,7 +485,7 @@ public struct LocalTurnSummary: Equatable {
 /// A short-lived estimate derived from two recent cumulative `token_count`
 /// events while a Codex task is still active. It expires quickly when the
 /// rollout stops advancing and is kept separate from completed-turn averages.
-public struct LocalLiveTurnSummary: Equatable {
+public struct LocalLiveTurnSummary: Equatable, Sendable {
     public let inputTPS: Double
     public let outputTPS: Double
     public let observedAt: Date
@@ -589,7 +589,7 @@ public enum LocalCodexUsageReader {
     }
     fileprivate struct CachedFileSummary { let summary: FileSummary; let evaluatedAt: Date }
     public final class Cache {
-        public struct Diagnostics: Equatable {
+        public struct Diagnostics: Equatable, Sendable {
             public fileprivate(set) var bytesRead = 0; public fileprivate(set) var parsedFiles = 0
             public fileprivate(set) var cacheHits = 0; public fileprivate(set) var safeOpens = 0
         }
@@ -1684,7 +1684,7 @@ public struct QuotaSnapshot: Codable {
 import Foundation
 import CoreFoundation
 
-public struct WindowQuota: Codable, Equatable {
+public struct WindowQuota: Codable, Equatable, Sendable {
     public let minutes: Int
     public let usedPercent: Double
     public let resetsAt: Date?
@@ -3162,7 +3162,20 @@ public enum TokenHubDirectQuotaDecoder {
         if let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() { raw = n.stringValue }
         else if let text = value as? String { raw = text }
         else { return nil }
-        guard let value = Decimal(string: raw, locale: Locale(identifier: "en_US_POSIX")), value.isFinite,
+        // Decimal(string:) accepts numeric prefixes, whitespace and even some
+        // incomplete forms. Require a bounded, complete JSON-number spelling
+        // before conversion; anchors reject trailing newlines as well as junk.
+        guard raw.utf8.count <= 128,
+              raw.range(of: #"\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z"#,
+                        options: .regularExpression) != nil else { return nil }
+        // Decimal can silently discard low-order significant digits. Bound
+        // the original string's meaningful mantissa to a conservative 38
+        // digits; leading/trailing zeroes do not change its numeric value.
+        // Native JSON numbers may already be normalized by JSONSerialization.
+        let digits = raw.utf8.prefix { $0 != 69 && $0 != 101 }.filter { (48...57).contains($0) }
+        let significantDigits = digits.drop(while: { $0 == 48 }).reversed().drop(while: { $0 == 48 }).count
+        guard significantDigits <= 38,
+              let value = Decimal(string: raw, locale: Locale(identifier: "en_US_POSIX")), value.isFinite,
               value >= 0, value <= Decimal(string: "1000000000000000000")! else { return nil }
         return value
     }
@@ -3299,6 +3312,45 @@ struct TokenHubDirectQuotaDependencies {
     }
 }
 
+/// Owns the non-Sendable mutable cache on one checked executor. Only numeric
+/// value snapshots cross back to the main actor; no cache reference escapes.
+actor LocalCodexScanWorker {
+    struct Result: Sendable {
+        let snapshot: LocalCodexSnapshot
+        let diagnostics: LocalCodexUsageReader.Cache.Diagnostics
+    }
+
+    private var cache = LocalCodexUsageReader.Cache()
+    private var cacheGeneration: Int?
+
+    func scan(directory: URL, now: Date, generation: Int,
+              routeContext: LocalCodexRouteContext?) throws -> Result {
+        // This method has no suspension point while the cache is in use:
+        // actor isolation serializes complete reads, including invalidation.
+        if cacheGeneration != generation {
+            cache = LocalCodexUsageReader.Cache()
+            cacheGeneration = generation
+        }
+        let snapshot = try LocalCodexUsageReader.scan(directory: directory, now: now,
+                                                       cache: cache, routeContext: routeContext)
+        return Result(snapshot: snapshot, diagnostics: cache.diagnostics)
+    }
+}
+
+/// Resolve the same permitted inputs on the main actor, then run bounded file
+/// I/O in the cache owner. Injection replaces external I/O in lifecycle checks.
+struct LocalCodexScanDependencies {
+    let resolveInputs: @MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext)
+    let scan: @Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result
+
+    @MainActor static var production: LocalCodexScanDependencies {
+        let worker = LocalCodexScanWorker()
+        return LocalCodexScanDependencies(resolveInputs: {
+            (LocalCodexUsageReader.defaultSessionsDirectory(), AppModel.seasunRouteContext())
+        }, scan: { try await worker.scan(directory: $0, now: $1, generation: $2, routeContext: $3) })
+    }
+}
+
 struct BackgroundServiceResources: Equatable, Encodable {
     let timerCount: Int
     let workspaceObserverCount: Int
@@ -3329,6 +3381,7 @@ struct PresentationTimeState: Equatable {
     private let isPreview: Bool
     private let startup: AppModelStartupDependencies
     private let directQuota: TokenHubDirectQuotaDependencies
+    private let tokenHubAXSource: TokenHubAXSource
     private let usesDirectQuotaSource: Bool
     private(set) var backgroundServicesStarted = false
     private(set) var permissionPromptRequested = false
@@ -3369,7 +3422,6 @@ struct PresentationTimeState: Equatable {
         get { preferences.tokenHubCompatibilityReadEnabled }
         set { preferences.tokenHubCompatibilityReadEnabled = newValue }
     }
-    var tokenHubScanner: TokenHubQuotaScanning = TokenHubAXReader()
     var tokenHubPermissionProvider: TokenHubPermissionProviding = TokenHubNativePermissionProvider()
     var tokenHubNow: () -> Date = Date.init
     @Published var panelVisible = false
@@ -3377,15 +3429,13 @@ struct PresentationTimeState: Equatable {
     private var timer: Timer?
     private var localScan: DispatchWorkItem?
     private var localScanRunning = false
-    private let tokenHubQueue = DispatchQueue(label: "TokenStatMenu.tokenHubAX", qos: .utility)
     private var tokenHubRefreshWork: DispatchWorkItem?
     private var tokenHubScanInFlight = false
     private var tokenHubDirectScanInFlight = false
     private var tokenHubWorkspaceObservers: [NSObjectProtocol] = []
     private var lastTokenHubPermissionCheck = Date.distantPast
     private var cachedTokenHubPermission = false
-    private let localScanQueue = DispatchQueue(label: "TokenStatMenu.localCodexScan", qos: .utility)
-    private var localCache = LocalCodexUsageReader.Cache()
+    private let localScanning: LocalCodexScanDependencies
     private var localRefreshScheduler = LocalRefreshScheduler()
     private var isShuttingDown = false
     private var generation = 0
@@ -3415,10 +3465,14 @@ struct PresentationTimeState: Equatable {
     }
 
     init(preview: Bool = false, startup: AppModelStartupDependencies = .production,
-         directQuota: TokenHubDirectQuotaDependencies? = nil) {
+         directQuota: TokenHubDirectQuotaDependencies? = nil,
+         localScanning: LocalCodexScanDependencies? = nil,
+         tokenHubAXSource: TokenHubAXSource? = nil) {
         isPreview = preview
         self.startup = startup
         self.directQuota = directQuota ?? .production
+        self.tokenHubAXSource = tokenHubAXSource ?? .production
+        self.localScanning = localScanning ?? .production
         usesDirectQuotaSource = directQuota != nil || !(preview || CommandLine.arguments.contains("--test-fixture"))
         if preview {
             sourceReadinessText = "模拟预览 · 无配置读取、无自动服务"
@@ -3696,7 +3750,6 @@ struct PresentationTimeState: Equatable {
         tokenHubQuotaStatus = tokenHubQuotaReadingEnabled ? .targetNotRunning : .disabled
         lastTokenHubPermissionCheck = .distantPast; cachedTokenHubPermission = false
         _ = localRefreshScheduler.invalidate()
-        localCache = LocalCodexUsageReader.Cache()
         localScan?.cancel(); localScan = nil
         localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
             filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
@@ -3750,30 +3803,23 @@ struct PresentationTimeState: Equatable {
                     self.scheduleLocalScan(immediate: false); return
                 }
                 self.localScanRunning = true
-                let directory = LocalCodexUsageReader.defaultSessionsDirectory()
-                let routeContext = self.seasunRouteContext()
-                let cache = self.localCache
-                self.localScanQueue.async {
-                    let result = try? LocalCodexUsageReader.scan(directory: directory, now: Date(), cache: cache,
-                        routeContext: routeContext)
-                    Task { @MainActor in
-                        self.localScanRunning = false
-                        guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
-                            if self.config.dataSource == "localCodex", self.backgroundServicesStarted, !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
-                            return
-                        }
-                        if self.config.dataSource == "localCodex" {
-                            if let result {
-                                self.localSnapshot = result; self.fiveHourQuota = result.fiveHour; self.sevenDayQuota = result.sevenDay
-                                self.quotaError = result.latestEventAt == nil ? "未发现有效本地用量记录" : "额度来自 Codex 会话事件，可能已过期"
-                            } else {
-                                self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
-                                self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
-                            }
-                        }
-                        if self.config.dataSource == "localCodex", self.backgroundServicesStarted { self.scheduleLocalScan() }
+                let inputs = self.localScanning.resolveInputs()
+                let result = try? await self.localScanning.scan(inputs.directory, Date(), version, inputs.routeContext)
+                self.localScanRunning = false
+                guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
+                    if self.config.dataSource == "localCodex", self.backgroundServicesStarted, !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
+                    return
+                }
+                if self.config.dataSource == "localCodex" {
+                    if let snapshot = result?.snapshot {
+                        self.localSnapshot = snapshot; self.fiveHourQuota = snapshot.fiveHour; self.sevenDayQuota = snapshot.sevenDay
+                        self.quotaError = snapshot.latestEventAt == nil ? "未发现有效本地用量记录" : "额度来自 Codex 会话事件，可能已过期"
+                    } else {
+                        self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
+                        self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
                     }
                 }
+                if self.config.dataSource == "localCodex", self.backgroundServicesStarted { self.scheduleLocalScan() }
             }
         }
         localScan = work
@@ -3783,7 +3829,7 @@ struct PresentationTimeState: Equatable {
     /// Associates the current Codex provider with this local Token Hub's
     /// configured origin. Historical rollout routes are not independently
     /// verifiable from the current provider name and configuration alone.
-    private func seasunRouteContext() -> LocalCodexRouteContext {
+    fileprivate static func seasunRouteContext() -> LocalCodexRouteContext {
         let configURL = LocalCodexUsageReader.defaultConfigURL()
         guard let active = GatewayDiscovery.activeCodexProvider(at: configURL),
               let connectionURLs = try? TokenHubConnectionDiscovery.readDefaultConnectionBaseURLs(),
@@ -3892,27 +3938,26 @@ struct PresentationTimeState: Equatable {
         tokenHubScanInFlight = true
         let version = tokenHubGeneration, axVersion = tokenHubAXGeneration, mode: TokenHubRunMode = .localCodex
         let now = tokenHubNow(), interval = config.refreshSeconds
-        let scanner = tokenHubScanner
-        let permission = cachedTokenHubPermission
-        tokenHubQueue.async { [weak self] in
-            let result = scanner.scan(now: now, monotonicNow: { ProcessInfo.processInfo.systemUptime },
-                                      permissionTrusted: permission, refreshSeconds: interval,
-                                      mode: mode, generation: version)
-            Task { @MainActor in
-                guard let self else { return }
-                self.tokenHubScanInFlight = false
-                guard !self.isShuttingDown, self.tokenHubGeneration == version, self.tokenHubAXGeneration == axVersion,
-                      self.config.dataSource == "localCodex", self.tokenHubAutomaticReadingEnabled,
-                      self.cachedTokenHubPermission, !self.tokenHubQuotaIsDirect else {
-                    if !self.isShuttingDown, self.config.dataSource == "localCodex",
-                       self.tokenHubQuotaReadingEnabled {
-                        self.scheduleTokenHubRefresh(after: self.tokenHubQuotaIsDirect ? interval : 0)
-                    }
-                    return
+        let source = tokenHubAXSource
+        let request = TokenHubAXRequest(now: now, permissionTrusted: cachedTokenHubPermission,
+            refreshSeconds: interval, mode: mode, generation: version)
+        Task(priority: .utility) { [weak self] in
+            // The main actor only awaits a value. Native traversal runs as one
+            // non-suspending operation on its private worker actor.
+            let result = await source.scan(request)
+            guard let self else { return }
+            self.tokenHubScanInFlight = false
+            guard !self.isShuttingDown, self.tokenHubGeneration == version, self.tokenHubAXGeneration == axVersion,
+                  self.config.dataSource == "localCodex", self.tokenHubAutomaticReadingEnabled,
+                  self.cachedTokenHubPermission, !self.tokenHubQuotaIsDirect else {
+                if !self.isShuttingDown, self.config.dataSource == "localCodex",
+                   self.tokenHubQuotaReadingEnabled {
+                    self.scheduleTokenHubRefresh(after: self.tokenHubQuotaIsDirect ? interval : 0)
                 }
-                self.applyTokenHubQuotaResult(result, generation: version, mode: mode, now: self.tokenHubNow())
-                self.scheduleTokenHubRefresh(after: self.config.refreshSeconds)
+                return
             }
+            self.applyTokenHubQuotaResult(result, generation: version, mode: mode, now: self.tokenHubNow())
+            self.scheduleTokenHubRefresh(after: self.config.refreshSeconds)
         }
     }
 
@@ -4040,7 +4085,7 @@ struct PresentationTimeState: Equatable {
     }
     var isFixtureUsingNativeTokenHubReader: Bool {
         Self.shouldSuppressNativeTokenHubRead(isTestFixture: isTestFixture,
-            scannerIsNative: tokenHubScanner is TokenHubAXReader)
+            scannerIsNative: tokenHubAXSource.kind == .native)
     }
 
     private func installTokenHubWorkspaceObservers() {
@@ -4763,6 +4808,51 @@ protocol TokenHubPermissionProviding {
     func requestOnceAndOpenSystemSettings()
 }
 
+/// Only immutable values cross the native AX actor boundary. AppKit process
+/// references, AXUIElement objects and the mutable traversal map stay inside it.
+struct TokenHubAXRequest: Sendable {
+    let now: Date
+    let permissionTrusted: Bool
+    let refreshSeconds: TimeInterval
+    let mode: TokenHubRunMode
+    let generation: UInt64
+}
+
+actor NativeTokenHubAXWorker {
+    private let reader = TokenHubAXReader()
+
+    func scan(_ request: TokenHubAXRequest) -> TokenHubQuotaResult {
+        // No suspension point while the native reader owns AX references.
+        // Core still rejects an untrusted or inactive request before discovery.
+        reader.scan(now: request.now, monotonicNow: { ProcessInfo.processInfo.systemUptime },
+                    permissionTrusted: request.permissionTrusted,
+                    refreshSeconds: request.refreshSeconds, mode: request.mode,
+                    generation: request.generation)
+    }
+}
+
+/// Immutable constructor injection keeps the native actor as the sole AX owner.
+/// The marker survives closure wrapping so fixture launches cannot read real UI.
+struct TokenHubAXSource {
+    enum Kind { case native, synthetic }
+    let kind: Kind
+    let scan: @MainActor (TokenHubAXRequest) async -> TokenHubQuotaResult
+
+    private init(kind: Kind, scan: @escaping @MainActor (TokenHubAXRequest) async -> TokenHubQuotaResult) {
+        self.kind = kind
+        self.scan = scan
+    }
+
+    @MainActor static var production: TokenHubAXSource {
+        let worker = NativeTokenHubAXWorker()
+        return TokenHubAXSource(kind: .native, scan: { await worker.scan($0) })
+    }
+
+    static func synthetic(_ scan: @escaping @MainActor (TokenHubAXRequest) async -> TokenHubQuotaResult) -> TokenHubAXSource {
+        TokenHubAXSource(kind: .synthetic, scan: scan)
+    }
+}
+
 /// Production boundary for one scan. AX objects live only in this instance's one scan call.
 final class TokenHubAXReader: TokenHubQuotaScanning {
     private let tree = TokenHubNativeTreeReader()
@@ -4839,17 +4929,17 @@ private final class TokenHubNativeTreeReader: TokenHubBoundedTreeReading {
         guard let role = raw as? String else { throw TokenHubNativeReadError.attribute }
         let value: TokenHubAXRole
         switch role {
-        case kAXApplicationRole as String: value = .application
-        case kAXWindowRole as String: value = .window
-        case kAXGroupRole as String: value = .group
-        case kAXStaticTextRole as String: value = .staticText
-        case kAXProgressIndicatorRole as String: value = .progressIndicator
-        case kAXButtonRole as String, kAXRadioButtonRole as String, kAXCheckBoxRole as String,
-             kAXPopUpButtonRole as String, kAXMenuButtonRole as String, "AXLink":
+        case kAXApplicationRole: value = .application
+        case kAXWindowRole: value = .window
+        case kAXGroupRole: value = .group
+        case kAXStaticTextRole: value = .staticText
+        case kAXProgressIndicatorRole: value = .progressIndicator
+        case kAXButtonRole, kAXRadioButtonRole, kAXCheckBoxRole,
+             kAXPopUpButtonRole, kAXMenuButtonRole, "AXLink":
             value = .button
-        case kAXTableRole as String, kAXOutlineRole as String, kAXListRole as String:
+        case kAXTableRole, kAXOutlineRole, kAXListRole:
             value = .table
-        case kAXTextFieldRole as String, kAXTextAreaRole as String, kAXComboBoxRole as String:
+        case kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole:
             value = .editableText
         case "AXSecureTextField": value = .secureText
         default: value = .other(role)
@@ -5034,8 +5124,8 @@ enum TokenHubDecimalFormatter {
 <key>CFBundleDisplayName</key><string>TokenStatMenu</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
-<key>CFBundleShortVersionString</key><string>1.1.1</string>
-<key>CFBundleVersion</key><string>3</string>
+<key>CFBundleShortVersionString</key><string>1.1.2</string>
+<key>CFBundleVersion</key><string>4</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -5160,6 +5250,29 @@ AD1646610FAAB916B1DAB3FC = { isa = XCConfigurationList; buildConfigurations = (5
     hasScannedForEncodings = 0; knownRegions = (en, Base, "zh-Hans",);
     mainGroup = 0D6E4079E36703EBD37C0072; productRefGroup = 0A3E27B8CA818264D75C8D81; projectDirPath = ""; projectRoot = ""; targets = (34A04005BCAF206EEC990BD9,); };
 }; rootObject = 244210E48437B6556980A702; }
+```
+
+### TokenStatMenu.xcodeproj/xcshareddata/xcschemes/TokenStatMenu.xcscheme
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion="1600" version="1.3">
+  <BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES">
+    <BuildActionEntries>
+      <BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">
+        <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="34A04005BCAF206EEC990BD9" BuildableName="TokenStatMenu.app" BlueprintName="TokenStatMenu" ReferencedContainer="container:TokenStatMenu.xcodeproj"/>
+      </BuildActionEntry>
+    </BuildActionEntries>
+  </BuildAction>
+  <LaunchAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.IDEFoundation.Launcher.LLDB" launchStyle="0" useCustomWorkingDirectory="NO" ignoresPersistentStateOnLaunch="NO" debugDocumentVersioning="YES" debugServiceExtension="internal" allowLocationSimulation="YES">
+    <BuildableProductRunnable runnableDebuggingMode="0">
+      <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="34A04005BCAF206EEC990BD9" BuildableName="TokenStatMenu.app" BlueprintName="TokenStatMenu" ReferencedContainer="container:TokenStatMenu.xcodeproj"/>
+    </BuildableProductRunnable>
+  </LaunchAction>
+  <ProfileAction buildConfiguration="Release" shouldUseLaunchSchemeArgsEnv="YES" savedToolIdentifier="" useCustomWorkingDirectory="NO" debugDocumentVersioning="YES"/>
+  <AnalyzeAction buildConfiguration="Debug"/>
+  <ArchiveAction buildConfiguration="Release" revealArchiveInOrganizer="YES"/>
+</Scheme>
 ```
 
 ### Tests/TokenStatCoreTests/CoreChecks.swift
@@ -7013,6 +7126,7 @@ extension CoreChecks {
     static func directQuotaChecks() throws {
         try directCallbackLocationChecks()
         try directDatabaseReplacementChecks()
+        try directAmountLexicalChecks()
         let identity = TokenHubIdentity(pid: 47816,
             bundleID: TokenHubTarget.bundleID,
             executablePath: "/Applications/Seasun Token Hub.app/Contents/MacOS/seasun-token-hub")
@@ -7152,6 +7266,123 @@ extension CoreChecks {
                       "direct client re-reads session after 401 and rejects changes before exchanging again")
             }
         }
+    }
+
+    /// Exercise the public response decoder, not Foundation's Decimal parser:
+    /// accepting a numeric prefix must never publish a believable quota.
+    private static func directAmountLexicalChecks() throws {
+        let identity = TokenHubIdentity(pid: 47901, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic Amount Hub.app/Contents/MacOS/Hub")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let contexts = [("fixed_5h", "used_amount"), ("fixed_5h", "quota_amount"),
+                        ("user_month", "used_amount"), ("user_month", "quota_amount")]
+        func response(kind: String, field: String, literal: String,
+                      companionLimit: String = "1000000000000000000") -> Data {
+            let used = field == "used_amount" ? literal : "0"
+            let limit = field == "quota_amount" ? literal : companionLimit
+            return json("{\"data\":{\"currency\":\"USD\",\"windows\":[{\"kind\":\"\(kind)\",\"used_amount\":\(used),\"quota_amount\":\(limit)}]}}")
+        }
+        func stringLiteral(_ value: String) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]), as: UTF8.self)
+        }
+        let invalidStrings = [
+            ("numeric suffix", "12.5junk"), ("exponent suffix", "1e2oops"),
+            ("blank", ""), ("space only", " "), ("leading whitespace", " 12.5"),
+            ("trailing whitespace", "12.5 "), ("embedded whitespace", "1 2"),
+            ("line break", "12.5\n"), ("decimal comma", "1,25"),
+            ("grouping comma", "1,000"), ("incomplete exponent", "1e"),
+            ("incomplete fraction", "1."), ("missing integer", ".5"),
+            ("leading plus", "+1"), ("leading zero", "01"),
+            ("non ASCII digits", "１２.５"), ("NaN", "NaN"),
+            ("positive infinity", "Infinity"), ("negative infinity", "-Infinity"),
+            ("negative value", "-1"), ("above amount limit", "1000000000000000001"),
+            ("decimal overflow", "1e999"),
+            ("decimal underflow", "1e-129"),
+            ("significant precision loss", "0.12345678901234567890123456789012345678901234567890"),
+            ("bounded string exceeded", "1." + String(repeating: "0", count: 127))
+        ]
+        var rejected: [(String, String)] = try invalidStrings.map { ($0.0, try stringLiteral($0.1)) }
+        rejected += [("Boolean true", "true"), ("Boolean false", "false"),
+                     ("negative JSON number", "-1"), ("above amount limit JSON number", "1000000000000000001"),
+                     ("nonfinite JSON number", "1e999"), ("array", "[]"), ("object", "{}")]
+        for (kind, field) in contexts {
+            for (label, literal) in rejected {
+                do {
+                    _ = try TokenHubDirectQuotaDecoder.decode(response(kind: kind, field: field, literal: literal),
+                        identity: identity, now: now)
+                    check(false, "direct amount rejects \(label) for \(kind).\(field)")
+                } catch let error as TokenHubDirectQuotaFailure {
+                    check(error == .malformedResponse,
+                          "direct amount rejects \(label) with a redacted typed failure for \(kind).\(field)")
+                } catch { check(false, "direct amount failure stays typed for \(kind).\(field)") }
+            }
+            // A monthly limit is optional/null by the existing contract;
+            // required window amounts and monthly usage are never nullable.
+            if kind != "user_month" || field != "quota_amount" {
+                do {
+                    _ = try TokenHubDirectQuotaDecoder.decode(response(kind: kind, field: field, literal: "null"),
+                        identity: identity, now: now)
+                    check(false, "required direct amount rejects null for \(kind).\(field)")
+                } catch let error as TokenHubDirectQuotaFailure {
+                    check(error == .malformedResponse, "required direct null amount has a typed failure")
+                }
+            }
+        }
+
+        // Literal expected values are independent of the production helper.
+        let validValues = [
+            ("JSON integer", "25", "25"), ("JSON fraction", "12.5", "12.5"),
+            ("JSON exponent", "1.25e1", "12.5"), ("numeric string", "\"12.50\"", "12.5"),
+            ("string exponent", "\"125e-1\"", "12.5"),
+            ("string signed exponent", "\"1.25E+1\"", "12.5"),
+            ("exact string precision", "\"0.1234567890123456789012345678\"", "0.1234567890123456789012345678"),
+            ("38 significant digits", "\"0.12345678901234567890123456789012345678\"", "0.12345678901234567890123456789012345678"),
+            ("equivalent trailing zero precision", "\"0.123456789012345678901234567890123456780000000000\"", "0.12345678901234567890123456789012345678"),
+            ("small fraction", "\"0.00000001\"", "0.00000001"),
+            ("minimum decimal exponent", "\"1e-128\"", "1e-128"),
+            ("amount maximum JSON", "1000000000000000000", "1000000000000000000"),
+            ("amount maximum string", "\"1e18\"", "1000000000000000000"),
+            ("bounded string exact boundary", "\"1." + String(repeating: "0", count: 126) + "\"", "1")
+        ]
+        for (label, literal, expectedText) in validValues {
+            let expected = Decimal(string: expectedText, locale: Locale(identifier: "en_US_POSIX"))!
+            for (kind, field) in contexts {
+                // Existing rolling used/limit percentage arithmetic may not
+                // represent this extreme ratio. Preserve the already valid
+                // monthly amount and rolling limit inputs without broadening
+                // the mathematical domain of the percentage calculation.
+                if expectedText == "1e-128", kind == "fixed_5h", field == "used_amount" { continue }
+                // Keep the minimum-exponent lexical case separate from
+                // percentage underflow caused by dividing by a huge limit.
+                let limit = expectedText == "1e-128" ? "1" : "1000000000000000000"
+                let decoded: TokenHubQuotaSnapshot
+                do {
+                    decoded = try TokenHubDirectQuotaDecoder.decode(response(kind: kind, field: field, literal: literal,
+                        companionLimit: limit), identity: identity, now: now)
+                } catch {
+                    check(false, "direct amount accepts \(label) for \(kind).\(field)")
+                    continue
+                }
+                if kind == "fixed_5h" {
+                    check((field == "used_amount" ? decoded.fiveHour?.usedAmount : decoded.fiveHour?.limitAmount) == expected,
+                          "direct amount preserves \(label) for \(kind).\(field)")
+                } else {
+                    check(decoded.monthly?.usedAmount == (field == "used_amount" ? expected : Decimal(0)),
+                          "direct amount accepts \(label) for \(kind).\(field) without inventing usage")
+                }
+            }
+        }
+        for literal in ["0", "0.0", "\"0\"", "\"0e0\""] {
+            for kind in ["fixed_5h", "user_month"] {
+                let decoded = try TokenHubDirectQuotaDecoder.decode(response(kind: kind, field: "used_amount", literal: literal),
+                    identity: identity, now: now)
+                check((kind == "fixed_5h" ? decoded.fiveHour?.usedAmount : decoded.monthly?.usedAmount) == Decimal(0),
+                      "direct amount preserves explicit zero \(literal) for \(kind)")
+            }
+        }
+        let noMonthlyLimit = try TokenHubDirectQuotaDecoder.decode(response(kind: "user_month", field: "quota_amount", literal: "null"),
+            identity: identity, now: now)
+        check(noMonthlyLimit.monthly?.usedAmount == Decimal(0), "optional monthly null limit remains supported")
     }
 }
 
@@ -8479,7 +8710,7 @@ extension CoreChecks {
 
         let duplicateReader = HubRecordingReader.valid()
         var duplicateRoot = duplicateReader.nodes[1]!
-        var duplicate = duplicateReader.nodes[2]!; duplicateReader.nodes[93] = duplicate
+        let duplicate = duplicateReader.nodes[2]!; duplicateReader.nodes[93] = duplicate
         duplicateRoot.children.append(93); duplicateReader.nodes[1] = duplicateRoot
         let duplicateResult = TokenHubQuotaScanner().scan(using: duplicateReader,
             now: Date(timeIntervalSince1970: 1_800_000_000), monotonicNow: { 10 },
@@ -8633,30 +8864,46 @@ import XCTest
 import TokenStatCore
 @testable import TokenStatMenu
 
-private final class HubTestScanner: TokenHubQuotaScanning {
-    private let lock = NSLock()
-    private var storedResult: TokenHubQuotaResult
-    var nextResult: TokenHubQuotaResult {
-        get { lock.lock(); defer { lock.unlock() }; return storedResult }
-        set { lock.lock(); storedResult = newValue; lock.unlock() }
-    }
+@MainActor
+private final class HubTestScanner {
+    var nextResult: TokenHubQuotaResult
     var started: (() -> Void)?
-    var beforeReturn: (() -> Void)?
+    var beforeReturn: (() async -> Void)?
     private var activeCount = 0
     private(set) var maximumConcurrent = 0
     private(set) var calls = 0
-    init(result: TokenHubQuotaResult) { storedResult = result }
+    private(set) var requests: [TokenHubAXRequest] = []
+    init(result: TokenHubQuotaResult) { nextResult = result }
 
-    func scan(now: Date, monotonicNow: () -> TimeInterval, permissionTrusted: Bool,
-              refreshSeconds: TimeInterval, mode: TokenHubRunMode,
-              generation: UInt64) -> TokenHubQuotaResult {
-        lock.lock(); calls += 1; activeCount += 1
+    var source: TokenHubAXSource {
+        .synthetic { request in await self.scan(request) }
+    }
+
+    func scan(_ request: TokenHubAXRequest) async -> TokenHubQuotaResult {
+        calls += 1; activeCount += 1; requests.append(request)
         maximumConcurrent = max(maximumConcurrent, activeCount)
-        let result = storedResult
-        lock.unlock()
-        started?(); beforeReturn?()
-        lock.lock(); activeCount -= 1; lock.unlock()
+        // Preserve the old fake's semantics: a suspended request returns the
+        // result captured when it started, not a later generation's value.
+        let result = nextResult
+        started?()
+        await beforeReturn?()
+        activeCount -= 1
         return result
+    }
+}
+
+/// Deterministic suspension without blocking the main actor's executor.
+@MainActor
+private final class HubScanGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func release() {
+        released = true
+        continuation?.resume(); continuation = nil
     }
 }
 
@@ -9034,8 +9281,8 @@ final class TokenHubQuotaStateTests: XCTestCase {
     }
 
     private func directModel(_ harness: HubDirectHarness, clock: HubManualClock,
-                             permission: HubTestPermission) -> AppModel {
-        let model = AppModel(preview: true, directQuota: harness.dependencies)
+                             permission: HubTestPermission, axSource: TokenHubAXSource? = nil) -> AppModel {
+        let model = AppModel(preview: true, directQuota: harness.dependencies, tokenHubAXSource: axSource)
         model.config.dataSource = "localCodex"
         model.config.refreshSeconds = 60
         model.tokenHubNow = { clock.now }
@@ -9162,9 +9409,8 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let harness = HubDirectHarness()
         let permission = HubTestPermission()
         let now = Date(timeIntervalSince1970: 1_800_000_000)
-        let model = directModel(harness, clock: HubManualClock(now), permission: permission)
         let scanner = HubTestScanner(result: result(now: now))
-        model.tokenHubScanner = scanner
+        let model = directModel(harness, clock: HubManualClock(now), permission: permission, axSource: scanner.source)
         defer { model.shutdown(); harness.finishPending() }
         model.setTokenHubAutomaticReadingEnabled(false)
         model.refreshTokenHubQuota()
@@ -9180,10 +9426,9 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let harness = HubDirectHarness()
         let permission = HubTestPermission()
         let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
-        let model = directModel(harness, clock: clock, permission: permission)
-        model.config.refreshSeconds = 0.05
         let scanner = HubTestScanner(result: result(now: clock.now))
-        model.tokenHubScanner = scanner
+        let model = directModel(harness, clock: clock, permission: permission, axSource: scanner.source)
+        model.config.refreshSeconds = 0.05
         defer { model.shutdown(); harness.finishPending() }
         model.refreshTokenHubQuota()
         guard await waitForDirectRequests(1, harness: harness) else { return }
@@ -9207,14 +9452,13 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let harness = HubDirectHarness()
         let permission = HubTestPermission()
         let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
-        let model = directModel(harness, clock: clock, permission: permission)
         let scanner = HubTestScanner(result: result(now: clock.now))
-        model.tokenHubScanner = scanner
+        let model = directModel(harness, clock: clock, permission: permission, axSource: scanner.source)
         let axStarted = expectation(description: "synthetic AX fallback started")
-        let releaseAX = DispatchSemaphore(value: 0)
+        let releaseAX = HubScanGate()
         scanner.started = { axStarted.fulfill() }
-        scanner.beforeReturn = { releaseAX.wait() }
-        defer { model.shutdown(); harness.finishPending(); releaseAX.signal() }
+        scanner.beforeReturn = { await releaseAX.wait() }
+        defer { model.shutdown(); harness.finishPending(); releaseAX.release() }
         model.refreshTokenHubQuota()
         guard await waitForDirectRequests(1, harness: harness) else { return }
         harness.complete(1, failure: .transportFailed)
@@ -9226,7 +9470,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         harness.complete(2)
         await waitForDirectObservation(model, at: clock.now)
         let directSnapshot = model.tokenHubQuotaSnapshot
-        releaseAX.signal()
+        releaseAX.release()
         for _ in 0..<100 {
             if model.backgroundServiceResources.axScanInFlightCount == 0 { break }
             try? await Task.sleep(for: .milliseconds(10))
@@ -9237,6 +9481,44 @@ final class TokenHubQuotaStateTests: XCTestCase {
         XCTAssertTrue(model.tokenHubQuotaIsDirect)
         XCTAssertEqual(model.tokenHubQuotaStatus, .connected)
         XCTAssertNil(model.tokenHubDirectFailure)
+    }
+
+    func testLateAXAfterRelaunchCannotUnlockCurrentDirectRequest() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission()
+        let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let scanner = HubTestScanner(result: result(now: clock.now))
+        let model = directModel(harness, clock: clock, permission: permission, axSource: scanner.source)
+        let gate = HubScanGate()
+        let started = expectation(description: "old target AX fallback suspended")
+        scanner.started = { started.fulfill() }
+        scanner.beforeReturn = { await gate.wait() }
+        defer { model.shutdown(); harness.finishPending(); gate.release() }
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1, failure: .transportFailed)
+        await fulfillment(of: [started], timeout: 2)
+
+        model.tokenHubApplicationDidTerminate(bundleIdentifier: TokenHubTarget.bundleID)
+        clock.now = clock.now.addingTimeInterval(1)
+        model.tokenHubApplicationDidLaunch(bundleIdentifier: TokenHubTarget.bundleID)
+        guard await waitForDirectRequests(2, harness: harness) else { return }
+        gate.release()
+        for _ in 0..<100 {
+            if model.backgroundServiceResources.axScanInFlightCount == 0 { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertNil(model.tokenHubQuotaSnapshot, "pre-exit AX data cannot become current after relaunch")
+        model.refreshTokenHubQuota()
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(harness.requestCount, 2,
+                       "an old AX completion must not release the newer direct request's in-flight guard")
+        XCTAssertEqual(scanner.calls, 1)
+        XCTAssertEqual(model.backgroundServiceResources.axScanInFlightCount, 0)
+        harness.complete(2)
+        await waitForDirectObservation(model, at: clock.now)
+        XCTAssertTrue(model.tokenHubQuotaIsDirect)
+        XCTAssertEqual(permission.requests, 0)
     }
 
     private func result(now: Date) -> TokenHubQuotaResult {
@@ -9262,14 +9544,13 @@ final class TokenHubQuotaStateTests: XCTestCase {
 
     private func configuredModel(_ value: TokenHubQuotaResult, clock: HubManualClock)
         -> (AppModel, HubTestScanner, HubTestPermission) {
-        let model = AppModel(preview: true)
+        let scanner = HubTestScanner(result: value)
+        let model = AppModel(preview: true, tokenHubAXSource: scanner.source)
         model.config.dataSource = "localCodex"
         model.config.refreshSeconds = 60
         model.tokenHubAutomaticReadingEnabled = true
         model.tokenHubNow = { clock.now }
-        let scanner = HubTestScanner(result: value)
         let permission = HubTestPermission()
-        model.tokenHubScanner = scanner
         model.tokenHubPermissionProvider = permission
         return (model, scanner, permission)
     }
@@ -9300,12 +9581,11 @@ final class TokenHubQuotaStateTests: XCTestCase {
                        "fixture mode must retain synthetic scanner injection for deterministic state tests")
         XCTAssertFalse(AppModel.shouldSuppressNativeTokenHubRead(isTestFixture: false, scannerIsNative: true))
 
-        let model = AppModel(preview: true)
+        let scanner = HubTestScanner(result: TokenHubQuotaResult(status: .targetNotRunning, snapshot: nil, failure: nil))
+        let model = AppModel(preview: true, tokenHubAXSource: scanner.source)
         defer { model.shutdown() }
         model.config.dataSource = "localCodex"
         model.tokenHubAutomaticReadingEnabled = false
-        let scanner = HubTestScanner(result: TokenHubQuotaResult(status: .targetNotRunning, snapshot: nil, failure: nil))
-        model.tokenHubScanner = scanner
 
         var staleEnabledDraft = AppConfiguration()
         staleEnabledDraft.model = "saved-other-setting"
@@ -9325,6 +9605,82 @@ final class TokenHubQuotaStateTests: XCTestCase {
                       "a stale disabled draft cannot overwrite a newer on toggle")
         XCTAssertEqual(savedEnabled.model, "second-saved-setting", "the second unrelated setting is preserved")
         XCTAssertEqual(scanner.calls, 0, "configuration reconciliation itself performs no scan")
+    }
+
+    func testNativeAXWorkerRejectsUntrustedRequestAndSourceRetainsNativeKind() async {
+        let request = TokenHubAXRequest(now: Date(timeIntervalSince1970: 1_800_000_000),
+            permissionTrusted: false, refreshSeconds: 60, mode: .localCodex, generation: 41)
+        let workerResult = await NativeTokenHubAXWorker().scan(request)
+        XCTAssertEqual(workerResult.status, .permissionRequired)
+        XCTAssertEqual(workerResult.failure, .permissionMissing)
+        XCTAssertNil(workerResult.snapshot)
+
+        // The real reader uses Core's already-tested pre-discovery permission
+        // gate. This negative call never discovers a process or sends AX I/O.
+        let native = TokenHubAXSource.production
+        XCTAssertEqual(native.kind, .native, "closure wrapping must not erase fixture suppression identity")
+        let wrappedResult = await native.scan(request)
+        XCTAssertEqual(wrappedResult.status, .permissionRequired)
+        XCTAssertEqual(wrappedResult.failure, .permissionMissing)
+        XCTAssertNil(wrappedResult.snapshot)
+        XCTAssertTrue(AppModel.shouldSuppressNativeTokenHubRead(isTestFixture: true,
+            scannerIsNative: native.kind == .native))
+        XCTAssertFalse(AppModel.shouldSuppressNativeTokenHubRead(isTestFixture: false,
+            scannerIsNative: native.kind == .native), "ordinary preview behavior must stay unchanged")
+
+        let scanner = HubTestScanner(result: wrappedResult)
+        XCTAssertEqual(scanner.source.kind, .synthetic)
+        XCTAssertFalse(AppModel.shouldSuppressNativeTokenHubRead(isTestFixture: true,
+            scannerIsNative: scanner.source.kind == .native))
+        let defaultModel = AppModel(preview: true)
+        defer { defaultModel.shutdown() }
+        XCTAssertEqual(defaultModel.isFixtureUsingNativeTokenHubReader, defaultModel.isTestFixture,
+                       "the default source stays classified as native after initializer injection")
+    }
+
+    func testPendingAXRejectsLateResultsAfterDisableRevocationModeChangeAndShutdown() async {
+        enum Transition: CaseIterable { case disable, revoke, proxy, shutdown }
+        for transition in Transition.allCases {
+            let now = Date(timeIntervalSince1970: 1_800_000_000)
+            let clock = HubManualClock(now)
+            let (model, scanner, permission) = configuredModel(result(now: now), clock: clock)
+            let gate = HubScanGate()
+            defer { model.shutdown(); gate.release() }
+            let started = expectation(description: "AX suspended before \(transition)")
+            scanner.started = { started.fulfill() }
+            scanner.beforeReturn = { await gate.wait() }
+            model.refreshTokenHubQuota()
+            await fulfillment(of: [started], timeout: 2)
+            XCTAssertEqual(model.backgroundServiceResources.axScanInFlightCount, 1)
+
+            let status: TokenHubQuotaStatus
+            switch transition {
+            case .disable:
+                model.setTokenHubAutomaticReadingEnabled(false); status = .disabled
+            case .revoke:
+                clock.now = clock.now.addingTimeInterval(2.1); permission.trusted = false
+                model.refreshTokenHubQuota(); status = .permissionRequired
+            case .proxy:
+                model.config.dataSource = "proxy"; model.refreshTokenHubQuota(); status = .disabled
+            case .shutdown:
+                model.shutdown(); status = .disabled
+            }
+            XCTAssertEqual(model.tokenHubQuotaStatus, status)
+            XCTAssertNil(model.tokenHubQuotaSnapshot)
+            gate.release()
+            for _ in 0..<100 {
+                let resources = model.backgroundServiceResources
+                if resources.axScanInFlightCount == 0 && resources.axRefreshScheduledCount == 0 { break }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertEqual(model.tokenHubQuotaStatus, status, "late success cannot undo \(transition)")
+            XCTAssertNil(model.tokenHubQuotaSnapshot, "late success cannot repopulate after \(transition)")
+            XCTAssertEqual(scanner.calls, 1)
+            XCTAssertEqual(scanner.maximumConcurrent, 1)
+            XCTAssertEqual(model.backgroundServiceResources.axScanInFlightCount, 0)
+            XCTAssertEqual(model.backgroundServiceResources.axRefreshScheduledCount, 0)
+            XCTAssertEqual(permission.requests, 0)
+        }
     }
 
     func testHubSnapshotFreshnessAndTokenAccountingIsolation() async {
@@ -9421,13 +9777,14 @@ final class TokenHubQuotaStateTests: XCTestCase {
 
         scanner.nextResult = result(now: now)
         let started = expectation(description: "late scan started")
-        let release = DispatchSemaphore(value: 0)
+        let release = HubScanGate()
+        defer { release.release() }
         scanner.started = { started.fulfill() }
-        scanner.beforeReturn = { release.wait() }
+        scanner.beforeReturn = { await release.wait() }
         model.refreshTokenHubQuota()
         await fulfillment(of: [started], timeout: 2)
         model.shutdown()
-        release.signal()
+        release.release()
         try? await Task.sleep(for: .milliseconds(100))
         XCTAssertNil(model.tokenHubQuotaSnapshot, "shutdown rejects a late scanner completion")
     }
@@ -9437,17 +9794,30 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let (model, scanner, _) = configuredModel(result(now: now), clock: HubManualClock(now))
         defer { model.shutdown() }
         let started = expectation(description: "one scan started")
-        let release = DispatchSemaphore(value: 0)
+        let release = HubScanGate()
+        defer { release.release() }
         scanner.started = { started.fulfill() }
-        scanner.beforeReturn = { release.wait() }
+        scanner.beforeReturn = { await release.wait() }
         model.refreshTokenHubQuota()
         await fulfillment(of: [started], timeout: 2)
+        XCTAssertEqual(model.backgroundServiceResources.axScanInFlightCount, 1)
+        XCTAssertEqual(model.backgroundServiceResources.axRefreshScheduledCount, 0)
+        let heartbeat = expectation(description: "main actor remains responsive during an AX suspension")
+        Task { @MainActor in heartbeat.fulfill() }
+        await fulfillment(of: [heartbeat], timeout: 1)
         model.refreshTokenHubQuota()
         try? await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(scanner.calls, 1, "a second refresh cannot overlap an in-flight scan")
-        release.signal()
+        XCTAssertEqual(scanner.requests.first?.now, now)
+        XCTAssertEqual(scanner.requests.first?.mode, .localCodex)
+        XCTAssertEqual(scanner.requests.first?.permissionTrusted, true)
+        XCTAssertEqual(scanner.requests.first?.refreshSeconds, 60)
+        release.release()
         try? await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(scanner.maximumConcurrent, 1)
+        XCTAssertEqual(model.backgroundServiceResources.axScanInFlightCount, 0)
+        XCTAssertEqual(model.backgroundServiceResources.axRefreshScheduledCount, 1,
+                       "one completion schedules one completion-relative next refresh")
     }
 
     func testMetadataLifecycleEventsInvalidateOldGenerationAndGateRelaunch() async {
@@ -9462,9 +9832,10 @@ final class TokenHubQuotaStateTests: XCTestCase {
         XCTAssertEqual(model.tokenHubQuotaSnapshot, initial, "unrelated app metadata cannot invalidate the selected target")
 
         let blocked = expectation(description: "old generation scan started")
-        let release = DispatchSemaphore(value: 0)
+        let release = HubScanGate()
+        defer { release.release() }
         scanner.started = { blocked.fulfill() }
-        scanner.beforeReturn = { release.wait() }
+        scanner.beforeReturn = { await release.wait() }
         model.refreshTokenHubQuota()
         await fulfillment(of: [blocked], timeout: 2)
 
@@ -9478,7 +9849,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         scanner.nextResult = TokenHubQuotaResult(status: .accessFailed, snapshot: nil, failure: .axError)
         scanner.started = nil
         scanner.beforeReturn = nil
-        release.signal()
+        release.release()
         await settle(model, status: .accessFailed)
         XCTAssertNil(model.tokenHubQuotaSnapshot, "blocked pre-exit success cannot repopulate after target relaunch")
         XCTAssertEqual(scanner.calls, 3, "relaunch performs a new read after the blocked generation exits")
@@ -9522,14 +9893,17 @@ final class TokenHubQuotaStateTests: XCTestCase {
             hostingView.frame = bounds
             let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
+            defer { window.close() }
             window.appearance = NSAppearance(named: appearance)
             window.contentView = hostingView
             window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
             window.displayIfNeeded()
             hostingView.layoutSubtreeIfNeeded()
-            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            try await Task.sleep(for: .milliseconds(200))
+            window.displayIfNeeded()
+            hostingView.layoutSubtreeIfNeeded()
             guard let bitmap = hostingView.bitmapImageRepForCachingDisplay(in: bounds) else {
-                window.close(); XCTFail("synthetic Hub dashboard bitmap should be available"); return
+                XCTFail("synthetic Hub dashboard bitmap should be available"); return
             }
             hostingView.cacheDisplay(in: bounds, to: bitmap)
             let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
@@ -9539,7 +9913,6 @@ final class TokenHubQuotaStateTests: XCTestCase {
             XCTAssertEqual(decoded.pixelsHigh, 700 * pixelScale)
             XCTAssertGreaterThan(png.count, 0)
             try png.write(to: output.appendingPathComponent("synthetic-tokenhub-\(name).png"))
-            window.close()
         }
 
         let cardBounds = NSRect(x: 0, y: 0, width: 460, height: 280)
@@ -9554,14 +9927,17 @@ final class TokenHubQuotaStateTests: XCTestCase {
             hostingView.frame = cardBounds
             let window = NSWindow(contentRect: cardBounds, styleMask: .borderless, backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
+            defer { window.close() }
             window.appearance = NSAppearance(named: appearance)
             window.contentView = hostingView
             window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
             window.displayIfNeeded()
             hostingView.layoutSubtreeIfNeeded()
-            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            try await Task.sleep(for: .milliseconds(200))
+            window.displayIfNeeded()
+            hostingView.layoutSubtreeIfNeeded()
             guard let bitmap = hostingView.bitmapImageRepForCachingDisplay(in: cardBounds) else {
-                window.close(); XCTFail("synthetic full-card bitmap should be available"); return
+                XCTFail("synthetic full-card bitmap should be available"); return
             }
             hostingView.cacheDisplay(in: cardBounds, to: bitmap)
             let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
@@ -9571,7 +9947,6 @@ final class TokenHubQuotaStateTests: XCTestCase {
             XCTAssertEqual(decoded.pixelsHigh, 280 * pixelScale)
             XCTAssertGreaterThan(png.count, 0)
             try png.write(to: output.appendingPathComponent("synthetic-tokenhub-full-card-\(name).png"))
-            window.close()
         }
         print("Synthetic Token Hub dashboard renders: \(output.path)/synthetic-tokenhub-light.png and synthetic-tokenhub-dark.png")
         print("Synthetic full-card renders: \(output.path)/synthetic-tokenhub-full-card-light.png and synthetic-tokenhub-full-card-dark.png")
@@ -9613,6 +9988,156 @@ extension TokenHubQuotaStateTests {
         XCTAssertEqual(TokenHubQuotaCard.resetLabel("  "), "重置时间未知")
         XCTAssertEqual(TokenHubQuotaCard.resetLabel("未知"), "重置时间未知")
         XCTAssertEqual(TokenHubQuotaCard.resetLabel("01-15 08:00"), "重置 01-15 08:00")
+    }
+}
+
+
+private actor ControlledLocalScan {
+    private var pending: [(Int, CheckedContinuation<LocalCodexScanWorker.Result, Error>)] = []
+    private(set) var requests = 0
+    private(set) var maximumPending = 0
+    func scan(generation: Int) async throws -> LocalCodexScanWorker.Result {
+        requests += 1
+        return try await withCheckedThrowingContinuation { continuation in
+            pending.append((generation, continuation)); maximumPending = max(maximumPending, pending.count)
+        }
+    }
+    func completeFirst(total: Int) {
+        guard !pending.isEmpty else { return }
+        let (_, continuation) = pending.removeFirst()
+        continuation.resume(returning: LocalCodexScanWorker.Result(
+            snapshot: LocalCodexSnapshot(input: total, output: 0, total: total,
+                sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: nil,
+                fiveHour: nil, sevenDay: nil, knownThreadCount: 1),
+            diagnostics: LocalCodexUsageReader.Cache().diagnostics))
+    }
+    func finishPending() {
+        while !pending.isEmpty { pending.removeFirst().1.resume(throwing: CancellationError()) }
+    }
+}
+
+extension TokenHubQuotaStateTests {
+    private func workerFixture() throws -> (URL, Date) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("TokenStatMenu-C23B-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let stamp = ISO8601DateFormatter().string(from: now)
+        let id = "51515151-5151-4515-8515-515151515151"
+        let rows: [[String: Any]] = [
+            ["type": "session_meta", "payload": ["id": id, "source": "cli", "model_provider": "synthetic"]],
+            ["timestamp": stamp, "type": "event_msg", "payload": ["type": "token_count",
+                "info": ["total_token_usage": ["input_tokens": 10, "output_tokens": 5, "total_tokens": 15]]]]
+        ]
+        var bytes = Data()
+        for row in rows { bytes.append(try JSONSerialization.data(withJSONObject: row)); bytes.append(10) }
+        try bytes.write(to: directory.appendingPathComponent("rollout-fixture-\(id).jsonl"))
+        return (directory, now)
+    }
+
+    func testLocalWorkerReusesRealCacheAndResetsItForNewGeneration() async throws {
+        let (directory, now) = try workerFixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let worker = LocalCodexScanWorker()
+        let cold = try await worker.scan(directory: directory, now: now, generation: 7, routeContext: nil)
+        XCTAssertEqual(cold.snapshot.total, 15)
+        XCTAssertEqual(cold.diagnostics.parsedFiles, 1)
+        let warm = try await worker.scan(directory: directory, now: now, generation: 7, routeContext: nil)
+        XCTAssertEqual(warm.snapshot, cold.snapshot)
+        XCTAssertEqual(warm.diagnostics.cacheHits, 1)
+        XCTAssertEqual(warm.diagnostics.bytesRead, 0)
+        let restarted = try await worker.scan(directory: directory, now: now, generation: 8, routeContext: nil)
+        XCTAssertEqual(restarted.snapshot.total, 15)
+        XCTAssertEqual(restarted.diagnostics.parsedFiles, 1, "a new generation cannot inherit the old worker cache")
+        XCTAssertEqual(restarted.diagnostics.cacheHits, 0)
+    }
+
+    func testLocalWorkerSerializesConcurrentRequestsAndKeepsRoutesIsolated() async throws {
+        let (directory, now) = try workerFixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let worker = LocalCodexScanWorker()
+        let route = LocalCodexRouteContext.verified(provider: "synthetic", origin: "https://gateway.example")
+        let results = try await withThrowingTaskGroup(of: LocalCodexScanWorker.Result.self) { group in
+            for _ in 0..<24 {
+                group.addTask { try await worker.scan(directory: directory, now: now, generation: 9, routeContext: route) }
+            }
+            var results: [LocalCodexScanWorker.Result] = []
+            for try await result in group { results.append(result) }
+            return results
+        }
+        XCTAssertEqual(results.count, 24)
+        XCTAssertTrue(results.allSatisfy { $0.snapshot.total == 15 && $0.snapshot.knownThreadCount == 1 })
+        XCTAssertEqual(results.filter { $0.diagnostics.parsedFiles == 1 }.count, 1)
+        XCTAssertEqual(results.filter { $0.diagnostics.cacheHits == 1 && $0.diagnostics.bytesRead == 0 }.count, 23)
+        let unknown = try await worker.scan(directory: directory, now: now, generation: 9, routeContext: .unverified)
+        XCTAssertEqual(unknown.snapshot.total, 0)
+        XCTAssertEqual(unknown.snapshot.knownThreadCount, 0)
+        let restored = try await worker.scan(directory: directory, now: now, generation: 9, routeContext: route)
+        XCTAssertEqual(restored.snapshot.total, 15)
+        XCTAssertEqual(restored.diagnostics.parsedFiles, 1, "a route change cannot reuse a summary from another source")
+    }
+
+    private func localConsumer(_ harness: ControlledLocalScan) -> AppModel {
+        let noHub = TokenHubDirectQuotaDependencies(discoverTarget: { throw TokenHubQuotaFailure.noTarget },
+            identityIsCurrent: { _ in false }, fetch: { _, _ in throw TokenHubDirectQuotaFailure.transportFailed })
+        let source = LocalCodexScanDependencies(resolveInputs: {
+            (directory: URL(fileURLWithPath: "/synthetic-unused-local-scan"), routeContext: .unverified)
+        }, scan: { _, _, generation, _ in try await harness.scan(generation: generation) })
+        let model = AppModel(startup: AppModelStartupDependencies(loadPreferences: { nil },
+            savePreferences: { _ in }, shouldStartBackgroundServices: { true }),
+            directQuota: noHub, localScanning: source)
+        let permission = HubTestPermission(); permission.trusted = false
+        model.tokenHubPermissionProvider = permission
+        return model
+    }
+
+    private func waitForLocalRequests(_ count: Int, harness: ControlledLocalScan) async {
+        for _ in 0..<100 {
+            if await harness.requests >= count { return }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("controlled local request did not arrive")
+    }
+
+    func testLocalConsumerRejectsOldGenerationWithoutOverlappingOrLosingRefresh() async {
+        let harness = ControlledLocalScan()
+        let model = localConsumer(harness)
+        defer { model.shutdown(); Task { await harness.finishPending() } }
+        await waitForLocalRequests(1, harness: harness)
+        model.reload()
+        try? await Task.sleep(for: .milliseconds(20))
+        let requestsWhileOldReadRuns = await harness.requests
+        XCTAssertEqual(requestsWhileOldReadRuns, 1, "reload must not overlap the old local read")
+        await harness.completeFirst(total: 111)
+        await waitForLocalRequests(2, harness: harness)
+        XCTAssertEqual(model.localSnapshot.total, 0, "the old generation must not publish after reload")
+        await harness.completeFirst(total: 15)
+        for _ in 0..<100 where model.localSnapshot.total != 15 { try? await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(model.localSnapshot.total, 15)
+        XCTAssertEqual(model.backgroundServiceResources.localScanQueuedCount, 1)
+        try? await Task.sleep(for: .milliseconds(30))
+        let requestsAfterCompletion = await harness.requests
+        let maximumPending = await harness.maximumPending
+        XCTAssertEqual(requestsAfterCompletion, 2, "completion must schedule at the five-second cadence, not immediate repetition")
+        XCTAssertEqual(maximumPending, 1)
+    }
+
+    func testLocalConsumerShutdownRejectsLateResultAndOwnsNoMoreResources() async {
+        let harness = ControlledLocalScan()
+        let model = localConsumer(harness)
+        defer { model.shutdown(); Task { await harness.finishPending() } }
+        await waitForLocalRequests(1, harness: harness)
+        model.shutdown()
+        await harness.completeFirst(total: 111)
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(model.localSnapshot.total, 0)
+        let resources = model.backgroundServiceResources
+        XCTAssertEqual(resources.timerCount, 0)
+        XCTAssertEqual(resources.workspaceObserverCount, 0)
+        XCTAssertEqual(resources.localScanQueuedCount, 0)
+        XCTAssertEqual(resources.axRefreshScheduledCount, 0)
+        XCTAssertEqual(resources.axScanInFlightCount, 0)
+        let requestsAfterShutdown = await harness.requests
+        XCTAssertEqual(requestsAfterShutdown, 1)
     }
 }
 ```
@@ -10160,16 +10685,16 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # Native SwiftPM also works with Command Line Tools; no global xcode-select changes.
 if [ "$MODE" = "--universal" ]; then
     for ARCH in arm64 x86_64; do
-        swift build --build-system native --arch "$ARCH" --scratch-path ".build/$ARCH" -c release --product TokenStatMenu
+        swift build --arch "$ARCH" --scratch-path ".build/$ARCH" -c release --product TokenStatMenu
     done
-    ARM_DIR="$(swift build --build-system native --arch arm64 --scratch-path .build/arm64 -c release --show-bin-path)"
-    INTEL_DIR="$(swift build --build-system native --arch x86_64 --scratch-path .build/x86_64 -c release --show-bin-path)"
+    ARM_DIR="$(swift build --arch arm64 --scratch-path .build/arm64 -c release --show-bin-path)"
+    INTEL_DIR="$(swift build --arch x86_64 --scratch-path .build/x86_64 -c release --show-bin-path)"
     lipo -create "$ARM_DIR/TokenStatMenu" "$INTEL_DIR/TokenStatMenu" -output "$APP/Contents/MacOS/TokenStatMenu"
 else
     CONFIG=debug
     if [ "$MODE" = "--release" ]; then CONFIG=release; fi
-    swift build --build-system native -c "$CONFIG" --product TokenStatMenu
-    BIN_DIR="$(swift build --build-system native -c "$CONFIG" --show-bin-path)"
+    swift build -c "$CONFIG" --product TokenStatMenu
+    BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
     cp "$BIN_DIR/TokenStatMenu" "$APP/Contents/MacOS/TokenStatMenu"
 fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"
@@ -10209,7 +10734,7 @@ esac
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-swift run --build-system native TokenStatCoreChecks
+swift run TokenStatCoreChecks
 ./script/build_and_run.sh --build-only
 python3 script/integration.py
 ```
@@ -10452,13 +10977,16 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     tools = checkout / "tools"
     tools.mkdir()
     pkill_log = checkout / "pkill-called"
+    open_log = checkout / "open-called"
+    swift_log = checkout / "swift-arguments"
     fake_bin = checkout / "fake-bin"
     fake_bin.mkdir()
     (fake_bin / "TokenStatMenu").write_bytes(b"synthetic-executable-fixture")
 
     stubs = {
+        "open": "#!/bin/sh\nprintf called >> \"$V23_OPEN_LOG\"\nexit 74\n",
         "pkill": "#!/bin/sh\nprintf called >> \"$BP10_PKILL_LOG\"\nexit 0\n",
-        "swift": "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = --show-bin-path ]; then printf '%s\\n' \"$BP10_FAKE_BIN\"; exit 0; fi; done\nexit 0\n",
+        "swift": "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$V23_SWIFT_ARGUMENT_LOG\"\nfor arg in \"$@\"; do if [ \"$arg\" = --build-system ]; then exit 73; fi; done\nfor arg in \"$@\"; do if [ \"$arg\" = --show-bin-path ]; then printf '%s\\n' \"$BP10_FAKE_BIN\"; exit 0; fi; done\nexit 0\n",
         "chmod": "#!/bin/sh\nexit 0\n",
         "codesign": "#!/bin/sh\nexit 0\n",
     }
@@ -10471,6 +10999,8 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     environment["PATH"] = str(tools) + os.pathsep + environment.get("PATH", "")
     environment["BP10_PKILL_LOG"] = str(pkill_log)
     environment["BP10_FAKE_BIN"] = str(fake_bin)
+    environment["V23_OPEN_LOG"] = str(open_log)
+    environment["V23_SWIFT_ARGUMENT_LOG"] = str(swift_log)
     completed = subprocess.run(
         ["/bin/bash", str(checkout / "script/build_and_run.sh"), "--build-only"],
         cwd=checkout,
@@ -10481,7 +11011,9 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
         timeout=20,
         check=False,
     )
-    assert completed.returncode == 0, "isolated --build-only control flow should complete with stubbed build tools"
+    assert completed.returncode == 0, "isolated --build-only must use default SwiftPM and complete with stubbed build tools"
+    assert not open_log.exists(), "--build-only must not invoke LaunchServices"
+    assert "--build-system" not in swift_log.read_text().splitlines(), "build script must use the default SwiftPM build system"
     assert not pkill_log.exists(), "--build-only must not invoke a global process-name kill"
     packaged_info = plistlib.loads((checkout / "dist/TokenStatMenu.app/Contents/Info.plist").read_bytes())
     source_info = plistlib.loads((ROOT / "Resources/Info.plist").read_bytes())
@@ -10508,6 +11040,8 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     nested_environment["PATH"] = str(nested_checkout / "tools") + os.pathsep + os.environ.get("PATH", "")
     nested_environment["BP10_PKILL_LOG"] = str(nested_checkout / "pkill-called")
     nested_environment["BP10_FAKE_BIN"] = str(nested_checkout / "fake-bin")
+    nested_environment["V23_OPEN_LOG"] = str(nested_checkout / "open-called")
+    nested_environment["V23_SWIFT_ARGUMENT_LOG"] = str(nested_checkout / "swift-arguments")
     nested = subprocess.run(["/bin/bash", str(nested_checkout / "script/build_and_run.sh"), "--build-only"],
                             cwd=nested_checkout, env=nested_environment, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, check=False)
@@ -10516,6 +11050,9 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     assert nested_info["TokenStatSourceRevision"] == "source-export", "export must not inherit an unrelated parent Git HEAD"
     assert nested_info["TokenStatSourceState"] == "unspecified"
     assert not (nested_checkout / "pkill-called").exists()
+    assert not (nested_checkout / "open-called").exists()
+    for script_name in ["script/build_and_run.sh", "script/test.sh", ".github/workflows/build.yml"]:
+        assert "--build-system native" not in (ROOT / script_name).read_text(), "published build/test/CI commands must not force deprecated native mode"
     print("PASS: --build-only invokes no global process kill; version and project-only source identity preserved (isolated fixtures)", flush=True)
 
 
@@ -11176,6 +11713,30 @@ text = '// !$*UTF8*$!\n{ archiveVersion = 1; classes = {}; objectVersion = 56; o
 text += "\n".join(f"{key} = {{ {value} }};" for key, value in objects.items())
 text += f"\n}}; rootObject = {project}; }}\n"
 (directory / "project.pbxproj").write_text(text)
+# Bind the app target explicitly. Relying on an inferred user scheme caused
+# Xcode's destination preflight to report an empty supported-platform set.
+scheme_directory = directory / "xcshareddata" / "xcschemes"
+scheme_directory.mkdir(parents=True, exist_ok=True)
+scheme = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion="1600" version="1.3">
+  <BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES">
+    <BuildActionEntries>
+      <BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">
+        <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="{target}" BuildableName="TokenStatMenu.app" BlueprintName="TokenStatMenu" ReferencedContainer="container:TokenStatMenu.xcodeproj"/>
+      </BuildActionEntry>
+    </BuildActionEntries>
+  </BuildAction>
+  <LaunchAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.IDEFoundation.Launcher.LLDB" launchStyle="0" useCustomWorkingDirectory="NO" ignoresPersistentStateOnLaunch="NO" debugDocumentVersioning="YES" debugServiceExtension="internal" allowLocationSimulation="YES">
+    <BuildableProductRunnable runnableDebuggingMode="0">
+      <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="{target}" BuildableName="TokenStatMenu.app" BlueprintName="TokenStatMenu" ReferencedContainer="container:TokenStatMenu.xcodeproj"/>
+    </BuildableProductRunnable>
+  </LaunchAction>
+  <ProfileAction buildConfiguration="Release" shouldUseLaunchSchemeArgsEnv="YES" savedToolIdentifier="" useCustomWorkingDirectory="NO" debugDocumentVersioning="YES"/>
+  <AnalyzeAction buildConfiguration="Debug"/>
+  <ArchiveAction buildConfiguration="Release" revealArchiveInOrganizer="YES"/>
+</Scheme>
+'''
+(scheme_directory / "TokenStatMenu.xcscheme").write_text(scheme)
 print(directory)
 ```
 
@@ -11429,6 +11990,7 @@ PUBLIC_FILES = [
     "Sources/TokenStatMenu/StatusBarController.swift", "Sources/TokenStatMenu/Storage.swift",
     "Sources/TokenStatMenu/TokenStatMenuApp.swift", "Sources/TokenStatMenu/PanelStyle.swift", "Sources/TokenStatMenu/WindowQuotaCard.swift", "Sources/TokenStatMenu/TokenHubAXReader.swift", "Sources/TokenStatMenu/TokenHubQuotaCard.swift",
     "Resources/Info.plist", "Resources/config.example.plist", "Resources/AppIcon.png", "Resources/AppIcon.icns", "TokenStatMenu.xcodeproj/project.pbxproj",
+    "TokenStatMenu.xcodeproj/xcshareddata/xcschemes/TokenStatMenu.xcscheme",
     "Tests/TokenStatCoreTests/CoreChecks.swift", "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/WindowQuotaChecks.swift", "Tests/TokenStatCoreTests/LocalCodexUsageChecks.swift", "Tests/TokenStatCoreTests/DirectQuotaChecks.swift",
     "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift", "Tests/TokenStatCoreTests/TokenHubQuotaChecks.swift", "Tests/TokenStatUITests/TokenHubQuotaStateTests.swift", "Tests/TokenStatUITests/SeasunStartupContractTests.swift",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png",
@@ -11449,7 +12011,7 @@ def source_document():
     architecture = readme.split("## 整体架构\n", 1)[1].split("## 文件与职责", 1)[0]
     architecture = rebase_links(architecture, "README.md", "docs/FULL_SOURCE.md")
     parts = ["# TokenStatMenu 完整源码\n\n## 项目整体架构\n", architecture, "\n## 分文件完整源码\n"]
-    languages = {".swift": "swift", ".plist": "xml", ".pbxproj": "text", ".py": "python", ".sh": "bash", ".yml": "yaml"}
+    languages = {".swift": "swift", ".plist": "xml", ".pbxproj": "text", ".xcscheme": "xml", ".py": "python", ".sh": "bash", ".yml": "yaml"}
     for name in PUBLIC_FILES:
         path = ROOT / name
         if path.suffix not in languages:

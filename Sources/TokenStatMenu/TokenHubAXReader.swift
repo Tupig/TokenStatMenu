@@ -11,6 +11,51 @@ protocol TokenHubPermissionProviding {
     func requestOnceAndOpenSystemSettings()
 }
 
+/// Only immutable values cross the native AX actor boundary. AppKit process
+/// references, AXUIElement objects and the mutable traversal map stay inside it.
+struct TokenHubAXRequest: Sendable {
+    let now: Date
+    let permissionTrusted: Bool
+    let refreshSeconds: TimeInterval
+    let mode: TokenHubRunMode
+    let generation: UInt64
+}
+
+actor NativeTokenHubAXWorker {
+    private let reader = TokenHubAXReader()
+
+    func scan(_ request: TokenHubAXRequest) -> TokenHubQuotaResult {
+        // No suspension point while the native reader owns AX references.
+        // Core still rejects an untrusted or inactive request before discovery.
+        reader.scan(now: request.now, monotonicNow: { ProcessInfo.processInfo.systemUptime },
+                    permissionTrusted: request.permissionTrusted,
+                    refreshSeconds: request.refreshSeconds, mode: request.mode,
+                    generation: request.generation)
+    }
+}
+
+/// Immutable constructor injection keeps the native actor as the sole AX owner.
+/// The marker survives closure wrapping so fixture launches cannot read real UI.
+struct TokenHubAXSource {
+    enum Kind { case native, synthetic }
+    let kind: Kind
+    let scan: @MainActor (TokenHubAXRequest) async -> TokenHubQuotaResult
+
+    private init(kind: Kind, scan: @escaping @MainActor (TokenHubAXRequest) async -> TokenHubQuotaResult) {
+        self.kind = kind
+        self.scan = scan
+    }
+
+    @MainActor static var production: TokenHubAXSource {
+        let worker = NativeTokenHubAXWorker()
+        return TokenHubAXSource(kind: .native, scan: { await worker.scan($0) })
+    }
+
+    static func synthetic(_ scan: @escaping @MainActor (TokenHubAXRequest) async -> TokenHubQuotaResult) -> TokenHubAXSource {
+        TokenHubAXSource(kind: .synthetic, scan: scan)
+    }
+}
+
 /// Production boundary for one scan. AX objects live only in this instance's one scan call.
 final class TokenHubAXReader: TokenHubQuotaScanning {
     private let tree = TokenHubNativeTreeReader()
@@ -87,17 +132,17 @@ private final class TokenHubNativeTreeReader: TokenHubBoundedTreeReading {
         guard let role = raw as? String else { throw TokenHubNativeReadError.attribute }
         let value: TokenHubAXRole
         switch role {
-        case kAXApplicationRole as String: value = .application
-        case kAXWindowRole as String: value = .window
-        case kAXGroupRole as String: value = .group
-        case kAXStaticTextRole as String: value = .staticText
-        case kAXProgressIndicatorRole as String: value = .progressIndicator
-        case kAXButtonRole as String, kAXRadioButtonRole as String, kAXCheckBoxRole as String,
-             kAXPopUpButtonRole as String, kAXMenuButtonRole as String, "AXLink":
+        case kAXApplicationRole: value = .application
+        case kAXWindowRole: value = .window
+        case kAXGroupRole: value = .group
+        case kAXStaticTextRole: value = .staticText
+        case kAXProgressIndicatorRole: value = .progressIndicator
+        case kAXButtonRole, kAXRadioButtonRole, kAXCheckBoxRole,
+             kAXPopUpButtonRole, kAXMenuButtonRole, "AXLink":
             value = .button
-        case kAXTableRole as String, kAXOutlineRole as String, kAXListRole as String:
+        case kAXTableRole, kAXOutlineRole, kAXListRole:
             value = .table
-        case kAXTextFieldRole as String, kAXTextAreaRole as String, kAXComboBoxRole as String:
+        case kAXTextFieldRole, kAXTextAreaRole, kAXComboBoxRole:
             value = .editableText
         case "AXSecureTextField": value = .secureText
         default: value = .other(role)

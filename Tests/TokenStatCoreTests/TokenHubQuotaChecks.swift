@@ -627,7 +627,7 @@ extension CoreChecks {
 
         let duplicateReader = HubRecordingReader.valid()
         var duplicateRoot = duplicateReader.nodes[1]!
-        var duplicate = duplicateReader.nodes[2]!; duplicateReader.nodes[93] = duplicate
+        let duplicate = duplicateReader.nodes[2]!; duplicateReader.nodes[93] = duplicate
         duplicateRoot.children.append(93); duplicateReader.nodes[1] = duplicateRoot
         let duplicateResult = TokenHubQuotaScanner().scan(using: duplicateReader,
             now: Date(timeIntervalSince1970: 1_800_000_000), monotonicNow: { 10 },

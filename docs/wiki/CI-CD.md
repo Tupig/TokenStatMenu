@@ -4,7 +4,7 @@
 
 ## 当前自动化范围
 
-仓库的 [macOS build 工作流](../../.github/workflows/build.yml) 在 `main` 的 push 和 pull request 上运行，使用 `macos-15` runner。工作流仅有读取仓库内容的权限，checkout 关闭凭据持久化。
+仓库的 [macOS build 工作流](../../.github/workflows/build.yml) 在 `main` 的 push 和 pull request 上运行，使用 `macos-15` runner。工作流仅有读取仓库内容的权限，checkout 关闭凭据持久化。当前 checkout 固定为官方 `v7.0.1` 的完整提交 `3d3c42e5aac5ba805825da76410c181273ba90b1`，其运行时为 Node 24；升级时重新核对官方 release/tag 与完整 SHA，不只移动标签。官方要求 Actions Runner 至少为 `v2.327.1`，自托管 runner 需同步满足此版本；GitHub 托管 runner 由平台维护。来源见 [checkout v7.0.1](https://github.com/actions/checkout/tree/v7.0.1)。
 
 | 顺序 | 检查 | 当前实际覆盖 |
 | --- | --- | --- |
@@ -12,7 +12,7 @@
 | 2 | 公开内容防线 | 检查 Git index 中白名单文件的精确内容 |
 | 3 | 核心与发现检查 | 运行 `TokenStatCoreChecks` 的合成回归 |
 | 4 | 原生测试目标编译及不依赖 OS 像素的检查 | 凭据用途/URL 绑定的纯身份检查，以及刻意图像差异可被检测的检查 |
-| 5 | Xcode Release 构建 | 禁用代码签名完成原生工程构建 |
+| 5 | Xcode Release 构建 | 使用明确绑定 App target 的共享 Scheme，禁用代码签名完成原生工程构建 |
 
 CI 不比较受特定 macOS 渲染环境约束的工具栏基线，也不调用真实 Seasun 网关、不读取企业账号或本地会话。当前工作流不是完整 `swift test`、隔离 `script/test.sh`、Universal 构建或本机安装验收的替代。性能基准也不在 CI 中作为时间阈值运行，以免把共享 runner 的负载变化当作性能回归。
 

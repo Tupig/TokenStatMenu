@@ -24,6 +24,7 @@ extension CoreChecks {
     static func directQuotaChecks() throws {
         try directCallbackLocationChecks()
         try directDatabaseReplacementChecks()
+        try directAmountLexicalChecks()
         let identity = TokenHubIdentity(pid: 47816,
             bundleID: TokenHubTarget.bundleID,
             executablePath: "/Applications/Seasun Token Hub.app/Contents/MacOS/seasun-token-hub")
@@ -163,6 +164,123 @@ extension CoreChecks {
                       "direct client re-reads session after 401 and rejects changes before exchanging again")
             }
         }
+    }
+
+    /// Exercise the public response decoder, not Foundation's Decimal parser:
+    /// accepting a numeric prefix must never publish a believable quota.
+    private static func directAmountLexicalChecks() throws {
+        let identity = TokenHubIdentity(pid: 47901, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic Amount Hub.app/Contents/MacOS/Hub")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let contexts = [("fixed_5h", "used_amount"), ("fixed_5h", "quota_amount"),
+                        ("user_month", "used_amount"), ("user_month", "quota_amount")]
+        func response(kind: String, field: String, literal: String,
+                      companionLimit: String = "1000000000000000000") -> Data {
+            let used = field == "used_amount" ? literal : "0"
+            let limit = field == "quota_amount" ? literal : companionLimit
+            return json("{\"data\":{\"currency\":\"USD\",\"windows\":[{\"kind\":\"\(kind)\",\"used_amount\":\(used),\"quota_amount\":\(limit)}]}}")
+        }
+        func stringLiteral(_ value: String) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]), as: UTF8.self)
+        }
+        let invalidStrings = [
+            ("numeric suffix", "12.5junk"), ("exponent suffix", "1e2oops"),
+            ("blank", ""), ("space only", " "), ("leading whitespace", " 12.5"),
+            ("trailing whitespace", "12.5 "), ("embedded whitespace", "1 2"),
+            ("line break", "12.5\n"), ("decimal comma", "1,25"),
+            ("grouping comma", "1,000"), ("incomplete exponent", "1e"),
+            ("incomplete fraction", "1."), ("missing integer", ".5"),
+            ("leading plus", "+1"), ("leading zero", "01"),
+            ("non ASCII digits", "１２.５"), ("NaN", "NaN"),
+            ("positive infinity", "Infinity"), ("negative infinity", "-Infinity"),
+            ("negative value", "-1"), ("above amount limit", "1000000000000000001"),
+            ("decimal overflow", "1e999"),
+            ("decimal underflow", "1e-129"),
+            ("significant precision loss", "0.12345678901234567890123456789012345678901234567890"),
+            ("bounded string exceeded", "1." + String(repeating: "0", count: 127))
+        ]
+        var rejected: [(String, String)] = try invalidStrings.map { ($0.0, try stringLiteral($0.1)) }
+        rejected += [("Boolean true", "true"), ("Boolean false", "false"),
+                     ("negative JSON number", "-1"), ("above amount limit JSON number", "1000000000000000001"),
+                     ("nonfinite JSON number", "1e999"), ("array", "[]"), ("object", "{}")]
+        for (kind, field) in contexts {
+            for (label, literal) in rejected {
+                do {
+                    _ = try TokenHubDirectQuotaDecoder.decode(response(kind: kind, field: field, literal: literal),
+                        identity: identity, now: now)
+                    check(false, "direct amount rejects \(label) for \(kind).\(field)")
+                } catch let error as TokenHubDirectQuotaFailure {
+                    check(error == .malformedResponse,
+                          "direct amount rejects \(label) with a redacted typed failure for \(kind).\(field)")
+                } catch { check(false, "direct amount failure stays typed for \(kind).\(field)") }
+            }
+            // A monthly limit is optional/null by the existing contract;
+            // required window amounts and monthly usage are never nullable.
+            if kind != "user_month" || field != "quota_amount" {
+                do {
+                    _ = try TokenHubDirectQuotaDecoder.decode(response(kind: kind, field: field, literal: "null"),
+                        identity: identity, now: now)
+                    check(false, "required direct amount rejects null for \(kind).\(field)")
+                } catch let error as TokenHubDirectQuotaFailure {
+                    check(error == .malformedResponse, "required direct null amount has a typed failure")
+                }
+            }
+        }
+
+        // Literal expected values are independent of the production helper.
+        let validValues = [
+            ("JSON integer", "25", "25"), ("JSON fraction", "12.5", "12.5"),
+            ("JSON exponent", "1.25e1", "12.5"), ("numeric string", "\"12.50\"", "12.5"),
+            ("string exponent", "\"125e-1\"", "12.5"),
+            ("string signed exponent", "\"1.25E+1\"", "12.5"),
+            ("exact string precision", "\"0.1234567890123456789012345678\"", "0.1234567890123456789012345678"),
+            ("38 significant digits", "\"0.12345678901234567890123456789012345678\"", "0.12345678901234567890123456789012345678"),
+            ("equivalent trailing zero precision", "\"0.123456789012345678901234567890123456780000000000\"", "0.12345678901234567890123456789012345678"),
+            ("small fraction", "\"0.00000001\"", "0.00000001"),
+            ("minimum decimal exponent", "\"1e-128\"", "1e-128"),
+            ("amount maximum JSON", "1000000000000000000", "1000000000000000000"),
+            ("amount maximum string", "\"1e18\"", "1000000000000000000"),
+            ("bounded string exact boundary", "\"1." + String(repeating: "0", count: 126) + "\"", "1")
+        ]
+        for (label, literal, expectedText) in validValues {
+            let expected = Decimal(string: expectedText, locale: Locale(identifier: "en_US_POSIX"))!
+            for (kind, field) in contexts {
+                // Existing rolling used/limit percentage arithmetic may not
+                // represent this extreme ratio. Preserve the already valid
+                // monthly amount and rolling limit inputs without broadening
+                // the mathematical domain of the percentage calculation.
+                if expectedText == "1e-128", kind == "fixed_5h", field == "used_amount" { continue }
+                // Keep the minimum-exponent lexical case separate from
+                // percentage underflow caused by dividing by a huge limit.
+                let limit = expectedText == "1e-128" ? "1" : "1000000000000000000"
+                let decoded: TokenHubQuotaSnapshot
+                do {
+                    decoded = try TokenHubDirectQuotaDecoder.decode(response(kind: kind, field: field, literal: literal,
+                        companionLimit: limit), identity: identity, now: now)
+                } catch {
+                    check(false, "direct amount accepts \(label) for \(kind).\(field)")
+                    continue
+                }
+                if kind == "fixed_5h" {
+                    check((field == "used_amount" ? decoded.fiveHour?.usedAmount : decoded.fiveHour?.limitAmount) == expected,
+                          "direct amount preserves \(label) for \(kind).\(field)")
+                } else {
+                    check(decoded.monthly?.usedAmount == (field == "used_amount" ? expected : Decimal(0)),
+                          "direct amount accepts \(label) for \(kind).\(field) without inventing usage")
+                }
+            }
+        }
+        for literal in ["0", "0.0", "\"0\"", "\"0e0\""] {
+            for kind in ["fixed_5h", "user_month"] {
+                let decoded = try TokenHubDirectQuotaDecoder.decode(response(kind: kind, field: "used_amount", literal: literal),
+                    identity: identity, now: now)
+                check((kind == "fixed_5h" ? decoded.fiveHour?.usedAmount : decoded.monthly?.usedAmount) == Decimal(0),
+                      "direct amount preserves explicit zero \(literal) for \(kind)")
+            }
+        }
+        let noMonthlyLimit = try TokenHubDirectQuotaDecoder.decode(response(kind: "user_month", field: "quota_amount", literal: "null"),
+            identity: identity, now: now)
+        check(noMonthlyLimit.monthly?.usedAmount == Decimal(0), "optional monthly null limit remains supported")
     }
 }
 

@@ -560,7 +560,20 @@ public enum TokenHubDirectQuotaDecoder {
         if let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() { raw = n.stringValue }
         else if let text = value as? String { raw = text }
         else { return nil }
-        guard let value = Decimal(string: raw, locale: Locale(identifier: "en_US_POSIX")), value.isFinite,
+        // Decimal(string:) accepts numeric prefixes, whitespace and even some
+        // incomplete forms. Require a bounded, complete JSON-number spelling
+        // before conversion; anchors reject trailing newlines as well as junk.
+        guard raw.utf8.count <= 128,
+              raw.range(of: #"\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z"#,
+                        options: .regularExpression) != nil else { return nil }
+        // Decimal can silently discard low-order significant digits. Bound
+        // the original string's meaningful mantissa to a conservative 38
+        // digits; leading/trailing zeroes do not change its numeric value.
+        // Native JSON numbers may already be normalized by JSONSerialization.
+        let digits = raw.utf8.prefix { $0 != 69 && $0 != 101 }.filter { (48...57).contains($0) }
+        let significantDigits = digits.drop(while: { $0 == 48 }).reversed().drop(while: { $0 == 48 }).count
+        guard significantDigits <= 38,
+              let value = Decimal(string: raw, locale: Locale(identifier: "en_US_POSIX")), value.isFinite,
               value >= 0, value <= Decimal(string: "1000000000000000000")! else { return nil }
         return value
     }

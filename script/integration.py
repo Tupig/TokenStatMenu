@@ -134,13 +134,16 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     tools = checkout / "tools"
     tools.mkdir()
     pkill_log = checkout / "pkill-called"
+    open_log = checkout / "open-called"
+    swift_log = checkout / "swift-arguments"
     fake_bin = checkout / "fake-bin"
     fake_bin.mkdir()
     (fake_bin / "TokenStatMenu").write_bytes(b"synthetic-executable-fixture")
 
     stubs = {
+        "open": "#!/bin/sh\nprintf called >> \"$V23_OPEN_LOG\"\nexit 74\n",
         "pkill": "#!/bin/sh\nprintf called >> \"$BP10_PKILL_LOG\"\nexit 0\n",
-        "swift": "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = --show-bin-path ]; then printf '%s\\n' \"$BP10_FAKE_BIN\"; exit 0; fi; done\nexit 0\n",
+        "swift": "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$V23_SWIFT_ARGUMENT_LOG\"\nfor arg in \"$@\"; do if [ \"$arg\" = --build-system ]; then exit 73; fi; done\nfor arg in \"$@\"; do if [ \"$arg\" = --show-bin-path ]; then printf '%s\\n' \"$BP10_FAKE_BIN\"; exit 0; fi; done\nexit 0\n",
         "chmod": "#!/bin/sh\nexit 0\n",
         "codesign": "#!/bin/sh\nexit 0\n",
     }
@@ -153,6 +156,8 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     environment["PATH"] = str(tools) + os.pathsep + environment.get("PATH", "")
     environment["BP10_PKILL_LOG"] = str(pkill_log)
     environment["BP10_FAKE_BIN"] = str(fake_bin)
+    environment["V23_OPEN_LOG"] = str(open_log)
+    environment["V23_SWIFT_ARGUMENT_LOG"] = str(swift_log)
     completed = subprocess.run(
         ["/bin/bash", str(checkout / "script/build_and_run.sh"), "--build-only"],
         cwd=checkout,
@@ -163,7 +168,9 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
         timeout=20,
         check=False,
     )
-    assert completed.returncode == 0, "isolated --build-only control flow should complete with stubbed build tools"
+    assert completed.returncode == 0, "isolated --build-only must use default SwiftPM and complete with stubbed build tools"
+    assert not open_log.exists(), "--build-only must not invoke LaunchServices"
+    assert "--build-system" not in swift_log.read_text().splitlines(), "build script must use the default SwiftPM build system"
     assert not pkill_log.exists(), "--build-only must not invoke a global process-name kill"
     packaged_info = plistlib.loads((checkout / "dist/TokenStatMenu.app/Contents/Info.plist").read_bytes())
     source_info = plistlib.loads((ROOT / "Resources/Info.plist").read_bytes())
@@ -190,6 +197,8 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     nested_environment["PATH"] = str(nested_checkout / "tools") + os.pathsep + os.environ.get("PATH", "")
     nested_environment["BP10_PKILL_LOG"] = str(nested_checkout / "pkill-called")
     nested_environment["BP10_FAKE_BIN"] = str(nested_checkout / "fake-bin")
+    nested_environment["V23_OPEN_LOG"] = str(nested_checkout / "open-called")
+    nested_environment["V23_SWIFT_ARGUMENT_LOG"] = str(nested_checkout / "swift-arguments")
     nested = subprocess.run(["/bin/bash", str(nested_checkout / "script/build_and_run.sh"), "--build-only"],
                             cwd=nested_checkout, env=nested_environment, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, check=False)
@@ -198,6 +207,9 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     assert nested_info["TokenStatSourceRevision"] == "source-export", "export must not inherit an unrelated parent Git HEAD"
     assert nested_info["TokenStatSourceState"] == "unspecified"
     assert not (nested_checkout / "pkill-called").exists()
+    assert not (nested_checkout / "open-called").exists()
+    for script_name in ["script/build_and_run.sh", "script/test.sh", ".github/workflows/build.yml"]:
+        assert "--build-system native" not in (ROOT / script_name).read_text(), "published build/test/CI commands must not force deprecated native mode"
     print("PASS: --build-only invokes no global process kill; version and project-only source identity preserved (isolated fixtures)", flush=True)
 
 
