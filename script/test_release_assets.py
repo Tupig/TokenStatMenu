@@ -372,6 +372,33 @@ class ReleaseChecks(unittest.TestCase):
         expected = f.synthetic_assets()
         self.assertEqual(release.validate_assets(f.root, f.assets, f.identity), expected)
 
+    def test_next_release_asset_names_add_universal_dmg_without_retroactive_legacy_asset(self):
+        f = self.fixture
+        next_identity = release.ReleaseIdentity("1.1.5", "7", "v1.1.5", f.commit)
+        legacy_identity = release.ReleaseIdentity("1.1.4", "6", "v1.1.4", f.commit)
+        self.assertEqual(release._names(next_identity), {
+            "universal": "TokenStatMenu-1.1.5-universal.zip",
+            "source": "TokenStatMenu-1.1.5-source.zip",
+            "dmg": "TokenStatMenu-1.1.5-universal.dmg",
+        })
+        self.assertNotIn("dmg", release._names(legacy_identity))
+
+    def test_verify_and_publish_request_native_dmg_validation(self):
+        f = self.fixture
+        f.synthetic_assets()
+        with mock.patch.object(release, "validate_assets", wraps=release.validate_assets) as validator:
+            release.publish_release(f.root, f.assets, f.identity, FakeClient(f))
+            self.assertTrue(validator.call_args.kwargs["validate_dmg_image"])
+
+        argv = ["release_assets.py", "verify", "--root", str(f.root),
+                "--tag", f.identity.tag, "--commit", f.identity.commit,
+                "--directory", str(f.assets)]
+        with mock.patch.object(release, "release_identity", return_value=f.identity), \
+             mock.patch.object(release, "validate_assets", return_value={}) as cli_validator, \
+             mock.patch.object(sys, "argv", argv):
+            release.main()
+        self.assertTrue(cli_validator.call_args.kwargs["validate_dmg_image"])
+
     def test_assets_reject_extra_hidden_missing_and_symlink(self):
         f = self.fixture
         f.synthetic_assets()
@@ -897,7 +924,8 @@ def workflow_contract(document: dict, raw: str) -> None:
                if step.get("uses", "").startswith("actions/upload-artifact@")]
     assert len(uploads) == 1 and uploads[0]["with"]["if-no-files-found"] == "error"
     paths = uploads[0]["with"]["path"]
-    assert "*" not in paths and len(paths.splitlines()) == 4
+    assert "*" not in paths and len(paths.splitlines()) == 5
+    assert any(path.endswith("-universal.dmg") for path in paths.splitlines())
     scripts = "\n".join(step.get("run", "") for job in [build, publish] for step in job["steps"])
     assert "$" + "{{ github.ref_name }}" not in scripts
     assert "--clobber" not in scripts and "continue-on-error: true" not in raw

@@ -1,5 +1,18 @@
 # 验证记录
 
+## 1.1.5 — DMG 分发候选（2026-10-18）
+
+本节记录 BP32 当前本机候选的 DMG 相关合同检查，不代表已经创建正式 GitHub Release。版本元数据已切换为 1.1.5/build7；当前工作树仍需完成最终来源、隐私、索引和发布审查。1.1.4/build6 的真实历史仍是 ZIP-only，见下一节及其既有 Release 边界，不追溯增加 DMG。
+
+| 检查 | 当前证据 | 限制 |
+| --- | --- | --- |
+| DMG 合同与反例 | `script/test_release_assets.py` 实际运行 47 tests、0 failures；其中覆盖五资产 manifest/SUMS、DMG 缺失/重复/篡改/错误身份/不安全成员/镜像错误以及发布集合冲突 | 合成 fixture 和 checker 通过不等于远端 Release 已发布 |
+| 本机 DMG 逻辑 | 使用 `hdiutil imageinfo` 与只读 attach/detach 的实现已完成；镜像只允许 App 与 `/Applications` 别名，并复用四文件 App、版本、来源、双架构、严格签名检查 | 正式本机 DMG 创建/挂载结果、最终 byte/hash、Finder 拖拽和用户安装仍待本轮完整执行 |
+| 发布资产合同 | 下一版目标为 App ZIP、源码 ZIP、Universal DMG、manifest、SHA256SUMS 五项；Homebrew 仍从源码 ZIP 构建 | 1.1.4 四资产历史不变；1.1.5 Actions/Release、下载回读和 tap 端点尚未通过 |
+| 数据与运行边界 | DMG 不增加运行时、企业数据源、权限或自动更新逻辑；验证设计不启动 App、不替换现有安装、不读配置/Hub/Codex 数据 | 本节不证明正常启动、企业额度或菜单栏统计 |
+
+DMG 文件名规则为 `TokenStatMenu-1.1.5-universal.dmg`，但只有实际 Release 中出现且 manifest/SHA256SUMS 一致时才可作为下载入口。安装说明使用 Finder 打开镜像并将 App 拖入“应用程序”；不自动退出旧进程，不绕过 Gatekeeper，不声明 Developer ID 或 Apple 公证。若下一版失败，保留失败标签并创建新的不可变版本；不移动或覆盖 v1.1.4。
+
 ## 1.1.4 — 跨工具链依赖锁修正候选（2026-10-18）
 
 本节分别记录 1.1.4（build 6）方案的隔离实验与修正后本机候选复验。实验克隆自公开提交 `30ea1ba0971e0f317bc08ec70acc45ebf6ebddbe`；之后对实际修改后的候选重新运行了下表中的整套本机检查，没有将旧 1.1.3 的通过结果直接转写。本轮截止于 `modified` 来源候选，最终干净提交、源码/隐私独立审查、远端 CI、Release 和 Homebrew 端点尚待对应证据。
