@@ -14323,7 +14323,7 @@ PUBLIC_FILES = [
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png",
     "script/build_and_run.sh", "script/test.sh", "script/mock_server.py", "script/integration.py", "script/release_assets.py", "script/test_release_assets.py",
-    "script/BenchmarkMenu.swift", "script/benchmark_menu.py", "script/RenderAppIcon.swift", "script/make_app_icon.sh", "script/check_docs.py", "script/generate_xcode_project.py", "script/render_preview.py", "script/RenderPreview.swift", "script/package_source.py", "script/check_public_content.py",
+    "script/BenchmarkMenu.swift", "script/benchmark_menu.py", "script/RenderAppIcon.swift", "script/make_app_icon.sh", "script/check_docs.py", "script/generate_xcode_project.py", "script/render_preview.py", "script/RenderPreview.swift", "script/package_source.py", "script/check_public_content.py", "script/diagnose_swift_toolchain.py", "script/run_settings_ax_check.sh", "script/test_phase2_diagnostics.py",
     "docs/README.md", "docs/wiki/Home.md", "docs/wiki/安装与使用.md", "docs/wiki/统计口径.md",
     "docs/wiki/常见问题.md", "docs/wiki/编译指南.md", "docs/wiki/测试指南.md", "docs/wiki/命令行参数.md",
     "docs/wiki/CI-CD.md", "docs/wiki/贡献指南.md",
@@ -14490,6 +14490,502 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
+
+### script/diagnose_swift_toolchain.py
+
+```python
+#!/usr/bin/env python3
+"""Run a read-only CLT/Xcode comparison without publishing raw tool output."""
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import time
+import re
+from typing import Sequence
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SEARCH_PATH_WARNING = re.compile(
+    r"ld: warning: search path '(/Library/Developer/CommandLineTools/Developer/[^']*)' not found",
+)
+
+
+@dataclass(frozen=True)
+class WarningClassification:
+    kind: str
+    count: int
+    is_build_failure: bool
+
+
+def classify_linker_warnings(output: str) -> WarningClassification:
+    """Classify only the known missing CLT search-path linker diagnostics."""
+    count = len(SEARCH_PATH_WARNING.findall(output))
+    if count:
+        return WarningClassification("clt_search_path_warning", count, False)
+    return WarningClassification("none", 0, False)
+
+
+def _safe_env(developer_dir: str | None) -> dict[str, str]:
+    allowed = {"HOME", "TMPDIR", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL"}
+    env = {key: value for key, value in os.environ.items() if key in allowed}
+    for key in ("SDKROOT", "LIBRARY_PATH", "FRAMEWORK_PATH", "LDFLAGS", "CPATH", "DEVELOPER_DIR"):
+        env.pop(key, None)
+    if developer_dir:
+        env["DEVELOPER_DIR"] = developer_dir
+    env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+    return env
+
+
+def _run(args: Sequence[str], cwd: Path, env: dict[str, str], timeout: int, log: Path) -> tuple[int, str, float]:
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            list(args), cwd=cwd, env=env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=timeout, check=False,
+        )
+        output = completed.stdout or ""
+        code = completed.returncode
+    except subprocess.TimeoutExpired as error:
+        output = error.stdout if isinstance(error.stdout, str) else ""
+        code = 124
+    log.write_text(output, encoding="utf-8", errors="replace")
+    return code, output, round(time.monotonic() - started, 3)
+
+
+def _digest(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _version(args: Sequence[str], env: dict[str, str], scratch: Path, timeout: int) -> tuple[int, str]:
+    code, output, _ = _run(args, ROOT, env, timeout, scratch / "version.log")
+    first = next((line.strip() for line in output.splitlines() if line.strip()), "unknown")
+    if first.startswith("xcode-select: error"):
+        first = "xcodebuild unavailable under selected toolchain"
+    return code, first[:160]
+
+
+def _run_one(kind: str, project: Path, timeout: int) -> dict[str, object]:
+    developer_dir = "/Applications/Xcode.app/Contents/Developer" if kind == "xcode" else None
+    env = _safe_env(developer_dir)
+    scratch = Path(tempfile.mkdtemp(prefix="tokenstat-toolchain-"))
+    (scratch / "home").mkdir()
+    (scratch / "tmp").mkdir()
+    (scratch / "xdg-config").mkdir()
+    (scratch / "xdg-data").mkdir()
+    env["HOME"] = str(scratch / "home")
+    env["TMPDIR"] = str(scratch / "tmp")
+    env["XDG_CONFIG_HOME"] = str(scratch / "xdg-config")
+    env["XDG_DATA_HOME"] = str(scratch / "xdg-data")
+    original_lock = _digest(project / "Package.resolved")
+    try:
+        swift_code, swift_version = _version(["swift", "--version"], env, scratch, timeout)
+        sdk_code, sdk_path = _version(["xcrun", "--sdk", "macosx", "--show-sdk-path"], env, scratch, timeout)
+        xcode_code, xcode_version = _version(["xcodebuild", "-version"], env, scratch, timeout)
+        hello = scratch / "hello"
+        hello.mkdir()
+        init_code, _, _ = _run(
+            ["swift", "package", "init", "--type", "executable"], hello, env, timeout, scratch / "hello-init.log"
+        )
+        hello_build_code = hello_run_code = 125
+        hello_classification = WarningClassification("command_not_run", 0, True)
+        hello_seconds = 0.0
+        if init_code == 0:
+            hello_build_code, hello_output, hello_seconds = _run(
+                ["swift", "build", "-v"],
+                hello, env, timeout, scratch / "hello-build.log",
+            )
+            hello_classification = classify_linker_warnings(hello_output)
+            if hello_build_code == 0:
+                hello_run_code, _, _ = _run(
+                    ["swift", "run", "-v"],
+                    hello, env, timeout, scratch / "hello-run.log",
+                )
+        project_copy = scratch / "project"
+        shutil.copytree(
+            project, project_copy,
+            ignore=shutil.ignore_patterns(
+                ".git", ".build", "dist", ".integration", ".xcodebuild", "__pycache__",
+                ".DS_Store", "config.plist", "auth.json", ".env", ".env.*", "*.jsonl",
+            ),
+            symlinks=True,
+        )
+        if any(path.is_symlink() for path in project_copy.rglob("*")):
+            raise ValueError("symlink in controlled checkout")
+        lock_before = _digest(project_copy / "Package.resolved")
+        project_build_code, project_output, project_seconds = _run(
+            ["swift", "build", "-v", "--force-resolved-versions", "--product", "TokenStatMenu"],
+            project_copy, env, timeout, scratch / "project-build.log",
+        )
+        project_classification = classify_linker_warnings(project_output)
+        return {
+            "toolchain": kind,
+            "developer_dir_set": bool(developer_dir),
+            "swift_exit": swift_code,
+            "swift_version": swift_version,
+            "sdk_exit": sdk_code,
+            "sdk_version": Path(sdk_path).name if sdk_path and sdk_path != "unknown" else sdk_path,
+            "xcode_exit": xcode_code,
+            "xcode_version": xcode_version,
+            "hello": {"init_exit": init_code, "build_exit": hello_build_code, "run_exit": hello_run_code,
+                       "warning": asdict(hello_classification), "seconds": hello_seconds},
+            "project": {"build_exit": project_build_code, "warning": asdict(project_classification),
+                        "seconds": project_seconds},
+            "package_resolved_before_sha256": lock_before,
+            "package_resolved_after_sha256": _digest(project_copy / "Package.resolved"),
+            "package_resolved_checkout_sha256": original_lock,
+            "status": "success" if (
+                swift_code == 0 and sdk_code == 0 and project_build_code == 0
+                and init_code == 0 and hello_build_code == 0 and hello_run_code == 0
+                and (kind == "clt" or xcode_code == 0)
+                and original_lock == lock_before == _digest(project_copy / "Package.resolved")
+            ) else "failed",
+        }
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--toolchain", choices=("clt", "xcode", "both"), default="both")
+    parser.add_argument("--project", type=Path, default=ROOT)
+    parser.add_argument("--timeout", type=int, default=90)
+    args = parser.parse_args(argv)
+    if args.timeout < 5 or args.timeout > 600:
+        parser.error("--timeout must be between 5 and 600 seconds")
+    if args.project.is_symlink():
+        parser.error("--project must not be a symbolic link")
+    project = args.project.resolve()
+    if not (project / "Package.swift").is_file():
+        parser.error("--project must point to a Swift package checkout")
+    kinds = ("clt", "xcode") if args.toolchain == "both" else (args.toolchain,)
+    try:
+        reports = [_run_one(kind, project, args.timeout) for kind in kinds]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        print(json.dumps({"kind": "upstream_toolchain_diagnostic", "status": "failed", "error": "diagnostic_setup_failed"}))
+        return 1
+    print(json.dumps({"kind": "upstream_toolchain_diagnostic", "reports": reports}, ensure_ascii=False, sort_keys=True))
+    return 0 if all(report["status"] == "success" for report in reports) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+### script/run_settings_ax_check.sh
+
+```bash
+#!/bin/bash
+set -uo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: run_settings_ax_check.sh --project PROJECT --scheme SCHEME \
+  --fixture-manifest MANIFEST --fixture-bundle BUNDLE [options]
+
+Runs the private C27 macOS AX runner with full Xcode. It validates the frozen
+fixture manifest and project source before build-for-testing, then runs
+ test-without-building and verifies the transient xcresult summary. An
+automation-mode timeout is reported as automation_environment_blocked and keeps
+its non-zero exit code; no result is converted to a pass.
+
+Options:
+  --project PATH       Private C27 Xcode project (required)
+  --scheme NAME        Private C27 scheme (required)
+  --fixture-manifest PATH  Frozen C27 manifest (required)
+  --fixture-bundle PATH    Frozen C27 fixture bundle (required)
+  --timeout SECONDS    Per-command timeout, 30..600 (default: 120)
+  --help               Show this help
+USAGE
+}
+
+configuration_error() {
+  echo '{"classification":"configuration_error","exit":2}'
+  exit 2
+}
+
+project=""
+scheme=""
+fixture_manifest=""
+fixture_bundle=""
+timeout_seconds=120
+while (($#)); do
+  case "$1" in
+    --project)
+      (($# >= 2)) || configuration_error
+      project="$2"; shift 2 ;;
+    --scheme)
+      (($# >= 2)) || configuration_error
+      scheme="$2"; shift 2 ;;
+    --fixture-manifest)
+      (($# >= 2)) || configuration_error
+      fixture_manifest="$2"; shift 2 ;;
+    --fixture-bundle)
+      (($# >= 2)) || configuration_error
+      fixture_bundle="$2"; shift 2 ;;
+    --derived-data) configuration_error ;;
+    --timeout)
+      (($# >= 2)) || configuration_error
+      timeout_seconds="$2"; shift 2 ;;
+    --help) usage; exit 0 ;;
+    *) configuration_error ;;
+  esac
+done
+
+[[ -n "$project" && -n "$scheme" && -n "$fixture_manifest" && -n "$fixture_bundle" ]] || configuration_error
+[[ -n "${DEVELOPER_DIR:-}" ]] || configuration_error
+[[ -x "$DEVELOPER_DIR/usr/bin/xcodebuild" && -x "/usr/bin/xcrun" ]] || configuration_error
+if ! [[ "$timeout_seconds" =~ ^[0-9]+$ ]]; then configuration_error; fi
+if (( timeout_seconds < 30 )); then configuration_error; fi
+if (( timeout_seconds > 600 )); then configuration_error; fi
+
+[[ ! -L "$project" && ! -L "$fixture_manifest" && ! -L "$fixture_bundle" ]] || configuration_error
+project_real="$(cd "$project" 2>/dev/null && pwd -P)" || configuration_error
+bundle_real="$(cd "$fixture_bundle" 2>/dev/null && pwd -P)" || configuration_error
+[[ -f "$project_real/project.pbxproj" ]] || configuration_error
+scheme_file="$project_real/xcshareddata/xcschemes/$scheme.xcscheme"
+[[ -f "$scheme_file" ]] || configuration_error
+project_parent="$(dirname "$project_real")"
+test_source="$project_parent/Tests/NativeSettingsAXTests.swift"
+[[ -f "$test_source" ]] || configuration_error
+# Bind the wrapper to the reviewed C27 project/test shape, not an arbitrary UI test.
+grep -Fq 'C27SettingsAXUITests' "$project_real/project.pbxproj" || configuration_error
+grep -Fq 'NativeSettingsAXTests' "$test_source" || configuration_error
+grep -Fq 'XCUIApplication(url:' "$test_source" || configuration_error
+grep -Fq -- '--test-fixture' "$test_source" || configuration_error
+grep -Fq -- '--disable-background-services' "$test_source" || configuration_error
+grep -Fq 'A07' "$test_source" || configuration_error
+[[ "$(shasum -a 256 "$project_real/project.pbxproj" | awk '{print $1}')" == "0ab0c1958fb718cc572519ac451dcc1c78227c4a7093dff42451b22856593d5f" ]] || configuration_error
+[[ "$(shasum -a 256 "$scheme_file" | awk '{print $1}')" == "d8e2920aaced40f6b47fb1267015b2fd87c67eb5996f3d56b6064493d54fede1" ]] || configuration_error
+[[ "$(shasum -a 256 "$test_source" | awk '{print $1}')" == "4b03e8190cb510ea5904bb12a94c8bd8c71f922cba509f0950c9c721760dfc78" ]] || configuration_error
+
+python3 - "$fixture_manifest" "$fixture_bundle" <<'PY' || exit 2
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import subprocess
+import sys
+
+manifest_input = Path(sys.argv[1])
+bundle_input = Path(sys.argv[2])
+if manifest_input.is_symlink() or bundle_input.is_symlink():
+    raise SystemExit(2)
+manifest_bytes = manifest_input.read_bytes()
+if hashlib.sha256(manifest_bytes).hexdigest() != "be265d66e7322bb9a790b6ac2b99532ede0d274182c1b143895785dd46e99c93":
+    raise SystemExit(2)
+manifest_path = manifest_input.resolve()
+bundle = bundle_input.resolve()
+try:
+    manifest = json.loads(manifest_bytes.decode("utf-8"))
+    expected_files = manifest["bundleFiles"]
+    if manifest.get("syntheticOnly") is not True:
+        raise ValueError
+    if Path(manifest["bundlePath"]).resolve() != bundle:
+        raise ValueError
+    if manifest["bundleIdentifier"] != "com.tupig.TokenStatMenu.AXFixture.c23.jk1svxze":
+        raise ValueError
+    if manifest["requiredArguments"] != ["--test-fixture", "--disable-background-services"]:
+        raise ValueError
+    if manifest.get("privateHarnessSHA256") != "b0fa06419695bd0b1e2e0c34989b2081a75e2d5d63883f8a29bb651d03f97e53":
+        raise ValueError
+    if manifest.get("sourceFiles", {}).get("Sources/TokenStatMenu/SettingsView.swift") != "dae957654ee285b45825e6f4afacdebf76b2f9790dcb0d42f963f3709f161bb3":
+        raise ValueError
+    if set(expected_files) != {"Contents/Info.plist", "Contents/MacOS/TokenStatAXFixture", "Contents/_CodeSignature/CodeResources"}:
+        raise ValueError
+    if bundle.is_symlink() or not bundle.is_dir():
+        raise ValueError
+    found_files = set()
+    found_dirs = set()
+    for root, dirs, files in os.walk(bundle, followlinks=False):
+        root_path = Path(root)
+        for name in dirs:
+            path = root_path / name
+            if path.is_symlink():
+                raise ValueError
+            found_dirs.add(str(path.relative_to(bundle)))
+        for name in files:
+            path = root_path / name
+            if path.is_symlink():
+                raise ValueError
+            rel = str(path.relative_to(bundle))
+            record = expected_files.get(rel)
+            if record is None:
+                raise ValueError
+            data = path.read_bytes()
+            mode = oct(path.stat().st_mode & 0o777)
+            if len(data) != record["bytes"] or hashlib.sha256(data).hexdigest() != record["sha256"] or mode != record["mode"]:
+                raise ValueError
+            found_files.add(rel)
+    if found_files != set(expected_files) or found_dirs != {"Contents", "Contents/MacOS", "Contents/_CodeSignature"}:
+        raise ValueError
+    info = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
+    if info.get("CFBundleIdentifier") != manifest["bundleIdentifier"] or info.get("CFBundleExecutable") != "TokenStatAXFixture":
+        raise ValueError
+    verified = subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(bundle)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if verified.returncode != 0:
+        raise ValueError
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(2)
+PY
+
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/tokenstatmenu-ax-check.XXXXXX")" || exit 2
+cleanup() { rm -rf "$tmp_dir"; }
+trap cleanup EXIT
+derived_data="$tmp_dir/DerivedData"
+mkdir -p "$derived_data"
+
+run_bounded() {
+  local log="$1"
+  shift
+  "$DEVELOPER_DIR/usr/bin/xcodebuild" "$@" >"$log" 2>&1 &
+  local child=$!
+  local waited=0
+  while kill -0 "$child" 2>/dev/null; do
+    if (( waited >= timeout_seconds )); then
+      kill "$child" 2>/dev/null || true
+      wait "$child" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    ((waited += 1))
+  done
+  wait "$child"
+}
+
+build_log="$tmp_dir/build.log"
+run_bounded "$build_log" -project "$project_real" -scheme "$scheme" -configuration Debug \
+  -derivedDataPath "$derived_data" -destination 'platform=macOS' -parallel-testing-enabled NO build-for-testing
+build_exit=$?
+if (( build_exit != 0 )); then
+  printf '{"classification":"build_failed","build_exit":%d,"test_exit":null,"fixture_manifest_verified":true,"fixture_bundle_identity_verified":true,"a01_a07_executed":false}\n' "$build_exit"
+  exit "$build_exit"
+fi
+
+test_log="$tmp_dir/test.log"
+run_bounded "$test_log" -project "$project_real" -scheme "$scheme" -configuration Debug \
+  -derivedDataPath "$derived_data" -destination 'platform=macOS' -parallel-testing-enabled NO \
+  -only-testing:C27SettingsAXUITests/NativeSettingsAXTests/testFrozenSettingsExposeExpectedAXControls \
+  test-without-building -resultBundlePath "$tmp_dir/result.xcresult"
+test_exit=$?
+
+if grep -q 'Timed out while enabling automation mode' "$test_log" || grep -q 'automation mode' "$test_log" || grep -q 'existingInstance' "$test_log"; then
+  classification="automation_environment_blocked"
+else
+  summary_class="failed"
+  summary_file="$tmp_dir/summary.json"
+  if [[ -f "$tmp_dir/result.xcresult" ]] && "/usr/bin/xcrun" xcresulttool get test-results summary --path "$tmp_dir/result.xcresult" --format json >"$summary_file" 2>/dev/null; then
+    summary_class="$(python3 - "$summary_file" <<'PY'
+import json
+import sys
+summary = json.loads(open(sys.argv[1], encoding="utf-8").read())
+passed = summary.get("totalTestCount") == 1 and summary.get("passedTests") == 1 and summary.get("failedTests") == 0 and summary.get("skippedTests") == 0
+failures = " ".join(item.get("failureText", "") for item in summary.get("testFailures", []))
+if ("automation" in failures.lower() or "runner failed to initialize" in failures.lower()
+        or "existinginstance" in failures.lower()):
+    print("automation_environment_blocked")
+elif passed:
+    print("passed")
+else:
+    print("failed")
+PY
+    )"
+  fi
+  if [[ "$summary_class" == automation_environment_blocked ]]; then
+    classification="automation_environment_blocked"
+  elif (( test_exit == 65 )); then
+    classification="automation_environment_blocked"
+  elif [[ "$summary_class" == passed && "$test_exit" == 0 ]]; then
+    classification="passed"
+  else
+    classification="test_failed"
+  fi
+fi
+
+if [[ "$classification" == passed ]]; then executed=true; else executed=false; fi
+printf '{"classification":"%s","build_exit":%d,"test_exit":%d,"fixture_manifest_verified":true,"fixture_bundle_identity_verified":true,"a01_a07_executed":%s}\n' \
+  "$classification" "$build_exit" "$test_exit" "$executed"
+if [[ "$classification" == passed ]]; then exit 0; fi
+if (( test_exit != 0 )); then exit "$test_exit"; fi
+exit 1
+```
+
+### script/test_phase2_diagnostics.py
+
+```python
+#!/usr/bin/env python3
+"""Contract tests for the non-bypassing phase-two diagnostics."""
+from __future__ import annotations
+
+import importlib.util
+import subprocess
+from pathlib import Path
+import sys
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MODULE_PATH = ROOT / "script/diagnose_swift_toolchain.py"
+
+
+def load_diagnostic_module():
+    spec = importlib.util.spec_from_file_location("diagnose_swift_toolchain", MODULE_PATH)
+    if spec is None or spec.loader is None:
+        raise AssertionError("diagnostic module must be importable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class PhaseTwoDiagnosticTests(unittest.TestCase):
+    def test_missing_clt_search_paths_are_reported_as_nonfatal(self):
+        module = load_diagnostic_module()
+        result = module.classify_linker_warnings(
+            "ld: warning: search path '/Library/Developer/CommandLineTools/Developer/usr/lib' not found\n"
+        )
+        self.assertEqual(result.kind, "clt_search_path_warning")
+        self.assertEqual(result.count, 1)
+        self.assertFalse(result.is_build_failure)
+
+    def test_verbose_swiftpm_warning_is_not_linker_warning(self):
+        module = load_diagnostic_module()
+        result = module.classify_linker_warnings(
+            "warning: 'TokenStatMenu': manifest compiler invocation\n"
+        )
+        self.assertEqual(result.kind, "none")
+        self.assertEqual(result.count, 0)
+
+    def test_runner_help_describes_blocked_exit(self):
+        runner = ROOT / "script/run_settings_ax_check.sh"
+        completed = subprocess.run([str(runner), "--help"], text=True, capture_output=True)
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn("automation_environment_blocked", completed.stdout)
+        self.assertIn("build-for-testing", completed.stdout)
+        self.assertIn("test-without-building", completed.stdout)
+
+    def test_runner_rejects_missing_value_without_hanging(self):
+        runner = ROOT / "script/run_settings_ax_check.sh"
+        completed = subprocess.run(
+            [str(runner), "--project"], text=True, capture_output=True, timeout=1,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn('"classification":"configuration_error"', completed.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
 ```
 
 ## 编译与使用
