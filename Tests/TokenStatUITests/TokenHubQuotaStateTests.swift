@@ -5,30 +5,46 @@ import XCTest
 import TokenStatCore
 @testable import TokenStatMenu
 
-private final class HubTestScanner: TokenHubQuotaScanning {
-    private let lock = NSLock()
-    private var storedResult: TokenHubQuotaResult
-    var nextResult: TokenHubQuotaResult {
-        get { lock.lock(); defer { lock.unlock() }; return storedResult }
-        set { lock.lock(); storedResult = newValue; lock.unlock() }
-    }
+@MainActor
+private final class HubTestScanner {
+    var nextResult: TokenHubQuotaResult
     var started: (() -> Void)?
-    var beforeReturn: (() -> Void)?
+    var beforeReturn: (() async -> Void)?
     private var activeCount = 0
     private(set) var maximumConcurrent = 0
     private(set) var calls = 0
-    init(result: TokenHubQuotaResult) { storedResult = result }
+    private(set) var requests: [TokenHubAXRequest] = []
+    init(result: TokenHubQuotaResult) { nextResult = result }
 
-    func scan(now: Date, monotonicNow: () -> TimeInterval, permissionTrusted: Bool,
-              refreshSeconds: TimeInterval, mode: TokenHubRunMode,
-              generation: UInt64) -> TokenHubQuotaResult {
-        lock.lock(); calls += 1; activeCount += 1
+    var source: TokenHubAXSource {
+        .synthetic { request in await self.scan(request) }
+    }
+
+    func scan(_ request: TokenHubAXRequest) async -> TokenHubQuotaResult {
+        calls += 1; activeCount += 1; requests.append(request)
         maximumConcurrent = max(maximumConcurrent, activeCount)
-        let result = storedResult
-        lock.unlock()
-        started?(); beforeReturn?()
-        lock.lock(); activeCount -= 1; lock.unlock()
+        // Preserve the old fake's semantics: a suspended request returns the
+        // result captured when it started, not a later generation's value.
+        let result = nextResult
+        started?()
+        await beforeReturn?()
+        activeCount -= 1
         return result
+    }
+}
+
+/// Deterministic suspension without blocking the main actor's executor.
+@MainActor
+private final class HubScanGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func release() {
+        released = true
+        continuation?.resume(); continuation = nil
     }
 }
 
@@ -406,8 +422,8 @@ final class TokenHubQuotaStateTests: XCTestCase {
     }
 
     private func directModel(_ harness: HubDirectHarness, clock: HubManualClock,
-                             permission: HubTestPermission) -> AppModel {
-        let model = AppModel(preview: true, directQuota: harness.dependencies)
+                             permission: HubTestPermission, axSource: TokenHubAXSource? = nil) -> AppModel {
+        let model = AppModel(preview: true, directQuota: harness.dependencies, tokenHubAXSource: axSource)
         model.config.dataSource = "localCodex"
         model.config.refreshSeconds = 60
         model.tokenHubNow = { clock.now }
@@ -534,9 +550,8 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let harness = HubDirectHarness()
         let permission = HubTestPermission()
         let now = Date(timeIntervalSince1970: 1_800_000_000)
-        let model = directModel(harness, clock: HubManualClock(now), permission: permission)
         let scanner = HubTestScanner(result: result(now: now))
-        model.tokenHubScanner = scanner
+        let model = directModel(harness, clock: HubManualClock(now), permission: permission, axSource: scanner.source)
         defer { model.shutdown(); harness.finishPending() }
         model.setTokenHubAutomaticReadingEnabled(false)
         model.refreshTokenHubQuota()
@@ -552,10 +567,9 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let harness = HubDirectHarness()
         let permission = HubTestPermission()
         let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
-        let model = directModel(harness, clock: clock, permission: permission)
-        model.config.refreshSeconds = 0.05
         let scanner = HubTestScanner(result: result(now: clock.now))
-        model.tokenHubScanner = scanner
+        let model = directModel(harness, clock: clock, permission: permission, axSource: scanner.source)
+        model.config.refreshSeconds = 0.05
         defer { model.shutdown(); harness.finishPending() }
         model.refreshTokenHubQuota()
         guard await waitForDirectRequests(1, harness: harness) else { return }
@@ -579,14 +593,13 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let harness = HubDirectHarness()
         let permission = HubTestPermission()
         let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
-        let model = directModel(harness, clock: clock, permission: permission)
         let scanner = HubTestScanner(result: result(now: clock.now))
-        model.tokenHubScanner = scanner
+        let model = directModel(harness, clock: clock, permission: permission, axSource: scanner.source)
         let axStarted = expectation(description: "synthetic AX fallback started")
-        let releaseAX = DispatchSemaphore(value: 0)
+        let releaseAX = HubScanGate()
         scanner.started = { axStarted.fulfill() }
-        scanner.beforeReturn = { releaseAX.wait() }
-        defer { model.shutdown(); harness.finishPending(); releaseAX.signal() }
+        scanner.beforeReturn = { await releaseAX.wait() }
+        defer { model.shutdown(); harness.finishPending(); releaseAX.release() }
         model.refreshTokenHubQuota()
         guard await waitForDirectRequests(1, harness: harness) else { return }
         harness.complete(1, failure: .transportFailed)
@@ -598,7 +611,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         harness.complete(2)
         await waitForDirectObservation(model, at: clock.now)
         let directSnapshot = model.tokenHubQuotaSnapshot
-        releaseAX.signal()
+        releaseAX.release()
         for _ in 0..<100 {
             if model.backgroundServiceResources.axScanInFlightCount == 0 { break }
             try? await Task.sleep(for: .milliseconds(10))
@@ -609,6 +622,44 @@ final class TokenHubQuotaStateTests: XCTestCase {
         XCTAssertTrue(model.tokenHubQuotaIsDirect)
         XCTAssertEqual(model.tokenHubQuotaStatus, .connected)
         XCTAssertNil(model.tokenHubDirectFailure)
+    }
+
+    func testLateAXAfterRelaunchCannotUnlockCurrentDirectRequest() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission()
+        let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let scanner = HubTestScanner(result: result(now: clock.now))
+        let model = directModel(harness, clock: clock, permission: permission, axSource: scanner.source)
+        let gate = HubScanGate()
+        let started = expectation(description: "old target AX fallback suspended")
+        scanner.started = { started.fulfill() }
+        scanner.beforeReturn = { await gate.wait() }
+        defer { model.shutdown(); harness.finishPending(); gate.release() }
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1, failure: .transportFailed)
+        await fulfillment(of: [started], timeout: 2)
+
+        model.tokenHubApplicationDidTerminate(bundleIdentifier: TokenHubTarget.bundleID)
+        clock.now = clock.now.addingTimeInterval(1)
+        model.tokenHubApplicationDidLaunch(bundleIdentifier: TokenHubTarget.bundleID)
+        guard await waitForDirectRequests(2, harness: harness) else { return }
+        gate.release()
+        for _ in 0..<100 {
+            if model.backgroundServiceResources.axScanInFlightCount == 0 { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertNil(model.tokenHubQuotaSnapshot, "pre-exit AX data cannot become current after relaunch")
+        model.refreshTokenHubQuota()
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(harness.requestCount, 2,
+                       "an old AX completion must not release the newer direct request's in-flight guard")
+        XCTAssertEqual(scanner.calls, 1)
+        XCTAssertEqual(model.backgroundServiceResources.axScanInFlightCount, 0)
+        harness.complete(2)
+        await waitForDirectObservation(model, at: clock.now)
+        XCTAssertTrue(model.tokenHubQuotaIsDirect)
+        XCTAssertEqual(permission.requests, 0)
     }
 
     private func result(now: Date) -> TokenHubQuotaResult {
@@ -634,14 +685,13 @@ final class TokenHubQuotaStateTests: XCTestCase {
 
     private func configuredModel(_ value: TokenHubQuotaResult, clock: HubManualClock)
         -> (AppModel, HubTestScanner, HubTestPermission) {
-        let model = AppModel(preview: true)
+        let scanner = HubTestScanner(result: value)
+        let model = AppModel(preview: true, tokenHubAXSource: scanner.source)
         model.config.dataSource = "localCodex"
         model.config.refreshSeconds = 60
         model.tokenHubAutomaticReadingEnabled = true
         model.tokenHubNow = { clock.now }
-        let scanner = HubTestScanner(result: value)
         let permission = HubTestPermission()
-        model.tokenHubScanner = scanner
         model.tokenHubPermissionProvider = permission
         return (model, scanner, permission)
     }
@@ -672,12 +722,11 @@ final class TokenHubQuotaStateTests: XCTestCase {
                        "fixture mode must retain synthetic scanner injection for deterministic state tests")
         XCTAssertFalse(AppModel.shouldSuppressNativeTokenHubRead(isTestFixture: false, scannerIsNative: true))
 
-        let model = AppModel(preview: true)
+        let scanner = HubTestScanner(result: TokenHubQuotaResult(status: .targetNotRunning, snapshot: nil, failure: nil))
+        let model = AppModel(preview: true, tokenHubAXSource: scanner.source)
         defer { model.shutdown() }
         model.config.dataSource = "localCodex"
         model.tokenHubAutomaticReadingEnabled = false
-        let scanner = HubTestScanner(result: TokenHubQuotaResult(status: .targetNotRunning, snapshot: nil, failure: nil))
-        model.tokenHubScanner = scanner
 
         var staleEnabledDraft = AppConfiguration()
         staleEnabledDraft.model = "saved-other-setting"
@@ -697,6 +746,82 @@ final class TokenHubQuotaStateTests: XCTestCase {
                       "a stale disabled draft cannot overwrite a newer on toggle")
         XCTAssertEqual(savedEnabled.model, "second-saved-setting", "the second unrelated setting is preserved")
         XCTAssertEqual(scanner.calls, 0, "configuration reconciliation itself performs no scan")
+    }
+
+    func testNativeAXWorkerRejectsUntrustedRequestAndSourceRetainsNativeKind() async {
+        let request = TokenHubAXRequest(now: Date(timeIntervalSince1970: 1_800_000_000),
+            permissionTrusted: false, refreshSeconds: 60, mode: .localCodex, generation: 41)
+        let workerResult = await NativeTokenHubAXWorker().scan(request)
+        XCTAssertEqual(workerResult.status, .permissionRequired)
+        XCTAssertEqual(workerResult.failure, .permissionMissing)
+        XCTAssertNil(workerResult.snapshot)
+
+        // The real reader uses Core's already-tested pre-discovery permission
+        // gate. This negative call never discovers a process or sends AX I/O.
+        let native = TokenHubAXSource.production
+        XCTAssertEqual(native.kind, .native, "closure wrapping must not erase fixture suppression identity")
+        let wrappedResult = await native.scan(request)
+        XCTAssertEqual(wrappedResult.status, .permissionRequired)
+        XCTAssertEqual(wrappedResult.failure, .permissionMissing)
+        XCTAssertNil(wrappedResult.snapshot)
+        XCTAssertTrue(AppModel.shouldSuppressNativeTokenHubRead(isTestFixture: true,
+            scannerIsNative: native.kind == .native))
+        XCTAssertFalse(AppModel.shouldSuppressNativeTokenHubRead(isTestFixture: false,
+            scannerIsNative: native.kind == .native), "ordinary preview behavior must stay unchanged")
+
+        let scanner = HubTestScanner(result: wrappedResult)
+        XCTAssertEqual(scanner.source.kind, .synthetic)
+        XCTAssertFalse(AppModel.shouldSuppressNativeTokenHubRead(isTestFixture: true,
+            scannerIsNative: scanner.source.kind == .native))
+        let defaultModel = AppModel(preview: true)
+        defer { defaultModel.shutdown() }
+        XCTAssertEqual(defaultModel.isFixtureUsingNativeTokenHubReader, defaultModel.isTestFixture,
+                       "the default source stays classified as native after initializer injection")
+    }
+
+    func testPendingAXRejectsLateResultsAfterDisableRevocationModeChangeAndShutdown() async {
+        enum Transition: CaseIterable { case disable, revoke, proxy, shutdown }
+        for transition in Transition.allCases {
+            let now = Date(timeIntervalSince1970: 1_800_000_000)
+            let clock = HubManualClock(now)
+            let (model, scanner, permission) = configuredModel(result(now: now), clock: clock)
+            let gate = HubScanGate()
+            defer { model.shutdown(); gate.release() }
+            let started = expectation(description: "AX suspended before \(transition)")
+            scanner.started = { started.fulfill() }
+            scanner.beforeReturn = { await gate.wait() }
+            model.refreshTokenHubQuota()
+            await fulfillment(of: [started], timeout: 2)
+            XCTAssertEqual(model.backgroundServiceResources.axScanInFlightCount, 1)
+
+            let status: TokenHubQuotaStatus
+            switch transition {
+            case .disable:
+                model.setTokenHubAutomaticReadingEnabled(false); status = .disabled
+            case .revoke:
+                clock.now = clock.now.addingTimeInterval(2.1); permission.trusted = false
+                model.refreshTokenHubQuota(); status = .permissionRequired
+            case .proxy:
+                model.config.dataSource = "proxy"; model.refreshTokenHubQuota(); status = .disabled
+            case .shutdown:
+                model.shutdown(); status = .disabled
+            }
+            XCTAssertEqual(model.tokenHubQuotaStatus, status)
+            XCTAssertNil(model.tokenHubQuotaSnapshot)
+            gate.release()
+            for _ in 0..<100 {
+                let resources = model.backgroundServiceResources
+                if resources.axScanInFlightCount == 0 && resources.axRefreshScheduledCount == 0 { break }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertEqual(model.tokenHubQuotaStatus, status, "late success cannot undo \(transition)")
+            XCTAssertNil(model.tokenHubQuotaSnapshot, "late success cannot repopulate after \(transition)")
+            XCTAssertEqual(scanner.calls, 1)
+            XCTAssertEqual(scanner.maximumConcurrent, 1)
+            XCTAssertEqual(model.backgroundServiceResources.axScanInFlightCount, 0)
+            XCTAssertEqual(model.backgroundServiceResources.axRefreshScheduledCount, 0)
+            XCTAssertEqual(permission.requests, 0)
+        }
     }
 
     func testHubSnapshotFreshnessAndTokenAccountingIsolation() async {
@@ -793,13 +918,14 @@ final class TokenHubQuotaStateTests: XCTestCase {
 
         scanner.nextResult = result(now: now)
         let started = expectation(description: "late scan started")
-        let release = DispatchSemaphore(value: 0)
+        let release = HubScanGate()
+        defer { release.release() }
         scanner.started = { started.fulfill() }
-        scanner.beforeReturn = { release.wait() }
+        scanner.beforeReturn = { await release.wait() }
         model.refreshTokenHubQuota()
         await fulfillment(of: [started], timeout: 2)
         model.shutdown()
-        release.signal()
+        release.release()
         try? await Task.sleep(for: .milliseconds(100))
         XCTAssertNil(model.tokenHubQuotaSnapshot, "shutdown rejects a late scanner completion")
     }
@@ -809,17 +935,30 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let (model, scanner, _) = configuredModel(result(now: now), clock: HubManualClock(now))
         defer { model.shutdown() }
         let started = expectation(description: "one scan started")
-        let release = DispatchSemaphore(value: 0)
+        let release = HubScanGate()
+        defer { release.release() }
         scanner.started = { started.fulfill() }
-        scanner.beforeReturn = { release.wait() }
+        scanner.beforeReturn = { await release.wait() }
         model.refreshTokenHubQuota()
         await fulfillment(of: [started], timeout: 2)
+        XCTAssertEqual(model.backgroundServiceResources.axScanInFlightCount, 1)
+        XCTAssertEqual(model.backgroundServiceResources.axRefreshScheduledCount, 0)
+        let heartbeat = expectation(description: "main actor remains responsive during an AX suspension")
+        Task { @MainActor in heartbeat.fulfill() }
+        await fulfillment(of: [heartbeat], timeout: 1)
         model.refreshTokenHubQuota()
         try? await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(scanner.calls, 1, "a second refresh cannot overlap an in-flight scan")
-        release.signal()
+        XCTAssertEqual(scanner.requests.first?.now, now)
+        XCTAssertEqual(scanner.requests.first?.mode, .localCodex)
+        XCTAssertEqual(scanner.requests.first?.permissionTrusted, true)
+        XCTAssertEqual(scanner.requests.first?.refreshSeconds, 60)
+        release.release()
         try? await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(scanner.maximumConcurrent, 1)
+        XCTAssertEqual(model.backgroundServiceResources.axScanInFlightCount, 0)
+        XCTAssertEqual(model.backgroundServiceResources.axRefreshScheduledCount, 1,
+                       "one completion schedules one completion-relative next refresh")
     }
 
     func testMetadataLifecycleEventsInvalidateOldGenerationAndGateRelaunch() async {
@@ -834,9 +973,10 @@ final class TokenHubQuotaStateTests: XCTestCase {
         XCTAssertEqual(model.tokenHubQuotaSnapshot, initial, "unrelated app metadata cannot invalidate the selected target")
 
         let blocked = expectation(description: "old generation scan started")
-        let release = DispatchSemaphore(value: 0)
+        let release = HubScanGate()
+        defer { release.release() }
         scanner.started = { blocked.fulfill() }
-        scanner.beforeReturn = { release.wait() }
+        scanner.beforeReturn = { await release.wait() }
         model.refreshTokenHubQuota()
         await fulfillment(of: [blocked], timeout: 2)
 
@@ -850,7 +990,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         scanner.nextResult = TokenHubQuotaResult(status: .accessFailed, snapshot: nil, failure: .axError)
         scanner.started = nil
         scanner.beforeReturn = nil
-        release.signal()
+        release.release()
         await settle(model, status: .accessFailed)
         XCTAssertNil(model.tokenHubQuotaSnapshot, "blocked pre-exit success cannot repopulate after target relaunch")
         XCTAssertEqual(scanner.calls, 3, "relaunch performs a new read after the blocked generation exits")
@@ -894,14 +1034,17 @@ final class TokenHubQuotaStateTests: XCTestCase {
             hostingView.frame = bounds
             let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
+            defer { window.close() }
             window.appearance = NSAppearance(named: appearance)
             window.contentView = hostingView
             window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
             window.displayIfNeeded()
             hostingView.layoutSubtreeIfNeeded()
-            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            try await Task.sleep(for: .milliseconds(200))
+            window.displayIfNeeded()
+            hostingView.layoutSubtreeIfNeeded()
             guard let bitmap = hostingView.bitmapImageRepForCachingDisplay(in: bounds) else {
-                window.close(); XCTFail("synthetic Hub dashboard bitmap should be available"); return
+                XCTFail("synthetic Hub dashboard bitmap should be available"); return
             }
             hostingView.cacheDisplay(in: bounds, to: bitmap)
             let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
@@ -911,7 +1054,6 @@ final class TokenHubQuotaStateTests: XCTestCase {
             XCTAssertEqual(decoded.pixelsHigh, 700 * pixelScale)
             XCTAssertGreaterThan(png.count, 0)
             try png.write(to: output.appendingPathComponent("synthetic-tokenhub-\(name).png"))
-            window.close()
         }
 
         let cardBounds = NSRect(x: 0, y: 0, width: 460, height: 280)
@@ -926,14 +1068,17 @@ final class TokenHubQuotaStateTests: XCTestCase {
             hostingView.frame = cardBounds
             let window = NSWindow(contentRect: cardBounds, styleMask: .borderless, backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
+            defer { window.close() }
             window.appearance = NSAppearance(named: appearance)
             window.contentView = hostingView
             window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
             window.displayIfNeeded()
             hostingView.layoutSubtreeIfNeeded()
-            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            try await Task.sleep(for: .milliseconds(200))
+            window.displayIfNeeded()
+            hostingView.layoutSubtreeIfNeeded()
             guard let bitmap = hostingView.bitmapImageRepForCachingDisplay(in: cardBounds) else {
-                window.close(); XCTFail("synthetic full-card bitmap should be available"); return
+                XCTFail("synthetic full-card bitmap should be available"); return
             }
             hostingView.cacheDisplay(in: cardBounds, to: bitmap)
             let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
@@ -943,7 +1088,6 @@ final class TokenHubQuotaStateTests: XCTestCase {
             XCTAssertEqual(decoded.pixelsHigh, 280 * pixelScale)
             XCTAssertGreaterThan(png.count, 0)
             try png.write(to: output.appendingPathComponent("synthetic-tokenhub-full-card-\(name).png"))
-            window.close()
         }
         print("Synthetic Token Hub dashboard renders: \(output.path)/synthetic-tokenhub-light.png and synthetic-tokenhub-dark.png")
         print("Synthetic full-card renders: \(output.path)/synthetic-tokenhub-full-card-light.png and synthetic-tokenhub-full-card-dark.png")
@@ -985,5 +1129,155 @@ extension TokenHubQuotaStateTests {
         XCTAssertEqual(TokenHubQuotaCard.resetLabel("  "), "重置时间未知")
         XCTAssertEqual(TokenHubQuotaCard.resetLabel("未知"), "重置时间未知")
         XCTAssertEqual(TokenHubQuotaCard.resetLabel("01-15 08:00"), "重置 01-15 08:00")
+    }
+}
+
+
+private actor ControlledLocalScan {
+    private var pending: [(Int, CheckedContinuation<LocalCodexScanWorker.Result, Error>)] = []
+    private(set) var requests = 0
+    private(set) var maximumPending = 0
+    func scan(generation: Int) async throws -> LocalCodexScanWorker.Result {
+        requests += 1
+        return try await withCheckedThrowingContinuation { continuation in
+            pending.append((generation, continuation)); maximumPending = max(maximumPending, pending.count)
+        }
+    }
+    func completeFirst(total: Int) {
+        guard !pending.isEmpty else { return }
+        let (_, continuation) = pending.removeFirst()
+        continuation.resume(returning: LocalCodexScanWorker.Result(
+            snapshot: LocalCodexSnapshot(input: total, output: 0, total: total,
+                sessionCount: 1, filesScanned: 1, isLimited: false, latestEventAt: nil,
+                fiveHour: nil, sevenDay: nil, knownThreadCount: 1),
+            diagnostics: LocalCodexUsageReader.Cache().diagnostics))
+    }
+    func finishPending() {
+        while !pending.isEmpty { pending.removeFirst().1.resume(throwing: CancellationError()) }
+    }
+}
+
+extension TokenHubQuotaStateTests {
+    private func workerFixture() throws -> (URL, Date) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("TokenStatMenu-C23B-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let stamp = ISO8601DateFormatter().string(from: now)
+        let id = "51515151-5151-4515-8515-515151515151"
+        let rows: [[String: Any]] = [
+            ["type": "session_meta", "payload": ["id": id, "source": "cli", "model_provider": "synthetic"]],
+            ["timestamp": stamp, "type": "event_msg", "payload": ["type": "token_count",
+                "info": ["total_token_usage": ["input_tokens": 10, "output_tokens": 5, "total_tokens": 15]]]]
+        ]
+        var bytes = Data()
+        for row in rows { bytes.append(try JSONSerialization.data(withJSONObject: row)); bytes.append(10) }
+        try bytes.write(to: directory.appendingPathComponent("rollout-fixture-\(id).jsonl"))
+        return (directory, now)
+    }
+
+    func testLocalWorkerReusesRealCacheAndResetsItForNewGeneration() async throws {
+        let (directory, now) = try workerFixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let worker = LocalCodexScanWorker()
+        let cold = try await worker.scan(directory: directory, now: now, generation: 7, routeContext: nil)
+        XCTAssertEqual(cold.snapshot.total, 15)
+        XCTAssertEqual(cold.diagnostics.parsedFiles, 1)
+        let warm = try await worker.scan(directory: directory, now: now, generation: 7, routeContext: nil)
+        XCTAssertEqual(warm.snapshot, cold.snapshot)
+        XCTAssertEqual(warm.diagnostics.cacheHits, 1)
+        XCTAssertEqual(warm.diagnostics.bytesRead, 0)
+        let restarted = try await worker.scan(directory: directory, now: now, generation: 8, routeContext: nil)
+        XCTAssertEqual(restarted.snapshot.total, 15)
+        XCTAssertEqual(restarted.diagnostics.parsedFiles, 1, "a new generation cannot inherit the old worker cache")
+        XCTAssertEqual(restarted.diagnostics.cacheHits, 0)
+    }
+
+    func testLocalWorkerSerializesConcurrentRequestsAndKeepsRoutesIsolated() async throws {
+        let (directory, now) = try workerFixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let worker = LocalCodexScanWorker()
+        let route = LocalCodexRouteContext.verified(provider: "synthetic", origin: "https://gateway.example")
+        let results = try await withThrowingTaskGroup(of: LocalCodexScanWorker.Result.self) { group in
+            for _ in 0..<24 {
+                group.addTask { try await worker.scan(directory: directory, now: now, generation: 9, routeContext: route) }
+            }
+            var results: [LocalCodexScanWorker.Result] = []
+            for try await result in group { results.append(result) }
+            return results
+        }
+        XCTAssertEqual(results.count, 24)
+        XCTAssertTrue(results.allSatisfy { $0.snapshot.total == 15 && $0.snapshot.knownThreadCount == 1 })
+        XCTAssertEqual(results.filter { $0.diagnostics.parsedFiles == 1 }.count, 1)
+        XCTAssertEqual(results.filter { $0.diagnostics.cacheHits == 1 && $0.diagnostics.bytesRead == 0 }.count, 23)
+        let unknown = try await worker.scan(directory: directory, now: now, generation: 9, routeContext: .unverified)
+        XCTAssertEqual(unknown.snapshot.total, 0)
+        XCTAssertEqual(unknown.snapshot.knownThreadCount, 0)
+        let restored = try await worker.scan(directory: directory, now: now, generation: 9, routeContext: route)
+        XCTAssertEqual(restored.snapshot.total, 15)
+        XCTAssertEqual(restored.diagnostics.parsedFiles, 1, "a route change cannot reuse a summary from another source")
+    }
+
+    private func localConsumer(_ harness: ControlledLocalScan) -> AppModel {
+        let noHub = TokenHubDirectQuotaDependencies(discoverTarget: { throw TokenHubQuotaFailure.noTarget },
+            identityIsCurrent: { _ in false }, fetch: { _, _ in throw TokenHubDirectQuotaFailure.transportFailed })
+        let source = LocalCodexScanDependencies(resolveInputs: {
+            (directory: URL(fileURLWithPath: "/synthetic-unused-local-scan"), routeContext: .unverified)
+        }, scan: { _, _, generation, _ in try await harness.scan(generation: generation) })
+        let model = AppModel(startup: AppModelStartupDependencies(loadPreferences: { nil },
+            savePreferences: { _ in }, shouldStartBackgroundServices: { true }),
+            directQuota: noHub, localScanning: source)
+        let permission = HubTestPermission(); permission.trusted = false
+        model.tokenHubPermissionProvider = permission
+        return model
+    }
+
+    private func waitForLocalRequests(_ count: Int, harness: ControlledLocalScan) async {
+        for _ in 0..<100 {
+            if await harness.requests >= count { return }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("controlled local request did not arrive")
+    }
+
+    func testLocalConsumerRejectsOldGenerationWithoutOverlappingOrLosingRefresh() async {
+        let harness = ControlledLocalScan()
+        let model = localConsumer(harness)
+        defer { model.shutdown(); Task { await harness.finishPending() } }
+        await waitForLocalRequests(1, harness: harness)
+        model.reload()
+        try? await Task.sleep(for: .milliseconds(20))
+        let requestsWhileOldReadRuns = await harness.requests
+        XCTAssertEqual(requestsWhileOldReadRuns, 1, "reload must not overlap the old local read")
+        await harness.completeFirst(total: 111)
+        await waitForLocalRequests(2, harness: harness)
+        XCTAssertEqual(model.localSnapshot.total, 0, "the old generation must not publish after reload")
+        await harness.completeFirst(total: 15)
+        for _ in 0..<100 where model.localSnapshot.total != 15 { try? await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertEqual(model.localSnapshot.total, 15)
+        XCTAssertEqual(model.backgroundServiceResources.localScanQueuedCount, 1)
+        try? await Task.sleep(for: .milliseconds(30))
+        let requestsAfterCompletion = await harness.requests
+        let maximumPending = await harness.maximumPending
+        XCTAssertEqual(requestsAfterCompletion, 2, "completion must schedule at the five-second cadence, not immediate repetition")
+        XCTAssertEqual(maximumPending, 1)
+    }
+
+    func testLocalConsumerShutdownRejectsLateResultAndOwnsNoMoreResources() async {
+        let harness = ControlledLocalScan()
+        let model = localConsumer(harness)
+        defer { model.shutdown(); Task { await harness.finishPending() } }
+        await waitForLocalRequests(1, harness: harness)
+        model.shutdown()
+        await harness.completeFirst(total: 111)
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(model.localSnapshot.total, 0)
+        let resources = model.backgroundServiceResources
+        XCTAssertEqual(resources.timerCount, 0)
+        XCTAssertEqual(resources.workspaceObserverCount, 0)
+        XCTAssertEqual(resources.localScanQueuedCount, 0)
+        XCTAssertEqual(resources.axRefreshScheduledCount, 0)
+        XCTAssertEqual(resources.axScanInFlightCount, 0)
+        let requestsAfterShutdown = await harness.requests
+        XCTAssertEqual(requestsAfterShutdown, 1)
     }
 }

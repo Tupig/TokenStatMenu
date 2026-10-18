@@ -92,6 +92,45 @@ struct TokenHubDirectQuotaDependencies {
     }
 }
 
+/// Owns the non-Sendable mutable cache on one checked executor. Only numeric
+/// value snapshots cross back to the main actor; no cache reference escapes.
+actor LocalCodexScanWorker {
+    struct Result: Sendable {
+        let snapshot: LocalCodexSnapshot
+        let diagnostics: LocalCodexUsageReader.Cache.Diagnostics
+    }
+
+    private var cache = LocalCodexUsageReader.Cache()
+    private var cacheGeneration: Int?
+
+    func scan(directory: URL, now: Date, generation: Int,
+              routeContext: LocalCodexRouteContext?) throws -> Result {
+        // This method has no suspension point while the cache is in use:
+        // actor isolation serializes complete reads, including invalidation.
+        if cacheGeneration != generation {
+            cache = LocalCodexUsageReader.Cache()
+            cacheGeneration = generation
+        }
+        let snapshot = try LocalCodexUsageReader.scan(directory: directory, now: now,
+                                                       cache: cache, routeContext: routeContext)
+        return Result(snapshot: snapshot, diagnostics: cache.diagnostics)
+    }
+}
+
+/// Resolve the same permitted inputs on the main actor, then run bounded file
+/// I/O in the cache owner. Injection replaces external I/O in lifecycle checks.
+struct LocalCodexScanDependencies {
+    let resolveInputs: @MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext)
+    let scan: @Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result
+
+    @MainActor static var production: LocalCodexScanDependencies {
+        let worker = LocalCodexScanWorker()
+        return LocalCodexScanDependencies(resolveInputs: {
+            (LocalCodexUsageReader.defaultSessionsDirectory(), AppModel.seasunRouteContext())
+        }, scan: { try await worker.scan(directory: $0, now: $1, generation: $2, routeContext: $3) })
+    }
+}
+
 struct BackgroundServiceResources: Equatable, Encodable {
     let timerCount: Int
     let workspaceObserverCount: Int
@@ -122,6 +161,7 @@ struct PresentationTimeState: Equatable {
     private let isPreview: Bool
     private let startup: AppModelStartupDependencies
     private let directQuota: TokenHubDirectQuotaDependencies
+    private let tokenHubAXSource: TokenHubAXSource
     private let usesDirectQuotaSource: Bool
     private(set) var backgroundServicesStarted = false
     private(set) var permissionPromptRequested = false
@@ -162,7 +202,6 @@ struct PresentationTimeState: Equatable {
         get { preferences.tokenHubCompatibilityReadEnabled }
         set { preferences.tokenHubCompatibilityReadEnabled = newValue }
     }
-    var tokenHubScanner: TokenHubQuotaScanning = TokenHubAXReader()
     var tokenHubPermissionProvider: TokenHubPermissionProviding = TokenHubNativePermissionProvider()
     var tokenHubNow: () -> Date = Date.init
     @Published var panelVisible = false
@@ -170,15 +209,13 @@ struct PresentationTimeState: Equatable {
     private var timer: Timer?
     private var localScan: DispatchWorkItem?
     private var localScanRunning = false
-    private let tokenHubQueue = DispatchQueue(label: "TokenStatMenu.tokenHubAX", qos: .utility)
     private var tokenHubRefreshWork: DispatchWorkItem?
     private var tokenHubScanInFlight = false
     private var tokenHubDirectScanInFlight = false
     private var tokenHubWorkspaceObservers: [NSObjectProtocol] = []
     private var lastTokenHubPermissionCheck = Date.distantPast
     private var cachedTokenHubPermission = false
-    private let localScanQueue = DispatchQueue(label: "TokenStatMenu.localCodexScan", qos: .utility)
-    private var localCache = LocalCodexUsageReader.Cache()
+    private let localScanning: LocalCodexScanDependencies
     private var localRefreshScheduler = LocalRefreshScheduler()
     private var isShuttingDown = false
     private var generation = 0
@@ -208,10 +245,14 @@ struct PresentationTimeState: Equatable {
     }
 
     init(preview: Bool = false, startup: AppModelStartupDependencies = .production,
-         directQuota: TokenHubDirectQuotaDependencies? = nil) {
+         directQuota: TokenHubDirectQuotaDependencies? = nil,
+         localScanning: LocalCodexScanDependencies? = nil,
+         tokenHubAXSource: TokenHubAXSource? = nil) {
         isPreview = preview
         self.startup = startup
         self.directQuota = directQuota ?? .production
+        self.tokenHubAXSource = tokenHubAXSource ?? .production
+        self.localScanning = localScanning ?? .production
         usesDirectQuotaSource = directQuota != nil || !(preview || CommandLine.arguments.contains("--test-fixture"))
         if preview {
             sourceReadinessText = "模拟预览 · 无配置读取、无自动服务"
@@ -489,7 +530,6 @@ struct PresentationTimeState: Equatable {
         tokenHubQuotaStatus = tokenHubQuotaReadingEnabled ? .targetNotRunning : .disabled
         lastTokenHubPermissionCheck = .distantPast; cachedTokenHubPermission = false
         _ = localRefreshScheduler.invalidate()
-        localCache = LocalCodexUsageReader.Cache()
         localScan?.cancel(); localScan = nil
         localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
             filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
@@ -543,30 +583,23 @@ struct PresentationTimeState: Equatable {
                     self.scheduleLocalScan(immediate: false); return
                 }
                 self.localScanRunning = true
-                let directory = LocalCodexUsageReader.defaultSessionsDirectory()
-                let routeContext = self.seasunRouteContext()
-                let cache = self.localCache
-                self.localScanQueue.async {
-                    let result = try? LocalCodexUsageReader.scan(directory: directory, now: Date(), cache: cache,
-                        routeContext: routeContext)
-                    Task { @MainActor in
-                        self.localScanRunning = false
-                        guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
-                            if self.config.dataSource == "localCodex", self.backgroundServicesStarted, !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
-                            return
-                        }
-                        if self.config.dataSource == "localCodex" {
-                            if let result {
-                                self.localSnapshot = result; self.fiveHourQuota = result.fiveHour; self.sevenDayQuota = result.sevenDay
-                                self.quotaError = result.latestEventAt == nil ? "未发现有效本地用量记录" : "额度来自 Codex 会话事件，可能已过期"
-                            } else {
-                                self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
-                                self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
-                            }
-                        }
-                        if self.config.dataSource == "localCodex", self.backgroundServicesStarted { self.scheduleLocalScan() }
+                let inputs = self.localScanning.resolveInputs()
+                let result = try? await self.localScanning.scan(inputs.directory, Date(), version, inputs.routeContext)
+                self.localScanRunning = false
+                guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
+                    if self.config.dataSource == "localCodex", self.backgroundServicesStarted, !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
+                    return
+                }
+                if self.config.dataSource == "localCodex" {
+                    if let snapshot = result?.snapshot {
+                        self.localSnapshot = snapshot; self.fiveHourQuota = snapshot.fiveHour; self.sevenDayQuota = snapshot.sevenDay
+                        self.quotaError = snapshot.latestEventAt == nil ? "未发现有效本地用量记录" : "额度来自 Codex 会话事件，可能已过期"
+                    } else {
+                        self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
+                        self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
                     }
                 }
+                if self.config.dataSource == "localCodex", self.backgroundServicesStarted { self.scheduleLocalScan() }
             }
         }
         localScan = work
@@ -576,7 +609,7 @@ struct PresentationTimeState: Equatable {
     /// Associates the current Codex provider with this local Token Hub's
     /// configured origin. Historical rollout routes are not independently
     /// verifiable from the current provider name and configuration alone.
-    private func seasunRouteContext() -> LocalCodexRouteContext {
+    fileprivate static func seasunRouteContext() -> LocalCodexRouteContext {
         let configURL = LocalCodexUsageReader.defaultConfigURL()
         guard let active = GatewayDiscovery.activeCodexProvider(at: configURL),
               let connectionURLs = try? TokenHubConnectionDiscovery.readDefaultConnectionBaseURLs(),
@@ -685,27 +718,26 @@ struct PresentationTimeState: Equatable {
         tokenHubScanInFlight = true
         let version = tokenHubGeneration, axVersion = tokenHubAXGeneration, mode: TokenHubRunMode = .localCodex
         let now = tokenHubNow(), interval = config.refreshSeconds
-        let scanner = tokenHubScanner
-        let permission = cachedTokenHubPermission
-        tokenHubQueue.async { [weak self] in
-            let result = scanner.scan(now: now, monotonicNow: { ProcessInfo.processInfo.systemUptime },
-                                      permissionTrusted: permission, refreshSeconds: interval,
-                                      mode: mode, generation: version)
-            Task { @MainActor in
-                guard let self else { return }
-                self.tokenHubScanInFlight = false
-                guard !self.isShuttingDown, self.tokenHubGeneration == version, self.tokenHubAXGeneration == axVersion,
-                      self.config.dataSource == "localCodex", self.tokenHubAutomaticReadingEnabled,
-                      self.cachedTokenHubPermission, !self.tokenHubQuotaIsDirect else {
-                    if !self.isShuttingDown, self.config.dataSource == "localCodex",
-                       self.tokenHubQuotaReadingEnabled {
-                        self.scheduleTokenHubRefresh(after: self.tokenHubQuotaIsDirect ? interval : 0)
-                    }
-                    return
+        let source = tokenHubAXSource
+        let request = TokenHubAXRequest(now: now, permissionTrusted: cachedTokenHubPermission,
+            refreshSeconds: interval, mode: mode, generation: version)
+        Task(priority: .utility) { [weak self] in
+            // The main actor only awaits a value. Native traversal runs as one
+            // non-suspending operation on its private worker actor.
+            let result = await source.scan(request)
+            guard let self else { return }
+            self.tokenHubScanInFlight = false
+            guard !self.isShuttingDown, self.tokenHubGeneration == version, self.tokenHubAXGeneration == axVersion,
+                  self.config.dataSource == "localCodex", self.tokenHubAutomaticReadingEnabled,
+                  self.cachedTokenHubPermission, !self.tokenHubQuotaIsDirect else {
+                if !self.isShuttingDown, self.config.dataSource == "localCodex",
+                   self.tokenHubQuotaReadingEnabled {
+                    self.scheduleTokenHubRefresh(after: self.tokenHubQuotaIsDirect ? interval : 0)
                 }
-                self.applyTokenHubQuotaResult(result, generation: version, mode: mode, now: self.tokenHubNow())
-                self.scheduleTokenHubRefresh(after: self.config.refreshSeconds)
+                return
             }
+            self.applyTokenHubQuotaResult(result, generation: version, mode: mode, now: self.tokenHubNow())
+            self.scheduleTokenHubRefresh(after: self.config.refreshSeconds)
         }
     }
 
@@ -833,7 +865,7 @@ struct PresentationTimeState: Equatable {
     }
     var isFixtureUsingNativeTokenHubReader: Bool {
         Self.shouldSuppressNativeTokenHubRead(isTestFixture: isTestFixture,
-            scannerIsNative: tokenHubScanner is TokenHubAXReader)
+            scannerIsNative: tokenHubAXSource.kind == .native)
     }
 
     private func installTokenHubWorkspaceObservers() {

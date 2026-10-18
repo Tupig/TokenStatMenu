@@ -1,5 +1,39 @@
 # 验证记录
 
+## 1.1.2 — 金额解析、并发边界与构建维护（2026-10-18）
+
+本节记录当前 1.1.2（build 4）候选的本地回归、构建与固定安装结果，后续各节保留原版本证据。最终干净提交来源、精确暂存/源码包复核、CI 与公开发布尚未完成；不能将 1.1.1 的通过结果套用于本候选。
+
+| 检查 | 当前已取得证据 | 覆盖与限制 |
+| --- | --- | --- |
+| 核心金额与原有 Core 回归 | 最终隔离集成中 611/611 通过 | 包含实际 decoder 的滚动/月度四类金额字段 |
+| 状态与并发回归 | 独立复跑 `TokenHubQuotaStateTests` 38/38，0 失败；该次编译 0 warning / 0 error | 使用完整 Xcode 与独立 scratch；不是完整原生套件、实际 Xcode 工程或真实 AX 正向验收 |
+| 独立检查充分性和源码审查 | 金额、local cache actor、native AX actor 均完成对应审查 | 实际检查先于成对实现；源码复核不替代运行验收 |
+| 隔离集成 | 最终 `script/test.sh` 退出码 0 | 核心、build-only 不全局终止/不启动、源码身份及五组隔离启动全部通过；不证明真实 Hub 默认接通 |
+| Xcode arm64 Release | 最终实际工程 `BUILD SUCCEEDED`，退出码 0 | 原 AX scanner 非 Sendable 捕获 warning 已消失；SDK 仍提示未依赖 AppIntents 而跳过元数据提取，不能写成整个日志零 warning |
+| 完整原生套件 | 最终 `swift test` 61/61，0 失败，退出码 0；该次编译 0 warning / 0 error | 12 项专用启动、38 项状态与 11 项快照；合成行为通过不等于真实原生 AX 正向验收 |
+| Universal、签名 | 两架构 Release 构建退出码 0，该日志 0 warning / 0 error；独立 `lipo` 确认 `arm64` 与 `x86_64`，严格签名检查通过 | 本机 ad hoc 签名；没有 Intel 硬件、Developer ID 或公证验收 |
+| 候选固定安装与默认启动 | 1.1.2（build 4）完整 4 文件 manifest 与构建产物相等，默认就绪 verifier 退出码 0 | 保留 1.1.1 回退副本；正常无诊断参数实例留运行，真实活动速度未验证 |
+| 最终干净提交来源、精确暂存/源码包、CI 与合并 | 待最终冻结后核对 | 候选安装通过不等于后续干净提交产物、CI 或发布已通过；公开 main 的 1.1.1 记录见下一节补记 |
+
+金额修正先通过真实 decoder 重现尾缀/空白/不完整数字等失败断言，再修正完整 ASCII JSON number 语法、128 字节和保守 38 位有效数字边界；扩大精度检查后也取得失败断言再修复。Foundation 可能已规范化原生 JSON number，结果不能证明任意精度原文保真；有限、非负、`10^18` 上限和窗口比例约束保持。详见[实现范围](IMPLEMENTATION.md#hub-企业额度)。
+
+`LocalCodexScanWorker` 独占缓存、按 generation 重建，`NativeTokenHubAXWorker` 独占真实 reader；完整同步扫描期间都不挂起，跨执行器只传值。独立状态检查涵盖缓存复用/路由隔离、reload/shutdown、单次扫描、主 actor heartbeat、原生负路径、fixture 标记、迟到结果与较新直接请求隔离。C24 新边界首先取得 API 缺失的 compile-RED；该证据没有执行运行时红断言，也不是实际企业 AX 正向扫描。
+
+异步 Hub 合成渲染改为可取消等待后重新布局，保留真实 PNG/尺寸断言并用 `defer` 清理窗口；未用删除渲染检查换取编译通过。共享 Xcode Scheme 与默认 SwiftPM 引擎已进入上述最终 Xcode/集成和双架构验证；干净提交来源与公开发布检查仍依上表补齐，不预称所有 warning 已消除。
+
+候选固定安装的只读脱敏诊断为：`exactInstalledProcess=true`、`directQuotaPresent=true`、`fiveHourPresent=true`、`sevenDayPresent=true`、`fiveHourResetPresent=true`、`sevenDayResetPresent=true`、`monthlyUsagePresent=true`、`statusItemVisible=true`、`defaultReadinessPassed=true`、`permissionPromptRequested=false`。随后退出诊断实例，重新正常启动并确认 `normalLaunchWithoutDiagnosticArguments=true`、`leftRunning=true`。
+
+同次 `liveTokenSpeedPresent=false`，说明没有完成本轮真实活动速度验收；不能用历史均速或合成测试补为实时通过。诊断只保存布尔就绪信息，不记录实际额度、Token 数、账号、内部地址或会话。候选 manifest 与回退比较也不能自动证明后续提交重新打包后的身份，需要再次核对。
+
+以下事项保持未完成：
+
+- [Issue #33](https://github.com/Tupig/TokenStatMenu/issues/33)：本机锁屏阻止实际 Settings 原生 AX 核验；合成窗口已准备，OCR 和源码标签不是替代证据。
+- [Issue #19](https://github.com/Tupig/TokenStatMenu/issues/19) 与 [Issue #37](https://github.com/Tupig/TokenStatMenu/issues/37)：企业额度已存在零配置直接来源，完整安装即用统计及服务端权威瞬时 token/s 仍有来源缺口；本地估算与完整轮均速不能关闭该缺口。
+- [Issue #52](https://github.com/Tupig/TokenStatMenu/issues/52)：CLT 默认 SwiftBuild 的搜索路径 warning 已用独立最小包复现，上游尚未修复。逐命令使用完整 Xcode 是已验证的规避路径，不等于消除 CLT 缺陷；见[编译指南](wiki/编译指南.md#clt-默认构建的已知工具链警告)。
+
+1.1.1 的菜单循环与短时进程资源样本保留为历史，见[性能与基准](PERFORMANCE.md)；本次双 actor 修正没有新的整 App CPU/RSS 降幅结论。
+
 ## 1.1.1 — 文档、原生图标与空闲展示路径（2026-10-18）
 
 本节区分最终候选的合成验证与既有安装记录。后续各节保留历史；它们不能替代本次候选的重新检查。
@@ -22,6 +56,14 @@
 上述合成菜单基准与自动状态检查使用合成输入和手动时钟，不执行真实 SSO、企业请求、AX 读取或新系统授权；真实进程资源采样不属于这组合成检查。候选固定安装验收另行执行正常真实来源读取，仅保留上述布尔结果。当前结论限于本机候选，不能推广到全新机器、所有企业部署或 Intel 硬件。CI 尚未记录为已执行，Developer ID 与公证未做。
 
 本节是候选安装验收。后续干净提交会改变公开源码 revision，必须重新写入 bundle 并核对 provenance 与安装产物一致性，不能将此候选记录套用于尚未构建的后续提交。以下 BP19 安装证据属于 1.1.0 历史。
+
+### 1.1.1 最终发布与安装补记
+
+上述“CI 尚未记录”和“后续干净提交”描述的是候选阶段。其后 [PR #49](https://github.com/Tupig/TokenStatMenu/pull/49) 的 macOS CI 成功并合并，公开 main `82874eeee9931deef9e62b62d3156c1db91303a9` 与已测试提交 `f0f43fc7f96b6ea1152a3087342e3a6b82dff7fd` 的文件树相同；公开 checkout 干净，79 文件源码 manifest 核对通过。
+
+最终固定安装保持 1.1.1（build 3），写入干净提交来源。候选与最终 Universal 的未签名字节相同，Info.plist 与签名的预期差异单独记录；安装副本、构建目录和本地归档 manifest 经独立比较一致。默认无参数启动确认企业 5 小时、7 天、两项重置、月度与菜单栏就绪，未请求权限，实时活动速度未验证；仅保留一个正常安装实例和回退副本。
+
+图标、文档、菜单重复工作和设置来源文案对应的 Issues #45–#48 随合并关闭。本地源码/App 归档已同步；未创建正式 GitHub Release、Developer ID 签名或公证。权威瞬时 TPS、Intel 硬件、真实 Hub 重启与完整历史归属/账单仍不在已完成证据内。本补记只完成 1.1.1 的发布追溯，不预称 1.1.2 已安装或发布。
 
 ## BP19 — 自动恢复、数值边界与固定安装验收（2026-10-18）
 
@@ -123,8 +165,8 @@
 ## 执行方式
 
 ```bash
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift run --build-system native TokenStatCoreChecks
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --build-system native
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift run TokenStatCoreChecks
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./script/test.sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -destination 'platform=macOS,arch=arm64' -derivedDataPath /tmp/TokenStatMenu-C12-XcodeDerivedData build
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./script/build_and_run.sh --universal

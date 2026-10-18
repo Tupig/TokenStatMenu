@@ -19,6 +19,7 @@ PUBLIC_FILES = [
     "Sources/TokenStatMenu/StatusBarController.swift", "Sources/TokenStatMenu/Storage.swift",
     "Sources/TokenStatMenu/TokenStatMenuApp.swift", "Sources/TokenStatMenu/PanelStyle.swift", "Sources/TokenStatMenu/WindowQuotaCard.swift", "Sources/TokenStatMenu/TokenHubAXReader.swift", "Sources/TokenStatMenu/TokenHubQuotaCard.swift",
     "Resources/Info.plist", "Resources/config.example.plist", "Resources/AppIcon.png", "Resources/AppIcon.icns", "TokenStatMenu.xcodeproj/project.pbxproj",
+    "TokenStatMenu.xcodeproj/xcshareddata/xcschemes/TokenStatMenu.xcscheme",
     "Tests/TokenStatCoreTests/CoreChecks.swift", "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/WindowQuotaChecks.swift", "Tests/TokenStatCoreTests/LocalCodexUsageChecks.swift", "Tests/TokenStatCoreTests/DirectQuotaChecks.swift",
     "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift", "Tests/TokenStatCoreTests/TokenHubQuotaChecks.swift", "Tests/TokenStatUITests/TokenHubQuotaStateTests.swift", "Tests/TokenStatUITests/SeasunStartupContractTests.swift",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png",
@@ -39,7 +40,7 @@ def source_document():
     architecture = readme.split("## 整体架构\n", 1)[1].split("## 文件与职责", 1)[0]
     architecture = rebase_links(architecture, "README.md", "docs/FULL_SOURCE.md")
     parts = ["# TokenStatMenu 完整源码\n\n## 项目整体架构\n", architecture, "\n## 分文件完整源码\n"]
-    languages = {".swift": "swift", ".plist": "xml", ".pbxproj": "text", ".py": "python", ".sh": "bash", ".yml": "yaml"}
+    languages = {".swift": "swift", ".plist": "xml", ".pbxproj": "text", ".xcscheme": "xml", ".py": "python", ".sh": "bash", ".yml": "yaml"}
     for name in PUBLIC_FILES:
         path = ROOT / name
         if path.suffix not in languages:

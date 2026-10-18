@@ -9,16 +9,16 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # Native SwiftPM also works with Command Line Tools; no global xcode-select changes.
 if [ "$MODE" = "--universal" ]; then
     for ARCH in arm64 x86_64; do
-        swift build --build-system native --arch "$ARCH" --scratch-path ".build/$ARCH" -c release --product TokenStatMenu
+        swift build --arch "$ARCH" --scratch-path ".build/$ARCH" -c release --product TokenStatMenu
     done
-    ARM_DIR="$(swift build --build-system native --arch arm64 --scratch-path .build/arm64 -c release --show-bin-path)"
-    INTEL_DIR="$(swift build --build-system native --arch x86_64 --scratch-path .build/x86_64 -c release --show-bin-path)"
+    ARM_DIR="$(swift build --arch arm64 --scratch-path .build/arm64 -c release --show-bin-path)"
+    INTEL_DIR="$(swift build --arch x86_64 --scratch-path .build/x86_64 -c release --show-bin-path)"
     lipo -create "$ARM_DIR/TokenStatMenu" "$INTEL_DIR/TokenStatMenu" -output "$APP/Contents/MacOS/TokenStatMenu"
 else
     CONFIG=debug
     if [ "$MODE" = "--release" ]; then CONFIG=release; fi
-    swift build --build-system native -c "$CONFIG" --product TokenStatMenu
-    BIN_DIR="$(swift build --build-system native -c "$CONFIG" --show-bin-path)"
+    swift build -c "$CONFIG" --product TokenStatMenu
+    BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
     cp "$BIN_DIR/TokenStatMenu" "$APP/Contents/MacOS/TokenStatMenu"
 fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"

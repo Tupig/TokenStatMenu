@@ -71,4 +71,28 @@ text = '// !$*UTF8*$!\n{ archiveVersion = 1; classes = {}; objectVersion = 56; o
 text += "\n".join(f"{key} = {{ {value} }};" for key, value in objects.items())
 text += f"\n}}; rootObject = {project}; }}\n"
 (directory / "project.pbxproj").write_text(text)
+# Bind the app target explicitly. Relying on an inferred user scheme caused
+# Xcode's destination preflight to report an empty supported-platform set.
+scheme_directory = directory / "xcshareddata" / "xcschemes"
+scheme_directory.mkdir(parents=True, exist_ok=True)
+scheme = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion="1600" version="1.3">
+  <BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES">
+    <BuildActionEntries>
+      <BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">
+        <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="{target}" BuildableName="TokenStatMenu.app" BlueprintName="TokenStatMenu" ReferencedContainer="container:TokenStatMenu.xcodeproj"/>
+      </BuildActionEntry>
+    </BuildActionEntries>
+  </BuildAction>
+  <LaunchAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.IDEFoundation.Launcher.LLDB" launchStyle="0" useCustomWorkingDirectory="NO" ignoresPersistentStateOnLaunch="NO" debugDocumentVersioning="YES" debugServiceExtension="internal" allowLocationSimulation="YES">
+    <BuildableProductRunnable runnableDebuggingMode="0">
+      <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="{target}" BuildableName="TokenStatMenu.app" BlueprintName="TokenStatMenu" ReferencedContainer="container:TokenStatMenu.xcodeproj"/>
+    </BuildableProductRunnable>
+  </LaunchAction>
+  <ProfileAction buildConfiguration="Release" shouldUseLaunchSchemeArgsEnv="YES" savedToolIdentifier="" useCustomWorkingDirectory="NO" debugDocumentVersioning="YES"/>
+  <AnalyzeAction buildConfiguration="Debug"/>
+  <ArchiveAction buildConfiguration="Release" revealArchiveInOrganizer="YES"/>
+</Scheme>
+'''
+(scheme_directory / "TokenStatMenu.xcscheme").write_text(scheme)
 print(directory)

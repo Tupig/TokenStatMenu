@@ -1,7 +1,7 @@
 import Foundation
 import CoreFoundation
 
-public struct WindowQuota: Codable, Equatable {
+public struct WindowQuota: Codable, Equatable, Sendable {
     public let minutes: Int
     public let usedPercent: Double
     public let resetsAt: Date?
