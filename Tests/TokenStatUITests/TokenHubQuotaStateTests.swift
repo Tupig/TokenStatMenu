@@ -263,6 +263,31 @@ final class TokenHubQuotaStateTests: XCTestCase {
         withExtendedLifetime(controller) {}
     }
 
+    func testTokenHubCardUsesModelClockForFreshness() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = HubManualClock(observedAt)
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1)
+        await settle(model, status: .connected)
+
+        let dashboard = DashboardView(model: model)
+        XCTAssertNotNil(dashboard.tokenHubCard.snapshot,
+                       "the card should use the injected model clock at the observation time")
+
+        clock.now = observedAt.addingTimeInterval(120)
+        XCTAssertNotNil(dashboard.tokenHubCard.snapshot,
+                       "the inclusive freshness boundary should remain visible")
+        clock.now = observedAt.addingTimeInterval(120.001)
+        XCTAssertNil(dashboard.tokenHubCard.snapshot,
+                     "the card should expire from the injected model clock")
+    }
+
     func testLiveObservationBetweenTicksStillInvalidatesAtItsNextExpiry() {
         let model = AppModel(preview: true)
         defer { model.shutdown() }

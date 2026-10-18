@@ -70,7 +70,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         .tint(PanelPalette.blue)
     }
     var tokenHubCard: TokenHubQuotaCard {
-        TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: Date()), status: model.tokenHubQuotaStatusText,
+        TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: model.tokenHubNow()), status: model.tokenHubQuotaStatusText,
             enabled: model.tokenHubQuotaReadingEnabled, refreshSeconds: model.preferences.refreshSeconds,
             directSource: model.tokenHubQuotaIsDirect)
     }
