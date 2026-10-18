@@ -158,7 +158,7 @@ python3 script/check_public_content.py
 python3 -B script/test_release_assets.py
 ```
 
-正式版本推送 `vMAJOR.MINOR.PATCH` 标签后，由 [macOS release 工作流](.github/workflows/release.yml) 检查版本、源码提交和 `main` 归属，构建 arm64 + x86_64 Universal App。当前 1.1.4 历史合同发布四项资产；从 1.1.5/build7 起，目标是五项资产：应用 ZIP、源码 ZIP、同一 App 的 Universal DMG、`release-manifest.json` 和 `SHA256SUMS`。构建检查与写入 Release 的作业分开授权；相同内容可安全重跑，不会覆盖不同内容的既有资产。DMG 只提供将 App 拖入“应用程序”的 Finder 包装，不声明 Developer ID 或公证。维护者步骤和失败恢复见 [CI/CD](docs/wiki/CI-CD.md)。
+正式版本推送 `vMAJOR.MINOR.PATCH` 标签后，由 [macOS CI 与发布工作流](.github/workflows/ci.yml) 检查版本、源码提交和 `main` 归属，构建 arm64 + x86_64 Universal App。该单一工作流也在 `main` push 和 pull request 上运行只读检查；只有 canonical 仓库的版本标签会在构建成功后进入发布 job。当前 1.1.4 历史合同发布四项资产；从 1.1.5/build7 起，目标是五项资产：应用 ZIP、源码 ZIP、同一 App 的 Universal DMG、`release-manifest.json` 和 `SHA256SUMS`。构建检查与写入 Release 的 job 分开授权；相同内容可安全重跑，不会覆盖不同内容的既有资产。DMG 只提供将 App 拖入“应用程序”的 Finder 包装，不声明 Developer ID 或公证。维护者步骤和失败恢复见 [CI/CD](docs/wiki/CI-CD.md)。
 
 真实机器核验与合成测试分开记录；后者不能证明企业账号、完整账单或真实服务器吞吐正确。视觉参考图只使用合成数据，录制图像本身不算通过。详细方法见 [测试指南](docs/wiki/测试指南.md) 和 [UI 测试说明](docs/UI_TESTING.md)，最近的结果与限制见 [验证记录](docs/VALIDATION.md)。
 

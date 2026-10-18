@@ -19,52 +19,19 @@ SwiftUI：概览、数据来源、偏好设置
 
 ## 分文件完整源码
 
-### .github/workflows/build.yml
+### .github/workflows/ci.yml
 
 ```yaml
-name: macOS build
+name: macOS CI and release
 on:
   push:
     branches: [main]
-  pull_request:
-permissions:
-  contents: read
-jobs:
-  build:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
-        with:
-          persist-credentials: false
-      - name: Documentation links and synthetic checker fixtures
-        run: python3 script/check_docs.py --self-test
-      - name: Public content guardrail
-        run: python3 script/check_public_content.py --git-index
-      - name: Release contract and private native fixtures
-        run: python3 -B script/test_release_assets.py
-      - name: Core and gateway discovery checks
-        run: swift run --force-resolved-versions TokenStatCoreChecks
-      - name: Compile UI test target and run OS-independent checks
-        run: |
-          swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
-          swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
-      - name: Native Xcode build
-        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build
-      - name: Require unchanged committed dependency lock
-        run: git diff --exit-code -- Package.resolved
-```
-
-### .github/workflows/release.yml
-
-```yaml
-name: macOS release
-on:
-  push:
     tags: ['v*']
+  pull_request: {}
 permissions:
   contents: read
 concurrency:
-  group: release-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   build:
@@ -79,6 +46,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Validate tag, version, source commit and main ancestry
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: |
           python3 -B script/release_assets.py preflight --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"
           echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
@@ -90,23 +58,30 @@ jobs:
         run: python3 -B script/test_release_assets.py
       - name: Core and gateway discovery checks
         run: swift run --force-resolved-versions TokenStatCoreChecks
-      - name: Compile UI target and run OS-independent checks
+      - name: Compile UI test target and run OS-independent checks
         run: |
           swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
           swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
       - name: Native Xcode build
-        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-Release-CI CODE_SIGNING_ALLOWED=NO build
+        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build
+      - name: Require unchanged committed dependency lock
+        run: git diff --exit-code -- Package.resolved
       - name: Build and ad hoc sign Universal app without launching
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: ./script/build_and_run.sh --universal
       - name: Export reviewed source and require committed generated document
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: |
           python3 -B script/package_source.py
           git diff --exit-code
       - name: Package exactly five assets with native checks
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: python3 -B script/release_assets.py package --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --app dist/TokenStatMenu.app --source dist/TokenStatMenu-source.zip --directory dist/release
       - name: Verify asset identities, payloads and checksums
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: python3 -B script/release_assets.py verify --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --directory dist/release
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (Node 24)
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         with:
           name: tokenstatmenu-release
           if-no-files-found: error
@@ -11465,7 +11440,7 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
     assert nested_info["TokenStatSourceState"] == "unspecified"
     assert not (nested_checkout / "pkill-called").exists()
     assert not (nested_checkout / "open-called").exists()
-    for script_name in ["script/build_and_run.sh", "script/test.sh", ".github/workflows/build.yml"]:
+    for script_name in ["script/build_and_run.sh", "script/test.sh", ".github/workflows/ci.yml"]:
         assert "--build-system native" not in (ROOT / script_name).read_text(), "published build/test/CI commands must not force deprecated native mode"
     print("PASS: --build-only invokes no global process kill; version and project-only source identity preserved (isolated fixtures)", flush=True)
 
@@ -12195,6 +12170,7 @@ TAG = "v1.1.3"
 VERSION = "1.1.3"
 BUILD = "5"
 PUBLISH_IF = "$" + "{{ github.repository == 'Tupig/TokenStatMenu' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
+TAG_ONLY_IF = "$" + "{{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
 APP_FILES = {
     "Contents/Info.plist": 0o644,
     "Contents/MacOS/TokenStatMenu": 0o755,
@@ -13094,7 +13070,10 @@ def load_workflow(path: Path) -> dict:
 
 def workflow_contract(document: dict, raw: str) -> None:
     """A bounded assertion for this workflow, not a general workflow scanner."""
-    assert document["on"] == {"push": {"tags": ["v*"]}}
+    assert document["on"] == {
+        "push": {"branches": ["main"], "tags": ["v*"]},
+        "pull_request": {},
+    }
     assert document["permissions"] == {"contents": "read"}
     assert set(document["jobs"]) == {"build", "publish"}
     build = document["jobs"]["build"]
@@ -13121,6 +13100,7 @@ def workflow_contract(document: dict, raw: str) -> None:
     uploads = [step for step in build["steps"]
                if step.get("uses", "").startswith("actions/upload-artifact@")]
     assert len(uploads) == 1 and uploads[0]["with"]["if-no-files-found"] == "error"
+    assert " ".join(uploads[0].get("if", "").split()) == TAG_ONLY_IF
     paths = uploads[0]["with"]["path"]
     assert "*" not in paths and len(paths.splitlines()) == 5
     assert any(path.endswith("-universal.dmg") for path in paths.splitlines())
@@ -13132,38 +13112,54 @@ def workflow_contract(document: dict, raw: str) -> None:
     assert "script/test_release_assets.py" in scripts
     assert "GH_TOKEN" in json.dumps(publish)
     assert "GH_TOKEN" not in json.dumps(build)
-    required = {
-        "build": ["python3 -B script/test_release_assets.py",
-                  "python3 -B script/release_assets.py preflight",
-                  "./script/build_and_run.sh --universal",
-                  "python3 -B script/package_source.py",
-                  "python3 -B script/release_assets.py package",
-                  "python3 -B script/release_assets.py verify"],
-        "publish": ["python3 -B script/release_assets.py verify",
-                    "python3 -B script/release_assets.py publish"],
-    }
-    for job_name, prefixes in required.items():
-        for prefix in prefixes:
-            matching = [step for step in document["jobs"][job_name]["steps"]
-                        if any(line.strip().startswith(prefix)
-                               for line in step.get("run", "").splitlines())]
-            assert len(matching) == 1
-            assert "if" not in matching[0]
-            assert matching[0].get("continue-on-error", False) is False
-            lines = [line.strip() for line in matching[0]["run"].splitlines()
-                     if line.strip().startswith(prefix)]
-            assert len(lines) == 1
-            assert "||" not in lines[0] and "; true" not in lines[0]
-            assert not lines[0].endswith("&")
+    def assert_step(job_name: str, prefix: str, expected_if: str | None,
+                    expected_lines: int = 1) -> None:
+        matching = [step for step in document["jobs"][job_name]["steps"]
+                    if any(line.strip().startswith(prefix)
+                           for line in step.get("run", "").splitlines())]
+        assert len(matching) == 1
+        step = matching[0]
+        if expected_if is None:
+            assert "if" not in step
+        else:
+            if_value = step.get("if", "")
+            assert isinstance(if_value, str)
+            assert " ".join(if_value.split()) == expected_if
+        assert step.get("continue-on-error", False) is False
+        lines = [line.strip() for line in step["run"].splitlines()
+                 if line.strip().startswith(prefix)]
+        assert len(lines) == expected_lines
+        for line in lines:
+            assert "||" not in line and "; true" not in line
+            assert not line.endswith("&")
+
+    for prefix in ["python3 -B script/test_release_assets.py",
+                   "swift run --force-resolved-versions TokenStatCoreChecks",
+                   "xcodebuild -project TokenStatMenu.xcodeproj",
+                   "git diff --exit-code -- Package.resolved"]:
+        assert_step("build", prefix, None)
+    assert_step("build", "swift test --force-resolved-versions", None, expected_lines=2)
+    for prefix in ["python3 -B script/release_assets.py preflight",
+                   "./script/build_and_run.sh --universal",
+                   "python3 -B script/package_source.py",
+                   "python3 -B script/release_assets.py package",
+                   "python3 -B script/release_assets.py verify"]:
+        assert_step("build", prefix, TAG_ONLY_IF)
+    assert_step("publish", "python3 -B script/release_assets.py verify", None)
+    assert_step("publish", "python3 -B script/release_assets.py publish", None)
 
 
 class WorkflowChecks(unittest.TestCase):
+    def test_repository_has_one_workflow_entrypoint(self):
+        workflow_files = sorted(path.name for path in (PROJECT / ".github/workflows").glob("*.yml"))
+        self.assertEqual(workflow_files, ["ci.yml"])
+
     def test_release_workflow_has_bounded_tag_only_write_permissions(self):
-        path = PROJECT / ".github/workflows/release.yml"
+        path = PROJECT / ".github/workflows/ci.yml"
         workflow_contract(load_workflow(path), path.read_text())
 
     def test_workflow_assertions_reject_gate_permission_and_asset_mutations(self):
-        path = PROJECT / ".github/workflows/release.yml"
+        path = PROJECT / ".github/workflows/ci.yml"
         raw = path.read_text()
         baseline = load_workflow(path)
         variants = []
@@ -14111,7 +14107,7 @@ from check_docs import rebase_links
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = [
-    ".gitignore", ".github/workflows/build.yml", ".github/workflows/release.yml", "Package.swift", "Package.resolved", "README.md", "LICENSE", "PRIVACY.md",
+    ".gitignore", ".github/workflows/ci.yml", "Package.swift", "Package.resolved", "README.md", "LICENSE", "PRIVACY.md",
     "Sources/TokenStatCore/Configuration.swift", "Sources/TokenStatCore/GatewayDiscovery.swift",
     "Sources/TokenStatCore/HTTPDecoder.swift", "Sources/TokenStatCore/LocalCodexUsageReader.swift", "Sources/TokenStatCore/MetricsEngine.swift",
     "Sources/TokenStatCore/ProxyServer.swift", "Sources/TokenStatCore/Quota.swift",
@@ -14346,7 +14342,7 @@ python3 script/check_public_content.py
 python3 -B script/test_release_assets.py
 ```
 
-正式版本推送 `vMAJOR.MINOR.PATCH` 标签后，由 [macOS release 工作流](../.github/workflows/release.yml) 检查版本、源码提交和 `main` 归属，构建 arm64 + x86_64 Universal App。当前 1.1.4 历史合同发布四项资产；从 1.1.5/build7 起，目标是五项资产：应用 ZIP、源码 ZIP、同一 App 的 Universal DMG、`release-manifest.json` 和 `SHA256SUMS`。构建检查与写入 Release 的作业分开授权；相同内容可安全重跑，不会覆盖不同内容的既有资产。DMG 只提供将 App 拖入“应用程序”的 Finder 包装，不声明 Developer ID 或公证。维护者步骤和失败恢复见 [CI/CD](wiki/CI-CD.md)。
+正式版本推送 `vMAJOR.MINOR.PATCH` 标签后，由 [macOS CI 与发布工作流](../.github/workflows/ci.yml) 检查版本、源码提交和 `main` 归属，构建 arm64 + x86_64 Universal App。该单一工作流也在 `main` push 和 pull request 上运行只读检查；只有 canonical 仓库的版本标签会在构建成功后进入发布 job。当前 1.1.4 历史合同发布四项资产；从 1.1.5/build7 起，目标是五项资产：应用 ZIP、源码 ZIP、同一 App 的 Universal DMG、`release-manifest.json` 和 `SHA256SUMS`。构建检查与写入 Release 的 job 分开授权；相同内容可安全重跑，不会覆盖不同内容的既有资产。DMG 只提供将 App 拖入“应用程序”的 Finder 包装，不声明 Developer ID 或公证。维护者步骤和失败恢复见 [CI/CD](wiki/CI-CD.md)。
 
 真实机器核验与合成测试分开记录；后者不能证明企业账号、完整账单或真实服务器吞吐正确。视觉参考图只使用合成数据，录制图像本身不算通过。详细方法见 [测试指南](wiki/测试指南.md) 和 [UI 测试说明](UI_TESTING.md)，最近的结果与限制见 [验证记录](VALIDATION.md)。
 

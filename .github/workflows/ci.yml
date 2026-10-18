@@ -1,11 +1,13 @@
-name: macOS release
+name: macOS CI and release
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  pull_request: {}
 permissions:
   contents: read
 concurrency:
-  group: release-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   build:
@@ -20,6 +22,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Validate tag, version, source commit and main ancestry
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: |
           python3 -B script/release_assets.py preflight --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"
           echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
@@ -31,23 +34,30 @@ jobs:
         run: python3 -B script/test_release_assets.py
       - name: Core and gateway discovery checks
         run: swift run --force-resolved-versions TokenStatCoreChecks
-      - name: Compile UI target and run OS-independent checks
+      - name: Compile UI test target and run OS-independent checks
         run: |
           swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
           swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
       - name: Native Xcode build
-        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-Release-CI CODE_SIGNING_ALLOWED=NO build
+        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build
+      - name: Require unchanged committed dependency lock
+        run: git diff --exit-code -- Package.resolved
       - name: Build and ad hoc sign Universal app without launching
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: ./script/build_and_run.sh --universal
       - name: Export reviewed source and require committed generated document
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: |
           python3 -B script/package_source.py
           git diff --exit-code
       - name: Package exactly five assets with native checks
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: python3 -B script/release_assets.py package --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --app dist/TokenStatMenu.app --source dist/TokenStatMenu-source.zip --directory dist/release
       - name: Verify asset identities, payloads and checksums
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: python3 -B script/release_assets.py verify --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --directory dist/release
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (Node 24)
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         with:
           name: tokenstatmenu-release
           if-no-files-found: error

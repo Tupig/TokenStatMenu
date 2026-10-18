@@ -4,7 +4,7 @@
 
 ## 当前自动化范围
 
-仓库的 [macOS build 工作流](../../.github/workflows/build.yml) 在 `main` 的 push 和 pull request 上运行，使用 `macos-15` runner。工作流仅有读取仓库内容的权限，checkout 关闭凭据持久化。当前 checkout 固定为官方 `v7.0.1` 的完整提交 `3d3c42e5aac5ba805825da76410c181273ba90b1`，其运行时为 Node 24；升级时重新核对官方 release/tag 与完整 SHA，不只移动标签。官方要求 Actions Runner 至少为 `v2.327.1`，自托管 runner 需同步满足此版本；GitHub 托管 runner 由平台维护。来源见 [checkout v7.0.1](https://github.com/actions/checkout/tree/v7.0.1)。
+仓库只有一个 [macOS CI 与发布工作流](../../.github/workflows/ci.yml)，在 `main` 的 push、pull request 和 `v*` 标签 push 上运行，使用 `macos-15` runner。工作流顶层仅有读取仓库内容的权限，checkout 关闭凭据持久化；只有标签触发且构建成功时，独立的 `publish` job 才取得 `contents: write`。当前 checkout 固定为官方 `v7.0.1` 的完整提交 `3d3c42e5aac5ba805825da76410c181273ba90b1`，其运行时为 Node 24；升级时重新核对官方 release/tag 与完整 SHA，不只移动标签。官方要求 Actions Runner 至少为 `v2.327.1`，自托管 runner 需同步满足此版本；GitHub 托管 runner 由平台维护。来源见 [checkout v7.0.1](https://github.com/actions/checkout/tree/v7.0.1)。
 
 | 顺序 | 检查 | 当前实际覆盖 |
 | --- | --- | --- |
@@ -47,7 +47,7 @@ CI 绿色说明该提交完成了工作流声明的检查，不能据此声称�
 
 ## 标签触发的正式 Release
 
-[macOS release 工作流](../../.github/workflows/release.yml) 在 `v*` 标签 push 时运行。宽触发模式不是版本校验：发布工具仍只接受数字稳定版本 `vMAJOR.MINOR.PATCH`，核对 Info.plist 的版本/构建号、标签实际提交、干净工作区及 `main` 祖先关系。分支名不能代替源码提交。
+[同一 macOS CI 与发布工作流](../../.github/workflows/ci.yml) 在 `v*` 标签 push 时进入发布分支。宽触发模式不是版本校验：发布工具仍只接受数字稳定版本 `vMAJOR.MINOR.PATCH`，核对 Info.plist 的版本/构建号、标签实际提交、干净工作区及 `main` 祖先关系。分支名不能代替源码提交。
 
 流水线分成 `build` 与 `publish` 两个 job：
 

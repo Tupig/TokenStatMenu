@@ -30,6 +30,7 @@ TAG = "v1.1.3"
 VERSION = "1.1.3"
 BUILD = "5"
 PUBLISH_IF = "$" + "{{ github.repository == 'Tupig/TokenStatMenu' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
+TAG_ONLY_IF = "$" + "{{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
 APP_FILES = {
     "Contents/Info.plist": 0o644,
     "Contents/MacOS/TokenStatMenu": 0o755,
@@ -929,7 +930,10 @@ def load_workflow(path: Path) -> dict:
 
 def workflow_contract(document: dict, raw: str) -> None:
     """A bounded assertion for this workflow, not a general workflow scanner."""
-    assert document["on"] == {"push": {"tags": ["v*"]}}
+    assert document["on"] == {
+        "push": {"branches": ["main"], "tags": ["v*"]},
+        "pull_request": {},
+    }
     assert document["permissions"] == {"contents": "read"}
     assert set(document["jobs"]) == {"build", "publish"}
     build = document["jobs"]["build"]
@@ -956,6 +960,7 @@ def workflow_contract(document: dict, raw: str) -> None:
     uploads = [step for step in build["steps"]
                if step.get("uses", "").startswith("actions/upload-artifact@")]
     assert len(uploads) == 1 and uploads[0]["with"]["if-no-files-found"] == "error"
+    assert " ".join(uploads[0].get("if", "").split()) == TAG_ONLY_IF
     paths = uploads[0]["with"]["path"]
     assert "*" not in paths and len(paths.splitlines()) == 5
     assert any(path.endswith("-universal.dmg") for path in paths.splitlines())
@@ -967,38 +972,58 @@ def workflow_contract(document: dict, raw: str) -> None:
     assert "script/test_release_assets.py" in scripts
     assert "GH_TOKEN" in json.dumps(publish)
     assert "GH_TOKEN" not in json.dumps(build)
-    required = {
-        "build": ["python3 -B script/test_release_assets.py",
-                  "python3 -B script/release_assets.py preflight",
-                  "./script/build_and_run.sh --universal",
-                  "python3 -B script/package_source.py",
-                  "python3 -B script/release_assets.py package",
-                  "python3 -B script/release_assets.py verify"],
-        "publish": ["python3 -B script/release_assets.py verify",
-                    "python3 -B script/release_assets.py publish"],
-    }
-    for job_name, prefixes in required.items():
-        for prefix in prefixes:
-            matching = [step for step in document["jobs"][job_name]["steps"]
-                        if any(line.strip().startswith(prefix)
-                               for line in step.get("run", "").splitlines())]
-            assert len(matching) == 1
-            assert "if" not in matching[0]
-            assert matching[0].get("continue-on-error", False) is False
-            lines = [line.strip() for line in matching[0]["run"].splitlines()
-                     if line.strip().startswith(prefix)]
-            assert len(lines) == 1
-            assert "||" not in lines[0] and "; true" not in lines[0]
-            assert not lines[0].endswith("&")
+    def assert_step(job_name: str, prefix: str, expected_if: str | None,
+                    expected_lines: int = 1) -> None:
+        matching = [step for step in document["jobs"][job_name]["steps"]
+                    if any(line.strip().startswith(prefix)
+                           for line in step.get("run", "").splitlines())]
+        assert len(matching) == 1
+        step = matching[0]
+        if expected_if is None:
+            assert "if" not in step
+        else:
+            if_value = step.get("if", "")
+            assert isinstance(if_value, str)
+            assert " ".join(if_value.split()) == expected_if
+        assert step.get("continue-on-error", False) is False
+        lines = [line.strip() for line in step["run"].splitlines()
+                 if line.strip().startswith(prefix)]
+        assert len(lines) == expected_lines
+        for line in lines:
+            assert "||" not in line and "; true" not in line
+            assert not line.endswith("&")
+
+    for prefix in ["python3 -B script/test_release_assets.py",
+                   "swift run --force-resolved-versions TokenStatCoreChecks",
+                   "xcodebuild -project TokenStatMenu.xcodeproj",
+                   "git diff --exit-code -- Package.resolved"]:
+        assert_step("build", prefix, None)
+    assert_step("build", "swift test --force-resolved-versions", None, expected_lines=2)
+    for prefix in ["python3 -B script/release_assets.py preflight",
+                   "./script/build_and_run.sh --universal",
+                   "python3 -B script/package_source.py",
+                   "python3 -B script/release_assets.py package",
+                   "python3 -B script/release_assets.py verify"]:
+        assert_step("build", prefix, TAG_ONLY_IF)
+    assert_step("publish", "python3 -B script/release_assets.py verify", None)
+    assert_step("publish", "python3 -B script/release_assets.py publish", None)
 
 
 class WorkflowChecks(unittest.TestCase):
+    def test_repository_has_one_workflow_entrypoint(self):
+        workflow_root = PROJECT / ".github/workflows"
+        workflow_files = sorted(
+            path.name for path in workflow_root.iterdir()
+            if path.is_file() and path.suffix in {".yml", ".yaml"}
+        )
+        self.assertEqual(workflow_files, ["ci.yml"])
+
     def test_release_workflow_has_bounded_tag_only_write_permissions(self):
-        path = PROJECT / ".github/workflows/release.yml"
+        path = PROJECT / ".github/workflows/ci.yml"
         workflow_contract(load_workflow(path), path.read_text())
 
     def test_workflow_assertions_reject_gate_permission_and_asset_mutations(self):
-        path = PROJECT / ".github/workflows/release.yml"
+        path = PROJECT / ".github/workflows/ci.yml"
         raw = path.read_text()
         baseline = load_workflow(path)
         variants = []
