@@ -22,7 +22,7 @@
 | 可选偏好 | 两项 | 刷新间隔和界面兼容读取开关 |
 | 合成核心/状态/视觉检查 | 已提供 | 测试与真实本机、安装验收分开，见 [测试指南](wiki/测试指南.md) |
 | 通用 API、Ollama、代理转发、价格/汇率、成本和失败延迟统计 | 正式入口不提供 | 历史核心组件不表示产品可以启用这些功能 |
-| 正式 Release 流水线 | 已提供标签触发流程 | 四资产、来源/包装/摘要检查、分离只读构建与写入发布；实际端到端结果另行记录 |
+| 正式 Release 流水线 | 已提供标签触发流程 | 1.1.4 历史为四资产；1.1.5/build7 目标为 App ZIP、源码 ZIP、Universal DMG、manifest、SUMS 五资产；实际端到端结果另行记录 |
 | Homebrew 源码安装与 tap 跟进 | 独立源码配方与更新流程 | 完整 Xcode 本机构建；先测试后更新 Formula，用户手动 brew upgrade；正式 pin 取自真实 Release |
 | App 内自动更新、Developer ID / Apple 公证 | 未提供 | ad hoc 签名和摘要不能代替 Apple 信任验证 |
 | 服务端瞬时 token/s | 未接通权威来源 | [Issue #37](https://github.com/Tupig/TokenStatMenu/issues/37) 持续跟踪 |
@@ -55,9 +55,11 @@ DashboardView / SettingsView / Quota Cards：中文 SwiftUI 展示
 | [RenderAppIcon.swift](../script/RenderAppIcon.swift)、[make_app_icon.sh](../script/make_app_icon.sh) | 从零绘制原创图标并生成原生尺寸资源，进入 SwiftPM App 与 Xcode 打包 |
 | [Tests](../Tests) | 合成核心、原生状态与 UI 检查 |
 | [script](../script) | 构建、隔离集成、离线预览、隐私检查与显式源码导出 |
-| [release_assets.py](../script/release_assets.py)、[release 工作流](../.github/workflows/release.yml) | 标签与四资产契约、原生包装、远端一致性检查及分离权限的发布 |
+| [release_assets.py](../script/release_assets.py)、[release 工作流](../.github/workflows/release.yml) | 当前四资产历史与下一版五资产 DMG 契约、原生包装、远端一致性检查及分离权限的发布 |
 
 SwiftPM 构建与测试使用经审阅的精确依赖锁和 `--force-resolved-versions`。锁同时保留 custom-dump 1.7.3 的工具链兼容图需要的 issue-reporting 2.1.2 与 overlay 1.13.1；SnapshotTesting 1.19.6 精确依赖和 App 仅依赖系统框架的边界不变。必要 pin 缺失或约束冲突应失败，不静默更新或事后恢复锁。1.1.3 的正式 Release 因真实 CI 锁漂移被干净源码检查拒绝，修正候选版本为 1.1.4/build6；本机实验、最终 CI、Release 和安装仍分别验收，见 [编译指南](wiki/编译指南.md#固定测试依赖与跨工具链锁) 与 [验证记录](VALIDATION.md)。
+
+BP32 的 DMG 仍是同一 App 的分发包装：`release_assets.py` 只在 1.1.5 及更新版本生成 `TokenStatMenu-<版本>-universal.dmg`，创建前后复用 Universal App 的版本、来源、四文件树、双架构和严格签名检查；挂载验证只读且拥有自己的临时 mountpoint，完成后 detach/清理。Homebrew 继续从已验证的源码 ZIP 构建，不从 DMG 提取或安装；当前 1.1.4 四资产/Formula 事实保持不变，1.1.5 公开 tap 端点待真实 Release 后验收。
 
 Dashboard 的实际 `overviewContent` 同时用于生产面板和完整渲染测试。正常本地路径保留一张企业主额度卡和本地 Token/线程/速度卡；历史额度通过默认折叠的原生 DisclosureGroup 展开，避免历史缺失五小时或旧七天百分比成为第二组主额度。展开只改变本地 SwiftUI 状态，不保存设置、不触发读取，也不改变直接来源、菜单文字、告警或数值。此项解决展示层次混淆，不能补造源端缺失的统计。
 

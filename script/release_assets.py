@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify the four public release assets, then publish without clobber.
+"""Build and verify the public release assets, then publish without clobber.
 
 Only the explicit ``publish`` command makes GitHub writes. It receives the
 short-lived Actions token through GH_TOKEN; no credential is read or logged.
@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -240,7 +241,102 @@ def validate_app(root: Path, app: Path, identity: ReleaseIdentity, command_runne
 
 def _names(identity: ReleaseIdentity) -> dict[str, str]:
     _identity_fields(identity)
-    return {kind: f"TokenStatMenu-{identity.version}-{kind}.zip" for kind in ["universal", "source"]}
+    names = {kind: f"TokenStatMenu-{identity.version}-{kind}.zip" for kind in ["universal", "source"]}
+    version_parts = tuple(int(part) for part in identity.version.split("."))
+    if version_parts >= (1, 1, 5):
+        names["dmg"] = f"TokenStatMenu-{identity.version}-universal.dmg"
+    return names
+
+
+def create_dmg(root: Path, app: Path, output_path: Path, identity: ReleaseIdentity,
+               command_runner=subprocess.run) -> dict:
+    """Create a Finder-friendly DMG around an already validated App.
+
+    The staging directory is private and disposable. The only link inside the
+    image is the conventional `/Applications` alias. No application is
+    launched and no caller-owned path is removed.
+    """
+    _identity_fields(identity)
+    _require(tuple(int(part) for part in identity.version.split(".")) >= (1, 1, 5),
+             "DMG assets start with the 1.1.5 release contract")
+    output_path = Path(output_path)
+    _require(not output_path.exists() and not output_path.is_symlink(),
+             "DMG output must be a new regular path")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    validate_app(root, app, identity, command_runner)
+    with tempfile.TemporaryDirectory(prefix="tokenstat-dmg-stage-", dir=str(output_path.parent)) as temporary:
+        staging = Path(temporary)
+        staged_app = staging / "TokenStatMenu.app"
+        shutil.copytree(app, staged_app, symlinks=True)
+        applications = staging / "Applications"
+        applications.symlink_to("/Applications")
+        command = ["/usr/bin/hdiutil", "create", "-volname", "TokenStatMenu " + identity.version,
+                   "-srcfolder", str(staging), "-format", "UDZO", "-ov", str(output_path)]
+        try:
+            result = command_runner(command, text=True, capture_output=True, check=False)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RuntimeError("DMG creation tool failed") from error
+        _require(result.returncode == 0 and output_path.is_file() and not output_path.is_symlink(),
+                 "DMG creation failed")
+    data = output_path.read_bytes()
+    return {"name": output_path.name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def validate_dmg(root: Path, dmg_path: Path, identity: ReleaseIdentity,
+                 command_runner=subprocess.run) -> dict:
+    """Inspect a DMG through imageinfo and a read-only owned mount."""
+    _identity_fields(identity)
+    dmg_path = Path(dmg_path)
+    _require(not dmg_path.is_symlink() and dmg_path.is_file(), "DMG is not a regular file")
+    mount = Path(tempfile.mkdtemp(prefix="tokenstat-dmg-mount-"))
+    device: str | None = None
+    def run_tool(arguments):
+        try:
+            return command_runner(arguments, text=True, capture_output=True, check=False)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RuntimeError("hdiutil command failed") from error
+    try:
+        info = run_tool(["/usr/bin/hdiutil", "imageinfo", str(dmg_path)])
+        _require(info.returncode == 0, "hdiutil imageinfo failed")
+        attach = run_tool(["/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse",
+                           "-mountpoint", str(mount), str(dmg_path)])
+        _require(attach.returncode == 0, "read-only DMG attach failed")
+        # `hdiutil attach` may print localized checksum diagnostics before
+        # its tabular device rows. Select only the row that explicitly names
+        # our disposable mountpoint; never detach an arbitrary first device.
+        # macOS commonly renders `/var/...` as its canonical `/private/var/...`
+        # spelling in hdiutil output, so compare both spellings of our path.
+        mount_texts = {str(mount), os.path.realpath(mount)}
+        for line in attach.stdout.splitlines():
+            fields = [field.strip() for field in line.split("\t")]
+            if fields and fields[0].startswith("/dev/") and any(field in mount_texts for field in fields[1:]):
+                device = fields[0]
+                break
+        _require(device is not None, "hdiutil attach returned no owned device")
+        entries = list(mount.iterdir())
+        _require({entry.name for entry in entries} == {"TokenStatMenu.app", "Applications"},
+                 "DMG root has unexpected members")
+        app = mount / "TokenStatMenu.app"
+        applications = mount / "Applications"
+        _require(app.is_dir() and not app.is_symlink(), "DMG App is missing or symbolic")
+        _require(applications.is_symlink() and os.readlink(applications) == "/Applications",
+                 "DMG Applications alias is unsafe")
+        validate_app(root, app, identity, command_runner)
+        data = dmg_path.read_bytes()
+        return {"name": dmg_path.name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    finally:
+        detach_error: BaseException | None = None
+        if device is not None:
+            try:
+                detached = run_tool(["/usr/bin/hdiutil", "detach", device])
+                _require(detached.returncode == 0, "owned DMG detach failed")
+            except BaseException as error:
+                detach_error = error
+        shutil.rmtree(mount, ignore_errors=True)
+        if detach_error is not None:
+            # A cleanup failure must remain visible even when inspection also
+            # failed; silently swallowing it could leave an owned image mounted.
+            raise RuntimeError("owned DMG detach failed") from detach_error
 
 
 def _canonical_zip(path: Path, prefix: str, files: dict[str, tuple[bytes, int]]) -> None:
@@ -273,6 +369,8 @@ def package_assets(root: Path, app: Path, source_zip: Path, output_dir: Path,
     names = _names(identity)
     _canonical_zip(output_dir / names["source"], "TokenStatMenu/", source)
     _canonical_zip(output_dir / names["universal"], "TokenStatMenu.app/", bundle)
+    if "dmg" in names:
+        create_dmg(root, app, output_dir / names["dmg"], identity)
     manifest = dict(fields, assets={})
     for kind, name in names.items():
         data = (output_dir / name).read_bytes()
@@ -280,7 +378,7 @@ def package_assets(root: Path, app: Path, source_zip: Path, output_dir: Path,
     (output_dir / "release-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
                                                         encoding="utf-8")
     (output_dir / "SHA256SUMS").write_bytes(_sums(output_dir, [*names.values(), "release-manifest.json"]))
-    return validate_assets(root, output_dir, identity)
+    return validate_assets(root, output_dir, identity, validate_dmg_image=("dmg" in names))
 
 
 def _unique_json(pairs: list[tuple]) -> dict:
@@ -291,7 +389,9 @@ def _unique_json(pairs: list[tuple]) -> dict:
     return result
 
 
-def validate_assets(root: Path, directory: Path, identity: ReleaseIdentity) -> dict:
+def validate_assets(root: Path, directory: Path, identity: ReleaseIdentity,
+                    validate_dmg_image: bool = False,
+                    command_runner=subprocess.run) -> dict:
     directory = Path(directory)
     fields, names = _identity_fields(identity), _names(identity)
     _require(not directory.is_symlink() and directory.is_dir(), "missing asset directory")
@@ -299,7 +399,7 @@ def validate_assets(root: Path, directory: Path, identity: ReleaseIdentity) -> d
     files = list(directory.iterdir())
     _require({path.name for path in files} == expected
              and all(not path.is_symlink() and path.is_file() and stat.S_ISREG(path.stat().st_mode)
-                     for path in files), "asset directory must contain exactly four regular files")
+                     for path in files), "asset directory must contain the exact release asset set")
     try:
         manifest = json.loads((directory / "release-manifest.json").read_text(encoding="utf-8"),
                               object_pairs_hook=_unique_json)
@@ -323,6 +423,8 @@ def validate_assets(root: Path, directory: Path, identity: ReleaseIdentity) -> d
     validate_source_archive(root, directory / names["source"], PUBLIC_FILES)
     bundle = _zip_files(directory / names["universal"], "TokenStatMenu.app/", set(APP_FILES), APP_FILES)
     _bundle_content(root, bundle, identity)
+    if "dmg" in names and validate_dmg_image:
+        validate_dmg(root, directory / names["dmg"], identity, command_runner)
     return manifest
 
 
@@ -332,7 +434,9 @@ def publish_release(root: Path, directory: Path, identity: ReleaseIdentity, clie
     Failures after upload leave a draft. Failure after publish is a readback
     failure and is never described as a rollback or a successful publication.
     """
-    validate_assets(root, directory, identity)
+    # Publication must validate the complete release set, including the
+    # native DMG image whenever this identity carries the fifth asset.
+    validate_assets(root, directory, identity, validate_dmg_image=True)
     paths = {path.name: path for path in Path(directory).iterdir()}
     _require(client.resolve_tag(identity.tag) == identity.commit, "remote tag moved or differs")
     remote = client.lookup(identity.tag)
@@ -443,8 +547,8 @@ class GitHubClient:
     def list_assets(self, release_id: int) -> list[str]:
         _require(type(release_id) is int and release_id > 0, "invalid remote release ID")
         value = self._get(self.base + f"/releases/{release_id}/assets?per_page=100")
-        # The required set has four files. A full page already proves a conflict;
-        # never hide additional pages behind an apparently complete four names.
+        # A full page already proves a conflict; never hide additional pages
+        # behind an apparently complete asset list.
         _require(isinstance(value, list) and len(value) < 100, "remote asset list is invalid or excessive")
         names = []
         for item in value:
@@ -504,7 +608,7 @@ def main() -> None:
         elif args.operation in ["verify", "publish"]:
             _require(args.directory is not None, "verify/publish requires --directory")
             if args.operation == "verify":
-                validate_assets(args.root, args.directory, identity)
+                validate_assets(args.root, args.directory, identity, validate_dmg_image=True)
             else:
                 outcome = publish_release(args.root, args.directory, identity, GitHubClient(identity))
                 print("Release outcome: " + outcome)

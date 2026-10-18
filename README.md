@@ -64,7 +64,7 @@ Homebrew 从正式 Release 的校验源码包构建原生 App，使用本机 ad 
 
 正常启动只显示菜单栏条目，点击后展开面板；没有主窗口属于预期行为。不需要创建 plist，也不需要授予辅助功能权限来连接后台。设置里的辅助功能入口仅用于可选界面兼容读取。
 
-首次 SwiftPM 构建可能需要联网解析测试依赖。版本发行由 GitHub Actions 构建 Universal 应用包、源码包与校验文件，入口为 [GitHub Releases](https://github.com/Tupig/TokenStatMenu/releases)。二进制发行使用 ad hoc 签名，尚未完成 Developer ID 签名或 Apple 公证；Homebrew 通过在本机编译源码安装。固定路径安装、升级、回退和首次打开说明见 [安装与使用](docs/wiki/安装与使用.md)。
+首次 SwiftPM 构建可能需要联网解析测试依赖。当前 1.1.4/build6 历史 Release 保持 ZIP-only；下一版目标 1.1.5/build7 在同一 Universal App ZIP 和源码 ZIP 之外增加 Finder 友好的 DMG 安装包装。DMG 不是新运行时或更新器，必须与同一已审核 App、源码、manifest 和 SHA256SUMS 绑定；实际发布页是否已有五资产仍以远端证据为准。二进制发行使用 ad hoc 签名，尚未完成 Developer ID 签名或 Apple 公证；Homebrew 通过在本机编译源码安装。固定路径安装、升级、回退和首次打开说明见 [安装与使用](docs/wiki/安装与使用.md)。
 
 ## 文档导航
 
@@ -158,7 +158,7 @@ python3 script/check_public_content.py
 python3 -B script/test_release_assets.py
 ```
 
-正式版本推送 `vMAJOR.MINOR.PATCH` 标签后，由 [macOS release 工作流](.github/workflows/release.yml) 检查版本、源码提交和 `main` 归属，构建 arm64 + x86_64 Universal App，并发布应用 ZIP、源码 ZIP、`release-manifest.json` 和 `SHA256SUMS`。构建检查与写入 Release 的作业分开授权；相同内容可安全重跑，不会覆盖不同内容的既有资产。维护者步骤和失败恢复见 [CI/CD](docs/wiki/CI-CD.md)。
+正式版本推送 `vMAJOR.MINOR.PATCH` 标签后，由 [macOS release 工作流](.github/workflows/release.yml) 检查版本、源码提交和 `main` 归属，构建 arm64 + x86_64 Universal App。当前 1.1.4 历史合同发布四项资产；从 1.1.5/build7 起，目标是五项资产：应用 ZIP、源码 ZIP、同一 App 的 Universal DMG、`release-manifest.json` 和 `SHA256SUMS`。构建检查与写入 Release 的作业分开授权；相同内容可安全重跑，不会覆盖不同内容的既有资产。DMG 只提供将 App 拖入“应用程序”的 Finder 包装，不声明 Developer ID 或公证。维护者步骤和失败恢复见 [CI/CD](docs/wiki/CI-CD.md)。
 
 真实机器核验与合成测试分开记录；后者不能证明企业账号、完整账单或真实服务器吞吐正确。视觉参考图只使用合成数据，录制图像本身不算通过。详细方法见 [测试指南](docs/wiki/测试指南.md) 和 [UI 测试说明](docs/UI_TESTING.md)，最近的结果与限制见 [验证记录](docs/VALIDATION.md)。
 

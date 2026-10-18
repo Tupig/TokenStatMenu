@@ -53,23 +53,24 @@ CI 绿色说明该提交完成了工作流声明的检查，不能据此声称�
 
 | 阶段 | 权限与实际动作 |
 | --- | --- |
-| `build` | `macos-15`、仓库只读；运行公开内容/文档/核心及指定原生检查，构建 Xcode 工程，再构建并 ad hoc 签名 Universal App；导出白名单源码并要求生成文档没有未提交差异；创建和核验四个资产后上传 Actions artifact |
-| `publish` | Ubuntu，仅此 job 有 `contents: write`；下载同一 run 的 artifact，再次按源码、版本、结构、摘要核验；只对固定主仓库的该标签处理 Release，支持继续匹配的草稿，远端逐个核验后才公开 |
+| `build` | `macos-15`、仓库只读；运行公开内容/文档/核心及指定原生检查，构建 Xcode 工程，再构建并 ad hoc 签名 Universal App；导出白名单源码并要求生成文档没有未提交差异；从 1.1.5/build7 起创建和核验五个资产（App ZIP、源码 ZIP、Universal DMG、manifest、SUMS）后上传 Actions artifact |
+| `publish` | `macos-15`、仅此 job 有 `contents: write`；下载同一 run 的 artifact，再次按源码、版本、结构、摘要和 DMG 镜像内容核验；只对固定主仓库的该标签处理 Release，支持继续匹配的草稿，远端逐个核验后才公开 |
 
-正式 Release 恰好包含以下四个手动上传资产，GitHub 自动提供的 Source code 归档不属于这四项：
+当前 1.1.4/build6 历史 Release 恰好包含以下四个手动上传资产；从 1.1.5/build7 起目标为五项，GitHub 自动提供的 Source code 归档不属于这些资产：
 
 | 文件 | 用途 |
 | --- | --- |
 | `TokenStatMenu-<版本>-universal.zip` | 包含 arm64 与 x86_64 的原生 App |
 | `TokenStatMenu-<版本>-source.zip` | 显式白名单导出的源码、原生工程和资源，统一 `TokenStatMenu/` 根目录 |
-| `release-manifest.json` | 版本、构建、标签、40 位公开提交，以及两个 ZIP 的文件名、字节数和 SHA-256 |
-| `SHA256SUMS` | 三行排序校验和，覆盖两个 ZIP 和 manifest，不包含自身摘要 |
+| `TokenStatMenu-<版本>-universal.dmg` | 与同一 Universal App 绑定的 Finder 拖拽安装包装，根目录仅含 App 与 `Applications` 别名 |
+| `release-manifest.json` | 版本、构建、标签、40 位公开提交，以及当前四资产或下一版五资产的文件名、字节数和 SHA-256 |
+| `SHA256SUMS` | 当前四资产历史为三行；五资产版本为四行排序校验和，覆盖所有三个发布二进制/源码资产和 manifest，不包含自身摘要 |
 
-应用包检查版本/架构、图标、Info/二进制/图标/签名四个文件和严格签名。源归档检查白名单及路径/类型/摘要。校验器不会因资产已经存在就直接成功；已有资产内容冲突会失败，不覆盖未知发布材料。工具的入口和边界见 [release_assets.py](../../script/release_assets.py) 与 [对应合成测试](../../script/test_release_assets.py)。
+应用包检查版本/架构、图标、Info/二进制/图标/签名四个文件和严格签名；DMG 另外使用 `hdiutil imageinfo` 并以只读方式挂载，核对根目录 App、`Applications` 别名和同一 App 身份，再安全卸载。源归档检查白名单及路径/类型/摘要。校验器不会因资产已经存在就直接成功；已有资产内容冲突会失败，不覆盖未知发布材料。工具的入口和边界见 [release_assets.py](../../script/release_assets.py) 与 [对应合成测试](../../script/test_release_assets.py)。
 
 App 使用 **ad hoc 签名**，没有配置 Developer ID 证书或 Apple 公证。资产摘要和 Git 提交用于核对完整性与来源，不是 Apple 信任证明，也不能证明用户机器上的企业链路可用。工作流不安装 App 到用户目录，不自动启动应用、不操作企业服务或系统权限。
 
-首次正式标签、Actions 实际完成、四资产下载核验及安装验收需分别记录在 [验证记录](../VALIDATION.md)。工作流文件存在、合成检查通过或草稿已创建，都不能直接称为发布完成。
+首次正式标签、Actions 实际完成、四资产历史或五资产下一版下载核验及安装验收需分别记录在 [验证记录](../VALIDATION.md)。工作流文件存在、合成检查通过或草稿已创建，都不能直接称为发布完成；当前页面不预写 1.1.5 CI/Release 成功。
 
 ## Homebrew 源码安装和自动跟进
 
