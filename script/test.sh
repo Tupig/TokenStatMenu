@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-swift run TokenStatCoreChecks
+swift run --force-resolved-versions TokenStatCoreChecks
 ./script/build_and_run.sh --build-only
 python3 script/integration.py

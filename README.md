@@ -120,7 +120,7 @@ SwiftUI：概览、数据来源、偏好设置
 | `./script/build_and_run.sh --universal` | 构建 arm64 与 x86_64 Release 通用 `.app`，不启动应用 |
 | `./script/build_and_run.sh` | 构建并运行本机架构 Debug `.app` |
 | `./script/build_and_run.sh --release` | 构建后运行本机架构 Release `.app`，不是只编译模式 |
-| `swift build -c release --product TokenStatMenu` | 编译 SwiftPM 可执行目标；不会单独完成 `.app` 资源打包 |
+| `swift build --force-resolved-versions -c release --product TokenStatMenu` | 按审核锁文件编译 SwiftPM 可执行目标；不会单独完成 `.app` 资源打包 |
 
 也可打开 `TokenStatMenu.xcodeproj`，选择 TokenStatMenu Scheme 和 My Mac 编译。若默认开发目录仍指向 Command Line Tools，可只为当前命令选择完整 Xcode：
 
@@ -133,14 +133,16 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
 
 更多环境准备、图标资源、双架构、构建身份和常见错误见 [编译指南](docs/wiki/编译指南.md)；发布前检查与签名限制见 [CI/CD](docs/wiki/CI-CD.md)。
 
+SwiftPM 构建和测试使用 `--force-resolved-versions`，只接受已提交的 `Package.resolved`。测试依赖在不同 Swift 工具链下会选择不同的兼容清单，锁文件包含这两条依赖图的审核版本；缺少必要 pin 或版本冲突时应停止，不能通过自动解析、构建后恢复锁文件或跳过源码一致性检查来掩盖。正式 App 的运行时依赖不因此增加。
+
 ## 验证与维护
 
 ```bash
 # 纯合成核心检查
-swift run TokenStatCoreChecks
+swift run --force-resolved-versions TokenStatCoreChecks
 
 # 原生 XCTest 与界面回归
-swift test
+swift test --force-resolved-versions
 
 # 核心、只构建及隔离启动集成
 ./script/test.sh

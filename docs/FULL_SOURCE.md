@@ -43,13 +43,15 @@ jobs:
       - name: Release contract and private native fixtures
         run: python3 -B script/test_release_assets.py
       - name: Core and gateway discovery checks
-        run: swift run TokenStatCoreChecks
+        run: swift run --force-resolved-versions TokenStatCoreChecks
       - name: Compile UI test target and run OS-independent checks
         run: |
-          swift test --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
-          swift test --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
+          swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
+          swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
       - name: Native Xcode build
         run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build
+      - name: Require unchanged committed dependency lock
+        run: git diff --exit-code -- Package.resolved
 ```
 
 ### .github/workflows/release.yml
@@ -87,11 +89,11 @@ jobs:
       - name: Release contract and private native fixtures
         run: python3 -B script/test_release_assets.py
       - name: Core and gateway discovery checks
-        run: swift run TokenStatCoreChecks
+        run: swift run --force-resolved-versions TokenStatCoreChecks
       - name: Compile UI target and run OS-independent checks
         run: |
-          swift test --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
-          swift test --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
+          swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
+          swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
       - name: Native Xcode build
         run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-Release-CI CODE_SIGNING_ALLOWED=NO build
       - name: Build and ad hoc sign Universal app without launching
@@ -5262,8 +5264,8 @@ enum TokenHubDecimalFormatter {
 <key>CFBundleDisplayName</key><string>TokenStatMenu</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
-<key>CFBundleShortVersionString</key><string>1.1.3</string>
-<key>CFBundleVersion</key><string>5</string>
+<key>CFBundleShortVersionString</key><string>1.1.4</string>
+<key>CFBundleVersion</key><string>6</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -11096,16 +11098,16 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # Native SwiftPM also works with Command Line Tools; no global xcode-select changes.
 if [ "$MODE" = "--universal" ]; then
     for ARCH in arm64 x86_64; do
-        swift build --arch "$ARCH" --scratch-path ".build/$ARCH" -c release --product TokenStatMenu
+        swift build --force-resolved-versions --arch "$ARCH" --scratch-path ".build/$ARCH" -c release --product TokenStatMenu
     done
-    ARM_DIR="$(swift build --arch arm64 --scratch-path .build/arm64 -c release --show-bin-path)"
-    INTEL_DIR="$(swift build --arch x86_64 --scratch-path .build/x86_64 -c release --show-bin-path)"
+    ARM_DIR="$(swift build --force-resolved-versions --arch arm64 --scratch-path .build/arm64 -c release --show-bin-path)"
+    INTEL_DIR="$(swift build --force-resolved-versions --arch x86_64 --scratch-path .build/x86_64 -c release --show-bin-path)"
     lipo -create "$ARM_DIR/TokenStatMenu" "$INTEL_DIR/TokenStatMenu" -output "$APP/Contents/MacOS/TokenStatMenu"
 else
     CONFIG=debug
     if [ "$MODE" = "--release" ]; then CONFIG=release; fi
-    swift build -c "$CONFIG" --product TokenStatMenu
-    BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
+    swift build --force-resolved-versions -c "$CONFIG" --product TokenStatMenu
+    BIN_DIR="$(swift build --force-resolved-versions -c "$CONFIG" --show-bin-path)"
     cp "$BIN_DIR/TokenStatMenu" "$APP/Contents/MacOS/TokenStatMenu"
 fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"
@@ -11145,7 +11147,7 @@ esac
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-swift run TokenStatCoreChecks
+swift run --force-resolved-versions TokenStatCoreChecks
 ./script/build_and_run.sh --build-only
 python3 script/integration.py
 ```
@@ -14061,7 +14063,7 @@ if __name__ == "__main__":
 | `./script/build_and_run.sh --universal` | 构建 arm64 与 x86_64 Release 通用 `.app`，不启动应用 |
 | `./script/build_and_run.sh` | 构建并运行本机架构 Debug `.app` |
 | `./script/build_and_run.sh --release` | 构建后运行本机架构 Release `.app`，不是只编译模式 |
-| `swift build -c release --product TokenStatMenu` | 编译 SwiftPM 可执行目标；不会单独完成 `.app` 资源打包 |
+| `swift build --force-resolved-versions -c release --product TokenStatMenu` | 按审核锁文件编译 SwiftPM 可执行目标；不会单独完成 `.app` 资源打包 |
 
 也可打开 `TokenStatMenu.xcodeproj`，选择 TokenStatMenu Scheme 和 My Mac 编译。若默认开发目录仍指向 Command Line Tools，可只为当前命令选择完整 Xcode：
 
@@ -14074,14 +14076,16 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
 
 更多环境准备、图标资源、双架构、构建身份和常见错误见 [编译指南](wiki/编译指南.md)；发布前检查与签名限制见 [CI/CD](wiki/CI-CD.md)。
 
+SwiftPM 构建和测试使用 `--force-resolved-versions`，只接受已提交的 `Package.resolved`。测试依赖在不同 Swift 工具链下会选择不同的兼容清单，锁文件包含这两条依赖图的审核版本；缺少必要 pin 或版本冲突时应停止，不能通过自动解析、构建后恢复锁文件或跳过源码一致性检查来掩盖。正式 App 的运行时依赖不因此增加。
+
 ## 验证与维护
 
 ```bash
 # 纯合成核心检查
-swift run TokenStatCoreChecks
+swift run --force-resolved-versions TokenStatCoreChecks
 
 # 原生 XCTest 与界面回归
-swift test
+swift test --force-resolved-versions
 
 # 核心、只构建及隔离启动集成
 ./script/test.sh

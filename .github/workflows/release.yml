@@ -30,11 +30,11 @@ jobs:
       - name: Release contract and private native fixtures
         run: python3 -B script/test_release_assets.py
       - name: Core and gateway discovery checks
-        run: swift run TokenStatCoreChecks
+        run: swift run --force-resolved-versions TokenStatCoreChecks
       - name: Compile UI target and run OS-independent checks
         run: |
-          swift test --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
-          swift test --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
+          swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
+          swift test --force-resolved-versions --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
       - name: Native Xcode build
         run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-Release-CI CODE_SIGNING_ALLOWED=NO build
       - name: Build and ad hoc sign Universal app without launching
