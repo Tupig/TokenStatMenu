@@ -1,8 +1,33 @@
 # 验证记录
 
+## 1.1.3 — 发布流程与额度展示层次，本机组合候选（2026-10-18）
+
+本节截止于 1.1.3（build 5）组合候选的本机源码、测试与构建验收。此时源码仍有未提交改动，构建来源状态为 `modified`；没有用候选构建冒充最终干净提交产物或正式 Release。当前已安装 1.1.2 的历史就绪结果也不能代替 1.1.3 最终安装验收。
+
+| 检查 | 已取得的本机证据 | 覆盖与限制 |
+| --- | --- | --- |
+| Core 回归 | `TokenStatCoreChecks` 611/611 通过；本轮未改 Core 采集与计量 | 使用合成记录，不能证明真实活动速度 |
+| 完整原生套件 | 64/64、0 失败，退出 0 | 12 启动、38 状态、11 快照与 3 项历史展示；不是 Settings 的私有 XCUITest |
+| 历史额度展示 | 3/3 通过；独立 PE 与 PM 检查实际概览浅/深、折叠/展开四张完整 460 点合成图 | 主企业卡保留、本地历史默认折叠、缺失/历史语义清楚、对称边距；初始状态渲染不是原生点击 |
+| 隔离集成 | build-only 和五组安全启动检查退出 0 | 只管理测试子进程，禁用后台；不证明默认企业链路 |
+| Release 工具合同 | 41/41 检查通过，退出 0 | 虚构元数据/下载、失败关闭与原生包装 fixture；不等于 Actions 已公开发布 |
+| Homebrew 更新器合同 | 24 methods 中 23 通过、1 项显式本机安装校验跳过 | 默认无真实安装；真实两版本升级及最终公开 Formula 安装另行记录 |
+| Xcode arm64 Release | `BUILD SUCCEEDED`，退出 0 | 仍有 SDK 未依赖 AppIntents 而跳过元数据提取的提示，不宣称全日志无 warning |
+| Universal 与签名 | arm64/x86_64 Release 构建退出 0；四文件 Bundle manifest、1.1.3/5、两架构和严格签名均核对 | 本地 ad hoc 签名；没有 Intel 硬件或 Apple 公证验收 |
+| 文档与公开内容 | 文档检查器自测及 19 篇链接/锚点通过；组合工作树公开内容检查通过 | 精确暂存/最终源码归档和最终发布身份需在冻结后核对 |
+| 最终交付 | 尚待对应正式记录 | 干净提交、CI/合并、四资产实际下载、正式 tap 和最终安装不能由上表推断 |
+
+[Issue #57](https://github.com/Tupig/TokenStatMenu/issues/57) 的本机展示修正已有源码与合成视觉证据：生产概览只保留企业当前窗口作为主额度，本地 Token/会话/覆盖与速度仍可见；未核验的本地历史窗口收进“本地历史额度（非企业当前额度）”默认折叠区。展开保留原已用比例、观察/重置时间和缺失文字，不补齐企业数据，不发起读取或改写设置。检查使用相互冲突的虚构直接/本地窗口，模型、菜单、告警及注入 I/O 守恒。合并、安装与 Issue 关闭仍以对应后续证据为准。
+
+[Issue #33](https://github.com/Tupig/TokenStatMenu/issues/33) 的当前阻塞已从锁屏转为原生自动化环境：Mac 已解锁，私有固定 fixture 的 `build-for-testing` 退出 0；`test-without-building` 在 runner 初始化时报 `Timed out while enabling automation mode`，退出 65，A01–A07 测试体均未运行。没有通过 OCR、离屏 getter、放宽断言、TCC 修改或重置权限替代实际 AX 核验，该问题保持未完成。
+
+主项目四资产 Release 与 Homebrew 三阶段更新流程已实装并完成本机合同检查；[Issue #55](https://github.com/Tupig/TokenStatMenu/issues/55)、[Issue #56](https://github.com/Tupig/TokenStatMenu/issues/56) 的实际正式发布、下载和安装结果，以对应 Issue 与 Actions run 证据为准。本节不提前写端到端通过，不以虚构 Formula pin 发布。1.1.3 也没有新的整 App CPU/RSS 降幅测量；历史性能数字仍仅用于其原合成场景。
+
+服务端权威瞬时 TPS 的 [#37](https://github.com/Tupig/TokenStatMenu/issues/37)、完整安装即用统计的 [#19](https://github.com/Tupig/TokenStatMenu/issues/19) 与 CLT 上游警告的 [#52](https://github.com/Tupig/TokenStatMenu/issues/52) 保持原证据边界。额度布局修正、构建或分发自动化不能关闭这些来源/环境缺口。
+
 ## 1.1.2 — 金额解析、并发边界与构建维护（2026-10-18）
 
-本节记录当前 1.1.2（build 4）候选的本地回归、构建与固定安装结果，后续各节保留原版本证据。最终干净提交来源、精确暂存/源码包复核、CI 与公开发布尚未完成；不能将 1.1.1 的通过结果套用于本候选。
+本节保留 1.1.2（build 4）当时的候选验收快照；“待完成”指该记录形成时的状态，不是当前远端或本机状态。后续该版本已通过 PR #54 合并到公开 `main`，本节不覆盖 1.1.3 的新验收，也不把 1.1.1 的通过结果套用于它。
 
 | 检查 | 当前已取得证据 | 覆盖与限制 |
 | --- | --- | --- |

@@ -40,6 +40,8 @@ jobs:
         run: python3 script/check_docs.py --self-test
       - name: Public content guardrail
         run: python3 script/check_public_content.py --git-index
+      - name: Release contract and private native fixtures
+        run: python3 -B script/test_release_assets.py
       - name: Core and gateway discovery checks
         run: swift run TokenStatCoreChecks
       - name: Compile UI test target and run OS-independent checks
@@ -48,6 +50,94 @@ jobs:
           swift test --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
       - name: Native Xcode build
         run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build
+```
+
+### .github/workflows/release.yml
+
+```yaml
+name: macOS release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate tag, version, source commit and main ancestry
+        run: |
+          python3 -B script/release_assets.py preflight --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
+      - name: Documentation links and synthetic checker fixtures
+        run: python3 -B script/check_docs.py --self-test
+      - name: Public content guardrail
+        run: python3 -B script/check_public_content.py --git-index
+      - name: Release contract and private native fixtures
+        run: python3 -B script/test_release_assets.py
+      - name: Core and gateway discovery checks
+        run: swift run TokenStatCoreChecks
+      - name: Compile UI target and run OS-independent checks
+        run: |
+          swift test --filter TokenStatUISnapshotTests.testCredentialAccountNamesAreURLAndPurposeBoundWithoutKeychainIO
+          swift test --filter TokenStatUISnapshotTests.testImageMatcherDetectsDeliberateMismatchWithoutRecording
+      - name: Native Xcode build
+        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-Release-CI CODE_SIGNING_ALLOWED=NO build
+      - name: Build and ad hoc sign Universal app without launching
+        run: ./script/build_and_run.sh --universal
+      - name: Export reviewed source and require committed generated document
+        run: |
+          python3 -B script/package_source.py
+          git diff --exit-code
+      - name: Package exactly four assets with native checks
+        run: python3 -B script/release_assets.py package --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --app dist/TokenStatMenu.app --source dist/TokenStatMenu-source.zip --directory dist/release
+      - name: Verify asset identities, payloads and checksums
+        run: python3 -B script/release_assets.py verify --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --directory dist/release
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2 (Node 24)
+        with:
+          name: tokenstatmenu-release
+          if-no-files-found: error
+          path: |
+            dist/release/TokenStatMenu-${{ env.RELEASE_VERSION }}-universal.zip
+            dist/release/TokenStatMenu-${{ env.RELEASE_VERSION }}-source.zip
+            dist/release/release-manifest.json
+            dist/release/SHA256SUMS
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ github.repository == 'Tupig/TokenStatMenu' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (Node 24)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2 (Node 24)
+        with:
+          name: tokenstatmenu-release
+          path: dist/release
+      - name: Verify downloaded assets against this source before writes
+        run: python3 -B script/release_assets.py verify --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --directory dist/release
+      - name: Resume matching draft, verify remote bytes and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B script/release_assets.py publish --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --directory dist/release
 ```
 
 ### Package.swift
@@ -4150,9 +4240,11 @@ typealias ValueState<Value> = SwiftUI.State<Value>
 @MainActor struct DashboardView: View {
     @ObservedObject var model: AppModel
     @ValueState private var settings = false
-    init(model: AppModel, settings: Bool = false) {
+    private let initialLocalHistoryExpanded: Bool
+    init(model: AppModel, settings: Bool = false, localHistoryExpanded: Bool = false) {
         self.model = model
         _settings = State(initialValue: settings)
+        initialLocalHistoryExpanded = localHistoryExpanded
     }
     var body: some View {
         VStack(spacing: 0) {
@@ -4170,19 +4262,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             if settings { SettingsView(model: model) }
             else {
                 ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        tokenHubCard
-                        Text(model.userFacingStatus)
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
-                        localUsageCard
-                        HStack(alignment: .top, spacing: 10) {
-                            WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
-                                color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
-                            WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
-                                color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
-                        }
-                        localQuotaCard
-                    }.padding(.horizontal, 16).padding(.bottom, 14)
+                    overviewContent
                 }
             }
             footer
@@ -4190,6 +4270,33 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         .frame(width: 460, height: 700)
         .background(.regularMaterial)
         .background(PanelPalette.gradient.opacity(0.09))
+        .groupBoxStyle(PanelCardStyle())
+        .tint(PanelPalette.blue)
+    }
+    /// Shared with full-content rendering checks, including the actual card
+    /// styles and insets rather than a reconstruction outside the ScrollView.
+    var overviewContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            tokenHubCard
+            Text(model.userFacingStatus)
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            localUsageCard
+            if model.quotaSource == .localCodex {
+                LocalHistoryDisclosure(initiallyExpanded: initialLocalHistoryExpanded) {
+                    localQuotaCard
+                }
+            } else {
+                // The generic enterprise branch is available to synthetic
+                // previews only; production local history has its own section.
+                HStack(alignment: .top, spacing: 10) {
+                    WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
+                        color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
+                    WindowQuotaCard(title: "7 天额度", quota: model.sevenDayQuota,
+                        color: PanelPalette.violet, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
+                }
+            }
+        }
+        .padding(.horizontal, 16).padding(.bottom, 14)
         .groupBoxStyle(PanelCardStyle())
         .tint(PanelPalette.blue)
     }
@@ -4254,13 +4361,21 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private var localQuotaCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 8) {
-                metric("5 小时额度", localQuotaDescription(model.fiveHourQuota))
-                metric("7 天额度", localQuotaDescription(model.sevenDayQuota))
+                historyWindow("5 小时历史", quota: model.fiveHourQuota)
+                historyWindow("7 天历史", quota: model.sevenDayQuota)
                 Text("本地记录额度始终只是历史参考，不论事件是否新鲜；不代表当前企业剩余额度，也不触发企业额度告警。保留源记录的已用比例、记录时间和原重置时间。")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
             }
-        } label: { Label("本地额度快照", systemImage: "chart.bar") }
+        } label: { Label("本地 Codex 历史 · 账号/组织未核验", systemImage: "clock") }
+    }
+    private func historyWindow(_ title: String, quota: WindowQuota?) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.system(size: 11, weight: .medium))
+            Text(localQuotaDescription(quota))
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        }
     }
     private func localQuotaDescription(_ quota: WindowQuota?) -> String {
         let state = WindowQuotaCard.presentation(for: quota, refreshSeconds: model.config.refreshSeconds, source: .localCodex)
@@ -4283,6 +4398,29 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private func count(_ n: Int) -> String { n.formatted() }
     private func localCount(_ n: Int) -> String { model.localSnapshot.knownThreadCount == 0 ? "—" : count(n) }
     private func count(_ n: Double) -> String { n.formatted(.number.precision(.fractionLength(0))) }
+}
+
+/// Expansion belongs to this installed view, never to the model or preferences.
+/// Keeping the State here also lets a detached overview be hosted for rendering
+/// without accessing a State projection on an uninstalled DashboardView value.
+private struct LocalHistoryDisclosure<Content: View>: View {
+    @ValueState private var expanded: Bool
+    private let content: Content
+
+    init(initiallyExpanded: Bool, @ViewBuilder content: () -> Content) {
+        _expanded = SwiftUI.State(initialValue: initiallyExpanded)
+        self.content = content()
+    }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            content.padding(.top, 8)
+        } label: {
+            Label("本地历史额度（非企业当前额度）", systemImage: "clock.arrow.circlepath")
+                .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+        }
+        .accessibilityHint("只显示本地历史记录，不代表企业当前剩余额度")
+    }
 }
 ```
 
@@ -5124,8 +5262,8 @@ enum TokenHubDecimalFormatter {
 <key>CFBundleDisplayName</key><string>TokenStatMenu</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
-<key>CFBundleShortVersionString</key><string>1.1.2</string>
-<key>CFBundleVersion</key><string>4</string>
+<key>CFBundleShortVersionString</key><string>1.1.3</string>
+<key>CFBundleVersion</key><string>5</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -10671,6 +10809,279 @@ final class SeasunStartupContractTests: XCTestCase {
 }
 ```
 
+### Tests/TokenStatUITests/DashboardHistoryTests.swift
+
+```swift
+import AppKit
+import Combine
+import CryptoKit
+import SwiftUI
+import XCTest
+import TokenStatCore
+@testable import TokenStatMenu
+
+/// These checks host the actual overview used by DashboardView.body. The four
+/// full-content images are synthetic private review artifacts, not snapshots
+/// of a user's running app. Initial state rendering does not prove a native
+/// disclosure click; that interaction remains outside this bounded check.
+@MainActor
+final class DashboardHistoryTests: XCTestCase {
+    private final class Calls {
+        var loads = 0, saves = 0, starts = 0, discoveries = 0, fetches = 0
+        var localResolves = 0, localScans = 0, axScans = 0
+        var values: [Int] { [loads, saves, starts, discoveries, fetches, localResolves, localScans, axScans] }
+    }
+    private final class Permission: TokenHubPermissionProviding {
+        var requests = 0
+        func isTrusted() -> Bool { false }
+        func requestOnceAndOpenSystemSettings() { requests += 1 }
+    }
+    private struct Fixture {
+        let model: AppModel
+        let calls: Calls
+        let permission: Permission
+        let now: Date
+    }
+    private struct Render {
+        let png: Data
+        let points: NSSize
+        let pixels: NSSize
+    }
+    private struct ModelState: Equatable {
+        let direct: TokenHubQuotaSnapshot?
+        let local: LocalCodexSnapshot
+        let five: WindowQuota?
+        let seven: WindowQuota?
+        let status: TokenHubQuotaStatus
+        let directSource: Bool
+        let failure: TokenHubDirectQuotaFailure?
+        let sourceReadiness: String
+        let title: String
+        let tooltip: String
+        let preferences: SeasunPreferences
+        let resources: BackgroundServiceResources
+    }
+
+    private func state(_ model: AppModel) -> ModelState {
+        ModelState(direct: model.tokenHubQuotaSnapshot, local: model.localSnapshot,
+            five: model.fiveHourQuota, seven: model.sevenDayQuota,
+            status: model.tokenHubQuotaStatus, directSource: model.tokenHubQuotaIsDirect,
+            failure: model.tokenHubDirectFailure, sourceReadiness: model.sourceReadinessText,
+            title: model.title, tooltip: model.menuTooltip, preferences: model.preferences,
+            resources: model.backgroundServiceResources)
+    }
+
+    private func fixture(failing: Bool = false) async throws -> Fixture {
+        let calls = Calls(), permission = Permission()
+        // Wall time is used only to keep the synthetic direct snapshot fresh in
+        // the real view, which uses Date(). All amounts/identities are invented.
+        let now = Date().addingTimeInterval(-5)
+        let identity = TokenHubIdentity(pid: 928, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic C28 Hub.app/Contents/MacOS/Hub")
+        let snapshot = TokenHubQuotaSnapshot(identity: identity,
+            fiveHour: TokenHubWindowQuota(kind: .fiveHour, usedAmount: Decimal(string: "3.75")!,
+                limitAmount: 10, sourceSymbol: "$", usedPercent: Decimal(string: "37.5")!,
+                resetDisplay: "synthetic five-hour reset"),
+            sevenDay: TokenHubWindowQuota(kind: .sevenDay, usedAmount: 4,
+                limitAmount: 10, sourceSymbol: "$", usedPercent: 40,
+                resetDisplay: "synthetic seven-day reset"),
+            monthly: TokenHubMonthlyUsage(usedAmount: Decimal(string: "12.5")!, sourceSymbol: "$"),
+            observedAt: now)
+        let startup = AppModelStartupDependencies(loadPreferences: {
+            calls.loads += 1; XCTFail("C28 rendering must not read real preferences"); return nil
+        }, savePreferences: { _ in
+            calls.saves += 1; XCTFail("C28 rendering must not save preferences")
+        }, shouldStartBackgroundServices: {
+            calls.starts += 1; XCTFail("C28 rendering must not start services"); return false
+        })
+        let direct = TokenHubDirectQuotaDependencies(discoverTarget: {
+            calls.discoveries += 1; return identity
+        }, identityIsCurrent: { $0 == identity }, fetch: { _, _ in
+            calls.fetches += 1
+            if failing { throw TokenHubDirectQuotaFailure.transportFailed }
+            return snapshot
+        })
+        let local = LocalCodexScanDependencies(resolveInputs: {
+            calls.localResolves += 1; XCTFail("C28 rendering must not discover local sessions")
+            return (URL(fileURLWithPath: "/tmp/TokenStatMenu-C28-no-read"), .unverified)
+        }, scan: { _, _, _, _ in
+            await MainActor.run { calls.localScans += 1; XCTFail("C28 rendering must not scan local sessions") }
+            throw TokenHubDirectQuotaFailure.transportFailed
+        })
+        let ax = TokenHubAXSource.synthetic { _ in
+            calls.axScans += 1; XCTFail("C28 rendering must not read another app")
+            return TokenHubQuotaResult(status: .accessFailed, snapshot: nil, failure: nil)
+        }
+        let model = AppModel(preview: true, startup: startup, directQuota: direct,
+                             localScanning: local, tokenHubAXSource: ax)
+        model.config.dataSource = "localCodex"
+        model.tokenHubNow = { now }
+        model.tokenHubPermissionProvider = permission
+        model.tokenHubAutomaticReadingEnabled = false
+        model.refreshTokenHubQuota()
+        for _ in 0..<100 {
+            if failing ? model.tokenHubDirectFailure == .transportFailed : model.tokenHubQuotaIsDirect {
+                return Fixture(model: model, calls: calls, permission: permission, now: now)
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        model.shutdown()
+        XCTFail("C28 injected direct result was not applied")
+        throw TokenHubDirectQuotaFailure.transportFailed
+    }
+
+    private func localQuotas(primary: Bool, secondary: Bool, now: Date,
+                             future: Bool = false, missingReset: Bool = false) throws -> QuotaReport {
+        var limits: [String: Any] = [:]
+        if primary {
+            var value: [String: Any] = ["usedPercent": 90, "windowDurationMins": 300]
+            if !missingReset { value["resetsAt"] = Int(now.addingTimeInterval(-3600).timeIntervalSince1970) }
+            limits["primary"] = value
+        }
+        if secondary {
+            var value: [String: Any] = ["usedPercent": 5, "windowDurationMins": 10_080]
+            if !missingReset { value["resetsAt"] = Int(now.addingTimeInterval(-1800).timeIntervalSince1970) }
+            limits["secondary"] = value
+        }
+        // Empty local objects are assigned directly as nil windows by the caller;
+        // QuotaReport intentionally rejects a response containing no facts.
+        let bytes = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": limits]])
+        return try QuotaReport.parse(bytes, config: AppConfiguration(),
+            now: future ? now.addingTimeInterval(3600) : now.addingTimeInterval(-7200))
+    }
+
+    private func assignLocal(_ report: QuotaReport?, to model: AppModel, now: Date) {
+        model.fiveHourQuota = report?.fiveHour; model.sevenDayQuota = report?.sevenDay
+        model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
+            sessionCount: 2, filesScanned: 3, isLimited: false,
+            latestEventAt: now.addingTimeInterval(-7200),
+            fiveHour: report?.fiveHour, sevenDay: report?.sevenDay,
+            knownThreadCount: 3, unknownThreadCount: 1, unidentifiedFileCount: 0,
+            subagentCount: 1, forkCount: 0,
+            lastTurn: LocalTurnSummary(outputTokens: 20, durationSeconds: 4,
+                completedAt: now.addingTimeInterval(-7200)))
+    }
+
+    private func render<V: View>(_ content: V, dark: Bool) throws -> Render {
+        let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
+        let root = content.environment(\.colorScheme, dark ? .dark : .light)
+            .frame(width: 460).fixedSize(horizontal: false, vertical: true)
+            .background(dark ? Color(red: 0.13, green: 0.14, blue: 0.17)
+                             : Color(red: 0.96, green: 0.97, blue: 0.99))
+        let host = NSHostingView(rootView: root)
+        host.appearance = appearance
+        host.frame = NSRect(x: 0, y: 0, width: 460, height: 1600)
+        host.layoutSubtreeIfNeeded()
+        let fitted = host.fittingSize
+        XCTAssertEqual(fitted.width, 460, accuracy: 0.5)
+        XCTAssertGreaterThan(fitted.height, 200, "render must include actual overview content, not a toolbar crop")
+        XCTAssertLessThan(fitted.height, 4000)
+        let bounds = NSRect(x: 0, y: 0, width: 460, height: ceil(fitted.height))
+        let window = NSWindow(contentRect: bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.orderOut(nil); window.close() }
+        host.frame = bounds; window.contentView = host; window.appearance = appearance
+        window.displayIfNeeded(); host.layoutSubtreeIfNeeded()
+        let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: bounds))
+        host.cacheDisplay(in: bounds, to: bitmap)
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        let decoded = try XCTUnwrap(NSBitmapImageRep(data: png))
+        XCTAssertGreaterThan(png.count, 4000, "a nonempty blank-sized stub is insufficient")
+        XCTAssertEqual(decoded.pixelsWide, Int(bounds.width * window.backingScaleFactor))
+        XCTAssertEqual(decoded.pixelsHigh, Int(bounds.height * window.backingScaleFactor))
+        return Render(png: png, points: bounds.size,
+            pixels: NSSize(width: decoded.pixelsWide, height: decoded.pixelsHigh))
+    }
+
+    func testC28ActualOverviewCollapsedAndExpandedFullContentRenders() async throws {
+        let f = try await fixture(); defer { f.model.shutdown() }
+        assignLocal(try localQuotas(primary: false, secondary: true, now: f.now), to: f.model, now: f.now)
+        let original = state(f.model), calls = f.calls.values, alert = f.model.alertColor
+        let direct = try XCTUnwrap(f.model.tokenHubQuotaSnapshot)
+        XCTAssertEqual(direct.fiveHour?.remainingPercent, Decimal(string: "62.5"))
+        XCTAssertEqual(direct.sevenDay?.remainingPercent, 60)
+        XCTAssertNil(f.model.fiveHourQuota)
+        XCTAssertEqual(f.model.sevenDayQuota?.usedPercent, 5)
+        let output = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenStatMenu-C28-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+        var manifest: [[String: Any]] = []
+        for (name, dark) in [("light", false), ("dark", true)] {
+            let implicit = try render(DashboardView(model: f.model).overviewContent, dark: dark)
+            let collapsed = try render(DashboardView(model: f.model, localHistoryExpanded: false).overviewContent, dark: dark)
+            let expanded = try render(DashboardView(model: f.model, localHistoryExpanded: true).overviewContent, dark: dark)
+            XCTAssertEqual(implicit.png, collapsed.png, "default history presentation must be collapsed")
+            XCTAssertGreaterThan(expanded.points.height, collapsed.points.height + 30,
+                                 "expanded history must contain actual secondary content")
+            XCTAssertNotEqual(expanded.png, collapsed.png)
+            for (stateName, image) in [("collapsed", collapsed), ("expanded", expanded)] {
+                let basename = "synthetic-c28-\(name)-\(stateName).png"
+                try image.png.write(to: output.appendingPathComponent(basename))
+                manifest.append(["name": basename, "sha256": SHA256.hash(data: image.png).map { String(format: "%02x", $0) }.joined(),
+                    "widthPoints": image.points.width, "heightPoints": image.points.height,
+                    "widthPixels": image.pixels.width, "heightPixels": image.pixels.height])
+            }
+        }
+        try JSONSerialization.data(withJSONObject: ["syntheticOnly": true, "nativeInteractionVerified": false,
+            "images": manifest], options: [.prettyPrinted, .sortedKeys])
+            .write(to: output.appendingPathComponent("render-manifest.json"))
+        print("C28 synthetic full-content review images: \(output.path)")
+        XCTAssertEqual(state(f.model), original)
+        XCTAssertEqual(f.calls.values, calls)
+        XCTAssertEqual(f.model.alertColor, alert)
+        XCTAssertEqual(f.permission.requests, 0)
+        XCTAssertEqual(calls, [0, 0, 0, 1, 1, 0, 0, 0])
+        XCTAssertEqual(f.model.localSnapshot.total, 200)
+        XCTAssertEqual(f.model.localSnapshot.unknownThreadCount, 1)
+    }
+
+    func testC28DirectFailureCannotBecomeCurrentFromExpandedLocalHistory() async throws {
+        let f = try await fixture(failing: true); defer { f.model.shutdown() }
+        assignLocal(try localQuotas(primary: true, secondary: true, now: f.now), to: f.model, now: f.now)
+        let original = state(f.model), calls = f.calls.values, alert = f.model.alertColor
+        XCTAssertNil(f.model.tokenHubQuotaSnapshot)
+        XCTAssertFalse(f.model.tokenHubQuotaIsDirect)
+        XCTAssertEqual(DashboardView(model: f.model).tokenHubCard.emptyStateText, "Token Hub 网络请求失败")
+        for expanded in [false, true] {
+            _ = try render(DashboardView(model: f.model, localHistoryExpanded: expanded).overviewContent, dark: false)
+        }
+        XCTAssertEqual(state(f.model), original)
+        XCTAssertEqual(f.calls.values, calls)
+        XCTAssertEqual(f.model.alertColor, alert)
+        XCTAssertEqual(f.permission.requests, 0)
+    }
+
+    func testC28LocalWindowCombinationsPreserveMissingAndHistoricalFacts() async throws {
+        let f = try await fixture(); defer { f.model.shutdown() }
+        for (five, seven, future, noReset) in [(false, false, false, false), (true, false, false, false),
+            (false, true, false, false), (true, true, false, false), (true, true, true, false),
+            (true, true, false, true)] {
+            let report = five || seven ? try localQuotas(primary: five, secondary: seven,
+                now: f.now, future: future, missingReset: noReset) : nil
+            assignLocal(report, to: f.model, now: f.now)
+            let original = state(f.model), calls = f.calls.values
+            _ = try render(DashboardView(model: f.model, localHistoryExpanded: true).overviewContent, dark: false)
+            XCTAssertEqual(state(f.model), original)
+            XCTAssertEqual(f.calls.values, calls)
+            XCTAssertEqual(f.model.fiveHourQuota != nil, five)
+            XCTAssertEqual(f.model.sevenDayQuota != nil, seven)
+            for value in [f.model.fiveHourQuota, f.model.sevenDayQuota].compactMap({ $0 }) {
+                let presentation = WindowQuotaCard.presentation(for: value, at: f.now, refreshSeconds: 60, source: .localCodex)
+                XCTAssertFalse(presentation.isFresh)
+                XCTAssertEqual(presentation.usedPercent, value.usedPercent)
+                XCTAssertEqual(presentation.recordedAt, value.fetchedAt)
+                XCTAssertEqual(presentation.resetsAt, value.resetsAt)
+                XCTAssertTrue(presentation.sourceLabel.contains("账号/组织未核验"))
+                XCTAssertTrue(presentation.statusLabel.contains("历史"))
+                if future { XCTAssertTrue(presentation.statusLabel.contains("异常时间戳")) }
+                if noReset { XCTAssertTrue(presentation.statusLabel.contains("重置时间未知")) }
+            }
+        }
+        XCTAssertEqual(f.permission.requests, 0)
+    }
+}
+```
+
 ### script/build_and_run.sh
 
 ```bash
@@ -11099,6 +11510,1480 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+```
+
+### script/release_assets.py
+
+```python
+#!/usr/bin/env python3
+"""Build and verify the four public release assets, then publish without clobber.
+
+Only the explicit ``publish`` command makes GitHub writes. It receives the
+short-lived Actions token through GH_TOKEN; no credential is read or logged.
+Native bundle checks run during packaging on macOS. Artifact readback checks
+are portable and never extract or execute an application.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+from package_source import PUBLIC_FILES
+
+
+REPOSITORY = "Tupig/TokenStatMenu"
+APP_FILES = {
+    "Contents/Info.plist": 0o644,
+    "Contents/MacOS/TokenStatMenu": 0o755,
+    "Contents/Resources/AppIcon.icns": 0o644,
+    "Contents/_CodeSignature/CodeResources": 0o644,
+}
+APP_DIRECTORIES = {"Contents", "Contents/MacOS", "Contents/Resources", "Contents/_CodeSignature"}
+TAG_PATTERN = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
+COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
+SHA_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True)
+class ReleaseIdentity:
+    version: str
+    build: str
+    tag: str
+    commit: str
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def _identity_fields(identity: ReleaseIdentity) -> dict:
+    _require(isinstance(identity.tag, str) and TAG_PATTERN.fullmatch(identity.tag) is not None,
+             "release tag must be a stable vMAJOR.MINOR.PATCH")
+    _require(identity.version == identity.tag[1:], "tag/version mismatch")
+    _require(isinstance(identity.build, str) and re.fullmatch(r"[1-9][0-9]*", identity.build) is not None,
+             "build must be a positive ASCII integer string")
+    _require(isinstance(identity.commit, str) and COMMIT_PATTERN.fullmatch(identity.commit) is not None,
+             "invalid source commit")
+    return dict(version=identity.version, build=identity.build, tag=identity.tag, commit=identity.commit)
+
+
+def _git(root: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess:
+    # Release checks must not inherit an unrelated index, worktree or Git config.
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_CONFIG_SYSTEM=os.devnull, GIT_TERMINAL_PROMPT="0")
+    command = ["git", "-c", "core.hooksPath=" + os.devnull, *arguments]
+    result = subprocess.run(command, cwd=root, env=environment, capture_output=True)
+    if check and result.returncode:
+        raise ValueError("required local Git check failed")
+    return result
+
+
+def _root(root: Path) -> Path:
+    root = Path(root).resolve()
+    _require(root.is_dir(), "missing source directory")
+    actual = _git(root, "rev-parse", "--show-toplevel").stdout.decode().strip()
+    _require(Path(actual).resolve() == root, "source must be the exact repository root")
+    return root
+
+
+def _plist(data: bytes) -> dict:
+    try:
+        value = plistlib.loads(data)
+    except (ValueError, plistlib.InvalidFileException, TypeError, OverflowError) as error:
+        raise ValueError("invalid bundle plist") from error
+    _require(isinstance(value, dict), "bundle plist must be a dictionary")
+    return value
+
+
+def release_identity(root: Path, tag: str, expected_commit: str) -> ReleaseIdentity:
+    root = _root(root)
+    # Validate untrusted tag text before it reaches even an argument-array tool.
+    _require(isinstance(tag, str) and TAG_PATTERN.fullmatch(tag) is not None, "invalid release tag")
+    _require(isinstance(expected_commit, str) and COMMIT_PATTERN.fullmatch(expected_commit) is not None,
+             "invalid expected source commit")
+    info = _plist((root / "Resources/Info.plist").read_bytes())
+    identity = ReleaseIdentity(info.get("CFBundleShortVersionString"), info.get("CFBundleVersion"),
+                               tag, expected_commit)
+    _identity_fields(identity)
+    head = _git(root, "rev-parse", "--verify", "HEAD").stdout.decode().strip()
+    peeled = _git(root, "rev-parse", "--verify", "refs/tags/" + tag + "^{commit}").stdout.decode().strip()
+    _require(head == expected_commit == peeled, "tag, HEAD and expected commit must match")
+    _require(_git(root, "merge-base", "--is-ancestor", head, "refs/remotes/origin/main",
+                  check=False).returncode == 0, "release commit must be in fetched origin/main history")
+    _require(not _git(root, "status", "--porcelain", "--untracked-files=normal").stdout,
+             "release source/index must be clean, with no untracked files")
+    return identity
+
+
+def _source_files(root: Path, public_files: list[str]) -> dict[str, tuple[bytes, int]]:
+    root = _root(root)
+    expected = set(public_files)
+    _require(len(expected) == len(public_files), "duplicate public source name")
+    for name in expected:
+        _require(isinstance(name, str) and name and not name.startswith("/")
+                 and all(part not in ["", ".", ".."] for part in name.split("/"))
+                 and not any(ord(character) < 32 for character in name), "unsafe public source name")
+    indexed = set(_git(root, "ls-files", "-z").stdout.decode().split("\0")[:-1])
+    _require(indexed == expected, "tracked source set differs from the public allowlist")
+    records = _git(root, "ls-tree", "-rz", "--full-tree", "HEAD").stdout.split(b"\0")
+    committed = {}
+    for record in records:
+        if not record:
+            continue
+        metadata, encoded_name = record.split(b"\t", 1)
+        mode, kind, object_id = metadata.decode().split()
+        name = encoded_name.decode()
+        _require(kind == "blob" and mode in ["100644", "100755"], "source has an unapproved Git file mode")
+        committed[name] = (object_id, int(mode, 8))
+    _require(set(committed) == expected, "commit source set differs from the public allowlist")
+    result = {}
+    for name, (object_id, git_mode) in committed.items():
+        path = root / name
+        # Inspect every component before reading, including directory symlinks.
+        current = root
+        for part in name.split("/"):
+            current = current / part
+            _require(not current.is_symlink(), "source contains a symbolic link")
+        _require(path.is_file() and stat.S_ISREG(path.stat().st_mode), "source file is not regular")
+        mode = stat.S_IMODE(path.stat().st_mode)
+        _require(mode == stat.S_IMODE(git_mode), "source filesystem/Git modes differ")
+        data = _git(root, "cat-file", "blob", object_id).stdout
+        _require(path.read_bytes() == data, "source bytes differ from the release commit")
+        result[name] = (data, mode)
+    _require(_git(root, "diff", "--quiet", "HEAD", "--", check=False).returncode == 0,
+             "source index or worktree differs from the release commit")
+    return result
+
+
+def _zip_files(path: Path, prefix: str, expected: set[str], modes: dict[str, int],
+               sizes: dict[str, int] | None = None) -> dict[str, tuple[bytes, int]]:
+    _require(not Path(path).is_symlink() and Path(path).is_file(), "archive is not a regular file")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+            names = [member.filename for member in members]
+            required = {prefix + name for name in expected}
+            _require(len(names) == len(set(names)) and set(names) == required,
+                     "archive has missing, duplicate or unexpected members")
+            result = {}
+            for member in members:
+                name = member.filename[len(prefix):]
+                mode = member.external_attr >> 16
+                _require(member.create_system == 3 and stat.S_ISREG(mode)
+                         and stat.S_IMODE(mode) == modes[name] and not member.is_dir(),
+                         "archive has a symbolic link, directory or incorrect mode")
+                if sizes is not None:
+                    _require(member.file_size == sizes[name], "archive member size differs from source")
+                data = archive.read(member)
+                _require(len(data) == member.file_size, "archive member is truncated")
+                result[name] = (data, modes[name])
+            return result
+    except (zipfile.BadZipFile, RuntimeError, OSError, EOFError, NotImplementedError) as error:
+        raise ValueError("invalid release archive") from error
+
+
+def validate_source_archive(root: Path, source_zip: Path, public_files: list[str]) -> dict:
+    source = _source_files(root, public_files)
+    archived = _zip_files(source_zip, "TokenStatMenu/", set(source),
+                          {name: mode for name, (_, mode) in source.items()},
+                          {name: len(data) for name, (data, _) in source.items()})
+    _require(archived == source, "archive source bytes differ from the release commit")
+    return archived
+
+
+def _bundle_content(root: Path, content: dict[str, tuple[bytes, int]], identity: ReleaseIdentity) -> None:
+    _identity_fields(identity)
+    _require(set(content) == set(APP_FILES), "bundle file set differs")
+    source_info = _plist((Path(root) / "Resources/Info.plist").read_bytes())
+    info = _plist(content["Contents/Info.plist"][0])
+    expected = dict(source_info, TokenStatSourceRevision=identity.commit, TokenStatSourceState="clean")
+    _require(info == expected, "bundle plist differs from source identity/provenance")
+    _require(info.get("CFBundleShortVersionString") == identity.version
+             and info.get("CFBundleVersion") == identity.build, "bundle version/build differs")
+    _require(info.get("CFBundleIdentifier") == "com.tupig.TokenStatMenu"
+             and info.get("CFBundleExecutable") == "TokenStatMenu"
+             and info.get("CFBundleName") == "TokenStatMenu"
+             and info.get("CFBundlePackageType") == "APPL"
+             and info.get("CFBundleIconFile") == "AppIcon"
+             and info.get("LSMinimumSystemVersion") == "13.0"
+             and info.get("LSUIElement") is True, "unexpected application identity/platform")
+    _require(content["Contents/Resources/AppIcon.icns"][0]
+             == (Path(root) / "Resources/AppIcon.icns").read_bytes(), "bundle icon differs from source")
+    _require(all(data and mode == APP_FILES[name] for name, (data, mode) in content.items()),
+             "bundle has an empty file or incorrect mode")
+
+
+def validate_app(root: Path, app: Path, identity: ReleaseIdentity, command_runner=subprocess.run) -> dict:
+    app = Path(app)
+    _require(not app.is_symlink() and app.is_dir(), "application is not a regular bundle directory")
+    files, directories = {}, set()
+    for path in app.rglob("*"):
+        _require(not path.is_symlink(), "application contains a symbolic link")
+        name = path.relative_to(app).as_posix()
+        mode = path.stat().st_mode
+        if stat.S_ISDIR(mode):
+            directories.add(name)
+        else:
+            _require(stat.S_ISREG(mode) and name in APP_FILES, "application contains an unapproved file")
+            _require(stat.S_IMODE(mode) == APP_FILES[name], "incorrect application file mode")
+            files[name] = (path.read_bytes(), stat.S_IMODE(mode))
+    _require(directories == APP_DIRECTORIES and set(files) == set(APP_FILES), "application full tree differs")
+    _bundle_content(root, files, identity)
+    try:
+        arch = command_runner(["lipo", "-archs", str(app / "Contents/MacOS/TokenStatMenu")],
+                              text=True, capture_output=True, check=False)
+        _require(arch.returncode == 0 and set(arch.stdout.split()) == {"arm64", "x86_64"}
+                 and len(arch.stdout.split()) == 2, "application must have exactly arm64 and x86_64")
+        signed = command_runner(["codesign", "--verify", "--deep", "--strict", str(app)],
+                                text=True, capture_output=True, check=False)
+        _require(signed.returncode == 0, "strict application signature verification failed")
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("native application validation tool failed") from error
+    return files
+
+
+def _names(identity: ReleaseIdentity) -> dict[str, str]:
+    _identity_fields(identity)
+    return {kind: f"TokenStatMenu-{identity.version}-{kind}.zip" for kind in ["universal", "source"]}
+
+
+def _canonical_zip(path: Path, prefix: str, files: dict[str, tuple[bytes, int]]) -> None:
+    # Release-only normalization: original payload/modes, fixed ZIP metadata.
+    # The generic source exporter retains its existing behavior.
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for name, (data, mode) in sorted(files.items()):
+            item = zipfile.ZipInfo(prefix + name, (2026, 1, 1, 0, 0, 0))
+            item.create_system = 3
+            item.external_attr = (stat.S_IFREG | mode) << 16
+            item.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(item, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+
+
+def _sums(directory: Path, names: list[str]) -> bytes:
+    return "".join(hashlib.sha256((directory / name).read_bytes()).hexdigest() + "  " + name + "\n"
+                   for name in sorted(names)).encode("ascii")
+
+
+def package_assets(root: Path, app: Path, source_zip: Path, output_dir: Path,
+                   identity: ReleaseIdentity) -> dict:
+    fields = _identity_fields(identity)
+    output_dir = Path(output_dir)
+    _require(not output_dir.is_symlink(), "staging directory is a symbolic link")
+    _require(not output_dir.exists() or (output_dir.is_dir() and not any(output_dir.iterdir())),
+             "staging directory must be new or empty; existing content is never removed")
+    source = validate_source_archive(root, source_zip, PUBLIC_FILES)
+    bundle = validate_app(root, app, identity)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    names = _names(identity)
+    _canonical_zip(output_dir / names["source"], "TokenStatMenu/", source)
+    _canonical_zip(output_dir / names["universal"], "TokenStatMenu.app/", bundle)
+    manifest = dict(fields, assets={})
+    for kind, name in names.items():
+        data = (output_dir / name).read_bytes()
+        manifest["assets"][kind] = dict(name=name, bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+    (output_dir / "release-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                                                        encoding="utf-8")
+    (output_dir / "SHA256SUMS").write_bytes(_sums(output_dir, [*names.values(), "release-manifest.json"]))
+    return validate_assets(root, output_dir, identity)
+
+
+def _unique_json(pairs: list[tuple]) -> dict:
+    result = {}
+    for key, value in pairs:
+        _require(key not in result, "duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def validate_assets(root: Path, directory: Path, identity: ReleaseIdentity) -> dict:
+    directory = Path(directory)
+    fields, names = _identity_fields(identity), _names(identity)
+    _require(not directory.is_symlink() and directory.is_dir(), "missing asset directory")
+    expected = {*names.values(), "release-manifest.json", "SHA256SUMS"}
+    files = list(directory.iterdir())
+    _require({path.name for path in files} == expected
+             and all(not path.is_symlink() and path.is_file() and stat.S_ISREG(path.stat().st_mode)
+                     for path in files), "asset directory must contain exactly four regular files")
+    try:
+        manifest = json.loads((directory / "release-manifest.json").read_text(encoding="utf-8"),
+                              object_pairs_hook=_unique_json)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid release manifest JSON") from error
+    _require(isinstance(manifest, dict) and set(manifest) == {*fields, "assets"}, "unexpected manifest keys")
+    _require(all(manifest[key] == value for key, value in fields.items()), "manifest release identity differs")
+    assets = manifest["assets"]
+    _require(isinstance(assets, dict) and set(assets) == set(names), "unexpected manifest asset keys")
+    for kind, name in names.items():
+        item = assets[kind]
+        _require(isinstance(item, dict) and set(item) == {"name", "bytes", "sha256"}, "unexpected asset fields")
+        _require(item["name"] == name and type(item["bytes"]) is int and item["bytes"] > 0
+                 and isinstance(item["sha256"], str) and SHA_PATTERN.fullmatch(item["sha256"]) is not None,
+                 "invalid asset name, byte count or digest")
+        data = (directory / name).read_bytes()
+        _require(len(data) == item["bytes"] and hashlib.sha256(data).hexdigest() == item["sha256"],
+                 "asset byte count/digest mismatch")
+    _require((directory / "SHA256SUMS").read_bytes()
+             == _sums(directory, [*names.values(), "release-manifest.json"]), "checksum file differs")
+    validate_source_archive(root, directory / names["source"], PUBLIC_FILES)
+    bundle = _zip_files(directory / names["universal"], "TokenStatMenu.app/", set(APP_FILES), APP_FILES)
+    _bundle_content(root, bundle, identity)
+    return manifest
+
+
+def publish_release(root: Path, directory: Path, identity: ReleaseIdentity, client) -> str:
+    """Validate before writes; a conflicting release is never overwritten.
+
+    Failures after upload leave a draft. Failure after publish is a readback
+    failure and is never described as a rollback or a successful publication.
+    """
+    validate_assets(root, directory, identity)
+    paths = {path.name: path for path in Path(directory).iterdir()}
+    _require(client.resolve_tag(identity.tag) == identity.commit, "remote tag moved or differs")
+    remote = client.lookup(identity.tag)
+    if remote is not None:
+        _require(remote.get("tag") == identity.tag and type(remote.get("draft")) is bool
+                 and remote.get("prerelease") is False,
+                 "remote release identity is invalid")
+        existing = client.list_assets(remote["id"])
+        _require(len(existing) == len(set(existing)) and set(existing) <= set(paths), "unexpected remote asset set")
+        _require(remote["draft"] or set(existing) == set(paths), "published release has missing assets")
+        for name in existing:
+            _require(client.download(remote["id"], name) == paths[name].read_bytes(), "conflicting remote asset bytes")
+        if not remote["draft"]:
+            return "already-published"
+    else:
+        remote = client.create_draft(identity)
+        _require(remote.get("tag") == identity.tag and remote.get("draft") is True
+                 and remote.get("prerelease") is False,
+                 "new release must be the matching draft")
+        existing = []
+    for name in sorted(set(paths) - set(existing)):
+        client.upload(remote["id"], paths[name])
+
+    def readback(release_id: int) -> None:
+        actual = client.list_assets(release_id)
+        _require(len(actual) == len(set(actual)) and set(actual) == set(paths), "remote asset set differs")
+        for name, path in sorted(paths.items()):
+            _require(client.download(release_id, name) == path.read_bytes(), "remote asset readback differs")
+        _require(client.resolve_tag(identity.tag) == identity.commit, "remote tag changed during publication")
+
+    readback(remote["id"])
+    client.publish(remote["id"])
+    final = client.lookup(identity.tag)
+    _require(final is not None and final.get("id") == remote["id"] and final.get("tag") == identity.tag
+             and final.get("draft") is False and final.get("prerelease") is False,
+             "post-publication release readback failed")
+    readback(final["id"])
+    return "published"
+
+
+class GitHubClient:
+    """Small fixed-repository GitHub CLI adapter; response bodies stay private."""
+    def __init__(self, identity: ReleaseIdentity):
+        self.identity = identity
+        self.base = "repos/" + REPOSITORY
+        self.asset_ids: dict[tuple[int, str], int] = {}
+
+    def _command(self, arguments: list[str], phase: str) -> bytes:
+        result = subprocess.run(["gh", *arguments], capture_output=True)
+        if result.returncode:
+            raise RuntimeError("GitHub " + phase + " failed; remote state was preserved")
+        return result.stdout
+
+    def _get(self, path: str, *, missing: bool = False):
+        result = subprocess.run(["gh", "api", "--hostname", "github.com", "--include", path], capture_output=True)
+        # --include exposes the actual HTTP status. Only an explicit 404 is a
+        # missing release; authentication, transport and service errors fail.
+        match = re.match(rb"HTTP/\S+\s+(\d{3})[^\r\n]*\r?\n", result.stdout)
+        if match and match.group(1) == b"404" and missing:
+            return None
+        if result.returncode or not match or match.group(1) != b"200":
+            raise RuntimeError("GitHub read failed; no missing-release assumption was made")
+        try:
+            body = re.split(rb"\r?\n\r?\n", result.stdout, maxsplit=1)[1]
+            return json.loads(body)
+        except (IndexError, UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("GitHub returned invalid response data") from error
+
+    def resolve_tag(self, tag: str) -> str:
+        _require(tag == self.identity.tag, "unexpected remote tag lookup")
+        value = self._get(self.base + "/git/ref/tags/" + tag)
+        for _ in range(8):
+            obj = value.get("object", {})
+            digest = obj.get("sha")
+            _require(isinstance(digest, str) and COMMIT_PATTERN.fullmatch(digest) is not None,
+                     "invalid remote Git object")
+            if obj.get("type") == "commit":
+                return digest
+            _require(obj.get("type") == "tag", "remote tag does not reference a commit")
+            value = self._get(self.base + "/git/tags/" + digest)
+        raise ValueError("remote annotated tag nesting is excessive")
+
+    def lookup(self, tag: str) -> dict | None:
+        _require(tag == self.identity.tag, "unexpected remote release lookup")
+        value = self._get(self.base + "/releases/tags/" + tag, missing=True)
+        if value is None:
+            return None
+        _require(type(value.get("id")) is int and type(value.get("draft")) is bool
+                 and type(value.get("prerelease")) is bool,
+                 "invalid remote release metadata")
+        return dict(id=value["id"], tag=value.get("tag_name"), draft=value["draft"],
+                    prerelease=value["prerelease"])
+
+    def list_assets(self, release_id: int) -> list[str]:
+        _require(type(release_id) is int and release_id > 0, "invalid remote release ID")
+        value = self._get(self.base + f"/releases/{release_id}/assets?per_page=100")
+        # The required set has four files. A full page already proves a conflict;
+        # never hide additional pages behind an apparently complete four names.
+        _require(isinstance(value, list) and len(value) < 100, "remote asset list is invalid or excessive")
+        names = []
+        for item in value:
+            _require(isinstance(item, dict) and isinstance(item.get("name"), str)
+                     and type(item.get("id")) is int and item["id"] > 0, "invalid remote asset metadata")
+            names.append(item["name"])
+            self.asset_ids[(release_id, item["name"])] = item["id"]
+        return names
+
+    def create_draft(self, identity: ReleaseIdentity) -> dict:
+        _require(identity == self.identity, "unexpected draft identity")
+        notes = (f"TokenStatMenu {identity.version} (build {identity.build}).\n\n"
+                 "macOS 13 or later; Universal arm64 and x86_64.\n"
+                 "This archive is ad hoc signed for local development. It is not Developer ID signed or notarized.\n"
+                 f"Public source commit: {identity.commit}.\n")
+        with tempfile.TemporaryDirectory(prefix="tokenstat-release-notes-") as temporary:
+            path = Path(temporary) / "notes.md"
+            path.write_text(notes, encoding="utf-8")
+            self._command(["release", "create", identity.tag, "--repo", "github.com/" + REPOSITORY,
+                           "--verify-tag", "--draft", "--title", "TokenStatMenu " + identity.version,
+                           "--notes-file", str(path)], "create-draft")
+        remote = self.lookup(identity.tag)
+        _require(remote is not None, "created draft could not be read back")
+        return remote
+
+    def upload(self, release_id: int, path: Path) -> None:
+        self._command(["release", "upload", self.identity.tag, str(path), "--repo", "github.com/" + REPOSITORY],
+                      "upload")
+
+    def download(self, release_id: int, name: str) -> bytes:
+        asset_id = self.asset_ids.get((release_id, name))
+        _require(type(asset_id) is int, "remote asset ID was not enumerated")
+        return self._command(["api", "--hostname", "github.com", "--header", "Accept: application/octet-stream",
+                              self.base + f"/releases/assets/{asset_id}"], "download")
+
+    def publish(self, release_id: int) -> None:
+        self._command(["release", "edit", self.identity.tag, "--repo", "github.com/" + REPOSITORY,
+                       "--draft=false"], "publish")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("operation", choices=["preflight", "package", "verify", "publish"])
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--tag", required=True)
+    parser.add_argument("--commit", required=True)
+    parser.add_argument("--app", type=Path)
+    parser.add_argument("--source", type=Path)
+    parser.add_argument("--directory", type=Path)
+    args = parser.parse_args()
+    try:
+        identity = release_identity(args.root, args.tag, args.commit)
+        if args.operation == "package":
+            _require(args.app is not None and args.source is not None and args.directory is not None,
+                     "package requires --app, --source and --directory")
+            package_assets(args.root, args.app, args.source, args.directory, identity)
+        elif args.operation in ["verify", "publish"]:
+            _require(args.directory is not None, "verify/publish requires --directory")
+            if args.operation == "verify":
+                validate_assets(args.root, args.directory, identity)
+            else:
+                outcome = publish_release(args.root, args.directory, identity, GitHubClient(identity))
+                print("Release outcome: " + outcome)
+        print("Release " + args.operation + " verified: " + identity.tag + " @ " + identity.commit)
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+        # The messages above are deliberately fixed and contain no raw API data.
+        print("Release " + args.operation + " failed: " + type(error).__name__, file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### script/test_release_assets.py
+
+```python
+#!/usr/bin/env python3
+"""Executable C26A checks. All fixtures are synthetic and private.
+
+The API import intentionally fails until the paired implementation exists.
+Native fixture success is not a substitute for the actual product build.
+"""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+import zipfile
+
+from package_source import PUBLIC_FILES
+import release_assets as release
+
+
+PROJECT = Path(__file__).resolve().parents[1]
+TAG = "v1.1.3"
+VERSION = "1.1.3"
+BUILD = "5"
+PUBLISH_IF = "$" + "{{ github.repository == 'Tupig/TokenStatMenu' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
+APP_FILES = {
+    "Contents/Info.plist": 0o644,
+    "Contents/MacOS/TokenStatMenu": 0o755,
+    "Contents/Resources/AppIcon.icns": 0o644,
+    "Contents/_CodeSignature/CodeResources": 0o644,
+}
+
+
+def run(*args: str, cwd: Path | None = None) -> str:
+    environment = os.environ.copy()
+    if args[0] == "git":
+        # A private fixture must not execute user hooks, read signing settings,
+        # inherit another index/worktree, or ask for any real credentials.
+        environment = {key: value for key, value in environment.items()
+                       if not key.startswith("GIT_")}
+        environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                           GIT_CONFIG_SYSTEM=os.devnull, GIT_TERMINAL_PROMPT="0")
+        args = ("git", "-c", "core.hooksPath=" + os.devnull,
+                "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args[1:])
+    result = subprocess.run(args, cwd=cwd, env=environment,
+                            text=True, capture_output=True, check=True)
+    return result.stdout.strip()
+
+
+def write_zip(path: Path, entries: list[tuple[str, bytes, int]]) -> None:
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data, mode in entries:
+            item = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
+            item.create_system = 3
+            item.external_attr = mode << 16
+            archive.writestr(item, data)
+
+
+def zip_entries(path: Path) -> list[tuple[str, bytes, int]]:
+    with zipfile.ZipFile(path) as archive:
+        return [(item.filename, archive.read(item), item.external_attr >> 16)
+                for item in archive.infolist()]
+
+
+class Fixture:
+    def __init__(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="tokenstat-release-fixture-")
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "source"
+        self.root.mkdir()
+        # Use actual reviewed file bytes and modes, without any real user data.
+        for name in PUBLIC_FILES:
+            target = self.root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(PROJECT / name, target)
+        self.source_info = plistlib.loads((self.root / "Resources/Info.plist").read_bytes())
+        self.source_info["CFBundleShortVersionString"] = VERSION
+        self.source_info["CFBundleVersion"] = BUILD
+        (self.root / "Resources/Info.plist").write_bytes(plistlib.dumps(self.source_info))
+        run("git", "init", "--quiet", "--initial-branch=main", cwd=self.root)
+        run("git", "config", "user.name", "Synthetic Release Fixture", cwd=self.root)
+        run("git", "config", "user.email", "release-fixture@example.invalid", cwd=self.root)
+        run("git", "add", "--all", cwd=self.root)
+        run("git", "commit", "--quiet", "-m", "Synthetic release fixture", cwd=self.root)
+        self.commit = run("git", "rev-parse", "HEAD", cwd=self.root)
+        run("git", "update-ref", "refs/remotes/origin/main", self.commit, cwd=self.root)
+        run("git", "tag", TAG, cwd=self.root)
+        self.identity = release.ReleaseIdentity(VERSION, BUILD, TAG, self.commit)
+        self.source_zip = self.base / "source.zip"
+        self.source_entries = []
+        for name in PUBLIC_FILES:
+            file = self.root / name
+            self.source_entries.append(("TokenStatMenu/" + name, file.read_bytes(),
+                                        stat.S_IFREG | stat.S_IMODE(file.stat().st_mode)))
+        write_zip(self.source_zip, self.source_entries)
+        self.app = self.base / "TokenStatMenu.app"
+        info = dict(self.source_info, TokenStatSourceRevision=self.commit,
+                    TokenStatSourceState="clean")
+        contents = {
+            "Contents/Info.plist": plistlib.dumps(info),
+            "Contents/MacOS/TokenStatMenu": b"synthetic-native-payload",
+            "Contents/Resources/AppIcon.icns": (self.root / "Resources/AppIcon.icns").read_bytes(),
+            "Contents/_CodeSignature/CodeResources": b"synthetic-signature-resource",
+        }
+        for name, data in contents.items():
+            file = self.app / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(data)
+            file.chmod(APP_FILES[name])
+        self.assets = self.base / "assets"
+
+    def close(self) -> None:
+        self.temporary.cleanup()
+
+    def source_archive(self, entries: list[tuple[str, bytes, int]]) -> None:
+        write_zip(self.source_zip, entries)
+
+    def synthetic_assets(self) -> dict:
+        """Independent file-format fixture; no production packager is called."""
+        self.assets.mkdir()
+        app_name = f"TokenStatMenu-{VERSION}-universal.zip"
+        source_name = f"TokenStatMenu-{VERSION}-source.zip"
+        app_entries = [("TokenStatMenu.app/" + name, (self.app / name).read_bytes(),
+                        stat.S_IFREG | mode) for name, mode in APP_FILES.items()]
+        write_zip(self.assets / app_name, app_entries)
+        shutil.copy2(self.source_zip, self.assets / source_name)
+        manifest = {
+            "version": VERSION, "build": BUILD, "tag": TAG, "commit": self.commit,
+            "assets": {},
+        }
+        for kind, name in [("universal", app_name), ("source", source_name)]:
+            data = (self.assets / name).read_bytes()
+            manifest["assets"][kind] = {
+                "name": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        (self.assets / "release-manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        self.refresh_sums()
+        return manifest
+
+    def refresh_sums(self) -> None:
+        names = [f"TokenStatMenu-{VERSION}-universal.zip",
+                 f"TokenStatMenu-{VERSION}-source.zip", "release-manifest.json"]
+        (self.assets / "SHA256SUMS").write_text("".join(
+            hashlib.sha256((self.assets / name).read_bytes()).hexdigest()
+            + "  " + name + "\n" for name in sorted(names)))
+
+    def mutate_manifest(self, change) -> None:
+        file = self.assets / "release-manifest.json"
+        value = json.loads(file.read_text())
+        change(value)
+        file.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        self.refresh_sums()
+
+
+class FakeClient:
+    """Only network transport is replaced; production state logic is exercised."""
+    def __init__(self, fixture: Fixture, draft: bool | None = None,
+                 existing: list[str] | None = None, failure: str | None = None,
+                 final_readback: str | None = None) -> None:
+        self.fixture = fixture
+        self.tag_commit = fixture.commit
+        self.remote = None if draft is None else {"id": 7, "tag": TAG, "draft": draft, "prerelease": False}
+        self.assets = {} if existing is None else {
+            name: (fixture.assets / name).read_bytes() for name in existing
+        }
+        self.calls: list[tuple] = []
+        self.mutations: list[tuple] = []
+        self.failure = failure
+        self.final_readback = final_readback
+        self.after_publish = False
+
+    def record(self, name: str, *args, mutation: bool = False) -> None:
+        self.calls.append((name, *args))
+        if mutation:
+            self.mutations.append((name, *args))
+        if self.failure == name:
+            raise RuntimeError("synthetic transport failure: " + name)
+
+    def resolve_tag(self, tag: str) -> str:
+        self.record("resolve_tag", tag)
+        return self.tag_commit
+
+    def lookup(self, tag: str) -> dict | None:
+        self.record("lookup", tag)
+        if self.after_publish and self.final_readback == "lookup-failed":
+            raise RuntimeError("synthetic final lookup failure")
+        result = copy.deepcopy(self.remote)
+        if self.after_publish and self.final_readback == "still-draft":
+            result["draft"] = True
+        if self.after_publish and self.final_readback == "wrong-tag":
+            result["tag"] = "v9.9.9"
+        if self.after_publish and self.final_readback == "prerelease":
+            result["prerelease"] = True
+        return result
+
+    def list_assets(self, release_id: int) -> list[str]:
+        self.record("list_assets", release_id)
+        return list(self.assets)
+
+    def create_draft(self, identity) -> dict:
+        self.record("create_draft", identity.tag, mutation=True)
+        self.remote = {"id": 7, "tag": identity.tag, "draft": True, "prerelease": False}
+        return copy.deepcopy(self.remote)
+
+    def upload(self, release_id: int, path: Path) -> None:
+        self.record("upload", Path(path).name, mutation=True)
+        assert Path(path).name not in self.assets, "client must not clobber"
+        self.assets[Path(path).name] = Path(path).read_bytes()
+
+    def download(self, release_id: int, name: str) -> bytes:
+        self.record("download", name)
+        return self.assets[name]
+
+    def publish(self, release_id: int) -> None:
+        self.record("publish", release_id, mutation=True)
+        self.remote["draft"] = False
+        self.after_publish = True
+
+
+class ReleaseChecks(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = Fixture()
+        self.addCleanup(self.fixture.close)
+
+    def reject_source(self, entries) -> None:
+        self.fixture.source_archive(entries)
+        with self.assertRaises(ValueError):
+            release.validate_source_archive(self.fixture.root, self.fixture.source_zip, PUBLIC_FILES)
+
+    def test_fixture_git_explicitly_disables_hooks_and_signing(self):
+        f = self.fixture
+        self.assertEqual(run("git", "config", "--get", "core.hooksPath", cwd=f.root), os.devnull)
+        self.assertEqual(run("git", "config", "--get", "commit.gpgsign", cwd=f.root), "false")
+        self.assertEqual(run("git", "config", "--get", "tag.gpgsign", cwd=f.root), "false")
+
+    def test_identity_accepts_real_lightweight_and_annotated_tags(self):
+        f = self.fixture
+        self.assertEqual(release.release_identity(f.root, TAG, f.commit), f.identity)
+        run("git", "tag", "-d", TAG, cwd=f.root)
+        run("git", "tag", "-a", TAG, "-m", "Synthetic annotated release", cwd=f.root)
+        self.assertEqual(release.release_identity(f.root, TAG, f.commit), f.identity)
+
+    def test_identity_rejects_malformed_and_shell_special_tags(self):
+        f = self.fixture
+        marker = f.base / "unexpected-marker"
+        for tag in ["1.1.3", "v01.1.3", "v1.1", "v1.1.3-rc.1", "v1.1.3;false",
+                    "v1.1.3\n", f"v1.1.3; touch {marker}", f"v1.1.3$(touch {marker})"]:
+            with self.subTest(tag=repr(tag)), self.assertRaises(ValueError):
+                release.release_identity(f.root, tag, f.commit)
+        self.assertFalse(marker.exists())
+
+    def test_identity_rejects_wrong_commit_or_info_and_non_main_history(self):
+        f = self.fixture
+        with self.assertRaises(ValueError):
+            release.release_identity(f.root, TAG, "a" * 40)
+        run("git", "update-ref", "-d", "refs/remotes/origin/main", cwd=f.root)
+        with self.assertRaises(ValueError):
+            release.release_identity(f.root, TAG, f.commit)
+        run("git", "update-ref", "refs/remotes/origin/main", f.commit, cwd=f.root)
+        info = dict(f.source_info, CFBundleShortVersionString="9.9.9")
+        (f.root / "Resources/Info.plist").write_bytes(plistlib.dumps(info))
+        run("git", "add", "Resources/Info.plist", cwd=f.root)
+        run("git", "commit", "--quiet", "-m", "Synthetic version mismatch", cwd=f.root)
+        commit = run("git", "rev-parse", "HEAD", cwd=f.root)
+        run("git", "tag", "-f", TAG, commit, cwd=f.root)
+        run("git", "update-ref", "refs/remotes/origin/main", commit, cwd=f.root)
+        with self.assertRaises(ValueError):
+            release.release_identity(f.root, TAG, commit)
+
+    def test_identity_rejects_dirty_staged_and_untracked_source(self):
+        f = self.fixture
+        (f.root / "README.md").write_text("synthetic changed source\n")
+        with self.assertRaises(ValueError):
+            release.release_identity(f.root, TAG, f.commit)
+        run("git", "add", "README.md", cwd=f.root)
+        with self.assertRaises(ValueError):
+            release.release_identity(f.root, TAG, f.commit)
+        run("git", "reset", "--hard", "HEAD", cwd=f.root)
+        (f.root / "unreviewed.txt").write_text("synthetic\n")
+        with self.assertRaises(ValueError):
+            release.release_identity(f.root, TAG, f.commit)
+
+    def test_identity_rejects_wrong_tag_target_and_unmerged_commit(self):
+        f = self.fixture
+        (f.root / "README.md").write_text("synthetic next commit\n")
+        run("git", "add", "README.md", cwd=f.root)
+        run("git", "commit", "--quiet", "-m", "Synthetic next commit", cwd=f.root)
+        next_commit = run("git", "rev-parse", "HEAD", cwd=f.root)
+        run("git", "update-ref", "refs/remotes/origin/main", next_commit, cwd=f.root)
+        with self.assertRaises(ValueError):
+            release.release_identity(f.root, TAG, next_commit)
+        run("git", "tag", "-f", TAG, next_commit, cwd=f.root)
+        run("git", "update-ref", "refs/remotes/origin/main", f.commit, cwd=f.root)
+        with self.assertRaises(ValueError):
+            release.release_identity(f.root, TAG, next_commit)
+
+    def test_identity_rejects_invalid_build_metadata_after_clean_commit(self):
+        f = self.fixture
+        info = dict(f.source_info, CFBundleVersion="not-an-integer")
+        (f.root / "Resources/Info.plist").write_bytes(plistlib.dumps(info))
+        run("git", "add", "Resources/Info.plist", cwd=f.root)
+        run("git", "commit", "--quiet", "-m", "Synthetic invalid build", cwd=f.root)
+        commit = run("git", "rev-parse", "HEAD", cwd=f.root)
+        run("git", "tag", "-f", TAG, commit, cwd=f.root)
+        run("git", "update-ref", "refs/remotes/origin/main", commit, cwd=f.root)
+        with self.assertRaises(ValueError):
+            release.release_identity(f.root, TAG, commit)
+
+    def test_identity_rejects_missing_tag_and_parent_repository_identity(self):
+        f = self.fixture
+        run("git", "tag", "-d", TAG, cwd=f.root)
+        with self.assertRaises(ValueError):
+            release.release_identity(f.root, TAG, f.commit)
+        run("git", "tag", TAG, cwd=f.root)
+        nested = f.root / "nested-export"
+        nested.mkdir()
+        with self.assertRaises(ValueError):
+            release.release_identity(nested, TAG, f.commit)
+
+    def test_source_archive_accepts_all_actual_commit_bytes_and_modes(self):
+        f = self.fixture
+        release.validate_source_archive(f.root, f.source_zip, PUBLIC_FILES)
+
+    def test_source_archive_rejects_missing_extra_duplicate_and_hidden_members(self):
+        entries = self.fixture.source_entries
+        for changed in [entries[:-1],
+                        entries + [("TokenStatMenu/extra.txt", b"x", stat.S_IFREG | 0o644)],
+                        entries + [entries[0]],
+                        entries + [("TokenStatMenu/.hidden", b"x", stat.S_IFREG | 0o644)]]:
+            with self.subTest(count=len(changed)):
+                self.reject_source(changed)
+
+    def test_source_archive_rejects_path_escape_symlink_directory_mode_and_content(self):
+        entries = self.fixture.source_entries
+        name, data, mode = entries[0]
+        for replacement in [("/absolute", data, mode), ("TokenStatMenu/../escape", data, mode),
+                            (name, b"target", stat.S_IFLNK | 0o777),
+                            (name + "/", b"", stat.S_IFDIR | 0o755),
+                            (name, data, stat.S_IFREG | 0o755),
+                            (name, data + b"changed", mode)]:
+            with self.subTest(replacement=replacement[0]):
+                self.reject_source([replacement, *entries[1:]])
+
+    def test_source_archive_rejects_source_symlink_extra_tracked_and_changed_bytes(self):
+        f = self.fixture
+        target = f.root / "README.md"
+        target.unlink()
+        target.symlink_to(f.root / "LICENSE")
+        with self.assertRaises(ValueError):
+            release.validate_source_archive(f.root, f.source_zip, PUBLIC_FILES)
+        target.unlink()
+        run("git", "checkout", "--", "README.md", cwd=f.root)
+        (f.root / "unreviewed.txt").write_text("synthetic")
+        run("git", "add", "unreviewed.txt", cwd=f.root)
+        with self.assertRaises(ValueError):
+            release.validate_source_archive(f.root, f.source_zip, PUBLIC_FILES)
+        run("git", "reset", "--hard", "HEAD", cwd=f.root)
+        target.write_text("changed fixture")
+        with self.assertRaises(ValueError):
+            release.validate_source_archive(f.root, f.source_zip, PUBLIC_FILES)
+
+    def test_cross_platform_assets_accept_independently_formatted_fixture(self):
+        f = self.fixture
+        expected = f.synthetic_assets()
+        self.assertEqual(release.validate_assets(f.root, f.assets, f.identity), expected)
+
+    def test_assets_reject_extra_hidden_missing_and_symlink(self):
+        f = self.fixture
+        f.synthetic_assets()
+        hidden = f.assets / ".unreviewed"
+        hidden.write_bytes(b"synthetic")
+        with self.assertRaises(ValueError):
+            release.validate_assets(f.root, f.assets, f.identity)
+        hidden.unlink()
+        target = f.assets / "SHA256SUMS"
+        data = target.read_bytes()
+        target.unlink()
+        with self.assertRaises(ValueError):
+            release.validate_assets(f.root, f.assets, f.identity)
+        outside = f.base / "sums"
+        outside.write_bytes(data)
+        target.symlink_to(outside)
+        with self.assertRaises(ValueError):
+            release.validate_assets(f.root, f.assets, f.identity)
+
+    def test_assets_reject_unexpected_empty_subdirectory(self):
+        f = self.fixture
+        f.synthetic_assets()
+        (f.assets / ".unexpected-directory").mkdir()
+        with self.assertRaises(ValueError):
+            release.validate_assets(f.root, f.assets, f.identity)
+
+    def test_assets_reject_manifest_identity_unknown_keys_names_and_numeric_types(self):
+        f = self.fixture
+        baseline = f.synthetic_assets()
+        changes = [
+            lambda x: x.update(commit="a" * 40),
+            lambda x: x.update(version="9.9.9"),
+            lambda x: x.update(build="99"),
+            lambda x: x.update(tag="v9.9.9"),
+            lambda x: x.update(environment="not-an-approved-key"),
+            lambda x: x["assets"]["source"].update(name="../source.zip"),
+            lambda x: x["assets"]["source"].update(bytes=True),
+            lambda x: x["assets"]["source"].update(bytes=-1),
+            lambda x: x["assets"]["source"].update(sha256="A" * 64),
+            lambda x: x["assets"]["source"].update(unreviewed=True),
+        ]
+        for change in changes:
+            with self.subTest(change=changes.index(change)):
+                (f.assets / "release-manifest.json").write_text(json.dumps(baseline))
+                f.mutate_manifest(change)
+                with self.assertRaises(ValueError):
+                    release.validate_assets(f.root, f.assets, f.identity)
+
+    def test_assets_reject_changed_checksum_duplicate_extra_and_path_sums(self):
+        f = self.fixture
+        f.synthetic_assets()
+        target = f.assets / "SHA256SUMS"
+        baseline = target.read_text()
+        for text in [baseline.replace(baseline[:64], "0" * 64, 1),
+                     baseline + baseline.splitlines()[0] + "\n",
+                     baseline + "0" * 64 + "  extra.txt\n",
+                     baseline.replace("  release-manifest.json", "  ../release-manifest.json")]:
+            with self.subTest(text_length=len(text)):
+                target.write_text(text)
+                with self.assertRaises(ValueError):
+                    release.validate_assets(f.root, f.assets, f.identity)
+
+    def test_assets_reject_zip_bytes_even_when_manifest_and_sums_are_recomputed(self):
+        f = self.fixture
+        f.synthetic_assets()
+        source_name = f"TokenStatMenu-{VERSION}-source.zip"
+        write_zip(f.assets / source_name, f.source_entries[:-1])
+        data = (f.assets / source_name).read_bytes()
+        f.mutate_manifest(lambda x: x["assets"]["source"].update(
+            bytes=len(data), sha256=hashlib.sha256(data).hexdigest()))
+        with self.assertRaises(ValueError):
+            release.validate_assets(f.root, f.assets, f.identity)
+
+    def test_assets_reject_truncated_or_duplicate_bundle_zip(self):
+        f = self.fixture
+        f.synthetic_assets()
+        name = f"TokenStatMenu-{VERSION}-universal.zip"
+        archive = f.assets / name
+        baseline = archive.read_bytes()
+        original = zip_entries(archive)
+        for kind in ["truncated", "duplicate", "hidden", "symlink"]:
+            with self.subTest(kind=kind):
+                if kind == "truncated":
+                    archive.write_bytes(baseline[:20])
+                else:
+                    changed = list(original)
+                    if kind == "duplicate":
+                        changed.append(original[0])
+                    elif kind == "hidden":
+                        changed.append(("TokenStatMenu.app/.hidden", b"x", stat.S_IFREG | 0o644))
+                    else:
+                        item, _, _ = changed[0]
+                        changed[0] = (item, b"target", stat.S_IFLNK | 0o777)
+                    write_zip(archive, changed)
+                data = archive.read_bytes()
+                f.mutate_manifest(lambda x: x["assets"]["universal"].update(
+                    bytes=len(data), sha256=hashlib.sha256(data).hexdigest()))
+                with self.assertRaises(ValueError):
+                    release.validate_assets(f.root, f.assets, f.identity)
+
+    def test_assets_reject_zip_info_identity_even_with_recomputed_digests(self):
+        f = self.fixture
+        f.synthetic_assets()
+        archive = f.assets / f"TokenStatMenu-{VERSION}-universal.zip"
+        baseline = zip_entries(archive)
+        for key, value in [("TokenStatSourceRevision", "a" * 40),
+                           ("TokenStatSourceState", "modified"),
+                           ("CFBundleShortVersionString", "9.9.9"),
+                           ("CFBundleVersion", "99")]:
+            with self.subTest(key=key):
+                changed = []
+                for name, data, mode in baseline:
+                    if name == "TokenStatMenu.app/Contents/Info.plist":
+                        info = plistlib.loads(data)
+                        info[key] = value
+                        data = plistlib.dumps(info)
+                    changed.append((name, data, mode))
+                write_zip(archive, changed)
+                data = archive.read_bytes()
+                f.mutate_manifest(lambda x: x["assets"]["universal"].update(
+                    bytes=len(data), sha256=hashlib.sha256(data).hexdigest()))
+                with self.assertRaises(ValueError):
+                    release.validate_assets(f.root, f.assets, f.identity)
+
+    def test_publish_creates_draft_reads_back_every_asset_then_publishes(self):
+        f = self.fixture
+        f.synthetic_assets()
+        client = FakeClient(f)
+        release.publish_release(f.root, f.assets, f.identity, client)
+        names = set(p.name for p in f.assets.iterdir())
+        self.assertEqual(set(client.assets), names)
+        self.assertFalse(client.remote["draft"])
+        self.assertEqual([item[0] for item in client.mutations],
+                         ["create_draft", "upload", "upload", "upload", "upload", "publish"])
+        publish_index = next(i for i, item in enumerate(client.calls) if item[0] == "publish")
+        before = {item[1] for item in client.calls[:publish_index] if item[0] == "download"}
+        self.assertEqual(before, names)
+        self.assertTrue(any(item[0] == "lookup" for item in client.calls[publish_index + 1:]))
+
+    def test_publish_identical_published_rerun_is_read_only(self):
+        f = self.fixture
+        f.synthetic_assets()
+        client = FakeClient(f, draft=False, existing=[p.name for p in f.assets.iterdir()])
+        release.publish_release(f.root, f.assets, f.identity, client)
+        self.assertEqual(client.mutations, [])
+        self.assertEqual({item[1] for item in client.calls if item[0] == "download"},
+                         set(client.assets))
+
+    def test_publish_matching_partial_draft_uploads_only_missing_assets(self):
+        f = self.fixture
+        f.synthetic_assets()
+        client = FakeClient(f, draft=True, existing=["release-manifest.json"])
+        release.publish_release(f.root, f.assets, f.identity, client)
+        self.assertFalse(client.remote["draft"])
+        uploaded = [item[1] for item in client.mutations if item[0] == "upload"]
+        self.assertEqual(set(uploaded), {p.name for p in f.assets.iterdir()} - {"release-manifest.json"})
+        self.assertEqual(len(uploaded), 3)
+        self.assertNotIn("create_draft", [item[0] for item in client.mutations])
+
+    def test_existing_release_requires_explicit_false_prerelease_before_writes(self):
+        f = self.fixture
+        f.synthetic_assets()
+        for draft in [False, True]:
+            for invalid in [True, None, 0, "false", "missing"]:
+                with self.subTest(draft=draft, prerelease=invalid):
+                    client = FakeClient(f, draft=draft, existing=[p.name for p in f.assets.iterdir()])
+                    if invalid == "missing":
+                        del client.remote["prerelease"]
+                    else:
+                        client.remote["prerelease"] = invalid
+                    with self.assertRaises(ValueError):
+                        release.publish_release(f.root, f.assets, f.identity, client)
+                    self.assertEqual(client.mutations, [], "never silently convert a prerelease or ambiguous release")
+
+    def test_new_draft_requires_explicit_false_prerelease_before_uploads(self):
+        f = self.fixture
+        f.synthetic_assets()
+        for invalid in [True, None, 0, "false", "missing"]:
+            with self.subTest(prerelease=invalid):
+                client = FakeClient(f)
+                original = client.create_draft
+                def create_invalid(identity):
+                    remote = original(identity)
+                    if invalid == "missing":
+                        del remote["prerelease"]
+                    else:
+                        remote["prerelease"] = invalid
+                    return remote
+                client.create_draft = create_invalid
+                with self.assertRaises(ValueError):
+                    release.publish_release(f.root, f.assets, f.identity, client)
+                self.assertEqual([item[0] for item in client.mutations], ["create_draft"])
+                self.assertTrue(client.remote["draft"])
+
+    def test_github_adapter_preserves_strict_boolean_prerelease_metadata(self):
+        client = release.GitHubClient(self.fixture.identity)
+        baseline = {"id": 7, "tag_name": TAG, "draft": False, "prerelease": False}
+        with mock.patch.object(client, "_get", return_value=baseline):
+            self.assertEqual(client.lookup(TAG),
+                             {"id": 7, "tag": TAG, "draft": False, "prerelease": False})
+        for invalid in [None, 0, "false", "missing"]:
+            value = dict(baseline)
+            if invalid == "missing":
+                del value["prerelease"]
+            else:
+                value["prerelease"] = invalid
+            with self.subTest(prerelease=invalid), mock.patch.object(client, "_get", return_value=value):
+                with self.assertRaises(ValueError):
+                    client.lookup(TAG)
+        # A real boolean true is preserved by transport, then rejected by the
+        # publisher. The adapter must never coerce any metadata to false.
+        with mock.patch.object(client, "_get", return_value=dict(baseline, prerelease=True)):
+            self.assertIs(client.lookup(TAG)["prerelease"], True)
+
+    def test_publish_conflicts_or_retagging_never_mutate_remote_release(self):
+        f = self.fixture
+        f.synthetic_assets()
+        names = [p.name for p in f.assets.iterdir()]
+        for kind in ["published-content", "draft-content", "extra", "missing", "retagged"]:
+            with self.subTest(kind=kind):
+                client = FakeClient(f, draft=(kind == "draft-content"), existing=names)
+                if kind.endswith("content"):
+                    client.assets[names[0]] += b"conflict"
+                elif kind == "extra":
+                    client.assets["unreviewed.txt"] = b"synthetic"
+                elif kind == "missing":
+                    del client.assets[names[0]]
+                else:
+                    client.tag_commit = "a" * 40
+                with self.assertRaises((ValueError, RuntimeError)):
+                    release.publish_release(f.root, f.assets, f.identity, client)
+                self.assertEqual(client.mutations, [])
+
+    def test_publish_rejects_invalid_local_assets_before_any_mutation(self):
+        f = self.fixture
+        f.synthetic_assets()
+        (f.assets / "unexpected.txt").write_text("synthetic")
+        client = FakeClient(f)
+        with self.assertRaises(ValueError):
+            release.publish_release(f.root, f.assets, f.identity, client)
+        self.assertEqual(client.mutations, [])
+
+    def test_publish_transport_failures_are_not_missing_release_or_success(self):
+        f = self.fixture
+        f.synthetic_assets()
+        for phase in ["resolve_tag", "lookup", "create_draft", "upload", "download", "publish"]:
+            with self.subTest(phase=phase):
+                client = FakeClient(f, failure=phase)
+                with self.assertRaises((ValueError, RuntimeError)):
+                    release.publish_release(f.root, f.assets, f.identity, client)
+                if phase in ["resolve_tag", "lookup"]:
+                    self.assertEqual(client.mutations, [])
+                if phase in ["upload", "download"]:
+                    self.assertTrue(client.remote["draft"])
+                    self.assertNotIn("publish", [item[0] for item in client.mutations])
+
+    def test_post_publish_readback_failures_do_not_claim_success_or_rollback(self):
+        f = self.fixture
+        f.synthetic_assets()
+        for mode in ["lookup-failed", "still-draft", "wrong-tag", "prerelease"]:
+            with self.subTest(mode=mode):
+                client = FakeClient(f, final_readback=mode)
+                with self.assertRaises((ValueError, RuntimeError)):
+                    release.publish_release(f.root, f.assets, f.identity, client)
+                self.assertTrue(client.after_publish)
+                self.assertFalse(client.remote["draft"],
+                                 "a failed readback must not pretend publication was rolled back")
+                self.assertEqual(client.mutations[-1][0], "publish")
+                self.assertEqual([item[0] for item in client.mutations].count("publish"), 1)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "real private macOS signing/Universal fixture")
+class NativeReleaseChecks(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.native_directory = tempfile.TemporaryDirectory(prefix="tokenstat-native-release-check-")
+        cls.addClassCleanup(cls.native_directory.cleanup)
+        cls.native_root = Path(cls.native_directory.name)
+        source = cls.native_root / "main.swift"
+        source.write_text('print("synthetic release validation")\n')
+        cls.thin = cls.native_root / "thin"
+        intel = cls.native_root / "intel"
+        cls.universal = cls.native_root / "universal"
+        run("xcrun", "--sdk", "macosx", "swiftc", "-target", "arm64-apple-macosx13.0",
+            str(source), "-o", str(cls.thin))
+        run("xcrun", "--sdk", "macosx", "swiftc", "-target", "x86_64-apple-macosx13.0",
+            str(source), "-o", str(intel))
+        run("lipo", "-create", str(cls.thin), str(intel), "-output", str(cls.universal))
+
+    def setUp(self):
+        self.fixture = Fixture()
+        self.addCleanup(self.fixture.close)
+        f = self.fixture
+        shutil.copy2(self.universal, f.app / "Contents/MacOS/TokenStatMenu")
+        self.sign()
+
+    def sign(self):
+        run("codesign", "--force", "--sign", "-", str(self.fixture.app))
+
+    def test_real_private_universal_signature_and_packaging(self):
+        f = self.fixture
+        release.validate_app(f.root, f.app, f.identity, subprocess.run)
+        release.package_assets(f.root, f.app, f.source_zip, f.assets, f.identity)
+        expected = {f"TokenStatMenu-{VERSION}-universal.zip",
+                    f"TokenStatMenu-{VERSION}-source.zip",
+                    "release-manifest.json", "SHA256SUMS"}
+        self.assertEqual({p.name for p in f.assets.iterdir()}, expected)
+        release.validate_assets(f.root, f.assets, f.identity)
+        with zipfile.ZipFile(f.assets / f"TokenStatMenu-{VERSION}-universal.zip") as archive:
+            for name, mode in APP_FILES.items():
+                member = archive.getinfo("TokenStatMenu.app/" + name)
+                self.assertEqual(archive.read(member), (f.app / name).read_bytes())
+                self.assertEqual(stat.S_IMODE(member.external_attr >> 16), mode)
+
+    def test_release_assets_ignore_only_filesystem_and_input_zip_metadata(self):
+        f = self.fixture
+        release.package_assets(f.root, f.app, f.source_zip, f.assets, f.identity)
+        first = {path.name: path.read_bytes() for path in f.assets.iterdir()}
+        original_source_zip = f.source_zip.read_bytes()
+        for file in f.app.rglob("*"):
+            if file.is_file():
+                original = file.stat()
+                os.utime(file, (original.st_atime + 3600, original.st_mtime + 3600))
+        with zipfile.ZipFile(f.source_zip, "w", zipfile.ZIP_STORED) as archive:
+            archive.comment = b"synthetic source archive metadata"
+            for name, data, mode in reversed(f.source_entries):
+                member = zipfile.ZipInfo(name, (2026, 2, 2, 1, 2, 4))
+                member.create_system = 3
+                member.external_attr = mode << 16
+                member.comment = b"synthetic entry metadata"
+                archive.writestr(member, data)
+        self.assertNotEqual(f.source_zip.read_bytes(), original_source_zip)
+        second_dir = f.base / "assets-second"
+        release.package_assets(f.root, f.app, f.source_zip, second_dir, f.identity)
+        second = {path.name: path.read_bytes() for path in second_dir.iterdir()}
+        self.assertEqual(first, second,
+                         "release metadata normalization must preserve deterministic four-asset bytes")
+
+    def test_real_signature_rejects_post_signing_plist_tamper(self):
+        f = self.fixture
+        file = f.app / "Contents/Info.plist"
+        info = plistlib.loads(file.read_bytes())
+        info["CFBundleDisplayName"] = "synthetic tamper"
+        file.write_bytes(plistlib.dumps(info))
+        result = subprocess.run(["codesign", "--verify", "--deep", "--strict", str(f.app)],
+                                text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        with self.assertRaises(ValueError):
+            release.validate_app(f.root, f.app, f.identity, subprocess.run)
+
+    def test_signature_is_required_when_only_signed_executable_bytes_change(self):
+        f = self.fixture
+        info = (f.app / "Contents/Info.plist").read_bytes()
+        icon = (f.app / "Contents/Resources/AppIcon.icns").read_bytes()
+        binary = f.app / "Contents/MacOS/TokenStatMenu"
+        data = bytearray(binary.read_bytes())
+        offset = data.index(b"synthetic release validation")
+        data[offset] ^= 1
+        binary.write_bytes(data)
+        self.assertEqual((f.app / "Contents/Info.plist").read_bytes(), info)
+        self.assertEqual((f.app / "Contents/Resources/AppIcon.icns").read_bytes(), icon)
+        self.assertEqual(set(run("lipo", "-archs", str(binary)).split()), {"arm64", "x86_64"})
+        result = subprocess.run(["codesign", "--verify", "--deep", "--strict", str(f.app)],
+                                text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0,
+                            "only the signature should distinguish this otherwise valid bundle")
+        with self.assertRaises(ValueError):
+            release.validate_app(f.root, f.app, f.identity, subprocess.run)
+
+    def test_real_thin_signed_bundle_is_not_universal(self):
+        f = self.fixture
+        shutil.copy2(self.thin, f.app / "Contents/MacOS/TokenStatMenu")
+        self.sign()
+        self.assertEqual(run("lipo", "-archs", str(f.app / "Contents/MacOS/TokenStatMenu")), "arm64")
+        with self.assertRaises(ValueError):
+            release.validate_app(f.root, f.app, f.identity, subprocess.run)
+
+    def test_architecture_reader_rejects_additional_unapproved_architecture(self):
+        f = self.fixture
+        def synthetic_tool_result(args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, "arm64 x86_64 arm64e\n", "")
+        with self.assertRaises(ValueError):
+            release.validate_app(f.root, f.app, f.identity, synthetic_tool_result)
+
+    def test_packaging_refuses_nonempty_staging_without_deleting_anything(self):
+        f = self.fixture
+        f.assets.mkdir()
+        sentinel = f.assets / "preserve-this-file"
+        sentinel.write_bytes(b"synthetic sentinel")
+        with self.assertRaises(ValueError):
+            release.package_assets(f.root, f.app, f.source_zip, f.assets, f.identity)
+        self.assertEqual({p.name for p in f.assets.iterdir()}, {sentinel.name})
+        self.assertEqual(sentinel.read_bytes(), b"synthetic sentinel")
+
+    def test_bundle_full_tree_modes_identity_and_icon_are_enforced(self):
+        f = self.fixture
+        hidden = f.app / ".hidden"
+        hidden.write_bytes(b"synthetic")
+        with self.assertRaises(ValueError):
+            release.validate_app(f.root, f.app, f.identity, subprocess.run)
+        hidden.unlink()
+        binary = f.app / "Contents/MacOS/TokenStatMenu"
+        binary.chmod(0o644)
+        with self.assertRaises(ValueError):
+            release.validate_app(f.root, f.app, f.identity, subprocess.run)
+        binary.chmod(0o755)
+        icon = f.app / "Contents/Resources/AppIcon.icns"
+        icon.write_bytes(b"synthetic wrong icon")
+        self.sign()
+        with self.assertRaises(ValueError):
+            release.validate_app(f.root, f.app, f.identity, subprocess.run)
+
+    def test_bundle_symlink_missing_resource_and_wrong_provenance_are_rejected(self):
+        f = self.fixture
+        resource = f.app / "Contents/_CodeSignature/CodeResources"
+        saved = resource.read_bytes()
+        resource.unlink()
+        with self.assertRaises(ValueError):
+            release.validate_app(f.root, f.app, f.identity, subprocess.run)
+        outside = f.base / "resource"
+        outside.write_bytes(saved)
+        resource.symlink_to(outside)
+        with self.assertRaises(ValueError):
+            release.validate_app(f.root, f.app, f.identity, subprocess.run)
+        resource.unlink()
+        resource.write_bytes(saved)
+        file = f.app / "Contents/Info.plist"
+        info = plistlib.loads(file.read_bytes())
+        info["TokenStatSourceRevision"] = "a" * 40
+        info["TokenStatSourceState"] = "modified"
+        file.write_bytes(plistlib.dumps(info))
+        self.sign()
+        with self.assertRaises(ValueError):
+            release.validate_app(f.root, f.app, f.identity, subprocess.run)
+
+
+def load_workflow(path: Path) -> dict:
+    # Ruby standard YAML is the frozen parser; normalize YAML1.1 on=>true.
+    program = (
+        "require 'yaml'; require 'json'; "
+        "value=YAML.safe_load(File.read(ARGV.fetch(0)), aliases: true); "
+        "value['on']=value.delete(true) if value.key?(true); "
+        "STDOUT.write(JSON.generate(value))"
+    )
+    return json.loads(run("ruby", "-e", program, str(path)))
+
+
+def workflow_contract(document: dict, raw: str) -> None:
+    """A bounded assertion for this workflow, not a general workflow scanner."""
+    assert document["on"] == {"push": {"tags": ["v*"]}}
+    assert document["permissions"] == {"contents": "read"}
+    assert set(document["jobs"]) == {"build", "publish"}
+    build = document["jobs"]["build"]
+    publish = document["jobs"]["publish"]
+    assert "if" not in build
+    assert all(job.get("continue-on-error", False) is False for job in [build, publish])
+    assert build.get("permissions", document["permissions"]) == {"contents": "read"}
+    assert publish["permissions"] == {"contents": "write"}
+    assert publish["needs"] in ["build", ["build"]]
+    assert " ".join(publish["if"].split()) == PUBLISH_IF
+    assert document["concurrency"]["cancel-in-progress"] is False
+    actions = [step["uses"] for job in [build, publish] for step in job["steps"] if "uses" in step]
+    allowed = {
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+        "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+    }
+    assert set(actions) == allowed
+    for job in [build, publish]:
+        for step in job["steps"]:
+            if step.get("uses", "").startswith("actions/checkout@"):
+                assert step["with"]["persist-credentials"] is False
+    assert any(step.get("with", {}).get("fetch-depth") == 0 for step in build["steps"])
+    uploads = [step for step in build["steps"]
+               if step.get("uses", "").startswith("actions/upload-artifact@")]
+    assert len(uploads) == 1 and uploads[0]["with"]["if-no-files-found"] == "error"
+    paths = uploads[0]["with"]["path"]
+    assert "*" not in paths and len(paths.splitlines()) == 4
+    scripts = "\n".join(step.get("run", "") for job in [build, publish] for step in job["steps"])
+    assert "$" + "{{ github.ref_name }}" not in scripts
+    assert "--clobber" not in scripts and "continue-on-error: true" not in raw
+    assert "script/release_assets.py" in scripts
+    assert "--universal" in scripts
+    assert "script/test_release_assets.py" in scripts
+    assert "GH_TOKEN" in json.dumps(publish)
+    assert "GH_TOKEN" not in json.dumps(build)
+    required = {
+        "build": ["python3 -B script/test_release_assets.py",
+                  "python3 -B script/release_assets.py preflight",
+                  "./script/build_and_run.sh --universal",
+                  "python3 -B script/package_source.py",
+                  "python3 -B script/release_assets.py package",
+                  "python3 -B script/release_assets.py verify"],
+        "publish": ["python3 -B script/release_assets.py verify",
+                    "python3 -B script/release_assets.py publish"],
+    }
+    for job_name, prefixes in required.items():
+        for prefix in prefixes:
+            matching = [step for step in document["jobs"][job_name]["steps"]
+                        if any(line.strip().startswith(prefix)
+                               for line in step.get("run", "").splitlines())]
+            assert len(matching) == 1
+            assert "if" not in matching[0]
+            assert matching[0].get("continue-on-error", False) is False
+            lines = [line.strip() for line in matching[0]["run"].splitlines()
+                     if line.strip().startswith(prefix)]
+            assert len(lines) == 1
+            assert "||" not in lines[0] and "; true" not in lines[0]
+            assert not lines[0].endswith("&")
+
+
+class WorkflowChecks(unittest.TestCase):
+    def test_release_workflow_has_bounded_tag_only_write_permissions(self):
+        path = PROJECT / ".github/workflows/release.yml"
+        workflow_contract(load_workflow(path), path.read_text())
+
+    def test_workflow_assertions_reject_gate_permission_and_asset_mutations(self):
+        path = PROJECT / ".github/workflows/release.yml"
+        raw = path.read_text()
+        baseline = load_workflow(path)
+        variants = []
+        value = copy.deepcopy(baseline)
+        value["on"]["pull_request_target"] = {}
+        variants.append(value)
+        value = copy.deepcopy(baseline)
+        value["permissions"] = {"contents": "write"}
+        variants.append(value)
+        value = copy.deepcopy(baseline)
+        value["jobs"]["publish"]["needs"] = []
+        variants.append(value)
+        value = copy.deepcopy(baseline)
+        value["jobs"]["publish"]["if"] = "always()"
+        variants.append(value)
+        value = copy.deepcopy(baseline)
+        value["jobs"]["build"]["steps"].append({"run": "echo " + "$" + "{{ github.ref_name }}"})
+        variants.append(value)
+        value = copy.deepcopy(baseline)
+        for step in value["jobs"]["build"]["steps"]:
+            if step.get("uses", "").startswith("actions/upload-artifact@"):
+                step["with"]["path"] = "dist/*"
+        variants.append(value)
+        value = copy.deepcopy(baseline)
+        value["jobs"]["publish"]["steps"].append({"run": "gh release upload --clobber"})
+        variants.append(value)
+        value = copy.deepcopy(baseline)
+        value["jobs"]["unexpected-writer"] = {
+            "permissions": {"contents": "write"}, "runs-on": "ubuntu-latest",
+            "steps": [{"run": "false"}],
+        }
+        variants.append(value)
+        for job_name in ["build", "publish"]:
+            value = copy.deepcopy(baseline)
+            value["jobs"][job_name]["continue-on-error"] = True
+            variants.append(value)
+            if job_name == "build":
+                value = copy.deepcopy(baseline)
+                value["jobs"][job_name]["if"] = False
+                variants.append(value)
+            for alteration in ["disabled", "removed", "commented", "shell-or", "shell-true", "background"]:
+                value = copy.deepcopy(baseline)
+                steps = value["jobs"][job_name]["steps"]
+                index = next(i for i, step in enumerate(steps)
+                             if any(line.strip().startswith("python3 -B script/release_assets.py verify")
+                                    for line in step.get("run", "").splitlines()))
+                if alteration == "disabled":
+                    steps[index]["if"] = False
+                elif alteration == "removed":
+                    steps.pop(index)
+                elif alteration == "commented":
+                    steps[index]["run"] = "\n".join("# " + line for line in steps[index]["run"].splitlines())
+                else:
+                    suffix = {"shell-or": " || true", "shell-true": "; true", "background": " &"}[alteration]
+                    steps[index]["run"] = "\n".join(
+                        line + suffix if line.strip().startswith("python3 -B script/release_assets.py verify")
+                        else line for line in steps[index]["run"].splitlines())
+                variants.append(value)
+        for index, value in enumerate(variants):
+            with self.subTest(index=index), self.assertRaises(AssertionError):
+                workflow_contract(value, raw)
+        with self.assertRaises(AssertionError):
+            workflow_contract(baseline, raw + "\ncontinue-on-error: true\n")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 ```
 
 ### script/BenchmarkMenu.swift
@@ -11979,7 +13864,7 @@ from check_docs import rebase_links
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = [
-    ".gitignore", ".github/workflows/build.yml", "Package.swift", "Package.resolved", "README.md", "LICENSE", "PRIVACY.md",
+    ".gitignore", ".github/workflows/build.yml", ".github/workflows/release.yml", "Package.swift", "Package.resolved", "README.md", "LICENSE", "PRIVACY.md",
     "Sources/TokenStatCore/Configuration.swift", "Sources/TokenStatCore/GatewayDiscovery.swift",
     "Sources/TokenStatCore/HTTPDecoder.swift", "Sources/TokenStatCore/LocalCodexUsageReader.swift", "Sources/TokenStatCore/MetricsEngine.swift",
     "Sources/TokenStatCore/ProxyServer.swift", "Sources/TokenStatCore/Quota.swift",
@@ -11992,12 +13877,12 @@ PUBLIC_FILES = [
     "Resources/Info.plist", "Resources/config.example.plist", "Resources/AppIcon.png", "Resources/AppIcon.icns", "TokenStatMenu.xcodeproj/project.pbxproj",
     "TokenStatMenu.xcodeproj/xcshareddata/xcschemes/TokenStatMenu.xcscheme",
     "Tests/TokenStatCoreTests/CoreChecks.swift", "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/WindowQuotaChecks.swift", "Tests/TokenStatCoreTests/LocalCodexUsageChecks.swift", "Tests/TokenStatCoreTests/DirectQuotaChecks.swift",
-    "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift", "Tests/TokenStatCoreTests/TokenHubQuotaChecks.swift", "Tests/TokenStatUITests/TokenHubQuotaStateTests.swift", "Tests/TokenStatUITests/SeasunStartupContractTests.swift",
+    "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift", "Tests/TokenStatCoreTests/TokenHubQuotaChecks.swift", "Tests/TokenStatUITests/TokenHubQuotaStateTests.swift", "Tests/TokenStatUITests/SeasunStartupContractTests.swift", "Tests/TokenStatUITests/DashboardHistoryTests.swift",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png",
-    "script/build_and_run.sh", "script/test.sh", "script/mock_server.py", "script/integration.py",
+    "script/build_and_run.sh", "script/test.sh", "script/mock_server.py", "script/integration.py", "script/release_assets.py", "script/test_release_assets.py",
     "script/BenchmarkMenu.swift", "script/benchmark_menu.py", "script/RenderAppIcon.swift", "script/make_app_icon.sh", "script/check_docs.py", "script/generate_xcode_project.py", "script/render_preview.py", "script/RenderPreview.swift", "script/package_source.py", "script/check_public_content.py",
     "docs/README.md", "docs/wiki/Home.md", "docs/wiki/安装与使用.md", "docs/wiki/统计口径.md",
     "docs/wiki/常见问题.md", "docs/wiki/编译指南.md", "docs/wiki/测试指南.md", "docs/wiki/命令行参数.md",
@@ -12207,7 +14092,12 @@ python3 script/package_source.py
 # 检查文档链接与公开内容
 python3 script/check_docs.py
 python3 script/check_public_content.py
+
+# 发布资产合同（合成 Git/ZIP 与隔离的本机签名样本）
+python3 -B script/test_release_assets.py
 ```
+
+正式版本推送 `vMAJOR.MINOR.PATCH` 标签后，由 [macOS release 工作流](../.github/workflows/release.yml) 检查版本、源码提交和 `main` 归属，构建 arm64 + x86_64 Universal App，并发布应用 ZIP、源码 ZIP、`release-manifest.json` 和 `SHA256SUMS`。构建检查与写入 Release 的作业分开授权；相同内容可安全重跑，不会覆盖不同内容的既有资产。维护者步骤和失败恢复见 [CI/CD](wiki/CI-CD.md)。
 
 真实机器核验与合成测试分开记录；后者不能证明企业账号、完整账单或真实服务器吞吐正确。视觉参考图只使用合成数据，录制图像本身不算通过。详细方法见 [测试指南](wiki/测试指南.md) 和 [UI 测试说明](UI_TESTING.md)，最近的结果与限制见 [验证记录](VALIDATION.md)。
 
