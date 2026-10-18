@@ -2,17 +2,17 @@
 
 ## 阶段 1 — 数据准确性与菜单口径（2026-10-18）
 
-本节记录提交 `fc42fab`、`991bcef`、`95416db` 所覆盖的阶段 1 复验。它们分别让 Dashboard 额度卡使用 `AppModel` 的 model clock、缓存可选诊断输出参数、并为 C29 的完整/受限本机记录标签加入合成回归。当前分支基线为 `95416db`；本节只记录本机证据，不表示企业服务端已提供权威瞬时 token/s。
+本节记录阶段 PR #70 合并提交 `60cba98`，以及后续时钟一致性修正提交 `459a106` 所覆盖的阶段 1 复验。它们分别让 Dashboard 额度卡、标题和诊断报告使用 `AppModel` 的 model clock，缓存可选诊断输出参数，并为 C29 的完整/受限本机记录标签加入合成回归。这些提交是阶段证据，不代表当前工作分支；本节只记录本机证据，不表示企业服务端已提供权威瞬时 token/s。
 
 | 检查 | 实际结果 | 口径和限制 |
 | --- | --- | --- |
 | `TokenStatCoreChecks` | `swift run --skip-build --force-resolved-versions` 退出 0；程序报告 `611/611 checks passed` | 使用隔离合成输入，不能证明真实网关数据或实时服务端吞吐 |
-| 完整 Swift/XCTest | `swift test --force-resolved-versions` 退出 0；`68/68` 通过（Dashboard 4、Seasun 启动 12、Token Hub 状态 41、UI 快照 11） | 合成与原生 XCTest 通过不等于真实 Settings AX 树验收；#33 仍开放 |
+| 完整 Swift/XCTest | `swift test --force-resolved-versions` 退出 0；`69/69` 通过（Dashboard 4、Seasun 启动 12、Token Hub 状态 42、UI 快照 11） | 合成与原生 XCTest 通过不等于真实 Settings AX 树验收；#33 仍开放 |
 | 隔离脚本 | `DEVELOPER_DIR=... ./script/test.sh` 退出 0；Core `611/611` | 脚本不会读取会话正文、Keychain 或企业私有日志；CLT linker warning 仍按 #52 记录 |
 | Xcode Release | 完整 Xcode `xcodebuild ... CODE_SIGNING_ALLOWED=NO build` 退出 0，`BUILD SUCCEEDED` | 这是本机构建证据，不是 Intel 实机、Developer ID 或公证证据 |
 | 文档检查 | `check_docs.py --self-test` 退出 0；21 篇公开 Markdown 链接/锚点通过 | 不替代产品行为测试 |
 | 公开内容 | `check_public_content.py --git-index` 退出 0；`85` 个白名单文件通过 | 扫描不包含账号、企业地址、额度、会话正文或个人路径；模式扫描不等同于任意 PII 的全面证明 |
-| 源码导出幂等 | `package_source.py` 连续运行两次；`docs/FULL_SOURCE.md` SHA-256 均为 `d20d516e60324e1d560796121aee94dbcf3cb53be32e7ed964be7212a9674de9` | 生成文件需随本阶段源码和文档一起审查 |
+| 源码导出幂等 | `package_source.py` 连续运行两次；`docs/FULL_SOURCE.md` SHA-256 均为 `4467ac18e5544d8275c83d7a7f74bc7cba1de4242d221ed39598f427ff9687c4` | 生成文件需随本阶段源码和文档一起审查 |
 | 依赖锁 | 以上命令前后 `Package.resolved` SHA-256 均为 `dd9d4ec707661dfd30768ea6437231e00ca5f892832fcc415599334f96b0fea0` | 未执行自动解析或恢复锁 |
 
 阶段 1 的真实限制保持明确：5 小时/7 天/月度额度使用企业只读来源；本机 Codex 统计保留来源、扫描范围、新鲜度和未核验线程标签；没有权威企业 server token/s 时间序列时，实时状态显示未知或明确标注为本机活动估算。`liveTokenSpeedPresent=false` 只代表本轮没有新鲜活动 token_count 证据，不是服务端吞吐为零。AX 树的真实可访问性验收继续留在 #33，CLT 默认 SwiftPM linker warning 继续留在 #52；本阶段没有关闭 #19 或 #37。
