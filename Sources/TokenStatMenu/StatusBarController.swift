@@ -113,7 +113,7 @@ struct StatusBarContentFactories {
             let sourceStatus: String
             let backgroundServiceResources: BackgroundServiceResources
         }
-        let snapshot = model.freshTokenHubQuota(at: Date())
+        let snapshot = model.freshTokenHubQuota(at: model.tokenHubNow())
         func hasReset(_ value: String?) -> Bool {
             guard let value else { return false }
             return !value.isEmpty && value != "未知"

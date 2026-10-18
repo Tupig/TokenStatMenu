@@ -217,6 +217,51 @@ final class TokenHubQuotaStateTests: XCTestCase {
         withExtendedLifetime(nilController) {}
     }
 
+    func testDiagnosticsUsesModelClockForFreshness() async throws {
+        _ = NSApplication.shared
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = HubManualClock(observedAt)
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1)
+        await settle(model, status: .connected)
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenStatMenu-diagnostics-clock-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let freshOutput = directory.appendingPathComponent("fresh.json")
+        let freshController = StatusBarController(model: model, diagnosticsURL: freshOutput)
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: freshOutput.path) { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let freshData = try Data(contentsOf: freshOutput)
+        let freshObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: freshData) as? [String: Any])
+        XCTAssertEqual(freshObject["directQuotaPresent"] as? Bool, true,
+                       "diagnostics should use the injected model clock while the snapshot is fresh")
+
+        clock.now = observedAt.addingTimeInterval(120.001)
+        let staleOutput = directory.appendingPathComponent("stale.json")
+        let staleController = StatusBarController(model: model, diagnosticsURL: staleOutput)
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: staleOutput.path) { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let staleData = try Data(contentsOf: staleOutput)
+        let staleObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: staleData) as? [String: Any])
+        XCTAssertEqual(staleObject["directQuotaPresent"] as? Bool, false,
+                       "diagnostics should expire the snapshot at the injected model-clock boundary")
+        withExtendedLifetime(freshController) {}
+        withExtendedLifetime(staleController) {}
+    }
+
     func testTooltipFormattingIsReusedForIdleTicksButTracksValuesAndTimeBoundaries() throws {
         _ = NSApplication.shared
         let model = AppModel(preview: true)

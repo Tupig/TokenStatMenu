@@ -82,7 +82,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 .background(PanelPalette.gradient, in: RoundedRectangle(cornerRadius: 10))
             VStack(alignment: .leading, spacing: 3) {
                 Text("TokenStatMenu").font(.system(size: 16, weight: .bold, design: .rounded))
-                Text(settings ? "Seasun Token Hub · 偏好设置" : "Seasun Token Hub · \(model.tokenHubQuotaIsDirect && model.freshTokenHubQuota(at: Date()) != nil ? "后台额度已连接" : "后台额度等待连接")")
+                Text(settings ? "Seasun Token Hub · 偏好设置" : "Seasun Token Hub · \(model.tokenHubQuotaIsDirect && model.freshTokenHubQuota(at: model.tokenHubNow()) != nil ? "后台额度已连接" : "后台额度等待连接")")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Spacer()
