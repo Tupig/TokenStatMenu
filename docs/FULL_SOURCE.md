@@ -4279,7 +4279,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         .tint(PanelPalette.blue)
     }
     var tokenHubCard: TokenHubQuotaCard {
-        TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: Date()), status: model.tokenHubQuotaStatusText,
+        TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: model.tokenHubNow()), status: model.tokenHubQuotaStatusText,
             enabled: model.tokenHubQuotaReadingEnabled, refreshSeconds: model.preferences.refreshSeconds,
             directSource: model.tokenHubQuotaIsDirect)
     }
@@ -4533,9 +4533,12 @@ struct StatusBarContentFactories {
     private var lastTitle = ""
     private var lastColor: NSColor?
     private var lastDiagnostic = Date.distantPast
-    init(model: AppModel, factories: StatusBarContentFactories = .production) {
+    private let diagnosticsURL: URL?
+    init(model: AppModel, factories: StatusBarContentFactories = .production,
+         diagnosticsURL: URL? = StatusBarController.commandLineDiagnosticsURL()) {
         self.model = model
         self.factories = factories
+        self.diagnosticsURL = diagnosticsURL
         // Keep a strong reference: a local NSStatusItem vanishes when deallocated.
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
@@ -4598,8 +4601,7 @@ struct StatusBarContentFactories {
     func popoverDidClose(_ notification: Notification) { model.panelVisible = false }
     /// Opt-in local diagnostic output for integration tests; contains only approved booleans and resource counts.
     private func writeDiagnosticsIfRequested() {
-        let args = CommandLine.arguments
-        guard let index = args.firstIndex(of: "--diagnostics-output"), args.indices.contains(index + 1),
+        guard let url = diagnosticsURL,
               Date().timeIntervalSince(lastDiagnostic) >= 1 else { return }
         lastDiagnostic = Date()
         struct Report: Encodable {
@@ -4647,9 +4649,15 @@ struct StatusBarContentFactories {
             sourceStatus: model.sourceStatus,
             backgroundServiceResources: model.backgroundServiceResources)
         if let data = try? JSONEncoder().encode(report) {
-            let url = URL(fileURLWithPath: args[index + 1])
             DispatchQueue.global(qos: .utility).async { try? data.write(to: url, options: .atomic) }
         }
+    }
+
+    private nonisolated static func commandLineDiagnosticsURL() -> URL? {
+        let arguments = CommandLine.arguments
+        guard let index = arguments.firstIndex(of: "--diagnostics-output"),
+              arguments.indices.contains(index + 1) else { return nil }
+        return URL(fileURLWithPath: arguments[index + 1])
     }
 }
 ```
@@ -9142,6 +9150,56 @@ final class TokenHubQuotaStateTests: XCTestCase {
         controller.toggle()
     }
 
+    func testDiagnosticsURLIsCachedAndNilDisablesOutput() async throws {
+        _ = NSApplication.shared
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenStatMenu-diagnostics-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appendingPathComponent("report.json")
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        let controller = StatusBarController(model: model, diagnosticsURL: output)
+
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: output.path) { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        let firstData = try Data(contentsOf: output)
+        let firstAttributes = try FileManager.default.attributesOfItem(atPath: output.path)
+        let firstModificationDate = try XCTUnwrap(firstAttributes[.modificationDate] as? Date)
+        let firstObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: firstData) as? [String: Any])
+        let approvedKeys: Set<String> = [
+            "seasunOnlyMode", "backgroundServicesStarted", "statusItemVisible",
+            "permissionPromptRequested", "quotaPresent", "directQuotaPresent",
+            "directQuotaStatus", "fiveHourPresent", "sevenDayPresent",
+            "fiveHourResetPresent", "sevenDayResetPresent", "resetTimePresent",
+            "monthlyUsagePresent", "liveTokenSpeedPresent", "sourceStatus",
+            "backgroundServiceResources"
+        ]
+        XCTAssertEqual(Set(firstObject.keys), approvedKeys)
+
+        controller.refreshTitle()
+        try await Task.sleep(for: .milliseconds(100))
+        let secondData = try Data(contentsOf: output)
+        let secondAttributes = try FileManager.default.attributesOfItem(atPath: output.path)
+        let secondModificationDate = try XCTUnwrap(secondAttributes[.modificationDate] as? Date)
+        XCTAssertEqual(secondData, firstData)
+        XCTAssertEqual(secondModificationDate, firstModificationDate,
+                       "the one-second diagnostic throttle should avoid a second write")
+
+        let nilOutput = directory.appendingPathComponent("nil.json")
+        let nilModel = AppModel(preview: true)
+        defer { nilModel.shutdown() }
+        let nilController = StatusBarController(model: nilModel, diagnosticsURL: nil)
+        nilController.refreshTitle()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: nilOutput.path))
+        withExtendedLifetime(controller) {}
+        withExtendedLifetime(nilController) {}
+    }
+
     func testTooltipFormattingIsReusedForIdleTicksButTracksValuesAndTimeBoundaries() throws {
         _ = NSApplication.shared
         let model = AppModel(preview: true)
@@ -9236,6 +9294,31 @@ final class TokenHubQuotaStateTests: XCTestCase {
         for _ in 0..<100 { model.tick() }
         XCTAssertEqual(tooltipBuilds, afterExpiry, "an expired snapshot must not cause endless redraws")
         withExtendedLifetime(controller) {}
+    }
+
+    func testTokenHubCardUsesModelClockForFreshness() async {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission(); permission.trusted = false
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = HubManualClock(observedAt)
+        let model = directModel(harness, clock: clock, permission: permission)
+        defer { model.shutdown(); harness.finishPending() }
+
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        harness.complete(1)
+        await settle(model, status: .connected)
+
+        let dashboard = DashboardView(model: model)
+        XCTAssertNotNil(dashboard.tokenHubCard.snapshot,
+                       "the card should use the injected model clock at the observation time")
+
+        clock.now = observedAt.addingTimeInterval(120)
+        XCTAssertNotNil(dashboard.tokenHubCard.snapshot,
+                       "the inclusive freshness boundary should remain visible")
+        clock.now = observedAt.addingTimeInterval(120.001)
+        XCTAssertNil(dashboard.tokenHubCard.snapshot,
+                     "the card should expire from the injected model clock")
     }
 
     func testLiveObservationBetweenTicksStillInvalidatesAtItsNextExpiry() {
@@ -9394,6 +9477,37 @@ final class TokenHubQuotaStateTests: XCTestCase {
         defer { model.shutdown() }
         model.config.dataSource = "localCodex"
         XCTAssertTrue(model.title.hasPrefix("上轮均:— ·"), "unknown speed must not duplicate its label")
+    }
+
+    func testUnknownAndAccountingLabelsRemainExplicitWhenSourcesAreMissing() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+
+        // No live turn, completed turn, or quota windows is the synthetic
+        // missing-data state used by a fresh or stale local scan.
+        model.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0,
+            sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 0,
+            unknownThreadCount: 0)
+        XCTAssertTrue(model.title.contains("上轮均:—"))
+        XCTAssertTrue(model.menuTooltip.contains("实时估算：未知"))
+        XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
+        XCTAssertTrue(model.menuTooltip.contains("7 天未知"))
+
+        model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
+            sessionCount: 2, filesScanned: 32, isLimited: true, latestEventAt: nil,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
+            unknownThreadCount: 2)
+        XCTAssertTrue(model.title.contains("小计"))
+        XCTAssertTrue(model.title.contains("未核验"))
+
+        model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
+            sessionCount: 2, filesScanned: 3, isLimited: false, latestEventAt: nil,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
+            unknownThreadCount: 0)
+        XCTAssertTrue(model.title.contains("Σ"))
+        XCTAssertTrue(model.title.contains("顶层对话"))
     }
 
     private func directModel(_ harness: HubDirectHarness, clock: HubManualClock,
@@ -11056,6 +11170,40 @@ final class DashboardHistoryTests: XCTestCase {
             }
         }
         XCTAssertEqual(f.permission.requests, 0)
+    }
+
+    func testC29AccountingLabelsRenderForLimitedAndCompleteSyntheticSnapshots() async throws {
+        let f = try await fixture(); defer { f.model.shutdown() }
+
+        f.model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
+            sessionCount: 2, filesScanned: 32, isLimited: true, latestEventAt: nil,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
+            unknownThreadCount: 2)
+        XCTAssertTrue(f.model.title.contains("小计"))
+        XCTAssertTrue(f.model.title.contains("未核验"))
+        XCTAssertTrue(f.model.menuTooltip.contains("实时估算：未知"))
+        XCTAssertTrue(f.model.menuTooltip.contains("当前配置关联的本机 Codex 记录"))
+        XCTAssertTrue(f.model.menuTooltip.contains("已核验记录小计"))
+        XCTAssertTrue(f.model.menuTooltip.contains("本次达到扫描上限"))
+        XCTAssertTrue(f.model.menuTooltip.contains("未核验线程 2"))
+        for dark in [false, true] {
+            let image = try render(DashboardView(model: f.model).overviewContent, dark: dark)
+            XCTAssertGreaterThan(image.png.count, 4000)
+        }
+
+        f.model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
+            sessionCount: 2, filesScanned: 3, isLimited: false, latestEventAt: nil,
+            fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
+            unknownThreadCount: 0)
+        XCTAssertTrue(f.model.title.contains("Σ"))
+        XCTAssertTrue(f.model.title.contains("顶层对话"))
+        XCTAssertTrue(f.model.menuTooltip.contains("本次扫描记录量"))
+        XCTAssertTrue(f.model.menuTooltip.contains("本次安全检查 3 个物理文件"))
+        XCTAssertTrue(f.model.menuTooltip.contains("未核验线程 0"))
+        for dark in [false, true] {
+            let image = try render(DashboardView(model: f.model).overviewContent, dark: dark)
+            XCTAssertGreaterThan(image.png.count, 4000)
+        }
     }
 }
 ```
