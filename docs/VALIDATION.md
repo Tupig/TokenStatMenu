@@ -17,6 +17,12 @@
 
 阶段 1 的真实限制保持明确：5 小时/7 天/月度额度使用企业只读来源；本机 Codex 统计保留来源、扫描范围、新鲜度和未核验线程标签；没有权威企业 server token/s 时间序列时，实时状态显示未知或明确标注为本机活动估算。`liveTokenSpeedPresent=false` 只代表本轮没有新鲜活动 token_count 证据，不是服务端吞吐为零。AX 树的真实可访问性验收继续留在 #33，CLT 默认 SwiftPM linker warning 继续留在 #52；本阶段没有关闭 #19 或 #37。
 
+## 阶段 2 — AX/CLT 诊断（2026-10-18）
+
+阶段 2 只新增不绕过权限的验收包装器和只读工具链诊断，不改变生产数据路径。`python3 -m unittest script/test_phase2_diagnostics.py` 通过 4/4；`run_settings_ax_check.sh` 的当前私有 C27 runner 结果为 `build_for_testing=0`、`test_without_building=65`、分类 `automation_environment_blocked`，A01–A07 执行数为 0。错误为 automation mode 初始化超时，因此 #33 保持 OPEN；没有修改 TCC、请求额外权限、读取真实 Hub 界面或使用 OCR/离屏 getter。
+
+CLT/完整 Xcode 对比使用仓库外临时复制和无凭据只读命令。当前本机 CLT Hello/项目构建均 exit 0，分别捕获 2/3 条 `clt_search_path_warning`；完整 Xcode Hello/项目构建均 exit 0，warning 数量为 0。两种结果的 `Package.resolved` SHA-256 均为 `dd9d4ec707661dfd30768ea6437231e00ca5f892832fcc415599334f96b0fea0`。这确认 #52 是 CLT/SwiftPM 上游布局诊断；完整 Xcode 的逐命令 `DEVELOPER_DIR` 是规避路径，未修改 SDK、全局 xcode-select 或隐藏 stderr，Issue #52 继续 OPEN。
+
 ## 1.1.5 — DMG 分发候选（2026-10-18）
 
 本节记录 BP32 当前本机候选的 DMG 相关合同检查，不代表已经创建正式 GitHub Release。版本元数据已切换为 1.1.5/build7；当前工作树仍需完成最终来源、隐私、索引和发布审查。1.1.4/build6 的真实历史仍是 ZIP-only，见下一节及其既有 Release 边界，不追溯增加 DMG。
