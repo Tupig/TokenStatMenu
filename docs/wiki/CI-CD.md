@@ -14,8 +14,9 @@
 | 4 | 核心与发现检查 | 运行 `TokenStatCoreChecks` 的合成回归 |
 | 5 | 原生测试目标编译及不依赖 OS 像素的检查 | 凭据用途/URL 绑定的纯身份检查，以及刻意图像差异可被检测的检查 |
 | 6 | Xcode Release 构建 | 使用明确绑定 App target 的共享 Scheme，禁用代码签名完成原生工程构建 |
+| 7 | 完整依赖锁未改动 | `git diff --exit-code -- Package.resolved`；任何隐式改写都会让 CI 失败 |
 
-CI 不比较受特定 macOS 渲染环境约束的工具栏基线，也不调用真实 Seasun 网关、不读取企业账号或本地会话。当前工作流不是完整 `swift test`、隔离 `script/test.sh`、Universal 构建或本机安装验收的替代。性能基准也不在 CI 中作为时间阈值运行，以免把共享 runner 的负载变化当作性能回归。
+CI 不比较受特定 macOS 渲染环境约束的工具栏基线，也不调用真实 Seasun 网关、不读取企业账号或本地会话。当前工作流不是完整 `swift test --force-resolved-versions`、隔离 `script/test.sh`、Universal 构建或本机安装验收的替代。性能基准也不在 CI 中作为时间阈值运行，以免把共享 runner 的负载变化当作性能回归。
 
 ## CI 通过应怎样解读
 
@@ -28,6 +29,12 @@ CI 绿色说明该提交完成了工作流声明的检查，不能据此声称�
 - 正在运行的 App 与该提交构建产物一致。
 
 每项交付报告都应把本地测试、CI、真实环境、安装和发布证据分别写清楚。
+
+## SwiftPM 锁定与失败保留
+
+所有会解析依赖的 SwiftPM 构建、运行、测试及路径查询都显式使用 `--force-resolved-versions`。已审阅的锁同时保留 custom-dump 1.7.3 两种工具链 manifest 所需的精确 pin，SnapshotTesting 仍固定 1.19.6。缺少当前图的必要 pin 或约束冲突必须失败，不运行自动更新、不用事后恢复锁文件掩盖变化。PR/main 构建末尾另用 `git diff --exit-code -- Package.resolved` 强制检查完整锁未改动；发布阶段原有的全树 `git diff --exit-code` 也继续保留。
+
+这项修正来自 [v1.1.3 的实际失败 run](https://github.com/Tupig/TokenStatMenu/actions/runs/39093885964)：构建已完成，但 CI 工具链将 issue-reporting pin 改成 overlay pin，源归档后的干净检查失败，后续打包/上传与 publish 均跳过，没有生成正式 Release。失败标签保留，后续候选采用 1.1.4（build 6）。本机 Swift 6.4 实验通过不能证明该旧工具链图或新 Release 已成功，必须等待对应 PR/main/tag run 与真实资产验收。完整原因见 [编译指南](编译指南.md#固定测试依赖与跨工具链锁)。
 
 ## 本地到推送的建议流程
 

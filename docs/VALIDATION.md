@@ -1,8 +1,33 @@
 # 验证记录
 
+## 1.1.4 — 跨工具链依赖锁修正候选（2026-10-18）
+
+本节分别记录 1.1.4（build 6）方案的隔离实验与修正后本机候选复验。实验克隆自公开提交 `30ea1ba0971e0f317bc08ec70acc45ebf6ebddbe`；之后对实际修改后的候选重新运行了下表中的整套本机检查，没有将旧 1.1.3 的通过结果直接转写。本轮截止于 `modified` 来源候选，最终干净提交、源码/隐私独立审查、远端 CI、Release 和 Homebrew 端点尚待对应证据。
+
+| 检查 | 已取得的实际证据 | 尚不能证明 |
+| --- | --- | --- |
+| 上游来源 | 官方精确 tag/revision 与版本化 manifest 已逐份核对，现有本机 checkout 字节与官方一致 | 历史 tag 从未移动或维护者密码学签名 |
+| 完整锁的正向实验 | 本机 Apple Swift 6.4 执行 forced resolve、arm64/x86_64 路径查询、本机 App build、CoreChecks、一个不作 Keychain I/O 的原生测试，六项全部退出 0；每次完整锁原始字节均不变 | 较旧工具链已通过；两个路径查询也不是双架构实际构建 |
+| 实验内部断言 | Core 611/611、筛选原生测试 1/1 通过 | 最终候选的完整 64 项套件或真实企业数据验收 |
+| 缺少必要 pin | 移除当前图所需 issue-reporting 后，forced resolve 退出 1，诊断明确为禁用自动解析时拒绝过期锁；输入锁字节不变 | 任意网络错误不能替代该预期诊断 |
+| 精确版本冲突 | SnapshotTesting 锁到合法旧版本 1.19.5，与根要求 1.19.6 冲突，forced resolve 退出 1；诊断明确约束已变，输入锁字节不变 | 不把失败当作成功解析，未自动修复锁 |
+| 本机候选 Core 与隔离集成 | 实际 `script/test.sh` 退出 0，Core 611/611 与五组隔离启动通过 | 后台关闭的测试不证明真实企业链路 |
+| 本机候选完整原生套件 | 实际 `swift test --force-resolved-versions` 64/64、0 失败，退出 0 | 不包含被自动化 runner 阻塞的 Settings 原生 AX 验收 |
+| 本机候选 Release 合同 | 实际 Release 工具检查 41/41 通过，退出 0 | 合成/原生 fixture 不能代替真实 Actions 发布 |
+| 本机候选 Xcode Release | `BUILD SUCCEEDED`，退出 0 | SDK 仍提示没有 AppIntents 依赖而跳过元数据提取，不宣称全日志零 warning |
+| 本机候选 Universal | arm64/x86_64 实际 Release 构建退出 0；独立核对 1.1.4/6、四文件 Bundle、两架构与严格签名 | 来源状态为 `modified`，本地 ad hoc；不是最终干净提交产物、Intel 实机或 Apple 公证 |
+| 复验后的完整依赖锁 | 全部上述命令后仍为 `dd9d4ec707661dfd30768ea6437231e00ca5f892832fcc415599334f96b0fea0`，独立 SHA-256 核对与实验组合锁相同 | 较旧工具链实际 CI 仍待运行；不靠恢复文件匹配摘要 |
+| 最终来源审查与交付 | 等待源码/隐私独立审查、精确暂存与归档、干净提交及远端证据 | 尚不声称 CI、正式 Release 下载、production Formula、公开 tap 或最终安装已通过 |
+
+组合锁完整保留四个原 pin，只增加经过官方 tag 核验的 `xctest-dynamic-overlay 1.13.1` / `d9308ad679143c26a30dec52daefe82f54af2b82`。本机图使用既有 `swift-issue-reporting 2.1.2` / `b23bb4493c439d3e05152bc167014235ba3d47fc`，另一工具链兼容图选择 overlay；SnapshotTesting 仍是精确 1.19.6。实验没有通过构建后恢复、覆盖或删除锁掩盖变化，公开源码在实验期间未被修改。
+
+新的当前命令与脚本统一使用 `--force-resolved-versions`，发布流程继续保留干净源码比较。较旧 CI 图必须在实际 PR/main/tag workflow 中成功，并保持完整锁与导出源码不变；本机 Swift 6.4 不能替代这项证据。[Issue #60](https://github.com/Tupig/TokenStatMenu/issues/60) 保留失败 v1.1.3 的原因和后续验证。正式四资产实际下载、production Formula、tap 工作流和受控安装切换另行验收，不能从锁实验或计划版本推断成功。
+
+服务端权威 TPS、完整安装即用统计、Settings 原生 AX 自动化环境和 CLT 上游诊断仍分别属于 #37、#19、#33、#52；本轮依赖锁修正不关闭它们。当前操作命令见 [编译指南](wiki/编译指南.md#固定测试依赖与跨工具链锁) 和 [测试指南](wiki/测试指南.md)。
+
 ## 1.1.3 — 发布流程与额度展示层次，本机组合候选（2026-10-18）
 
-本节截止于 1.1.3（build 5）组合候选的本机源码、测试与构建验收。此时源码仍有未提交改动，构建来源状态为 `modified`；没有用候选构建冒充最终干净提交产物或正式 Release。当前已安装 1.1.2 的历史就绪结果也不能代替 1.1.3 最终安装验收。
+本节保留 1.1.3（build 5）组合候选当时的本机源码、测试与构建验收；当时源码仍有未提交改动，构建来源状态为 `modified`。随后公开提交 `30ea1ba0971e0f317bc08ec70acc45ebf6ebddbe` 已合并，但正式标签的 [Release run 39093885964](https://github.com/Tupig/TokenStatMenu/actions/runs/39093885964) 在导出后的干净源码比较中发现 `Package.resolved` 改动，正确失败。Core、指定原生检查、Xcode 和 Universal 构建步骤成功不等于 Release 成功；后续打包、上传与 publish 均跳过，没有 v1.1.3 正式 Release。失败标签保留，由 [Issue #60](https://github.com/Tupig/TokenStatMenu/issues/60) 跟踪，修正使用新候选 1.1.4/build6。以下原始通过记录没有被改写为新版本事实。
 
 | 检查 | 已取得的本机证据 | 覆盖与限制 |
 | --- | --- | --- |
@@ -187,7 +212,9 @@
 
 以下 BP06 记录是历史证据，不是本轮重新执行的结果：此前核心检查 145/145、UI XCTest 9/9、四张静态 Dashboard / Settings SnapshotTesting 基线及 BP06 runtime readiness 检查。BP07 当前结果以上一节实际数字为准。
 
-## 执行方式
+## BP07 当时执行方式（历史）
+
+以下是 BP07 当时的执行记录，不是当前构建建议。当前复验使用带 `--force-resolved-versions` 的[测试指南](wiki/测试指南.md)与[编译指南](wiki/编译指南.md)，不要按历史命令删除或重新生成锁。
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift run TokenStatCoreChecks

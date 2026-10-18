@@ -57,6 +57,8 @@ DashboardView / SettingsView / Quota Cards：中文 SwiftUI 展示
 | [script](../script) | 构建、隔离集成、离线预览、隐私检查与显式源码导出 |
 | [release_assets.py](../script/release_assets.py)、[release 工作流](../.github/workflows/release.yml) | 标签与四资产契约、原生包装、远端一致性检查及分离权限的发布 |
 
+SwiftPM 构建与测试使用经审阅的精确依赖锁和 `--force-resolved-versions`。锁同时保留 custom-dump 1.7.3 的工具链兼容图需要的 issue-reporting 2.1.2 与 overlay 1.13.1；SnapshotTesting 1.19.6 精确依赖和 App 仅依赖系统框架的边界不变。必要 pin 缺失或约束冲突应失败，不静默更新或事后恢复锁。1.1.3 的正式 Release 因真实 CI 锁漂移被干净源码检查拒绝，修正候选版本为 1.1.4/build6；本机实验、最终 CI、Release 和安装仍分别验收，见 [编译指南](wiki/编译指南.md#固定测试依赖与跨工具链锁) 与 [验证记录](VALIDATION.md)。
+
 Dashboard 的实际 `overviewContent` 同时用于生产面板和完整渲染测试。正常本地路径保留一张企业主额度卡和本地 Token/线程/速度卡；历史额度通过默认折叠的原生 DisclosureGroup 展开，避免历史缺失五小时或旧七天百分比成为第二组主额度。展开只改变本地 SwiftUI 状态，不保存设置、不触发读取，也不改变直接来源、菜单文字、告警或数值。此项解决展示层次混淆，不能补造源端缺失的统计。
 
 ## 后台读取流程
