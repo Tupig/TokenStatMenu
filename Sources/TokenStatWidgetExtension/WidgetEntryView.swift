@@ -1,5 +1,15 @@
 import SwiftUI
 import WidgetKit
+#if SWIFT_PACKAGE
+import TokenStatWidgetShared
+#endif
+
+/// 系统扩展与离线渲染测试使用同一个条目，不复制视图实现。
+struct WidgetEntry: TimelineEntry {
+    let date: Date
+    let snapshot: WidgetQuotaSnapshot?
+    let channelAvailable: Bool
+}
 
 /// 小组件视图：数据缺失时显示“未知”，不借用其他窗口的值或将过期数据当作当前值。
 struct WidgetEntryView: View {
@@ -27,7 +37,7 @@ struct WidgetEntryView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
             Text("需要签名与 App Group")
-                .font(.system(size: 9))
+                .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
         }
     }
@@ -38,7 +48,7 @@ struct WidgetEntryView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
             Text("打开 TokenStatMenu 后自动更新")
-                .font(.system(size: 9))
+                .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
         }
     }
@@ -167,6 +177,7 @@ struct WidgetEntryView: View {
 
     private func amountText(_ value: Double) -> String {
         let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.numberStyle = .decimal
         formatter.usesGroupingSeparator = true
         formatter.maximumFractionDigits = 2
@@ -177,6 +188,7 @@ struct WidgetEntryView: View {
     /// 月度金额与面板一致：千分位、两位小数。
     private func monthlyAmountText(_ value: Double) -> String {
         let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.numberStyle = .decimal
         formatter.usesGroupingSeparator = true
         formatter.minimumFractionDigits = 2

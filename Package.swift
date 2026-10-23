@@ -17,6 +17,9 @@ let package = Package(
         // Shared between the menu-bar app and its embedded widget extension.
         // Kept dependency-free of WidgetKit so both processes can link it.
         .target(name: "TokenStatWidgetShared"),
+        .target(name: "TokenStatWidgetUI", dependencies: ["TokenStatWidgetShared"],
+                path: "Sources/TokenStatWidgetExtension", exclude: ["TokenStatWidget.swift"],
+                sources: ["WidgetEntryView.swift"]),
         .executableTarget(name: "TokenStatMenu", dependencies: ["TokenStatCore", "TokenStatWidgetShared"]),
         .executableTarget(name: "TokenStatCoreChecks", dependencies: ["TokenStatCore"], path: "Tests/TokenStatCoreTests",
                           swiftSettings: [.define("TOKENSTAT_BP38_C01"), .define("TOKENSTAT_BP38_C02"), .define("TOKENSTAT_BP38_C03")]),
@@ -29,7 +32,8 @@ let package = Package(
         // Pure-logic coverage for the shared widget protocol: codec round
         // trips, rejection cases, and container-unavailable degradation.
         .testTarget(name: "TokenStatWidgetSharedTests",
-                    dependencies: ["TokenStatWidgetShared", "TokenStatMenu"]),
+                     dependencies: ["TokenStatWidgetShared", "TokenStatMenu"]),
+        .testTarget(name: "TokenStatWidgetUITests", dependencies: ["TokenStatWidgetUI", "TokenStatWidgetShared"]),
         // Development-only widget probe. It is not a product and is not linked
         // into the menu-bar executable. The AppKit host and WidgetKit extension
         // stay in the generated Xcode project.

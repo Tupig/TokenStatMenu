@@ -1,13 +1,6 @@
 import SwiftUI
 import WidgetKit
 
-/// 已解码的时间线条目。快照为 nil 表示通道或数据缺失，视图显示未知而非零。
-struct WidgetEntry: TimelineEntry {
-    let date: Date
-    let snapshot: WidgetQuotaSnapshot?
-    let channelAvailable: Bool
-}
-
 /// 读取应用最近发布的 App Group 快照，不访问网络或偏好设置。
 struct WidgetProvider: TimelineProvider {
     func placeholder(in context: Context) -> WidgetEntry {

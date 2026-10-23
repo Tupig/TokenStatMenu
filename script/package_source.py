@@ -52,6 +52,7 @@ PUBLIC_FILES = [
     "Tests/TokenStatWidgetSharedTests/WidgetSnapshotStoreTests.swift",
     "Tests/TokenStatWidgetSharedTests/WidgetPublishDecisionTests.swift",
     "Tests/TokenStatWidgetSharedTests/WidgetPublisherFailureTests.swift",
+    "Tests/TokenStatWidgetUITests/WidgetEntryViewTests.swift",
     "Tests/TokenStatDevWidgetSharedTests/DevWidgetProbeTests.swift",
     "Resources/Info.plist",
     "Resources/config.example.plist",
