@@ -3010,7 +3010,7 @@ extension TokenHubQuotaStateTests {
     }
 
     private func bp39UIRenderOverview(_ model: AppModel, expanded: Bool, dark: Bool,
-                                     output: URL) async throws -> (text: String, png: Data) {
+                                     output: URL) async throws -> (text: String, candidates: String, png: Data) {
         let content = DashboardView(model: model, detailedMetricsExpanded: expanded).overviewContent
             .environment(\.colorScheme, dark ? .dark : .light)
             .fixedSize(horizontal: false, vertical: true)
@@ -3020,8 +3020,7 @@ extension TokenHubQuotaStateTests {
         let host = NSHostingView(rootView: content)
         host.frame = NSRect(x: 0, y: 0, width: 460, height: 700)
         host.layoutSubtreeIfNeeded()
-        // 部分 macOS 的 GroupBox/disclosure 在挂到窗口后才完成 intrinsic
-        // 尺寸计算；预留底部空间，避免完整轮次的最后几行被截入边界。
+        // 预留底部空间，保留完整轮次最后几行的可检查位图。
         let height = max(700, ceil(host.fittingSize.height) + 24)
         guard height.isFinite, height <= 8_000 else { throw NSError(domain: "BP39OverviewRender", code: 1) }
         let bounds = NSRect(x: 0, y: 0, width: 460, height: height)
@@ -3073,7 +3072,11 @@ extension TokenHubQuotaStateTests {
         let text = lines.map { line in
             line.sorted { $0.bounds.minX < $1.bounds.minX }.map(\.text).joined(separator: " ")
         }.joined(separator: "\n")
-        return (text, png)
+        // 不将 OCR 错字替换成预期文字。标签检查允许 Vision 的其他原始
+        // 候选；数值、未知原因和泄露检查仍使用 top-1，避免词表掩盖问题。
+        let candidates = (request.results ?? []).flatMap { $0.topCandidates(10) }
+            .map(\.string).joined(separator: "\n")
+        return (text, candidates, png)
     }
 
     func testBP39DashboardActuallyRendersCacheFactsAndExpandedWholeTurnOffline() async throws {
@@ -3094,8 +3097,9 @@ extension TokenHubQuotaStateTests {
             let expanded = try await bp39UIRenderOverview(model, expanded: true, dark: dark,
                 output: artifacts.url.appendingPathComponent("\(appearance)-expanded.png"))
             let text = expanded.text.replacingOccurrences(of: " ", with: "")
+            let labels = expanded.candidates.replacingOccurrences(of: " ", with: "")
             for marker in ["缓存", "未缓存", "命中率", "线程", "轮次", "整轮用时", "整轮均速"] {
-                XCTAssertTrue(text.contains(marker), "\(appearance) actual bitmap must display \(marker); OCR: \(text)")
+                XCTAssertTrue(labels.contains(marker), "\(appearance) actual bitmap must display \(marker); OCR: \(text)")
             }
             XCTAssertTrue(text.contains("43.75%"), "the actual summary renders source C=70 / I=160")
             XCTAssertTrue(text.contains("线程1")); XCTAssertTrue(text.contains("轮次1"))

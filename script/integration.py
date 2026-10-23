@@ -182,6 +182,9 @@ def verify_build_only_never_invokes_global_kill(root: pathlib.Path) -> None:
         path.chmod(0o755)
 
     environment = os.environ.copy()
+    # 此 fixture 验证 build-only 不启动/杀进程且不改变版本；build 递增
+    # 由独立 BumpBuildChecks 覆盖，不继承调用者是否设置跳过变量。
+    environment["TOKENSTAT_SKIP_BUILD_BUMP"] = "1"
     environment["PATH"] = str(tools) + os.pathsep + environment.get("PATH", "")
     environment["BP10_PKILL_LOG"] = str(pkill_log)
     environment["BP10_FAKE_BIN"] = str(fake_bin)
