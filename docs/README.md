@@ -13,6 +13,6 @@ TokenStatMenu 是面向 Seasun Token Hub 的原生 macOS 菜单栏统计工具�
 
 本文档保存在源码仓库的 `docs/wiki/` 中，链接可直接在 GitHub 源码页访问。目录名称沿用 Wiki 的阅读习惯，不表示已经配置 GitHub Wiki 同步。
 
-更深入的资料见 [可选偏好](CONFIGURATION.md)、[实现范围](IMPLEMENTATION.md)、[设计说明](DESIGN.md)、[性能与基准](PERFORMANCE.md)、[UI 测试说明](UI_TESTING.md)、[验证记录](VALIDATION.md) 和 [完整源码](FULL_SOURCE.md)。数据与会话处理方式见 [隐私说明](../PRIVACY.md)。
+更深入的资料见 [可选偏好](CONFIGURATION.md)、[实现范围](IMPLEMENTATION.md)、[设计说明](DESIGN.md)、[性能与基准](PERFORMANCE.md)、[UI 测试说明](UI_TESTING.md) 和 [验证记录](VALIDATION.md)。数据与会话处理方式见 [隐私说明](../PRIVACY.md)。仓库源文件是维护与阅读的权威内容；源码 ZIP 按显式文件白名单构建，详情见[编译指南](wiki/编译指南.md)和 [CI/CD](wiki/CI-CD.md)。
 
 相关页面：[项目首页](../README.md) · [文档中心](wiki/Home.md)

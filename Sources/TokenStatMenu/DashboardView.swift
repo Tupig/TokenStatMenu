@@ -10,10 +10,16 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     @ObservedObject var model: AppModel
     @ValueState private var settings = false
     private let initialLocalHistoryExpanded: Bool
-    init(model: AppModel, settings: Bool = false, localHistoryExpanded: Bool = false) {
+    private let initialDetailedMetricsExpanded: Bool
+    private let quitAction: @MainActor () -> Void
+    init(model: AppModel, settings: Bool = false, localHistoryExpanded: Bool = false,
+         detailedMetricsExpanded: Bool = false,
+         quitAction: @escaping @MainActor () -> Void = { NSApp.terminate(nil) }) {
         self.model = model
         _settings = State(initialValue: settings)
         initialLocalHistoryExpanded = localHistoryExpanded
+        initialDetailedMetricsExpanded = detailedMetricsExpanded
+        self.quitAction = quitAction
     }
     var body: some View {
         VStack(spacing: 0) {
@@ -50,6 +56,9 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             Text(model.userFacingStatus)
                 .font(.system(size: 10)).foregroundStyle(.secondary)
             localUsageCard
+            LocalDetailsDisclosure(initiallyExpanded: initialDetailedMetricsExpanded) {
+                localDetailedMetricsCard
+            }
             if model.quotaSource == .localCodex {
                 LocalHistoryDisclosure(initiallyExpanded: initialLocalHistoryExpanded) {
                     localQuotaCard
@@ -70,7 +79,9 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         .tint(PanelPalette.blue)
     }
     var tokenHubCard: TokenHubQuotaCard {
-        TokenHubQuotaCard(snapshot: model.freshTokenHubQuota(at: model.tokenHubNow()), status: model.tokenHubQuotaStatusText,
+        let now = model.tokenHubNow()
+        let projection = model.quotaPresentation(at: now)
+        return TokenHubQuotaCard(presentation: projection, status: model.tokenHubQuotaStatusText,
             enabled: model.tokenHubQuotaReadingEnabled, refreshSeconds: model.preferences.refreshSeconds,
             directSource: model.tokenHubQuotaIsDirect)
     }
@@ -91,7 +102,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                     .frame(width: HeaderActionMetrics.actionSize, height: HeaderActionMetrics.actionSize)
             }.buttonStyle(NeutralHeaderActionButtonStyle()).help(settings ? "返回概览" : "偏好设置")
                 .accessibilityLabel(settings ? "返回概览" : "偏好设置")
-            Button { NSApp.terminate(nil) } label: {
+            Button { quitAction() } label: {
                 Image(systemName: "power").frame(width: HeaderActionMetrics.actionSize, height: HeaderActionMetrics.actionSize)
             }.buttonStyle(NeutralHeaderActionButtonStyle()).help("退出 TokenStatMenu").accessibilityLabel("退出")
         }.padding(16)
@@ -142,6 +153,86 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
             }
         } label: { Label("本地 Codex 历史 · 账号/组织未核验", systemImage: "clock") }
+    }
+    private var localDetailedMetricsCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                metric("缓存读取", model.localCacheReadout)
+                metric("未缓存输入", model.localUncachedInputReadout)
+                metric("命中率", model.localCacheHitRateReadout)
+                metric("缓存覆盖", model.localCacheCoverageReadout)
+                metric("线程轮次明细", model.localSnapshot.detailLimited
+                    ? "已达到展示上限" : "当前扫描候选范围")
+                if let matched = model.localMatchedCacheReadout {
+                    Text(matched).font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(model.localReadAtReadout)
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                metric("模型调用用时", "未知（来源未提供）")
+                metric("平均 TTFT", "未知（来源未提供）")
+                metric("decode TPS", "未知（来源未提供）")
+
+                ForEach(model.localSnapshot.details, id: \.opaqueKey) { thread in
+                    Divider().padding(.vertical, 3)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("线程 \(thread.ordinal) · \(lineageName(thread.kind))")
+                            .font(.system(size: 11, weight: .semibold))
+                        metric("输入 Token", localOptionalCount(thread.usage.input))
+                        metric("输出 Token", localOptionalCount(thread.usage.output))
+                        metric("总计 Token", localOptionalCount(thread.usage.total))
+                        metric("缓存读取", localCacheInput(thread.usage.cache))
+                        metric("未缓存输入", localOptionalCount(thread.usage.uncachedInput))
+                        ForEach(thread.turns, id: \.opaqueKey) { turn in
+                            Divider().padding(.vertical, 2)
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("轮次 \(turn.ordinal)")
+                                    .font(.system(size: 11, weight: .medium))
+                                metric("输入 Token", localOptionalCount(turn.usage.input))
+                                metric("输出 Token", localOptionalCount(turn.usage.output))
+                                metric("总计 Token", localOptionalCount(turn.usage.total))
+                                metric("缓存读取", localCacheInput(turn.usage.cache))
+                                metric("未缓存输入", localOptionalCount(turn.usage.uncachedInput))
+                                metric("整轮用时", localDuration(turn.durationSeconds))
+                                metric("整轮均速", localRate(turn.outputTPS))
+                                metric("完成时间", turn.completedAt.formatted(date: .abbreviated, time: .shortened))
+                            }
+                            .padding(.leading, 10)
+                        }
+                    }
+                }
+                Text("完整轮次只表示整轮记录均速；没有模型调用、TTFT 或 decode 的来源事件时，这些指标保持未知。")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        } label: {
+            Label("本次缓存与线程汇总", systemImage: "number")
+        }
+    }
+    private func localOptionalCount(_ value: Int?) -> String {
+        value.map { count($0) } ?? "未知（无完整数值来源）"
+    }
+    private func localCacheInput(_ value: LocalCacheInput) -> String {
+        switch value {
+        case .value(let count): return "\(self.count(count)) tokens"
+        case .notReported: return "未知（来源未提供）"
+        case .invalid: return "未知（来源值无效）"
+        }
+    }
+    private func localDuration(_ value: Double?) -> String {
+        guard let value, value.isFinite, value >= 0 else { return "未知（来源未提供）" }
+        return String(format: "%.2f 秒", value)
+    }
+    private func localRate(_ value: Double?) -> String {
+        guard let value, value.isFinite, value >= 0 else { return "未知（来源未提供）" }
+        return String(format: "%.1f tok/s", value)
+    }
+    private func lineageName(_ kind: LocalThreadLineage) -> String {
+        switch kind {
+        case .root: return "顶层对话"
+        case .subagent: return "子代理"
+        case .fork: return "分叉"
+        case .unknown: return "类型未知"
+        }
     }
     private func historyWindow(_ title: String, quota: WindowQuota?) -> some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -194,6 +285,28 @@ private struct LocalHistoryDisclosure<Content: View>: View {
                 .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
         }
         .accessibilityHint("只显示本地历史记录，不代表企业当前剩余额度")
+    }
+}
+
+/// The detailed projection is opt-in and remains view-local; expanding it
+/// never triggers a scan or changes the retained snapshot.
+private struct LocalDetailsDisclosure<Content: View>: View {
+    @ValueState private var expanded: Bool
+    private let content: Content
+
+    init(initiallyExpanded: Bool, @ViewBuilder content: () -> Content) {
+        _expanded = SwiftUI.State(initialValue: initiallyExpanded)
+        self.content = content()
+    }
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            content.padding(.top, 8)
+        } label: {
+            Label("缓存与线程轮次明细", systemImage: "list.bullet.rectangle")
+                .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+        }
+        .accessibilityHint("仅展开本次扫描已核验的本地缓存与完整轮次明细")
     }
 }
 

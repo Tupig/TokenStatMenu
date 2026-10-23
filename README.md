@@ -17,12 +17,15 @@
 | 5 小时与 7 天额度 | Token Hub 后台只读响应中的金额额度、剩余比例和重置时间；缺失窗口保持未知 |
 | 月度用量 | 后台提供的月度金额，与本地 Token 量分开显示 |
 | 本地 Token 与对话分类 | 有界扫描内可核算的输入、输出、总量与线程分类；不代表本次启动消耗或侧栏全部对话 |
+| 缓存与线程轮次明细 | 展开概览中的明细区，查看缓存读取、未缓存输入、命中率及完整轮次用量；缺失和无效值分别说明 |
 | 可选界面兼容快照 | 已有辅助功能信任时的回退来源，明确标注“界面”；关闭它不会关闭后台直接读取 |
 | 中文菜单栏界面 | 无主窗口、适配深浅色，不使用 Electron，不引入第三方运行时框架 |
 
 应用目前专用于 Seasun Token Hub。通用 API、Ollama、手填网关、价格和代理接入不属于正式界面；核心库保留的旧协议代码用于回归测试，不能据此推断正式 App 已支持这些接入方式。
 
 当前配置只能关联同名 provider 的本地记录，不能反向证明全部历史会话的实际网关路由。无法核算、超出覆盖范围或来源缺失的部分会标为未知，不当作零。完整解释见 [统计口径](docs/wiki/统计口径.md)。
+
+输入 Token 已包含缓存读取，不能将两者再次相加。明细仅保留当前扫描范围内最多 32 个线程、每线程 16 个完整轮次、合计 128 个轮次；重新扫描替换旧快照，不建立跨重启历史账本。整轮用时与均速包含工具、网络和等待，模型调用用时、平均 TTFT 与 decode TPS 在没有来源事件时保持未知。
 
 ## 快速开始
 
@@ -64,7 +67,7 @@ Homebrew 从正式 Release 的校验源码包构建原生 App，使用本机 ad 
 
 正常启动只显示菜单栏条目，点击后展开面板；没有主窗口属于预期行为。不需要创建 plist，也不需要授予辅助功能权限来连接后台。设置里的辅助功能入口仅用于可选界面兼容读取。
 
-首次 SwiftPM 构建可能需要联网解析测试依赖。当前 1.1.4/build6 历史 Release 保持 ZIP-only；下一版目标 1.1.5/build7 在同一 Universal App ZIP 和源码 ZIP 之外增加 Finder 友好的 DMG 安装包装。DMG 不是新运行时或更新器，必须与同一已审核 App、源码、manifest 和 SHA256SUMS 绑定；实际发布页是否已有五资产仍以远端证据为准。二进制发行使用 ad hoc 签名，尚未完成 Developer ID 签名或 Apple 公证；Homebrew 通过在本机编译源码安装。固定路径安装、升级、回退和首次打开说明见 [安装与使用](docs/wiki/安装与使用.md)。
+首次 SwiftPM 构建可能需要联网解析测试依赖。当前 1.1.4/build6 历史 Release 为 ZIP-only；1.1.5/build7 已在同一 Universal App ZIP 和源码 ZIP 之外增加 Finder 友好的 DMG 安装包装，并已按五资产正式发布。DMG 不是新运行时或更新器，必须与同一已审核 App、源码、manifest 和 SHA256SUMS 绑定。二进制发行使用 ad hoc 签名，尚未完成 Developer ID 签名或 Apple 公证；Homebrew 通过在本机编译源码安装。固定路径安装、升级、回退和首次打开说明见 [安装与使用](docs/wiki/安装与使用.md)。
 
 ## 文档导航
 
@@ -76,9 +79,8 @@ Homebrew 从正式 Release 的校验源码包构建原生 App，使用本机 ad 
 | 看懂速度、额度和会话数 | [统计口径](docs/wiki/统计口径.md) → [常见问题](docs/wiki/常见问题.md) |
 | 了解读取范围和会话复用 | [隐私说明](PRIVACY.md) → [设计说明](docs/DESIGN.md) |
 | 编译、测试或调试 | [编译指南](docs/wiki/编译指南.md) → [测试指南](docs/wiki/测试指南.md) → [命令行参数](docs/wiki/命令行参数.md) |
-| 查看自动检查与交付状态 | [CI/CD](docs/wiki/CI-CD.md) → [实现范围](docs/IMPLEMENTATION.md) → [验证记录](docs/VALIDATION.md) |
+| 查看自动检查与交付状态 | [CI/CD](docs/wiki/CI-CD.md) → [实现范围](docs/IMPLEMENTATION.md) → [验证状态](docs/VALIDATION.md) |
 | 报告问题或贡献代码 | [贡献指南](docs/wiki/贡献指南.md) → [Issues](https://github.com/Tupig/TokenStatMenu/issues) |
-| 按文件阅读全部源码 | [完整源码文档](docs/FULL_SOURCE.md) |
 
 ## 整体架构
 
@@ -88,7 +90,10 @@ AppKit NSStatusItem + NSPopover
       ├─ Token Hub 只读会话交换 → 5 小时／7 天／月度后台额度
       ├─ 当前 provider 与 Hub origin 匹配 → 有界本地 Codex 记录扫描
       │   └─ Token 小计、线程分类、活动速率估算、完整轮次均速
-      └─ 已有系统信任下的可选 AX 兼容读取 → 独立界面快照
+      ├─ 已有系统信任下的可选 AX 兼容读取 → 独立界面快照
+      └─ 共享只读快照发布（App Group 容器）
+WidgetKit 扩展（内嵌于 App 的 Contents/PlugIns）
+  └─ 读取共享快照 → 小/中号渲染，缺失显示“未知”
 SwiftUI：概览、数据来源、偏好设置
 ```
 
@@ -100,15 +105,16 @@ SwiftUI：概览、数据来源、偏好设置
 
 | 位置 | 职责 |
 | --- | --- |
-| `Sources/TokenStatMenu/` | AppKit 菜单栏与弹出面板、SwiftUI 界面、来源调度、偏好存储与 AX 适配 |
+| `Sources/TokenStatMenu/` | AppKit 菜单栏与弹出面板、SwiftUI 界面、来源调度、偏好存储、共享快照发布与 AX 适配 |
 | `Sources/TokenStatCore/` | 本地记录核算、后台额度交换与解析、窗口模型及旧协议回归组件 |
-| `Resources/` | 应用元数据、图标与仅含可选偏好的示例 plist |
-| `Tests/` | 纯合成核心检查、原生状态与界面快照测试 |
+| `Sources/TokenStatWidgetShared/` | 菜单栏与小组件共用的只读快照模型、字节编解码与 App Group 读写 |
+| `Sources/TokenStatWidgetExtension/` | 内嵌的 WidgetKit 扩展：时间线提供器与小/中号渲染 |
+| `Resources/` | 应用元数据、图标、Widget 扩展配置与仅含可选偏好的示例 plist |
+| `Tests/` | 纯合成核心检查、共享协议检查、原生状态与界面快照测试 |
 | `script/` | 原生构建、隔离集成、离线渲染、文档校验与源码导出 |
 | `docs/wiki/` | 面向使用者、开发者和贡献者的专题指南 |
 | `docs/DESIGN.md`、`docs/IMPLEMENTATION.md` | 设计细节、当前支持范围与剩余工作 |
-| `docs/VALIDATION.md` | 有日期和范围的验证记录；历史通过不自动等于当前全部能力已验收 |
-| `docs/FULL_SOURCE.md` | 由脚本生成的架构、分文件完整源码和构建说明，不手工编辑 |
+| `docs/VALIDATION.md` | 当前验证范围、复验方法与未验收限制；历史通过不自动等于当前全部能力已验收 |
 
 ## 构建与运行
 
@@ -141,13 +147,13 @@ SwiftPM 构建和测试使用 `--force-resolved-versions`，只接受已提交�
 # 纯合成核心检查
 swift run --force-resolved-versions TokenStatCoreChecks
 
-# 原生 XCTest 与界面回归
+# 原生 XCTest 与界面回归（需要完整 Xcode：Command Line Tools 不含 XCTest.framework）
 swift test --force-resolved-versions
 
 # 核心、只构建及隔离启动集成
 ./script/test.sh
 
-# 更新完整源码文档，并按白名单打包源码
+# 按白名单生成源码 ZIP，不改写已跟踪文件
 python3 script/package_source.py
 
 # 检查文档链接与公开内容

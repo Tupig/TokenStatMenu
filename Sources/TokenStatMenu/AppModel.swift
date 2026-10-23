@@ -3,6 +3,7 @@ import Combine
 import CoreFoundation
 #if SWIFT_PACKAGE
 @preconcurrency import TokenStatCore
+import TokenStatWidgetShared
 #endif
 
 struct SpeedPoint: Identifiable {
@@ -57,12 +58,44 @@ struct AppModelStartupDependencies {
     let loadPreferences: @MainActor () throws -> Data?
     let savePreferences: @MainActor (SeasunPreferences) throws -> Void
     let shouldStartBackgroundServices: @MainActor () -> Bool
+    var observeWorkspaceNotifications: Bool = false
 
     static var production: AppModelStartupDependencies {
         AppModelStartupDependencies(
             loadPreferences: { try ConfigStore.loadPreferences(at: AppPaths.configURL) },
             savePreferences: { try ConfigStore.savePreferences($0) },
-            shouldStartBackgroundServices: { !CommandLine.arguments.contains("--disable-background-services") })
+            shouldStartBackgroundServices: { !CommandLine.arguments.contains("--disable-background-services") },
+            observeWorkspaceNotifications: true)
+    }
+}
+
+struct AppModelTimingDependencies {
+    let wallNow: @Sendable () -> Date
+    let monotonicNow: @Sendable () -> TimeInterval
+    let schedule: @MainActor (TimeInterval, @escaping @MainActor () -> Void) -> (@MainActor () -> Void)
+
+    init(wallNow: @escaping @Sendable () -> Date,
+         monotonicNow: @escaping @Sendable () -> TimeInterval,
+         schedule: @escaping @MainActor (TimeInterval, @escaping @MainActor () -> Void) -> (@MainActor () -> Void)) {
+        self.wallNow = wallNow
+        self.monotonicNow = monotonicNow
+        self.schedule = schedule
+    }
+
+    static var production: AppModelTimingDependencies {
+        let clock = ContinuousClock()
+        let origin = clock.now
+        return AppModelTimingDependencies(
+            wallNow: { Date() },
+            monotonicNow: {
+                let elapsed = origin.duration(to: clock.now).components
+                return Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+            },
+            schedule: { delay, operation in
+                let work = DispatchWorkItem { MainActor.assumeIsolated { operation() } }
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+                return { work.cancel() }
+            })
     }
 }
 
@@ -100,7 +133,8 @@ struct DirectQuotaTransportSnapshot: Sendable {
 private actor TokenHubDirectQuotaWorker {
     private let client = TokenHubDirectQuotaClient()
 
-    func fetch(now: Date) async throws -> DirectQuotaTransportSnapshot {
+    func fetch(nowProvider: @Sendable () -> Date) async throws -> DirectQuotaTransportSnapshot {
+        let observedAt = nowProvider()
         let applications = NSRunningApplication.runningApplications(withBundleIdentifier: TokenHubTarget.bundleID)
             .filter { !$0.isTerminated }
         guard !applications.isEmpty else { throw TokenHubQuotaFailure.noTarget }
@@ -110,7 +144,8 @@ private actor TokenHubDirectQuotaWorker {
             throw applications.count > 1 ? TokenHubQuotaFailure.multipleTargets : TokenHubQuotaFailure.identityChanged
         }
         let identity = TokenHubIdentity(pid: app.processIdentifier, bundleID: bundle, executablePath: executable)
-        let snapshot = try await client.fetch(identity: identity, now: now)
+        let snapshot = try await client.fetch(identity: identity, nowProvider: nowProvider,
+                                              observationAt: observedAt)
         try Task.checkCancellation()
         // TokenHubDirectQuotaClient revalidates its settings/database identity
         // around the network exchange. Do not return the target identity.
@@ -127,12 +162,12 @@ struct TokenHubDirectQuotaDependencies {
     let fetch: (TokenHubIdentity, Date) async throws -> TokenHubQuotaSnapshot
     /// Production uses this worker closure. The three actor-isolated closures
     /// remain as a compatibility seam for synthetic tests only.
-    let workerFetch: (@Sendable (Date) async throws -> DirectQuotaTransportSnapshot)?
+    let workerFetch: (@Sendable (@Sendable () -> Date) async throws -> DirectQuotaTransportSnapshot)?
 
     init(discoverTarget: @escaping () throws -> TokenHubIdentity,
          identityIsCurrent: @escaping (TokenHubIdentity) -> Bool,
          fetch: @escaping (TokenHubIdentity, Date) async throws -> TokenHubQuotaSnapshot,
-         workerFetch: (@Sendable (Date) async throws -> DirectQuotaTransportSnapshot)? = nil) {
+         workerFetch: (@Sendable (@Sendable () -> Date) async throws -> DirectQuotaTransportSnapshot)? = nil) {
         self.discoverTarget = discoverTarget
         self.identityIsCurrent = identityIsCurrent
         self.fetch = fetch
@@ -146,7 +181,7 @@ struct TokenHubDirectQuotaDependencies {
         return TokenHubDirectQuotaDependencies(discoverTarget: { throw TokenHubQuotaFailure.noTarget },
             identityIsCurrent: { _ in false },
             fetch: { _, _ in throw TokenHubDirectQuotaFailure.transportFailed },
-            workerFetch: { now in try await worker.fetch(now: now) })
+            workerFetch: { nowProvider in try await worker.fetch(nowProvider: nowProvider) })
     }
 }
 
@@ -159,16 +194,37 @@ actor LocalCodexScanWorker {
     }
 
     private var cache = LocalCodexUsageReader.Cache()
+    private var archiveCache = LocalCodexUsageReader.Cache()
     private var cacheGeneration: Int?
+
+    func invalidate(generation: Int) {
+        if let cacheGeneration, generation <= cacheGeneration { return }
+        cache = LocalCodexUsageReader.Cache()
+        archiveCache = LocalCodexUsageReader.Cache()
+        cacheGeneration = generation
+    }
+
+    private func prepareCache(for generation: Int) throws {
+        if let cacheGeneration, generation < cacheGeneration { throw CancellationError() }
+        if cacheGeneration != generation {
+            cache = LocalCodexUsageReader.Cache()
+            archiveCache = LocalCodexUsageReader.Cache()
+            cacheGeneration = generation
+        }
+    }
 
     func scan(directory: URL, now: Date, generation: Int,
               routeContext: LocalCodexRouteContext?) throws -> Result {
+        try scan(directory: directory, nowProvider: { now }, generation: generation,
+                  routeContext: routeContext)
+    }
+
+    func scan(directory: URL, nowProvider: @Sendable () -> Date, generation: Int,
+              routeContext: LocalCodexRouteContext?) throws -> Result {
+        try prepareCache(for: generation)
         // This method has no suspension point while the cache is in use:
         // actor isolation serializes complete reads, including invalidation.
-        if cacheGeneration != generation {
-            cache = LocalCodexUsageReader.Cache()
-            cacheGeneration = generation
-        }
+        let now = nowProvider()
         let snapshot = try LocalCodexUsageReader.scan(directory: directory, now: now,
                                                        cache: cache, routeContext: routeContext)
         return Result(snapshot: snapshot, diagnostics: cache.diagnostics)
@@ -176,10 +232,30 @@ actor LocalCodexScanWorker {
 
     /// Production discovery stays inside the same worker as file scanning so
     /// session paths and route origins never cross back through the main actor.
-    func scanDefault(now: Date, generation: Int) throws -> Result {
+    func scanDefault(nowProvider: @Sendable () -> Date, generation: Int) throws -> Result {
+        try prepareCache(for: generation)
+        let now = nowProvider()
         let directory = LocalCodexUsageReader.defaultSessionsDirectory()
         let routeContext = AppModel.seasunRouteContext()
-        return try scan(directory: directory, now: now, generation: generation, routeContext: routeContext)
+        let snapshot = try LocalCodexUsageReader.scanCodexHome(sessions: directory, now: now,
+                                                               cache: cache, archiveCache: archiveCache,
+                                                               routeContext: routeContext)
+        return Result(snapshot: snapshot, diagnostics: cache.diagnostics)
+    }
+
+    private func scan(directory: URL, fixedNow now: Date, generation: Int,
+                      routeContext: LocalCodexRouteContext?) throws -> Result {
+        try prepareCache(for: generation)
+        let snapshot = try LocalCodexUsageReader.scan(directory: directory, now: now,
+                                                       cache: cache, routeContext: routeContext)
+        return Result(snapshot: snapshot, diagnostics: cache.diagnostics)
+    }
+
+    func scanInjected(directory: URL, nowProvider: @Sendable () -> Date, generation: Int,
+                      routeContext: LocalCodexRouteContext,
+                      operation: @Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> Result) async throws -> Result {
+        let now = nowProvider()
+        return try await operation(directory, now, generation, routeContext)
     }
 }
 
@@ -196,22 +272,27 @@ struct LocalCodexScanDependencies {
     /// boundary in the production configuration.
     let resolveInputs: (@MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext))?
     let scan: (@Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result)?
-    let scanDefault: (@Sendable (Date, Int) async throws -> LocalCodexScanWorker.Result)?
+    let scanDefault: (@Sendable (@Sendable () -> Date, Int) async throws -> LocalCodexScanWorker.Result)?
+    let invalidate: (@Sendable (Int) async -> Void)?
 
     init(resolveInputs: @escaping @MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext),
          scan: @escaping @Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result,
-         scanDefault: (@Sendable (Date, Int) async throws -> LocalCodexScanWorker.Result)? = nil) {
+         scanDefault: (@Sendable (@Sendable () -> Date, Int) async throws -> LocalCodexScanWorker.Result)? = nil,
+         invalidate: (@Sendable (Int) async -> Void)? = nil) {
         self.resolveInputs = resolveInputs
         self.scan = scan
         self.scanDefault = scanDefault
+        self.invalidate = invalidate
     }
 
     private init(resolveInputs: (@MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext))?,
                  scan: (@Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result)?,
-                 scanDefault: (@Sendable (Date, Int) async throws -> LocalCodexScanWorker.Result)?) {
+                 scanDefault: (@Sendable (@Sendable () -> Date, Int) async throws -> LocalCodexScanWorker.Result)?,
+                 invalidate: (@Sendable (Int) async -> Void)?) {
         self.resolveInputs = resolveInputs
         self.scan = scan
         self.scanDefault = scanDefault
+        self.invalidate = invalidate
     }
 
     @MainActor static var production: LocalCodexScanDependencies {
@@ -220,7 +301,8 @@ struct LocalCodexScanDependencies {
         // URL on the main actor. Discovery and route reading remain inside the
         // same worker that owns the cache and performs the bounded file scan.
         return LocalCodexScanDependencies(resolveInputs: nil, scan: nil,
-            scanDefault: { now, generation in try await worker.scanDefault(now: now, generation: generation) })
+            scanDefault: { nowProvider, generation in try await worker.scanDefault(nowProvider: nowProvider, generation: generation) },
+            invalidate: { generation in await worker.invalidate(generation: generation) })
     }
 }
 
@@ -232,13 +314,6 @@ struct BackgroundServiceResources: Equatable, Encodable {
     let axScanInFlightCount: Int
 }
 
-/// A model-captured time used by one refresh request. Capturing this before a
-/// delayed work item is enqueued keeps local/direct workers from consulting
-/// independent wall clocks after the scheduling delay.
-private struct RefreshObservationContext: Sendable, Equatable {
-    let observationNow: Date
-}
-
 /// Clock-derived presentation changes are distinct from new measurements.
 /// Comparing these cheap booleans keeps the half-second menu cadence without
 /// formatting dates or invalidating every SwiftUI view when nothing changed.
@@ -247,6 +322,7 @@ struct PresentationTimeState: Equatable {
         let futureObservation: Bool
         let fresh: Bool
         let resetPassed: Bool
+        let resetAt: Date?
     }
     let localLive: Bool
     let tokenHubFresh: Bool
@@ -255,11 +331,66 @@ struct PresentationTimeState: Equatable {
     let sevenDay: Window?
 }
 
+/// A single clock-bound view of the raw Token Hub observation. Keeping the
+/// decisions here lets the status item, diagnostics and SwiftUI card agree
+/// without repeating date or Decimal formatting on timer ticks.
+struct TokenHubQuotaPresentation: Equatable, Sendable {
+    enum AlertLevel: Equatable, Sendable { case none, warning, critical }
+
+    struct WindowProjection: Equatable, Sendable {
+        let futureObservation: Bool
+        let fresh: Bool
+        let resetPassed: Bool
+        let resetAt: Date?
+    }
+
+    let snapshot: TokenHubQuotaSnapshot?
+    let futureObservation: Bool
+    let snapshotFresh: Bool
+    let fiveHourCurrent: TokenHubWindowQuota?
+    let sevenDayCurrent: TokenHubWindowQuota?
+    let monthlyCurrent: TokenHubMonthlyUsage?
+    let fiveHour: WindowProjection?
+    let sevenDay: WindowProjection?
+    let menuAlertLevel: AlertLevel
+
+    static func project(snapshot: TokenHubQuotaSnapshot?, now: Date,
+                        refreshSeconds: TimeInterval) -> TokenHubQuotaPresentation {
+        guard let snapshot else {
+            return TokenHubQuotaPresentation(snapshot: nil, futureObservation: false, snapshotFresh: false,
+                fiveHourCurrent: nil, sevenDayCurrent: nil, monthlyCurrent: nil,
+                fiveHour: nil, sevenDay: nil, menuAlertLevel: .none)
+        }
+        let future = snapshot.observedAt > now
+        let fresh = !future && now.timeIntervalSince(snapshot.observedAt) <= max(120, refreshSeconds * 2)
+        func window(_ value: TokenHubWindowQuota?) -> WindowProjection? {
+            value.map { raw in
+                WindowProjection(futureObservation: future, fresh: fresh,
+                    resetPassed: raw.resetAt.map { $0 <= now } ?? false, resetAt: raw.resetAt)
+            }
+        }
+        let fiveProjection = window(snapshot.fiveHour)
+        let sevenProjection = window(snapshot.sevenDay)
+        let fiveCurrent = fresh && fiveProjection?.resetPassed != true ? snapshot.fiveHour : nil
+        let sevenCurrent = fresh && sevenProjection?.resetPassed != true ? snapshot.sevenDay : nil
+        let monthly = fresh ? snapshot.monthly : nil
+        let highest = [fiveCurrent?.usedPercent, sevenCurrent?.usedPercent].compactMap { $0 }.max()
+        let alert: AlertLevel
+        if let highest, highest >= Decimal(95) { alert = .critical }
+        else if let highest, highest >= Decimal(80) { alert = .warning }
+        else { alert = .none }
+        return TokenHubQuotaPresentation(snapshot: snapshot, futureObservation: future, snapshotFresh: fresh,
+            fiveHourCurrent: fiveCurrent, sevenDayCurrent: sevenCurrent, monthlyCurrent: monthly,
+            fiveHour: fiveProjection, sevenDay: sevenProjection, menuAlertLevel: alert)
+    }
+}
+
 @MainActor final class AppModel: ObservableObject {
     // Explicit launch-only flag: fixtures never masquerade as enterprise measurements.
     let isTestFixture = CommandLine.arguments.contains("--test-fixture")
     private let isPreview: Bool
     private let startup: AppModelStartupDependencies
+    private let timing: AppModelTimingDependencies
     private let directQuota: TokenHubDirectQuotaDependencies
     private let tokenHubAXSource: TokenHubAXSource
     private let usesDirectQuotaSource: Bool
@@ -271,8 +402,8 @@ struct PresentationTimeState: Equatable {
     @Published var config = AppConfiguration() {
         didSet {
             if oldValue.dataSource != config.dataSource {
-                history.removeAll(keepingCapacity: true)
-                lastHistorySampleAt = .distantPast
+                if !history.isEmpty { history.removeAll(keepingCapacity: true) }
+                lastHistorySampleMonotonic = nil
             }
             capturePresentationTimeBaseline()
         }
@@ -308,31 +439,51 @@ struct PresentationTimeState: Equatable {
         get { preferences.tokenHubCompatibilityReadEnabled }
         set { preferences.tokenHubCompatibilityReadEnabled = newValue }
     }
-    var tokenHubPermissionProvider: TokenHubPermissionProviding = TokenHubNativePermissionProvider()
-    var tokenHubNow: () -> Date = Date.init
+    var tokenHubPermissionProvider: TokenHubPermissionProviding
+    private var legacyTokenHubNow: (() -> Date)?
+    var tokenHubNow: () -> Date {
+        get { legacyTokenHubNow ?? timing.wallNow }
+        set { legacyTokenHubNow = newValue }
+    }
     @Published var panelVisible = false
     let engine = MetricsEngine()
     private var timer: Timer?
-    private var localScan: DispatchWorkItem?
+    private var localScan: (@MainActor () -> Void)?
     private var localScanRunning = false
-    private var tokenHubRefreshWork: DispatchWorkItem?
+    private var localScanTicket: UInt64 = 0
+    private var localScanRunTicket: UInt64?
+    private var localScanDeferredGeneration: Int?
+    private var tokenHubRefreshWork: (@MainActor () -> Void)?
+    private var tokenHubRefreshTicket: UInt64 = 0
     private var tokenHubScanInFlight = false
     private var tokenHubDirectScanInFlight = false
     private var tokenHubWorkspaceObservers: [NSObjectProtocol] = []
     private var lastTokenHubPermissionCheck = Date.distantPast
     private var cachedTokenHubPermission = false
     private let localScanning: LocalCodexScanDependencies
+    private let localInjectedWorker = LocalCodexScanWorker()
     private var localRefreshScheduler = LocalRefreshScheduler()
     private var isShuttingDown = false
     private var generation = 0
     private var tokenHubGeneration: UInt64 = 0
     private var tokenHubAXGeneration: UInt64 = 0
     private var lastPresentationTimeState: PresentationTimeState?
-    private var lastHistorySampleAt = Date.distantPast
+    private var lastHistorySampleMonotonic: TimeInterval?
+    /// Publishes presentation values to the embedded widget's App Group.
+    private let widgetPublisher = WidgetSnapshotPublisher()
     var onTick: (() -> Void)?
 
     private static let historyDuration: TimeInterval = 10 * 60
     private static let historyCapacity = 1_200
+    private static let localCachePercentFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        formatter.roundingMode = .halfUp
+        return formatter
+    }()
 
     var isSeasunOnly: Bool { true }
     var tokenHubQuotaReadingEnabled: Bool { usesDirectQuotaSource || tokenHubAutomaticReadingEnabled }
@@ -352,20 +503,24 @@ struct PresentationTimeState: Equatable {
     var backgroundServiceResources: BackgroundServiceResources {
         BackgroundServiceResources(timerCount: timer == nil ? 0 : 1,
             workspaceObserverCount: tokenHubWorkspaceObservers.count,
-            localScanQueuedCount: localScan == nil || localScan!.isCancelled ? 0 : 1,
-            axRefreshScheduledCount: tokenHubRefreshWork == nil || tokenHubRefreshWork!.isCancelled ? 0 : 1,
+            localScanQueuedCount: localScan == nil ? 0 : 1,
+            axRefreshScheduledCount: tokenHubRefreshWork == nil ? 0 : 1,
             axScanInFlightCount: tokenHubScanInFlight ? 1 : 0)
     }
 
     init(preview: Bool = false, startup: AppModelStartupDependencies = .production,
+         timing: AppModelTimingDependencies = .production,
          directQuota: TokenHubDirectQuotaDependencies? = nil,
          localScanning: LocalCodexScanDependencies? = nil,
+         tokenHubPermissionProvider: TokenHubPermissionProviding? = nil,
          tokenHubAXSource: TokenHubAXSource? = nil) {
         isPreview = preview
         self.startup = startup
+        self.timing = timing
         self.directQuota = directQuota ?? .production
         self.tokenHubAXSource = tokenHubAXSource ?? .production
         self.localScanning = localScanning ?? .production
+        self.tokenHubPermissionProvider = tokenHubPermissionProvider ?? TokenHubNativePermissionProvider()
         usesDirectQuotaSource = directQuota != nil || !(preview || CommandLine.arguments.contains("--test-fixture"))
         if preview {
             sourceReadinessText = "模拟预览 · 无配置读取、无自动服务"
@@ -384,21 +539,26 @@ struct PresentationTimeState: Equatable {
     }
     func shutdown() {
         isShuttingDown = true; backgroundServicesStarted = false
+        localScanDeferredGeneration = nil
         generation += 1; _ = localRefreshScheduler.invalidate()
-        timer?.invalidate(); timer = nil; localScan?.cancel(); localScan = nil
+        invalidateLocalWorker(generation: generation)
+        clearLocalSnapshot()
+        lastHistorySampleMonotonic = nil
+        timer?.invalidate(); timer = nil; cancelLocalScanSchedule()
         tokenHubGeneration &+= 1
-        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        cancelTokenHubSchedule()
         for observer in tokenHubWorkspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
         tokenHubWorkspaceObservers.removeAll()
         tokenHubQuotaSnapshot = nil; tokenHubQuotaStatus = .disabled; tokenHubQuotaFailure = nil
         tokenHubDirectFailure = nil; tokenHubQuotaIsDirect = false; tokenHubDirectScanInFlight = false
     }
     func tick() {
+        let now = tokenHubNow()
+        updateLocalHistory(at: now, monotonicNow: timing.monotonicNow())
         // The formal local-history mode never consumes proxy engine metrics.
         // Publishing its identical empty snapshot would redraw a hidden or
         // open dashboard twice a second. Legacy proxy previews keep sampling.
         if config.dataSource != "localCodex" { stats = engine.snapshot() }
-        let now = tokenHubNow()
         var publishedTransition = false
         // Check presence first: creating a date formatter for an absent quota
         // was otherwise part of every idle menu tick.
@@ -406,34 +566,133 @@ struct PresentationTimeState: Equatable {
             self.quota = nil; quotaError = "已跨月，等待本月用量"
             publishedTransition = true
         }
-        if tokenHubQuotaStatus == .connected, freshTokenHubQuota(at: now) == nil {
+        if tokenHubQuotaStatus == .connected,
+           !TokenHubQuotaPresentation.project(snapshot: tokenHubQuotaSnapshot, now: now,
+                refreshSeconds: config.refreshSeconds).snapshotFresh {
             tokenHubQuotaStatus = .stale
             publishedTransition = true
         }
         if backgroundServicesStarted { pollTokenHubPermissionIfDue() }
-        updateLocalHistory(at: now)
-        let timeState = presentationTimeState
+        let timeState = presentationTimeState(at: now, quotaPresentation: quotaPresentation(at: now))
         if let previous = lastPresentationTimeState, previous != timeState, !publishedTransition {
             objectWillChange.send()
         }
         lastPresentationTimeState = timeState
+        publishWidgetSnapshot(at: now)
         onTick?()
     }
 
-    /// Keep one bounded point per half-second for ten minutes. Only fresh local
-    /// estimates enter this series; stale or unknown values create no fake
-    /// zero-speed samples and mode switches cannot leak proxy observations.
-    private func updateLocalHistory(at now: Date) {
-        guard panelVisible, config.dataSource == "localCodex", let live = freshLocalLiveTurn,
-              now.timeIntervalSince(lastHistorySampleAt) >= 0.5 else { return }
-        lastHistorySampleAt = now
-        let point = SpeedPoint(date: now, value: live.outputTPS)
-        let cutoff = now.addingTimeInterval(-Self.historyDuration)
-        history = (history + [point]).filter { $0.date >= cutoff }
-        if history.count > Self.historyCapacity { history.removeFirst(history.count - Self.historyCapacity) }
+    /// Projects the values the menu bar already shows into the shared snapshot.
+    ///
+    /// Only displayed results are projected, so the widget cannot disagree with
+    /// the menu: a window that presentation reports as reset or stale becomes
+    /// unknown here too, and a missing source stays unknown instead of zero.
+    private func publishWidgetSnapshot(at now: Date) {
+        // Previews and test fixtures never publish: they would otherwise expose
+        // synthetic numbers through a real system surface.
+        guard !isPreview, !isTestFixture else { return }
+        let presentation = quotaPresentation(at: now)
+        let source: WidgetQuotaSnapshot.HubSource
+        if tokenHubQuotaIsDirect, tokenHubQuotaStatus == .connected || tokenHubQuotaStatus == .stale {
+            source = .direct
+        } else if tokenHubQuotaSnapshot != nil {
+            source = .compatibility
+        } else {
+            source = .none
+        }
+        var state: WidgetQuotaSnapshot.HubState = .unavailable
+        switch tokenHubQuotaStatus {
+        case .connected: state = .ready
+        case .stale: state = .stale
+        case .disabled: state = .disabled
+        case .unsupportedLayout, .accessFailed, .quotaGroupUnavailable,
+             .permissionRequired, .targetNotRunning, .ambiguousTarget: state = .unavailable
+        }
+        if presentation.snapshot == nil { state = .unavailable }
+
+        // `fiveHourCurrent` is already nil when the projection is stale or the
+        // window has reset, so projecting it keeps the widget aligned with the
+        // menu without re-deriving freshness here.
+        func window(_ quota: TokenHubWindowQuota?) -> WidgetQuotaSnapshot.Window? {
+            guard let quota else { return nil }
+            let percent = NSDecimalNumber(decimal: quota.remainingPercent).doubleValue
+            guard percent.isFinite, (0...100).contains(percent) else { return nil }
+            return WidgetQuotaSnapshot.Window(remainingPercent: percent, resetsAt: quota.resetAt)
+        }
+
+        let monthly = presentation.monthlyCurrent.map { usage in
+            WidgetQuotaSnapshot.Monthly(
+                usedAmount: NSDecimalNumber(decimal: usage.usedAmount).doubleValue,
+                limitAmount: usage.limitAmount.map { NSDecimalNumber(decimal: $0).doubleValue },
+                sourceSymbol: usage.sourceSymbol)
+        }
+        let local: WidgetQuotaSnapshot.Local? = {
+            let snapshot = localSnapshot
+            guard snapshot.filesScanned > 0 || snapshot.total > 0 else { return nil }
+            return WidgetQuotaSnapshot.Local(
+                inputTokens: snapshot.input, outputTokens: snapshot.output,
+                totalTokens: snapshot.total, knownThreads: snapshot.knownThreadCount,
+                unknownThreads: snapshot.unknownThreadCount, isLimited: snapshot.isLimited)
+        }()
+        let observedAt = tokenHubQuotaSnapshot?.observedAt
+        let published = WidgetQuotaSnapshot(
+            writtenAt: now, observedAt: observedAt,
+            validUntil: observedAt.map { $0.addingTimeInterval(max(120, config.refreshSeconds * 2)) },
+            hubSource: source, hubState: state,
+            fiveHour: window(presentation.fiveHourCurrent),
+            sevenDay: window(presentation.sevenDayCurrent),
+            monthly: monthly, local: local)
+        widgetPublisher.publish(published)
     }
-    var freshQuota: QuotaSnapshot? {
+
+    /// Keep only the closed ten-minute wall-clock interval on every tick,
+    /// including while hidden or when the current mode cannot sample. A
+    /// successful append is independently throttled by monotonic time.
+    private func updateLocalHistory(at now: Date, monotonicNow: TimeInterval) {
+        var retained = retainedHistory(at: now)
+        defer { publishHistoryIfChanged(retained) }
+
+        guard panelVisible, config.dataSource == "localCodex",
+              let live = freshLocalLiveTurn(at: now),
+              live.outputTPS.isFinite, live.outputTPS >= 0,
+              monotonicNow.isFinite else { return }
+        if let lastHistorySampleMonotonic,
+           monotonicNow - lastHistorySampleMonotonic < 0.5 { return }
+
+        lastHistorySampleMonotonic = monotonicNow
+        retained.append(SpeedPoint(date: now, value: live.outputTPS))
+        if retained.count > Self.historyCapacity {
+            retained.removeFirst(retained.count - Self.historyCapacity)
+        }
+    }
+
+    private func retainedHistory(at now: Date) -> [SpeedPoint] {
+        let cutoff = now.addingTimeInterval(-Self.historyDuration)
+        var retained = history.filter { point in
+            point.date >= cutoff && point.date <= now
+        }
+        if retained.count > Self.historyCapacity {
+            retained.removeFirst(retained.count - Self.historyCapacity)
+        }
+        return retained
+    }
+
+    private func publishHistoryIfChanged(_ updated: [SpeedPoint]) {
+        guard updated.count != history.count || zip(updated, history).contains(where: { pair in
+            pair.0.id != pair.1.id || pair.0.date != pair.1.date
+                || pair.0.value.bitPattern != pair.1.value.bitPattern
+        }) else { return }
+        history = updated
+    }
+
+    /// The panel can be opened between timer ticks, so discard any expired or
+    /// future samples before SwiftUI first renders its history chart.
+    func pruneHistoryBeforePanelDisplay() {
         let now = tokenHubNow()
+        publishHistoryIfChanged(retainedHistory(at: now))
+    }
+    var freshQuota: QuotaSnapshot? { freshQuota(at: tokenHubNow()) }
+    func freshQuota(at now: Date) -> QuotaSnapshot? {
         guard let quota, quota.month == QuotaSnapshot.currentMonth(at: now),
               quota.fetchedAt <= now,
               now.timeIntervalSince(quota.fetchedAt) < max(120, config.refreshSeconds * 2) else { return nil }
@@ -447,14 +706,43 @@ struct PresentationTimeState: Equatable {
     }
     var presentationTimeState: PresentationTimeState {
         let now = tokenHubNow()
+        return presentationTimeState(at: now, quotaPresentation: quotaPresentation(at: now))
+    }
+    func presentationTimeState(at now: Date, quotaPresentation: TokenHubQuotaPresentation) -> PresentationTimeState {
         func window(_ value: WindowQuota?) -> PresentationTimeState.Window? {
             value.map { PresentationTimeState.Window(futureObservation: $0.fetchedAt > now,
                 fresh: $0.isFresh(at: now, refreshSeconds: config.refreshSeconds),
-                resetPassed: $0.resetsAt.map { $0 <= now } ?? false) }
+                resetPassed: $0.resetsAt.map { $0 <= now } ?? false, resetAt: $0.resetsAt) }
         }
-        return PresentationTimeState(localLive: freshLocalLiveTurn != nil,
-            tokenHubFresh: freshTokenHubQuota(at: now) != nil, monthlyFresh: freshQuota != nil,
-            fiveHour: window(fiveHourQuota), sevenDay: window(sevenDayQuota))
+        let fiveHourState = quotaPresentation.fiveHour.map {
+            PresentationTimeState.Window(futureObservation: $0.futureObservation, fresh: $0.fresh,
+                resetPassed: $0.resetPassed, resetAt: $0.resetAt)
+        }
+        let sevenDayState = quotaPresentation.sevenDay.map {
+            PresentationTimeState.Window(futureObservation: $0.futureObservation, fresh: $0.fresh,
+                resetPassed: $0.resetPassed, resetAt: $0.resetAt)
+        }
+        return PresentationTimeState(localLive: freshLocalLiveTurn(at: now) != nil,
+            tokenHubFresh: quotaPresentation.snapshotFresh, monthlyFresh: freshQuota(at: now) != nil,
+            fiveHour: tokenHubQuotaIsDirect ? fiveHourState : window(fiveHourQuota),
+            sevenDay: tokenHubQuotaIsDirect ? sevenDayState : window(sevenDayQuota))
+    }
+    var quotaPresentation: TokenHubQuotaPresentation { quotaPresentation(at: tokenHubNow()) }
+    func quotaPresentation(at now: Date) -> TokenHubQuotaPresentation {
+        let projected = TokenHubQuotaPresentation.project(snapshot: tokenHubQuotaSnapshot, now: now,
+            refreshSeconds: config.refreshSeconds)
+        let sourceEligible = config.dataSource == "localCodex" && tokenHubQuotaReadingEnabled
+            && tokenHubQuotaStatus == .connected
+        guard !sourceEligible, projected.snapshot != nil else { return projected }
+        func historical(_ state: TokenHubQuotaPresentation.WindowProjection?) -> TokenHubQuotaPresentation.WindowProjection? {
+            state.map { .init(futureObservation: $0.futureObservation, fresh: false,
+                resetPassed: $0.resetPassed, resetAt: $0.resetAt) }
+        }
+        return TokenHubQuotaPresentation(snapshot: projected.snapshot,
+            futureObservation: projected.futureObservation, snapshotFresh: false,
+            fiveHourCurrent: nil, sevenDayCurrent: nil, monthlyCurrent: nil,
+            fiveHour: historical(projected.fiveHour), sevenDay: historical(projected.sevenDay),
+            menuAlertLevel: .none)
     }
     var currencyFactor: Double { config.currency == "CNY" ? config.usdToCNY : 1 }
     var currencySymbol: String { config.currency == "CNY" ? "¥" : "$" }
@@ -476,8 +764,8 @@ struct PresentationTimeState: Equatable {
     }
     /// Presentation checks freshness on every menu update, even if the local
     /// file scan stalls. A future or invalid observation is never called live.
-    var freshLocalLiveTurn: LocalLiveTurnSummary? {
-        let now = tokenHubNow()
+    var freshLocalLiveTurn: LocalLiveTurnSummary? { freshLocalLiveTurn(at: tokenHubNow()) }
+    func freshLocalLiveTurn(at now: Date) -> LocalLiveTurnSummary? {
         guard let live = localSnapshot.liveTurn,
               live.observedAt <= now, now.timeIntervalSince(live.observedAt) <= 15,
               live.inputTPS.isFinite, live.outputTPS.isFinite,
@@ -485,9 +773,13 @@ struct PresentationTimeState: Equatable {
         return live
     }
     var title: String {
+        let now = tokenHubNow()
+        return title(at: now, quotaPresentation: quotaPresentation(at: now))
+    }
+    func title(at now: Date, quotaPresentation: TokenHubQuotaPresentation) -> String {
         if config.dataSource == "localCodex" {
             let rate: String
-            if let live = freshLocalLiveTurn {
+            if let live = freshLocalLiveTurn(at: now) {
                 rate = String(format: "实时≈%.1ftok/s", live.outputTPS)
             } else if let turn = localSnapshot.lastTurn {
                 rate = String(format: "上轮均:%.1ftok/s", turn.outputTPS)
@@ -498,7 +790,7 @@ struct PresentationTimeState: Equatable {
             let total = localSnapshot.hasCompleteAccounting ? "Σ\(formatCompactCount(localSnapshot.total))"
                 : localSnapshot.knownThreadCount > 0 ? "小计\(formatCompactCount(localSnapshot.total)) · 未核验\(uncertainty)" : "Σ— · 未核验\(uncertainty)"
             let sessions = localSnapshot.hasCompleteAccounting ? " · \(localSnapshot.sessionCount)顶层对话" : ""
-            let quotaSuffix = tokenHubMenuSuffix
+            let quotaSuffix = tokenHubMenuSuffix(quotaPresentation)
             return (isTestFixture ? "测试 " : "") + "\(rate) · \(total)\(sessions)\(quotaSuffix)"
         }
         let value = !hasRequestData ? "T:—" : stats.active > 0
@@ -507,10 +799,14 @@ struct PresentationTimeState: Equatable {
         return (isTestFixture ? "测试 " : "") + "\(value) · Σ\(total) · 请求\(stats.requests)"
     }
     var menuTooltip: String {
+        let now = tokenHubNow()
+        return menuTooltip(at: now, quotaPresentation: quotaPresentation(at: now))
+    }
+    func menuTooltip(at now: Date, quotaPresentation: TokenHubQuotaPresentation) -> String {
         if isPreview && config.dataSource != "localCodex" {
             return "\(dataNotice) · \(sourceReadinessText)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .enterprise))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .enterprise))"
         }
-        let live = freshLocalLiveTurn.map { String(format: "实时估算：输入 %.1f · 输出 %.1f tok/s（观测于 %@）", $0.inputTPS, $0.outputTPS, $0.observedAt.formatted()) } ?? "实时估算：未知（无新鲜活动 token_count）"
+        let live = freshLocalLiveTurn(at: now).map { String(format: "实时估算：输入 %.1f · 输出 %.1f tok/s（观测于 %@）", $0.inputTPS, $0.outputTPS, $0.observedAt.formatted()) } ?? "实时估算：未知（无新鲜活动 token_count）"
         let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
         let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
         let coverage = "扫描范围最多32个物理文件；不是全部对话；每文件头64KiB与尾256KiB，总计10MiB；" + (localSnapshot.isLimited ? "本次达到扫描上限" : "本次安全检查 \(localSnapshot.filesScanned) 个物理文件")
@@ -518,22 +814,94 @@ struct PresentationTimeState: Equatable {
         let output = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.output) : "未知"
         let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "已核验记录小计"
         let total = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.total) : "未知"
-        let hub = tokenHubTooltipDetail
-        return "\(userFacingStatus)\n当前配置关联的本机 Codex 记录，历史路由未核验；当前扫描范围：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+        let hub = tokenHubTooltipDetail(quotaPresentation)
+        return "\(userFacingStatus)\n当前配置关联的本机 Codex 记录，历史路由未核验；当前扫描范围：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(localDetailedMetricsTooltip)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
     }
-    private var tokenHubMenuSuffix: String {
-        guard let snapshot = freshTokenHubQuota(at: tokenHubNow()) else { return "" }
-        let windows = [snapshot.fiveHour.map { "5h剩 \(percentText($0.remainingPercent))" },
-                       snapshot.sevenDay.map { "7d剩 \(percentText($0.remainingPercent))" }].compactMap { $0 }
+    var localCacheReadout: String {
+        guard localSnapshot.cacheCoverage.state == .complete,
+              let value = localSnapshot.cacheCoverage.cachedInputTokens else {
+            return "未知（\(localCacheUnknownReason)）"
+        }
+        return "\(formatCount(value)) tokens"
+    }
+    var localUncachedInputReadout: String {
+        guard localSnapshot.cacheCoverage.state == .complete,
+              let value = localSnapshot.cacheCoverage.uncachedInputTokens else {
+            return "未知（\(localCacheUnknownReason)）"
+        }
+        return "\(formatCount(value)) tokens"
+    }
+    var localCacheHitRateReadout: String {
+        let coverage = localSnapshot.cacheCoverage
+        guard coverage.state == .complete else { return "未知（\(localCacheUnknownReason)）" }
+        guard let input = coverage.matchedInputTokens,
+              let cached = coverage.matchedCachedInputTokens,
+              input >= 0, cached >= 0, cached <= input else {
+            return "未知（来源覆盖不完整）"
+        }
+        guard input > 0 else { return "未知（输入总计为 0，比例不适用）" }
+        if cached == input { return "100.00%" }
+        let percent = Decimal(cached) * Decimal(100) / Decimal(input)
+        let rendered = Self.localCachePercentFormatter.string(from: NSDecimalNumber(decimal: percent)) ?? "未知（比例不可用）"
+        // A non-full integer ratio must never round up to the exact-full label.
+        return rendered == "100.00" ? "99.99%" : "\(rendered)%"
+    }
+    var localCacheCoverageReadout: String {
+        let coverage = localSnapshot.cacheCoverage
+        let rows = "\(coverage.cacheKnownRows)/\(coverage.baseRows) 行"
+        switch coverage.state {
+        case .complete: return "\(rows) 完整"
+        case .partial: return "\(rows) 部分覆盖"
+        case .missing: return "\(rows) 来源未提供"
+        case .invalid: return "\(rows) 来源值无效"
+        }
+    }
+    var localMatchedCacheReadout: String? {
+        let coverage = localSnapshot.cacheCoverage
+        guard coverage.state == .partial,
+              let input = coverage.matchedInputTokens,
+              let cached = coverage.matchedCachedInputTokens else { return nil }
+        return "同覆盖匹配小计：缓存读取 \(formatCount(cached)) / 输入 \(formatCount(input)) tokens"
+    }
+    var localReadAtReadout: String {
+        localSnapshot.readAt.map { "本次扫描/核对时间：\($0.formatted())" }
+            ?? "本次扫描/核对时间：未知"
+    }
+    private var localCacheUnknownReason: String {
+        switch localSnapshot.cacheCoverage.state {
+        case .complete: return "来源未提供"
+        case .partial: return "覆盖不完整，存在未提供或无效项"
+        case .missing: return "来源未提供（字段缺失）"
+        case .invalid: return "来源值无效（字段非法）"
+        }
+    }
+    private var localDetailedMetricsTooltip: String {
+        var lines = [
+            "缓存读取：\(localCacheReadout)",
+            "未缓存输入：\(localUncachedInputReadout)",
+            "命中率：\(localCacheHitRateReadout)",
+            "缓存覆盖：\(localCacheCoverageReadout)",
+            "线程轮次明细：\(localSnapshot.detailLimited ? "已达到展示上限" : "当前扫描候选范围")",
+            localReadAtReadout,
+            "模型调用用时：未知（来源未提供）",
+            "平均 TTFT：未知（来源未提供）",
+            "decode TPS：未知（来源未提供）"
+        ]
+        if let matched = localMatchedCacheReadout { lines.insert(matched, at: 4) }
+        return lines.joined(separator: "\n")
+    }
+    private func tokenHubMenuSuffix(_ presentation: TokenHubQuotaPresentation) -> String {
+        let windows = [presentation.fiveHourCurrent.map { "5h剩 \(percentText($0.remainingPercent))" },
+                       presentation.sevenDayCurrent.map { "7d剩 \(percentText($0.remainingPercent))" }].compactMap { $0 }
         return windows.isEmpty ? "" : " · Hub \(windows.joined(separator: " / "))"
     }
+    private var tokenHubMenuSuffix: String { tokenHubMenuSuffix(quotaPresentation) }
     var menuTitleContainsTokenHubSuffix: Bool { !tokenHubMenuSuffix.isEmpty }
     var tokenHubPermissionGrantedForDiagnostics: Bool { cachedTokenHubPermission }
     var tokenHubPermissionRequiredForDiagnostics: Bool { tokenHubQuotaStatus == .permissionRequired }
-    private var tokenHubTooltipDetail: String {
-        let snapshot = freshTokenHubQuota(at: tokenHubNow())
-        let five = snapshot?.fiveHour.map { "界面显示剩余 \(percentText($0.remainingPercent))（5 小时）" } ?? "5 小时未知"
-        let seven = snapshot?.sevenDay.map { "界面显示剩余 \(percentText($0.remainingPercent))（7 天）" } ?? "7 天未知"
+    private func tokenHubTooltipDetail(_ presentation: TokenHubQuotaPresentation) -> String {
+        let five = presentation.fiveHourCurrent.map { "界面显示剩余 \(percentText($0.remainingPercent))（5 小时）" } ?? "5 小时未知"
+        let seven = presentation.sevenDayCurrent.map { "界面显示剩余 \(percentText($0.remainingPercent))（7 天）" } ?? "7 天未知"
         let source = tokenHubQuotaIsDirect ? "Token Hub 后台直接响应" : "Token Hub 界面快照"
         let timing = tokenHubQuotaIsDirect ? "后台响应已提供" : "后台更新时间未提供"
         let currency = tokenHubQuotaIsDirect ? "币种来自后台响应" : "币种未核验"
@@ -563,6 +931,8 @@ struct PresentationTimeState: Equatable {
         case .identityChanged: "Token Hub 进程在读取期间发生变化"
         case .connectionUnavailable, .connectionMalformed, .databaseUnsafe: "Token Hub 连接配置不可用"
         case .sessionUnavailable: "Token Hub 本机登录态不可用"
+        case .loginRejected: "Token Hub 登录验证未通过，请在 Hub 中确认登录状态"
+        case .exchangeRejected: "Token Hub 服务端拒绝登录交换"
         case .exchangeFailed, .redirectMissing, .accessTokenMissing: "Token Hub 登录态交换失败"
         case .endpointRejected: "Token Hub 地址不在受信范围"
         case .httpStatus(let status) where status == 401 || status == 403: "Token Hub 会话未获授权"
@@ -585,13 +955,14 @@ struct PresentationTimeState: Equatable {
     }
     private func formatCount(_ value: Int) -> String { value.formatted(.number) }
     private func formatCompactCount(_ value: Int) -> String { value.formatted(.number.notation(.compactName)) }
-    var alertColor: NSColor {
-        if tokenHubQuotaIsDirect, let snapshot = freshTokenHubQuota(at: tokenHubNow()) {
-            let windows = [snapshot.fiveHour?.usedPercent, snapshot.sevenDay?.usedPercent].compactMap { $0 }
-            guard let used = windows.max() else { return .labelColor }
-            if used >= Decimal(string: "95")! { return .systemRed }
-            if used >= Decimal(string: "80")! { return .systemYellow }
-            return .labelColor
+    var alertColor: NSColor { alertColor(for: quotaPresentation) }
+    func alertColor(for quotaPresentation: TokenHubQuotaPresentation) -> NSColor {
+        if tokenHubQuotaIsDirect {
+            switch quotaPresentation.menuAlertLevel {
+            case .none: return .labelColor
+            case .warning: return .systemYellow
+            case .critical: return .systemRed
+            }
         }
         guard quotaSource == .enterprise else { return .labelColor }
         let windows = (quotaSource == .enterprise ? [fiveHourQuota, sevenDayQuota].compactMap { $0 } : [])
@@ -657,24 +1028,22 @@ struct PresentationTimeState: Equatable {
     private func startBackgroundServices() {
         guard !isPreview, !isShuttingDown, backgroundServicesStarted else { return }
         stopBackgroundResources()
+        localScanDeferredGeneration = nil
         generation += 1; tokenHubGeneration &+= 1
-        history.removeAll(keepingCapacity: true)
-        lastHistorySampleAt = .distantPast
-        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        invalidateLocalWorker(generation: generation)
+        if !history.isEmpty { history.removeAll(keepingCapacity: true) }
+        lastHistorySampleMonotonic = nil
+        cancelTokenHubSchedule()
         tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
         tokenHubDirectFailure = nil; tokenHubQuotaIsDirect = false; tokenHubDirectScanInFlight = false
         tokenHubQuotaStatus = tokenHubQuotaReadingEnabled ? .targetNotRunning : .disabled
         lastTokenHubPermissionCheck = .distantPast; cachedTokenHubPermission = false
         _ = localRefreshScheduler.invalidate()
-        localScan?.cancel(); localScan = nil
-        localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
-            filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
-            knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0,
-            subagentCount: 0, forkCount: 0)
+        cancelLocalScanSchedule()
+        clearLocalSnapshot()
         resetQuotaState()
-        let observationNow = tokenHubNow()
-        scheduleLocalScan(immediate: true, observationNow: observationNow)
-        if tokenHubQuotaReadingEnabled { scheduleTokenHubRefresh(after: 0, observationNow: observationNow) }
+        scheduleLocalScan(immediate: true)
+        if tokenHubQuotaReadingEnabled { scheduleTokenHubRefresh(after: 0) }
         installTokenHubWorkspaceObservers()
         timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
         timer?.tolerance = 0.1
@@ -683,8 +1052,8 @@ struct PresentationTimeState: Equatable {
 
     private func stopBackgroundResources() {
         timer?.invalidate(); timer = nil
-        localScan?.cancel(); localScan = nil
-        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        cancelLocalScanSchedule()
+        cancelTokenHubSchedule()
         for observer in tokenHubWorkspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
         tokenHubWorkspaceObservers.removeAll()
     }
@@ -692,11 +1061,24 @@ struct PresentationTimeState: Equatable {
     private func stopBackgroundServices() {
         backgroundServicesStarted = false
         generation += 1; tokenHubGeneration &+= 1
+        invalidateLocalWorker(generation: generation)
+        clearLocalSnapshot()
         _ = localRefreshScheduler.invalidate()
         stopBackgroundResources()
         tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
         tokenHubDirectFailure = nil; tokenHubQuotaIsDirect = false; tokenHubDirectScanInFlight = false
         tokenHubQuotaStatus = tokenHubQuotaReadingEnabled ? .targetNotRunning : .disabled
+    }
+    private func invalidateLocalWorker(generation token: Int) {
+        guard let invalidate = localScanning.invalidate else { return }
+        Task { await invalidate(token) }
+    }
+    private func clearLocalSnapshot() {
+        localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
+            filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
+            knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0,
+            subagentCount: 0, forkCount: 0)
+        fiveHourQuota = nil; sevenDayQuota = nil
     }
     /// Clears quota values at a source transition without performing I/O.
     func resetQuotaState() {
@@ -706,56 +1088,81 @@ struct PresentationTimeState: Equatable {
         quotaLoading = false
         quotaError = "Token Hub 界面快照数据未知"
     }
-    private func scheduleLocalScan(immediate: Bool = false, observationNow scheduledObservationNow: Date? = nil) {
+    private func cancelLocalScanSchedule() {
+        localScanTicket &+= 1
+        localScan?(); localScan = nil
+    }
+
+    private func cancelTokenHubSchedule() {
+        tokenHubRefreshTicket &+= 1
+        tokenHubRefreshWork?(); tokenHubRefreshWork = nil
+    }
+
+    private func scheduleLocalScan(immediate: Bool = false) {
         guard backgroundServicesStarted else { return }
-        let context = RefreshObservationContext(observationNow: scheduledObservationNow ?? tokenHubNow())
-        localScan?.cancel()
+        cancelLocalScanSchedule()
         let version = generation
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
+        let ticket = localScanTicket
+        localScan = timing.schedule(immediate ? 0 : 5) { [weak self] in
+            guard let self, self.localScanTicket == ticket else { return }
+            self.localScan = nil
             Task { @MainActor in
-                guard !self.isShuttingDown, self.backgroundServicesStarted, self.generation == version,
-                      self.config.dataSource == "localCodex" else { return }
-                guard !self.localScanRunning else { return }
-                guard let scanGeneration = self.localRefreshScheduler.begin(now: Date()) else {
-                    self.scheduleLocalScan(immediate: false); return
-                }
-                self.localScanRunning = true
-                let observationNow = context.observationNow
-                // Production discovers the path and route inside the scan
-                // worker. Injected legacy seams remain available for tests.
-                let result: LocalCodexScanWorker.Result?
-                if let scanDefault = self.localScanning.scanDefault {
-                    result = try? await scanDefault(observationNow, version)
-                } else {
-                    if let resolveInputs = self.localScanning.resolveInputs,
-                       let scan = self.localScanning.scan {
-                        let inputs = resolveInputs()
-                        result = try? await scan(inputs.directory, observationNow,
-                                                version, inputs.routeContext)
-                    } else {
-                        result = nil
-                    }
-                }
+            guard self.localScanTicket == ticket, !self.isShuttingDown,
+                  self.backgroundServicesStarted, self.generation == version,
+                  self.config.dataSource == "localCodex" else { return }
+            guard !self.localScanRunning else {
+                self.localScanDeferredGeneration = version
+                return
+            }
+            let monoNow = self.timing.monotonicNow()
+            guard let scanGeneration = self.localRefreshScheduler.begin(monotonicNow: monoNow) else {
+                self.scheduleLocalScan(immediate: false)
+                return
+            }
+            self.localScanRunning = true
+            self.localScanRunTicket = ticket
+            let nowProvider = self.timing.wallNow
+            let result: LocalCodexScanWorker.Result?
+            if let scanDefault = self.localScanning.scanDefault {
+                result = try? await scanDefault(nowProvider, version)
+            } else if let resolveInputs = self.localScanning.resolveInputs,
+                      let scan = self.localScanning.scan {
+                let inputs = resolveInputs()
+                result = try? await self.localInjectedWorker.scanInjected(
+                    directory: inputs.directory, nowProvider: nowProvider, generation: version,
+                    routeContext: inputs.routeContext, operation: scan)
+            } else {
+                result = nil
+            }
+            if self.localScanRunTicket == ticket {
                 self.localScanRunning = false
-                guard self.generation == version, self.localRefreshScheduler.complete(generation: scanGeneration, now: Date()) else {
-                    if self.config.dataSource == "localCodex", self.backgroundServicesStarted, !self.isShuttingDown { self.scheduleLocalScan(immediate: true) }
-                    return
+                self.localScanRunTicket = nil
+            }
+            guard self.generation == version,
+                  self.localRefreshScheduler.complete(generation: scanGeneration,
+                                                      monotonicNow: self.timing.monotonicNow()) else {
+                if let deferred = self.localScanDeferredGeneration,
+                   deferred == self.generation, self.localScan == nil,
+                   self.backgroundServicesStarted, !self.isShuttingDown,
+                   self.config.dataSource == "localCodex" {
+                    self.localScanDeferredGeneration = nil
+                    self.scheduleLocalScan(immediate: true)
                 }
-                if self.config.dataSource == "localCodex" {
-                    if let snapshot = result?.snapshot {
-                        self.localSnapshot = snapshot; self.fiveHourQuota = snapshot.fiveHour; self.sevenDayQuota = snapshot.sevenDay
-                        self.quotaError = snapshot.latestEventAt == nil ? "未发现有效本地用量记录" : "额度来自 Codex 会话事件，可能已过期"
-                    } else {
-                        self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
-                        self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
-                    }
+                return
+            }
+            self.localScanDeferredGeneration = nil
+            if self.config.dataSource == "localCodex" {
+                if let snapshot = result?.snapshot {
+                    self.localSnapshot = snapshot; self.fiveHourQuota = snapshot.fiveHour; self.sevenDayQuota = snapshot.sevenDay
+                    self.quotaError = snapshot.latestEventAt == nil ? "未发现有效本地用量记录" : "额度来自 Codex 会话事件，可能已过期"
+                } else {
+                    self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
+                    self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
                 }
-                if self.config.dataSource == "localCodex", self.backgroundServicesStarted { self.scheduleLocalScan() }
+            }
+            if self.config.dataSource == "localCodex", self.backgroundServicesStarted { self.scheduleLocalScan() }
             }
         }
-        localScan = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0 : 5), execute: work)
     }
 
     /// Associates the current Codex provider with this local Token Hub's
@@ -777,7 +1184,7 @@ struct PresentationTimeState: Equatable {
     func refreshTokenHubQuota(observationNow: Date? = nil) {
         guard !isShuttingDown else { return }
         guard config.dataSource == "localCodex", tokenHubQuotaReadingEnabled else {
-            invalidateTokenHubQuota(status: .disabled); tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+            invalidateTokenHubQuota(status: .disabled); cancelTokenHubSchedule()
             return
         }
         if !usesDirectQuotaSource {
@@ -796,9 +1203,10 @@ struct PresentationTimeState: Equatable {
         // returns to this main-actor model.
         if let workerFetch = source.workerFetch {
             tokenHubDirectScanInFlight = true
+            let nowProvider = timing.wallNow
             Task { [weak self] in
                 let result: Result<DirectQuotaTransportSnapshot, Error>
-                do { result = .success(try await workerFetch(now)) }
+                do { result = .success(try await workerFetch(nowProvider)) }
                 catch { result = .failure(error) }
                 guard let self else { return }
                 guard !self.isShuttingDown, self.tokenHubGeneration == version else { return }
@@ -904,7 +1312,7 @@ struct PresentationTimeState: Equatable {
         guard !isShuttingDown else { return }
         guard !isFixtureUsingNativeTokenHubReader else { return }
         guard config.dataSource == "localCodex", tokenHubAutomaticReadingEnabled else {
-            invalidateTokenHubQuota(status: .disabled); tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+            invalidateTokenHubQuota(status: .disabled); cancelTokenHubSchedule()
             return
         }
         checkTokenHubPermissionIfDue(scheduleIfGranted: false)
@@ -916,7 +1324,7 @@ struct PresentationTimeState: Equatable {
             return
         }
         guard !tokenHubScanInFlight else { return }
-        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        cancelTokenHubSchedule()
         tokenHubScanInFlight = true
         let version = tokenHubGeneration, axVersion = tokenHubAXGeneration, mode: TokenHubRunMode = .localCodex
         let now = tokenHubNow(), interval = config.refreshSeconds
@@ -961,7 +1369,7 @@ struct PresentationTimeState: Equatable {
             return
         }
         tokenHubGeneration &+= 1
-        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        cancelTokenHubSchedule()
         if enabled && config.dataSource == "localCodex" && !isShuttingDown && (backgroundServicesStarted || isPreview) {
             tokenHubQuotaStatus = .targetNotRunning; tokenHubQuotaFailure = nil
             lastTokenHubPermissionCheck = .distantPast
@@ -993,7 +1401,7 @@ struct PresentationTimeState: Equatable {
 
     func invalidateTokenHubQuota(status: TokenHubQuotaStatus) {
         tokenHubGeneration &+= 1
-        tokenHubRefreshWork?.cancel(); tokenHubRefreshWork = nil
+        cancelTokenHubSchedule()
         tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil; tokenHubDirectFailure = nil
         tokenHubQuotaIsDirect = false; tokenHubDirectScanInFlight = false; tokenHubQuotaStatus = status
     }
@@ -1021,10 +1429,14 @@ struct PresentationTimeState: Equatable {
 
     func freshTokenHubQuota(at now: Date) -> TokenHubQuotaSnapshot? {
         guard config.dataSource == "localCodex", tokenHubQuotaReadingEnabled,
-              tokenHubQuotaStatus == .connected, let snapshot = tokenHubQuotaSnapshot,
-              snapshot.observedAt <= now,
-              now.timeIntervalSince(snapshot.observedAt) <= max(120, config.refreshSeconds * 2) else { return nil }
-        return snapshot
+              tokenHubQuotaStatus == .connected, let snapshot = tokenHubQuotaSnapshot else { return nil }
+        let presentation = TokenHubQuotaPresentation.project(snapshot: snapshot, now: now,
+            refreshSeconds: config.refreshSeconds)
+        guard presentation.snapshotFresh,
+              presentation.fiveHourCurrent != nil || presentation.sevenDayCurrent != nil || presentation.monthlyCurrent != nil else { return nil }
+        return TokenHubQuotaSnapshot(identity: snapshot.identity, fiveHour: presentation.fiveHourCurrent,
+            sevenDay: presentation.sevenDayCurrent, monthly: presentation.monthlyCurrent,
+            observedAt: snapshot.observedAt)
     }
 
     private func checkTokenHubPermissionIfDue(scheduleIfGranted: Bool = true) {
@@ -1046,21 +1458,19 @@ struct PresentationTimeState: Equatable {
         checkTokenHubPermissionIfDue()
     }
 
-    private func scheduleTokenHubRefresh(after seconds: TimeInterval, observationNow scheduledObservationNow: Date? = nil) {
+    private func scheduleTokenHubRefresh(after seconds: TimeInterval, observationNow _: Date? = nil) {
         guard (backgroundServicesStarted || isPreview), config.dataSource == "localCodex", tokenHubQuotaReadingEnabled,
               !isShuttingDown, (usesDirectQuotaSource || !tokenHubScanInFlight), !isFixtureUsingNativeTokenHubReader else { return }
-        let context = RefreshObservationContext(observationNow: scheduledObservationNow ?? tokenHubNow())
-        tokenHubRefreshWork?.cancel()
+        cancelTokenHubSchedule()
         let version = tokenHubGeneration
-        let work = DispatchWorkItem { [weak self] in
-            Task { @MainActor in
-                guard let self, !self.isShuttingDown, self.tokenHubGeneration == version,
-                      self.config.dataSource == "localCodex", self.tokenHubQuotaReadingEnabled else { return }
-                self.refreshTokenHubQuota(observationNow: context.observationNow)
-            }
+        let ticket = tokenHubRefreshTicket
+        tokenHubRefreshWork = timing.schedule(max(0, seconds)) { [weak self] in
+            guard let self, self.tokenHubRefreshTicket == ticket else { return }
+            self.tokenHubRefreshWork = nil
+            guard !self.isShuttingDown, self.tokenHubGeneration == version,
+                  self.config.dataSource == "localCodex", self.tokenHubQuotaReadingEnabled else { return }
+            self.refreshTokenHubQuota()
         }
-        tokenHubRefreshWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, seconds), execute: work)
     }
 
     static func shouldSuppressNativeTokenHubRead(isTestFixture: Bool, scannerIsNative: Bool) -> Bool {
@@ -1072,6 +1482,7 @@ struct PresentationTimeState: Equatable {
     }
 
     private func installTokenHubWorkspaceObservers() {
+        guard startup.observeWorkspaceNotifications else { return }
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
             let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in

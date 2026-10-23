@@ -2,6 +2,7 @@ import Foundation
 import TokenStatCore
 import SQLite3
 import Darwin
+import os
 
 private final class DirectQuotaCounter: @unchecked Sendable {
     private let lock = NSLock()
@@ -20,8 +21,33 @@ private final class DirectQuotaCounter: @unchecked Sendable {
     }
 }
 
+private enum DirectQuotaOutcome<Value: Sendable>: Sendable {
+    case success(Value)
+    case failure(TokenHubDirectQuotaFailure)
+}
+
+private struct DirectQuotaOutcomeBox<Value: Sendable>: Sendable {
+    private let storage = OSAllocatedUnfairLock<DirectQuotaOutcome<Value>?>(initialState: nil)
+    func setSuccess(_ value: Value) { storage.withLock { $0 = .success(value) } }
+    func setFailure(_ error: Error) {
+        storage.withLock { $0 = .failure((error as? TokenHubDirectQuotaFailure) ?? .transportFailed) }
+    }
+    func get() -> DirectQuotaOutcome<Value>? { storage.withLock { $0 } }
+}
+
+private struct DirectQuotaClock: Sendable {
+    private struct State { var value: Date }
+    private let storage: OSAllocatedUnfairLock<State>
+    init(_ value: Date) { storage = OSAllocatedUnfairLock(initialState: State(value: value)) }
+    func now() -> Date { storage.withLock { $0.value } }
+    func set(_ value: Date) { storage.withLock { $0.value = value } }
+}
+
 extension CoreChecks {
     static func directQuotaChecks() throws {
+#if TOKENSTAT_BP38_C01
+        try bp38C01DirectQuotaChecks()
+#endif
         try directCallbackLocationChecks()
         try directDatabaseReplacementChecks()
         try directAmountLexicalChecks()
@@ -202,6 +228,181 @@ extension CoreChecks {
         }
     }
 
+#if TOKENSTAT_BP38_C01
+    /// Synthetic database, clock and HTTP callbacks verify that a worker's
+    /// observation timestamp is fixed at transaction start while credential
+    /// freshness is re-read at the existing exchange checkpoints.
+    private static func bp38C01DirectQuotaChecks() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tokenstat-bp38-c01-direct-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let startedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: home),
+                                    now: startedAt, sessionToken: "bp38-synthetic")
+
+        let counter = DirectQuotaCounter()
+        let clock = DirectQuotaClock(startedAt)
+        let client = TokenHubDirectQuotaClient(request: { _, _ in
+            counter.noteQuota(true)
+            clock.set(startedAt.addingTimeInterval(2))
+            return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
+            {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100,"period_end":"2027-01-15T08:05:00Z"}]}}
+            """))
+        }, callbackRequest: { _ in
+            counter.noteCallback(true)
+            clock.set(startedAt.addingTimeInterval(1))
+            return "synthetic-access"
+        })
+        let identity = TokenHubIdentity(pid: 84_201, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Synthetic/Hub")
+        let observation = try awaitDirectQuota {
+            try await client.fetch(identity: identity, nowProvider: { clock.now() }, home: home)
+        }
+        counter.noteSuccess(true) // Reaching here proves the fetch returned a decoded success.
+        check(observation.observedAt == startedAt,
+              "BP38 C01 decoding retains one transaction-start observedAt despite later callback work")
+        check(observation.fiveHour?.resetAt == startedAt.addingTimeInterval(300),
+              "BP38 C01 synthetic response reset date is decoded against its fixed transaction")
+        let counts = counter.snapshot()
+        check(counts.0 == 1 && counts.1 == 1 && counts.2 && counts.3 && counts.4,
+              "BP38 C01 uses the controlled callback and exactly one quota request")
+
+        // Each substitute moves the stable clock to the exact boundary when
+        // that named phase occurs. Harmless extra provider reads therefore
+        // cannot shift the trigger to a different transaction checkpoint.
+        let checkpointCases: [(name: String, transition: String, callbacks: Int, quotas: Int)] = [
+            ("before-callback", "initial", 0, 0),
+            ("after-callback", "callback-1", 1, 0),
+            ("before-retry", "quota-1", 1, 1),
+            ("after-retry-callback", "callback-2", 2, 1),
+            ("after-success-response", "quota-1", 1, 1)
+        ]
+        for checkpoint in checkpointCases {
+            let boundaryHome = FileManager.default.temporaryDirectory
+                .appendingPathComponent("tokenstat-bp38-c01-checkpoint-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: boundaryHome) }
+            let expiration = startedAt.addingTimeInterval(checkpoint.transition == "initial" ? 30 : 31)
+            try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: boundaryHome),
+                now: startedAt, sessionToken: "bp38-checkpoint-\(checkpoint.name)", expiresAt: expiration)
+            let boundaryClock = DirectQuotaClock(startedAt)
+            let exactBoundary = expiration.addingTimeInterval(-30)
+            let checkpointCounts = DirectQuotaCounter()
+            let checkpointClient = TokenHubDirectQuotaClient(request: { _, _ in
+                let number = checkpointCounts.noteQuota(true)
+                if checkpoint.transition == "quota-\(number)" { boundaryClock.set(exactBoundary) }
+                if (checkpoint.name == "before-retry" || checkpoint.name == "after-retry-callback") && number == 1 {
+                    return TokenHubDirectQuotaHTTPResponse(statusCode: 401, data: Data())
+                }
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
+                {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100}]}}
+                """))
+            }, callbackRequest: { _ in
+                let number = checkpointCounts.noteCallback(true)
+                if checkpoint.transition == "callback-\(number)" { boundaryClock.set(exactBoundary) }
+                return "synthetic-access"
+            })
+            let result = awaitDirectQuotaOutcome {
+                try await checkpointClient.fetch(identity: identity,
+                    nowProvider: { boundaryClock.now() }, home: boundaryHome)
+            }
+            let checkpointState = checkpointCounts.snapshot()
+            check(!result.succeeded && result.failure == .credentialExpired
+                && checkpointState.0 == checkpoint.callbacks && checkpointState.1 == checkpoint.quotas,
+                  "BP38 C01 \(checkpoint.name) checkpoint rejects exactly-30-second session before later exchange")
+        }
+
+        // Credential freshness is intentionally tested through the client’s
+        // explicit clock parameter; production’s injected provider is covered
+        // by the AppModel worker-level tests in A38-01.
+        for remaining in [30.001, 30.0] {
+            let boundaryHome = FileManager.default.temporaryDirectory
+                .appendingPathComponent("tokenstat-bp38-c01-expiry-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: boundaryHome) }
+            try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: boundaryHome),
+                now: startedAt, sessionToken: "bp38-boundary-\(remaining)",
+                expiresAt: startedAt.addingTimeInterval(remaining))
+            let calls = DirectQuotaCounter()
+            let boundedClient = TokenHubDirectQuotaClient(request: { _, _ in
+                calls.noteQuota(true)
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
+                {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100}]}}
+                """))
+            }, callbackRequest: { _ in calls.noteCallback(true); return "synthetic-access" })
+            let outcome = awaitDirectQuotaOutcome {
+                try await boundedClient.fetch(identity: identity, nowProvider: { startedAt }, home: boundaryHome)
+            }
+            let count = calls.snapshot()
+            if remaining > 30 {
+                check(outcome.succeeded && count.0 == 1 && count.1 == 1,
+                      "BP38 C01 accepts a synthetic session with more than 30 seconds remaining")
+            } else {
+                check(!outcome.succeeded && outcome.failure == .credentialExpired
+                    && count.0 == 0 && count.1 == 0,
+                      "BP38 C01 rejects an exactly-30-second session before callback or quota request")
+            }
+        }
+
+        let exactCurrentHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tokenstat-bp38-c01-current-initial-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: exactCurrentHome) }
+        let expiresAt = startedAt.addingTimeInterval(100)
+        try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: exactCurrentHome),
+            now: startedAt, sessionToken: "bp38-current-exact-30", expiresAt: expiresAt)
+        let exactCurrentClock = DirectQuotaClock(startedAt.addingTimeInterval(70))
+        let exactCurrentCalls = DirectQuotaCounter()
+        let exactCurrentClient = TokenHubDirectQuotaClient(request: { _, _ in
+            _ = exactCurrentCalls.noteQuota(true)
+            return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
+            {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100}]}}
+            """))
+        }, callbackRequest: { _ in
+            _ = exactCurrentCalls.noteCallback(true)
+            return "synthetic-access"
+        })
+        let exactCurrentResult = awaitDirectQuotaOutcome {
+            try await exactCurrentClient.fetch(identity: identity,
+                nowProvider: { exactCurrentClock.now() }, observationAt: startedAt, home: exactCurrentHome)
+        }
+        let exactCurrentCounts = exactCurrentCalls.snapshot()
+        check(!exactCurrentResult.succeeded && exactCurrentResult.failure == .credentialExpired
+            && exactCurrentCounts.0 == 0 && exactCurrentCounts.1 == 0,
+            "BP38 C01 initial settings read uses current provider time and rejects exactly 30 seconds before callback or quota request")
+
+        let aboveBoundaryHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tokenstat-bp38-c01-current-initial-above-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: aboveBoundaryHome) }
+        try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: aboveBoundaryHome),
+            now: startedAt, sessionToken: "bp38-current-above-30",
+            expiresAt: expiresAt)
+        let aboveBoundaryClock = DirectQuotaClock(startedAt.addingTimeInterval(69.999))
+        let aboveBoundaryCalls = DirectQuotaCounter()
+        let aboveBoundaryClient = TokenHubDirectQuotaClient(request: { url, bearer in
+            _ = aboveBoundaryCalls.noteQuota(url.path == "/api/v1/auth/me/quota-usage" && bearer == "synthetic-access")
+            return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
+            {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100}]}}
+            """))
+        }, callbackRequest: { url in
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            let shape = components?.path == "/api/v1/auth/it-sso/callback"
+                && Set(components?.queryItems?.map(\.name) ?? []).isSuperset(of: [
+                    "token", "verifySign", "redirect", "sourceChannel", "sourceTokenType"
+                ])
+            _ = aboveBoundaryCalls.noteCallback(shape)
+            return "synthetic-access"
+        })
+        let aboveBoundarySnapshot = try? awaitDirectQuota {
+            try await aboveBoundaryClient.fetch(identity: identity,
+                nowProvider: { aboveBoundaryClock.now() }, observationAt: startedAt, home: aboveBoundaryHome)
+        }
+        let aboveBoundaryCounts = aboveBoundaryCalls.snapshot()
+        check(aboveBoundarySnapshot?.observedAt == startedAt
+            && aboveBoundarySnapshot?.fiveHour?.usedPercent == Decimal(20)
+            && aboveBoundaryCounts.0 == 1 && aboveBoundaryCounts.1 == 1
+            && aboveBoundaryCounts.2 && aboveBoundaryCounts.3,
+            "BP38 C01 initial settings read accepts 30.001 seconds remaining with one callback, one quota request and fixed decoder observation")
+    }
+#endif
+
     /// Exercise the public response decoder, not Foundation's Decimal parser:
     /// accepting a numeric prefix must never publish a believable quota.
     private static func directAmountLexicalChecks() throws {
@@ -327,6 +528,7 @@ extension CoreChecks {
 
 extension CoreChecks {
     static func directCallbackLocationChecks() throws {
+        try bp46SafeCallbackErrorChecks()
         var callbackComponents = URLComponents(string: "https://aihub.example.test/api/v1/auth/it-sso/callback")!
         callbackComponents.queryItems = [URLQueryItem(name: "token", value: "fixture")]
         let callback = callbackComponents.url!
@@ -386,8 +588,215 @@ extension CoreChecks {
     }
 }
 
+// C46 uses the public parser and fixed, payload-free failure labels so the
+// checks compile against the predecessor enum and can first fail on behavior.
+extension CoreChecks {
+    private static func bp46SafeCallbackErrorChecks() throws {
+        var callbackComponents = URLComponents(string: "https://aihub.example.test/api/v1/auth/it-sso/callback")!
+        callbackComponents.queryItems = [URLQueryItem(name: "token", value: "fixture-session")]
+        let callback = callbackComponents.url!
+        let landing = "https://aihub.example.test/auth/it/callback"
+        func location(_ items: [URLQueryItem]) -> String {
+            var fragment = URLComponents()
+            fragment.queryItems = items
+            return landing + "#" + fragment.percentEncodedQuery!
+        }
+        func reject(_ name: String, _ value: String, _ expected: String, original: URL? = nil) {
+            do {
+                _ = try TokenHubDirectQuotaClient.accessToken(fromCallbackLocation: value,
+                                                               callbackURL: original ?? callback)
+                check(false, "BP46 \(name) rejects instead of returning a token")
+            } catch let failure as TokenHubDirectQuotaFailure {
+                check(String(describing: failure) == expected, "BP46 \(name) has the required safe failure type")
+            } catch {
+                check(false, "BP46 \(name) remains a direct-quota typed failure")
+            }
+        }
+        func accept(_ name: String, _ value: String, _ expected: String, original: URL? = nil) {
+            do {
+                let actual = try TokenHubDirectQuotaClient.accessToken(fromCallbackLocation: value,
+                                                                        callbackURL: original ?? callback)
+                check(actual == expected, "BP46 \(name) preserves the exact synthetic token")
+            } catch {
+                check(false, "BP46 \(name) accepts its valid synthetic callback")
+            }
+        }
 
-private func writeDirectQuotaFixture(at database: URL, now: Date, sessionToken: String) throws {
+        // This is the first RED oracle: the old parser returns fixture-access.
+        let token = URLQueryItem(name: "access_token", value: "fixture-access")
+        reject("C01b error-plus-token behavior", location([URLQueryItem(name: "error", value: "token_verify_failed"), token]),
+               "loginRejected")
+        if ProcessInfo.processInfo.environment["TOKENSTAT_BP46_RED_ONLY"] == "1" { return }
+
+        for (index, marker) in ["token_verify_failed", "synthetic_other_rejection"].enumerated() {
+            let expected = index == 0 ? "loginRejected" : "exchangeRejected"
+            let error = URLQueryItem(name: "error", value: marker)
+            let variants = [[error], [error, token], [token, error],
+                [error, token, URLQueryItem(name: "redirect", value: "/me/api-key")],
+                [token, error, URLQueryItem(name: "access_token", value: "other")],
+                [URLQueryItem(name: "access_token", value: nil), error],
+                [error, URLQueryItem(name: "access_token", value: "bad\nvalue")]]
+            for (variant, items) in variants.enumerated() {
+                reject("C01b priority \(index)-\(variant)", location(items), expected)
+            }
+        }
+        let known = ["token_verify_failed", "ToKeN_vErIfY_FaIlEd", " token_verify_failed ",
+            "\t\r\ntoken_verify_failed\r\n\t", "\u{00A0}\u{3000}TOKEN_VERIFY_FAILED\u{0085}"]
+        for (index, marker) in known.enumerated() {
+            reject("C01c known marker \(index)", location([URLQueryItem(name: "error", value: marker)]), "loginRejected")
+        }
+        reject("C01c once-encoded marker", landing + "#error=%74oken%5Fverify%5Ffailed", "loginRejected")
+        reject("C01b once-encoded exact key", landing + "#err%6Fr=token_verify_failed", "loginRejected")
+        let unknown = ["xtoken_verify_failed", "token_verify_failedx", "token_verify_failed_extra",
+            "token_verify_failed.extra", "token verify_failed", "token_ve rify_failed", "token_verify_failed+",
+            "\u{200B}token_verify_failed", "token_ver\u{0131}fy_failed", "ｔoken_verify_failed", "synthetic_unknown"]
+        for (index, marker) in unknown.enumerated() {
+            reject("C01c unknown marker \(index)", location([URLQueryItem(name: "error", value: marker)]), "exchangeRejected")
+        }
+        reject("C01c twice-encoded marker", landing + "#error=%2574oken_verify_failed", "exchangeRejected")
+        reject("C01c twice-encoded separator", landing + "#error=token%255Fverify_failed", "exchangeRejected")
+
+        let malformed: [[URLQueryItem]] = [
+            [URLQueryItem(name: "error", value: nil)], [URLQueryItem(name: "error", value: "")],
+            [URLQueryItem(name: "error", value: " \t\r\n\u{00A0}\u{3000}")],
+            [URLQueryItem(name: "error", value: "token_verify_failed"), URLQueryItem(name: "error", value: "token_verify_failed")],
+            [URLQueryItem(name: "error", value: "token_verify_failed"), URLQueryItem(name: "error", value: "synthetic_other")],
+            [URLQueryItem(name: "error", value: nil), URLQueryItem(name: "error", value: "token_verify_failed")]
+        ]
+        for (index, items) in malformed.enumerated() {
+            reject("C01d malformed error \(index)", location(items), "malformedResponse")
+            reject("C01d malformed error with token \(index)", location(items + [token]), "malformedResponse")
+        }
+        reject("C01d no token", location([URLQueryItem(name: "redirect", value: "/me/api-key")]), "accessTokenMissing")
+        reject("C01b description alone", location([URLQueryItem(name: "error_description", value: "token_verify_failed")]),
+               "accessTokenMissing")
+        accept("C01b description is not an error key", location([token, URLQueryItem(name: "error_description", value: "token_verify_failed")]),
+               "fixture-access")
+        accept("C01b error key remains case-sensitive", location([token, URLQueryItem(name: "Error", value: "token_verify_failed")]),
+               "fixture-access")
+        reject("C01b wrong-case key without token", location([URLQueryItem(name: "ERROR", value: "token_verify_failed")]),
+               "accessTokenMissing")
+
+        accept("C01a token-only positive control", location([token]), "fixture-access")
+        accept("C01a explicit default port", "https://aihub.example.test:443/auth/it/callback#access_token=fixture-access",
+               "fixture-access")
+        let prefixed = URL(string: "https://aihub.example.test/aimanager/api/v1/auth/it-sso/callback")!
+        accept("C01a verified prefix", "https://aihub.example.test/aimanager/auth/it/callback#access_token=fixture-access",
+               "fixture-access", original: prefixed)
+        reject("C01a error on verified prefix", "https://aihub.example.test/aimanager/auth/it/callback#error=token_verify_failed",
+               "loginRejected", original: prefixed)
+        reject("C01a error respects verified prefix", "https://aihub.example.test/auth/it/callback#error=token_verify_failed",
+               "accessTokenMissing", original: prefixed)
+        reject("C01a unrelated registrant with error", "https://other.co.id/auth/it/callback#error=token_verify_failed",
+               "accessTokenMissing", original: URL(string: "https://manager.organization.co.id/api/v1/auth/it-sso/callback")!)
+        let safeError = String(location([URLQueryItem(name: "error", value: "token_verify_failed"), token]).dropFirst(landing.count))
+        // Foundation encodes the second literal hash into the token value.
+        // Preserve the predecessor's token behavior while keeping error first.
+        reject("C01b normalized second hash keeps error priority", landing + safeError + "#nested", "loginRejected")
+        accept("C01d normalized second hash preserves original token", location([token]) + "#nested", "fixture-access#nested")
+        let badTrust = [
+            "https://sibling.example.test/auth/it/callback" + safeError,
+            "https://other.example.test:8443/auth/it/callback" + safeError,
+            "https://aihub.example.test:8443/auth/it/callback" + safeError,
+            "https://user:password@aihub.example.test/auth/it/callback" + safeError,
+            landing + "?ignored=1" + safeError,
+            "http://aihub.example.test/auth/it/callback" + safeError,
+            "https://aihub.example.test/unexpected" + safeError,
+            landing + safeError + "&redirect=%2Funexpected",
+            landing + safeError + "&redirect=%2Fme%2Fapi-key&redirect=%2Funexpected",
+            "/auth/it/callback" + safeError,
+            landing,
+            landing + "#error= token_verify_failed",
+            landing + "#error=token_verify_failed\n",
+            landing + safeError + "&padding=" + String(repeating: "x", count: 65_536)
+        ]
+        for (index, value) in badTrust.enumerated() {
+            reject("C01a untrusted shape \(index)", value, "accessTokenMissing")
+        }
+        for (index, original) in [
+            "http://aihub.example.test/api/v1/auth/it-sso/callback",
+            "https://aihub.example.test:8443/api/v1/auth/it-sso/callback",
+            "https://user:password@aihub.example.test/api/v1/auth/it-sso/callback",
+            "https://aihub.example.test/unexpected"
+        ].enumerated() {
+            reject("C01a untrusted original \(index)", landing + safeError, "accessTokenMissing", original: URL(string: original)!)
+        }
+        for (index, items) in [
+            [URLQueryItem(name: "access_token", value: nil)], [URLQueryItem(name: "access_token", value: "")],
+            [token, token], [URLQueryItem(name: "access_token", value: "bad value")],
+            [URLQueryItem(name: "access_token", value: "bad\nvalue")],
+            [URLQueryItem(name: "access_token", value: String(repeating: "x", count: 16_385))]
+        ].enumerated() {
+            reject("C01d original token boundary \(index)", location(items), "accessTokenMissing")
+        }
+        let maximumToken = String(repeating: "x", count: 16_384)
+        accept("C01d token length positive boundary", location([URLQueryItem(name: "access_token", value: maximumToken)]), maximumToken)
+        accept("C01d one token decoding pass", landing + "#access_token=fixture%252Daccess", "fixture%2Daccess")
+
+        let canaries = ["bp46-synthetic-account@example.invalid", "/synthetic/bp46-only/path",
+            "bp46-synthetic-body", "https://canary.example.invalid/bp46", "bp46-synthetic-token"]
+        for (index, marker) in ["token_verify_failed", canaries.joined(separator: "|")].enumerated() {
+            let input = location([URLQueryItem(name: "error", value: marker),
+                URLQueryItem(name: "error_description", value: canaries.joined(separator: "|")),
+                URLQueryItem(name: "access_token", value: canaries.last!)])
+            do {
+                _ = try TokenHubDirectQuotaClient.accessToken(fromCallbackLocation: input, callbackURL: callback)
+                check(false, "BP46 C09 privacy input \(index) cannot become success")
+            } catch let failure as TokenHubDirectQuotaFailure {
+                check(String(describing: failure) == (index == 0 ? "loginRejected" : "exchangeRejected"),
+                      "BP46 C09 privacy input \(index) preserves the required safe category")
+                let publicFailure = String(describing: failure) + String(reflecting: failure)
+                check(canaries.allSatisfy { !publicFailure.contains($0) }, "BP46 C09 failure carries no synthetic private fields")
+            } catch { check(false, "BP46 C09 privacy failure stays typed") }
+        }
+        try bp46RejectedCallbackClientChecks()
+    }
+
+    private static func bp46RejectedCallbackClientChecks() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let identity = TokenHubIdentity(pid: 46_201, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic BP46 Hub.app/Contents/MacOS/Hub")
+        let data = json(#"{"data":{"currency":"USD","windows":[{"kind":"fixed_5h","quota_amount":10,"used_amount":1}]}}"#)
+        for (index, marker) in ["token_verify_failed", "synthetic_other_rejection"].enumerated() {
+            for rejectedCallback in [1, 2] {
+                let home = FileManager.default.temporaryDirectory.appendingPathComponent("tokenstat-bp46-client-" + UUID().uuidString)
+                defer { try? FileManager.default.removeItem(at: home) }
+                try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: home),
+                                            now: now, sessionToken: "fixture-session")
+                let calls = DirectQuotaCounter()
+                let client = TokenHubDirectQuotaClient(request: { url, bearer in
+                    let count = calls.noteQuota(url.absoluteString == "https://aihub.example.test/api/v1/auth/me/quota-usage"
+                        && bearer == "fixture-access")
+                    return TokenHubDirectQuotaHTTPResponse(statusCode: rejectedCallback == 2 && count == 1 ? 401 : 200, data: data)
+                }, callbackRequest: { url in
+                    let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+                    let expected = ["token": "fixture-session", "verifySign": "fixture-signature", "redirect": "/me/api-key",
+                        "sourceChannel": "fixture-channel", "sourceTokenType": "fixture-type"]
+                    let items = components?.queryItems ?? []
+                    let count = calls.noteCallback(components?.scheme == "https" && components?.host == "aihub.example.test"
+                        && components?.path == "/api/v1/auth/it-sso/callback" && items.count == expected.count
+                        && expected.allSatisfy { key, value in items.filter { $0.name == key && $0.value == value }.count == 1 })
+                    var fragment = URLComponents()
+                    let token = URLQueryItem(name: "access_token", value: "fixture-access")
+                    fragment.queryItems = count == rejectedCallback ? [URLQueryItem(name: "error", value: marker), token] : [token]
+                    return try TokenHubDirectQuotaClient.accessToken(
+                        fromCallbackLocation: "https://aihub.example.test/auth/it/callback#" + fragment.percentEncodedQuery!, callbackURL: url)
+                })
+                let outcome = awaitDirectQuotaOutcome { try await client.fetch(identity: identity, now: now, home: home) }
+                let state = calls.snapshot()
+                check(!outcome.succeeded && outcome.failure.map { String(describing: $0) } == (index == 0 ? "loginRejected" : "exchangeRejected"),
+                      "BP46 C02 callback \(rejectedCallback) propagates safe rejection category \(index)")
+                check(state.0 == rejectedCallback && state.1 == rejectedCallback - 1,
+                      "BP46 C02 callback \(rejectedCallback) stops before quota or any additional retry")
+                check(state.2 && (state.1 == 0 || state.3), "BP46 C02 retains synthetic callback and bearer request contracts")
+            }
+        }
+    }
+}
+
+
+private func writeDirectQuotaFixture(at database: URL, now: Date, sessionToken: String,
+                                     expiresAt: Date? = nil) throws {
     try FileManager.default.createDirectory(at: database.deletingLastPathComponent(), withIntermediateDirectories: true,
                                            attributes: [.posixPermissions: 0o700])
     var db: OpaquePointer?
@@ -399,7 +808,7 @@ private func writeDirectQuotaFixture(at database: URL, now: Date, sessionToken: 
     let connection = "{\"aiManagerBaseUrl\":\"https://aihub.example.test\",\"ssoBaseUrl\":\"https://sso.example.test\"}"
     let session = try JSONSerialization.data(withJSONObject: [
         "token": sessionToken, "verifySign": "fixture-signature", "channel": "fixture-channel",
-        "tokenType": "fixture-type", "expiresAt": (now.timeIntervalSince1970 + 3600) * 1000
+        "tokenType": "fixture-type", "expiresAt": ((expiresAt ?? now.addingTimeInterval(3600)).timeIntervalSince1970) * 1000
     ])
     let sessionJSON = String(decoding: session, as: UTF8.self).replacingOccurrences(of: "'", with: "''")
     let sql = "CREATE TABLE IF NOT EXISTS client_settings (key TEXT PRIMARY KEY, value_json TEXT);"
@@ -409,6 +818,36 @@ private func writeDirectQuotaFixture(at database: URL, now: Date, sessionToken: 
         throw NSError(domain: "SyntheticDirectQuotaFixture", code: 2)
     }
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: database.path)
+}
+
+private func awaitDirectQuota<Value: Sendable>(
+    _ operation: @escaping @Sendable () async throws -> Value
+) throws -> Value {
+    let done = DispatchSemaphore(value: 0)
+    let result = DirectQuotaOutcomeBox<Value>()
+    Task {
+        do { result.setSuccess(try await operation()) }
+        catch { result.setFailure(error) }
+        done.signal()
+    }
+    guard done.wait(timeout: .now() + 3) == .success,
+          let value = result.get() else { throw TokenHubDirectQuotaFailure.transportFailed }
+    switch value {
+    case .success(let value): return value
+    case .failure(let failure): throw failure
+    }
+}
+
+private struct DirectQuotaAttempt: Sendable {
+    let succeeded: Bool
+    let failure: TokenHubDirectQuotaFailure?
+}
+
+private func awaitDirectQuotaOutcome<Value: Sendable>(
+    _ operation: @escaping @Sendable () async throws -> Value
+) -> DirectQuotaAttempt {
+    do { _ = try awaitDirectQuota(operation); return DirectQuotaAttempt(succeeded: true, failure: nil) }
+    catch { return DirectQuotaAttempt(succeeded: false, failure: error as? TokenHubDirectQuotaFailure) }
 }
 
 

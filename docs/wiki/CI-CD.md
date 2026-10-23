@@ -4,7 +4,7 @@
 
 ## 当前自动化范围
 
-仓库只有一个 [macOS CI 与发布工作流](../../.github/workflows/ci.yml)，在 `main` 的 push、pull request 和 `v*` 标签 push 上运行，使用 `macos-15` runner。工作流顶层仅有读取仓库内容的权限，checkout 关闭凭据持久化；只有标签触发且构建成功时，独立的 `publish` job 才取得 `contents: write`。当前 checkout 固定为官方 `v7.0.1` 的完整提交 `3d3c42e5aac5ba805825da76410c181273ba90b1`，其运行时为 Node 24；升级时重新核对官方 release/tag 与完整 SHA，不只移动标签。官方要求 Actions Runner 至少为 `v2.327.1`，自托管 runner 需同步满足此版本；GitHub 托管 runner 由平台维护。来源见 [checkout v7.0.1](https://github.com/actions/checkout/tree/v7.0.1)。
+仓库只有一个 [TokenStatMenu CI 与发布工作流](../../.github/workflows/ci.yml)，在 `main` 的 push、pull request 和 `v*` 标签 push 上运行，使用 `macos-15` runner。工作流顶层仅有读取仓库内容的权限，checkout 关闭凭据持久化；只有标签触发且构建成功时，独立的 `publish` job 才取得 `contents: write`。当前 checkout 固定为官方 `v7.0.1` 的完整提交 `3d3c42e5aac5ba805825da76410c181273ba90b1`，其运行时为 Node 24；升级时重新核对官方 release/tag 与完整 SHA，不只移动标签。官方要求 Actions Runner 至少为 `v2.327.1`，自托管 runner 需同步满足此版本；GitHub 托管 runner 由平台维护。来源见 [checkout v7.0.1](https://github.com/actions/checkout/tree/v7.0.1)。
 
 | 顺序 | 检查 | 当前实际覆盖 |
 | --- | --- | --- |
@@ -41,19 +41,19 @@ CI 绿色说明该提交完成了工作流声明的检查，不能据此声称�
 1. 用合成数据复现问题，为确认的问题建立或关联 Issue。
 2. 实现最小改动，执行与改动相符的核心、状态或视觉验证。
 3. 按 [测试指南](测试指南.md) 完成本地回归、原生构建及必要的真实本机验收。
-4. 更新文档、公开文件白名单与完整源码汇编，检查差异及隐私边界。
+4. 更新文档、公开文件白名单与源码 ZIP 语义，并检查差异与隐私边界。
 5. 审阅暂存内容并执行 `check_public_content.py --git-index`，本地验证完成后再推送。
 6. 创建可审查的 PR，写明问题、最终行为、测试结果和未覆盖范围；等待该提交的 CI 结果。
 
 ## 标签触发的正式 Release
 
-[同一 macOS CI 与发布工作流](../../.github/workflows/ci.yml) 在 `v*` 标签 push 时进入发布分支。宽触发模式不是版本校验：发布工具仍只接受数字稳定版本 `vMAJOR.MINOR.PATCH`，核对 Info.plist 的版本/构建号、标签实际提交、干净工作区及 `main` 祖先关系。分支名不能代替源码提交。
+[同一 TokenStatMenu CI 与发布工作流](../../.github/workflows/ci.yml) 在 `v*` 标签 push 时进入发布分支。宽触发模式不是版本校验：发布工具仍只接受数字稳定版本 `vMAJOR.MINOR.PATCH`，核对 Info.plist 的版本/构建号、标签实际提交、干净工作区及 `main` 祖先关系。分支名不能代替源码提交。
 
 流水线分成 `build` 与 `publish` 两个 job：
 
 | 阶段 | 权限与实际动作 |
 | --- | --- |
-| `build` | `macos-15`、仓库只读；运行公开内容/文档/核心及指定原生检查，构建 Xcode 工程，再构建并 ad hoc 签名 Universal App；导出白名单源码并要求生成文档没有未提交差异；从 1.1.5/build7 起创建和核验五个资产（App ZIP、源码 ZIP、Universal DMG、manifest、SUMS）后上传 Actions artifact |
+| `build` | `macos-15`、仓库只读；运行公开内容/文档/核心及指定原生检查，构建 Xcode 工程，再构建并 ad hoc 签名 Universal App；使用显式白名单生成源码 ZIP，并要求跟踪文件无未提交差异；从 1.1.5/build7 起创建和核验五个资产（App ZIP、源码 ZIP、Universal DMG、manifest、SUMS）后上传 Actions artifact |
 | `publish` | `macos-15`、仅此 job 有 `contents: write`；下载同一 run 的 artifact，再次按源码、版本、结构、摘要和 DMG 镜像内容核验；只对固定主仓库的该标签处理 Release，支持继续匹配的草稿，远端逐个核验后才公开 |
 
 当前 1.1.4/build6 历史 Release 恰好包含以下四个手动上传资产；从 1.1.5/build7 起目标为五项，GitHub 自动提供的 Source code 归档不属于这些资产：

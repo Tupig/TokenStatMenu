@@ -1,63 +1,164 @@
 #!/usr/bin/env python3
-"""Generate the complete source document and export only reviewed project files."""
+"""Build the reviewed source archive or explicitly export the reviewed files."""
+
 import argparse
 import shutil
 import zipfile
 from pathlib import Path
-from check_docs import rebase_links
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = [
-    ".gitignore", ".github/workflows/ci.yml", "Package.swift", "Package.resolved", "README.md", "LICENSE", "PRIVACY.md",
-    "Sources/TokenStatCore/Configuration.swift", "Sources/TokenStatCore/GatewayDiscovery.swift",
-    "Sources/TokenStatCore/HTTPDecoder.swift", "Sources/TokenStatCore/LocalCodexUsageReader.swift", "Sources/TokenStatCore/MetricsEngine.swift",
-    "Sources/TokenStatCore/ProxyServer.swift", "Sources/TokenStatCore/Quota.swift",
-    "Sources/TokenStatCore/WindowQuota.swift", "Sources/TokenStatCore/RateWindow.swift", "Sources/TokenStatCore/StreamParser.swift",
-    "Sources/TokenStatCore/TokenHubQuota.swift", "Sources/TokenStatCore/TokenHubAXScanning.swift", "Sources/TokenStatCore/TokenHubDirectQuota.swift",
-    "Sources/TokenStatMenu/AppModel.swift", "Sources/TokenStatMenu/DashboardView.swift",
+    ".gitignore",
+    ".github/workflows/ci.yml",
+    "Package.swift",
+    "Package.resolved",
+    "README.md",
+    "LICENSE",
+    "PRIVACY.md",
+    "Sources/TokenStatCore/Configuration.swift",
+    "Sources/TokenStatCore/GatewayDiscovery.swift",
+    "Sources/TokenStatCore/HTTPDecoder.swift",
+    "Sources/TokenStatCore/LocalCodexUsageReader.swift",
+    "Sources/TokenStatCore/MetricsEngine.swift",
+    "Sources/TokenStatCore/ProxyServer.swift",
+    "Sources/TokenStatCore/Quota.swift",
+    "Sources/TokenStatCore/WindowQuota.swift",
+    "Sources/TokenStatCore/RateWindow.swift",
+    "Sources/TokenStatCore/StreamParser.swift",
+    "Sources/TokenStatCore/TokenHubQuota.swift",
+    "Sources/TokenStatCore/TokenHubAXScanning.swift",
+    "Sources/TokenStatCore/TokenHubDirectQuota.swift",
+    "Sources/TokenStatMenu/AppModel.swift",
+    "Sources/TokenStatMenu/DashboardView.swift",
     "Sources/TokenStatMenu/SettingsView.swift",
-    "Sources/TokenStatMenu/StatusBarController.swift", "Sources/TokenStatMenu/Storage.swift",
-    "Sources/TokenStatMenu/TokenStatMenuApp.swift", "Sources/TokenStatMenu/PanelStyle.swift", "Sources/TokenStatMenu/WindowQuotaCard.swift", "Sources/TokenStatMenu/TokenHubAXReader.swift", "Sources/TokenStatMenu/TokenHubQuotaCard.swift",
-    "Resources/Info.plist", "Resources/config.example.plist", "Resources/AppIcon.png", "Resources/AppIcon.icns", "TokenStatMenu.xcodeproj/project.pbxproj",
+    "Sources/TokenStatMenu/StatusBarController.swift",
+    "Sources/TokenStatMenu/Storage.swift",
+    "Sources/TokenStatMenu/TokenStatMenuApp.swift",
+    "Sources/TokenStatMenu/PanelStyle.swift",
+    "Sources/TokenStatMenu/WindowQuotaCard.swift",
+    "Sources/TokenStatMenu/TokenHubAXReader.swift",
+    "Sources/TokenStatMenu/TokenHubQuotaCard.swift",
+    "Sources/TokenStatMenu/WidgetSnapshotPublisher.swift",
+    "Sources/TokenStatWidgetShared/WidgetQuotaSnapshot.swift",
+    "Sources/TokenStatWidgetShared/WidgetSnapshotCodec.swift",
+    "Sources/TokenStatWidgetShared/WidgetSnapshotStore.swift",
+    "Sources/TokenStatWidgetExtension/TokenStatWidget.swift",
+    "Sources/TokenStatWidgetExtension/WidgetEntryView.swift",
+    "Sources/TokenStatDevWidgetShared/WidgetSnapshot.swift",
+    "Sources/TokenStatDevWidgetShared/WidgetSnapshotStore.swift",
+    "Sources/TokenStatDevWidgetShared/DevWidgetReloadGate.swift",
+    "Sources/TokenStatDevWidgetShared/DevProbeAudit.swift",
+    "Sources/TokenStatDevWidgetHost/main.swift",
+    "Sources/TokenStatDevWidgetExtension/DevWidget.swift",
+    "Tests/TokenStatWidgetSharedTests/WidgetSnapshotCodecTests.swift",
+    "Tests/TokenStatWidgetSharedTests/WidgetSnapshotStoreTests.swift",
+    "Tests/TokenStatWidgetSharedTests/WidgetPublishDecisionTests.swift",
+    "Tests/TokenStatDevWidgetSharedTests/DevWidgetProbeTests.swift",
+    "Resources/Info.plist",
+    "Resources/config.example.plist",
+    "Resources/AppIcon.png",
+    "Resources/AppIcon.icns",
+    "TokenStatMenu.xcodeproj/project.pbxproj",
     "TokenStatMenu.xcodeproj/xcshareddata/xcschemes/TokenStatMenu.xcscheme",
-    "Tests/TokenStatCoreTests/CoreChecks.swift", "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/WindowQuotaChecks.swift", "Tests/TokenStatCoreTests/LocalCodexUsageChecks.swift", "Tests/TokenStatCoreTests/DirectQuotaChecks.swift",
-    "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift", "Tests/TokenStatCoreTests/TokenHubQuotaChecks.swift", "Tests/TokenStatUITests/TokenHubQuotaStateTests.swift", "Tests/TokenStatUITests/SeasunStartupContractTests.swift", "Tests/TokenStatUITests/DashboardHistoryTests.swift",
+    "TokenStatMenu.xcodeproj/xcshareddata/xcschemes/TokenStatMenuWidget.xcscheme",
+    "TokenStatMenu.xcodeproj/xcshareddata/xcschemes/TokenStatMenuDevWidgetTest.xcscheme",
+    "Resources/WidgetExtension-Info.plist",
+    "Resources/WidgetExtension.entitlements",
+    "Resources/TokenStatMenu.entitlements",
+    "Resources/DevWidgetHost-Info.plist",
+    "Resources/DevWidgetHost.entitlements",
+    "Resources/DevWidgetExtension-Info.plist",
+    "Resources/DevWidgetExtension.entitlements",
+    "Tests/TokenStatCoreTests/CoreChecks.swift",
+    "Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift",
+    "Tests/TokenStatCoreTests/WindowQuotaChecks.swift",
+    "Tests/TokenStatCoreTests/LocalCodexUsageChecks.swift",
+    "Tests/TokenStatCoreTests/DirectQuotaChecks.swift",
+    "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift",
+    "Tests/TokenStatCoreTests/TokenHubQuotaChecks.swift",
+    "Tests/TokenStatUITests/TokenHubQuotaStateTests.swift",
+    "Tests/TokenStatUITests/SeasunStartupContractTests.swift",
+    "Tests/TokenStatUITests/DashboardHistoryTests.swift",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png",
-    "script/build_and_run.sh", "script/test.sh", "script/mock_server.py", "script/integration.py", "script/release_assets.py", "script/test_release_assets.py",
-    "script/BenchmarkMenu.swift", "script/benchmark_menu.py", "script/RenderAppIcon.swift", "script/make_app_icon.sh", "script/check_docs.py", "script/generate_xcode_project.py", "script/render_preview.py", "script/RenderPreview.swift", "script/package_source.py", "script/check_public_content.py", "script/diagnose_swift_toolchain.py", "script/run_settings_ax_check.sh", "script/test_phase2_diagnostics.py",
-    "docs/README.md", "docs/wiki/Home.md", "docs/wiki/安装与使用.md", "docs/wiki/统计口径.md",
-    "docs/wiki/常见问题.md", "docs/wiki/编译指南.md", "docs/wiki/测试指南.md", "docs/wiki/命令行参数.md",
-    "docs/wiki/CI-CD.md", "docs/wiki/贡献指南.md",
-    "docs/superpowers/specs/2026-10-18-accuracy-and-validation-optimization-design.md",
-    "docs/superpowers/plans/2026-10-18-accuracy-and-validation-optimization.md",
-    "docs/PERFORMANCE.md", "docs/DESIGN.md", "docs/IMPLEMENTATION.md", "docs/CONFIGURATION.md", "docs/VALIDATION.md", "docs/UI_TESTING.md", "docs/FULL_SOURCE.md",
+    "script/build_and_run.sh",
+    "script/test.sh",
+    "script/mock_server.py",
+    "script/integration.py",
+    "script/release_assets.py",
+    "script/test_release_assets.py",
+    "script/BenchmarkMenu.swift",
+    "script/benchmark_menu.py",
+    "script/RenderAppIcon.swift",
+    "script/make_app_icon.sh",
+    "script/check_docs.py",
+    "script/generate_xcode_project.py",
+    "script/render_preview.py",
+    "script/RenderPreview.swift",
+    "script/package_source.py",
+    "script/check_public_content.py",
+    "script/diagnose_swift_toolchain.py",
+    "script/run_settings_ax_check.sh",
+    "script/test_phase2_diagnostics.py",
+    "docs/README.md",
+    "docs/wiki/Home.md",
+    "docs/wiki/安装与使用.md",
+    "docs/wiki/统计口径.md",
+    "docs/wiki/常见问题.md",
+    "docs/wiki/编译指南.md",
+    "docs/wiki/测试指南.md",
+    "docs/wiki/命令行参数.md",
+    "docs/wiki/CI-CD.md",
+    "docs/wiki/贡献指南.md",
+    "docs/PERFORMANCE.md",
+    "docs/DESIGN.md",
+    "docs/IMPLEMENTATION.md",
+    "docs/CONFIGURATION.md",
+    "docs/VALIDATION.md",
+    "docs/UI_TESTING.md",
 ]
 
+# These paths stay local even if a future allowlist edit accidentally names them.
+LOCAL_ONLY_FILES = frozenset(
+    {
+        "docs/FULL_SOURCE.md",
+        "docs/superpowers/specs/2026-10-18-accuracy-and-validation-optimization-design.md",
+        "docs/superpowers/plans/2026-10-18-accuracy-and-validation-optimization.md",
+    }
+)
+LOCAL_ONLY_PREFIXES = (
+    "docs/superpowers/",
+    "docs/local/",
+    "governance/",
+    "reports/",
+    "artifacts/",
+    ".local/",
+)
 
-def source_document():
-    readme = (ROOT / "README.md").read_text()
-    architecture = readme.split("## 整体架构\n", 1)[1].split("## 文件与职责", 1)[0]
-    architecture = rebase_links(architecture, "README.md", "docs/FULL_SOURCE.md")
-    parts = ["# TokenStatMenu 完整源码\n\n## 项目整体架构\n", architecture, "\n## 分文件完整源码\n"]
-    languages = {".swift": "swift", ".plist": "xml", ".pbxproj": "text", ".xcscheme": "xml", ".py": "python", ".sh": "bash", ".yml": "yaml"}
-    for name in PUBLIC_FILES:
-        path = ROOT / name
-        if path.suffix not in languages:
-            continue
-        parts += [f"\n### {name}\n\n```{languages[path.suffix]}\n", path.read_text().rstrip(), "\n```\n"]
-    usage = rebase_links(readme.split("## 构建与运行\n", 1)[1], "README.md", "docs/FULL_SOURCE.md")
-    parts += ["\n## 编译与使用\n\n", usage]
-    (ROOT / "docs/FULL_SOURCE.md").write_text("".join(parts))
+
+def is_local_only(name: str) -> bool:
+    return name in LOCAL_ONLY_FILES or name.startswith(LOCAL_ONLY_PREFIXES)
+
+
+def validate_public_files(names: list[str]) -> None:
+    if len(names) != len(set(names)):
+        raise SystemExit("Duplicate publication path in allowlist")
+    denied = [name for name in names if is_local_only(name)]
+    if denied:
+        raise SystemExit("Local-only publication path rejected: " + ", ".join(denied))
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--export", type=Path, help="Copy the allowlist into a new/empty publication directory")
+    parser.add_argument(
+        "--export",
+        type=Path,
+        help="Copy the allowlist into a new/empty publication directory",
+    )
     args = parser.parse_args()
-    source_document()
+    validate_public_files(PUBLIC_FILES)
     for name in PUBLIC_FILES:
         path = ROOT / name
         if path.is_symlink() or not path.is_file():

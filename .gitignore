@@ -22,3 +22,12 @@ auth.json
 *.pfx
 *.key
 *.pem
+
+# Local-only repository workflow material is never published.
+/docs/FULL_SOURCE.md
+/docs/superpowers/
+/docs/local/
+/governance/
+/reports/
+/artifacts/
+/.local/

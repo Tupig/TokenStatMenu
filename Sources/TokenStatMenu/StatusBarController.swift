@@ -7,9 +7,18 @@ import SwiftUI
 struct StatusBarContentFactories {
     let dashboard: @MainActor (AppModel) -> NSViewController
     let tooltip: @MainActor (AppModel) -> String
+    let projectedTooltip: (@MainActor (AppModel, Date, TokenHubQuotaPresentation) -> String)?
+    init(dashboard: @escaping @MainActor (AppModel) -> NSViewController,
+         tooltip: @escaping @MainActor (AppModel) -> String,
+         projectedTooltip: (@MainActor (AppModel, Date, TokenHubQuotaPresentation) -> String)? = nil) {
+        self.dashboard = dashboard; self.tooltip = tooltip; self.projectedTooltip = projectedTooltip
+    }
     static var production: StatusBarContentFactories {
         StatusBarContentFactories(dashboard: { NSHostingController(rootView: DashboardView(model: $0)) },
-                                  tooltip: { $0.menuTooltip })
+            tooltip: { $0.menuTooltip },
+            projectedTooltip: { model, now, projection in
+                model.menuTooltip(at: now, quotaPresentation: projection)
+            })
     }
 }
 
@@ -54,26 +63,30 @@ struct StatusBarContentFactories {
         refreshTitle()
     }
     func refreshTitle() {
-        let title = model.title, color = model.alertColor
+        let now = model.tokenHubNow()
+        let projection = model.quotaPresentation(at: now)
+        let title = model.title(at: now, quotaPresentation: projection)
+        let color = model.alertColor(for: projection)
         if title != lastTitle || color != lastColor {
             lastTitle = title; lastColor = color
             item.button?.attributedTitle = NSAttributedString(string: title, attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: color
             ])
         }
-        let timeState = model.presentationTimeState
+        let timeState = model.presentationTimeState(at: now, quotaPresentation: projection)
         if tooltipNeedsRefresh || lastTooltipTimeState != timeState {
-            item.button?.toolTip = factories.tooltip(model)
+            item.button?.toolTip = factories.projectedTooltip?(model, now, projection) ?? factories.tooltip(model)
             tooltipNeedsRefresh = false
             lastTooltipTimeState = timeState
         }
-        writeDiagnosticsIfRequested()
+        writeDiagnosticsIfRequested(at: now, projection: projection)
     }
     @objc func toggle() {
         if popover.isShown { popover.performClose(nil) } else { show() }
     }
     func show() {
         guard let button = item.button else { return }
+        model.pruneHistoryBeforePanelDisplay()
         // Do not allocate SwiftUI's dashboard/layout graph for users who only
         // need the menu title. Keep it after first open so settings state lives.
         if popover.contentViewController == nil {
@@ -91,10 +104,9 @@ struct StatusBarContentFactories {
     }
     func popoverDidClose(_ notification: Notification) { model.panelVisible = false }
     /// Opt-in local diagnostic output for integration tests; contains only approved booleans and resource counts.
-    private func writeDiagnosticsIfRequested() {
-        guard let url = diagnosticsURL,
-              Date().timeIntervalSince(lastDiagnostic) >= 1 else { return }
-        lastDiagnostic = Date()
+    private func writeDiagnosticsIfRequested(at now: Date, projection: TokenHubQuotaPresentation) {
+        guard let url = diagnosticsURL, now.timeIntervalSince(lastDiagnostic) >= 1 else { return }
+        lastDiagnostic = now
         struct Report: Encodable {
             let seasunOnlyMode: Bool
             let backgroundServicesStarted: Bool
@@ -113,30 +125,26 @@ struct StatusBarContentFactories {
             let sourceStatus: String
             let backgroundServiceResources: BackgroundServiceResources
         }
-        let snapshot = model.freshTokenHubQuota(at: model.tokenHubNow())
-        func hasReset(_ value: String?) -> Bool {
-            guard let value else { return false }
-            return !value.isEmpty && value != "未知"
-        }
-        let fiveHourResetPresent = hasReset(snapshot?.fiveHour?.resetDisplay)
-        let sevenDayResetPresent = hasReset(snapshot?.sevenDay?.resetDisplay)
+        let fiveHourResetPresent = projection.fiveHourCurrent.map { !$0.resetDisplay.isEmpty && $0.resetDisplay != "未知" } ?? false
+        let sevenDayResetPresent = projection.sevenDayCurrent.map { !$0.resetDisplay.isEmpty && $0.resetDisplay != "未知" } ?? false
         let resetTimePresent = fiveHourResetPresent || sevenDayResetPresent
         let report = Report(
             seasunOnlyMode: model.isSeasunOnly,
             backgroundServicesStarted: model.backgroundServicesStarted,
             statusItemVisible: item.isVisible,
             permissionPromptRequested: model.permissionPromptRequested,
-            quotaPresent: snapshot != nil || model.quota != nil || model.fiveHourQuota != nil || model.sevenDayQuota != nil,
-            directQuotaPresent: model.tokenHubQuotaIsDirect && snapshot != nil,
+            quotaPresent: projection.fiveHourCurrent != nil || projection.sevenDayCurrent != nil || projection.monthlyCurrent != nil
+                || model.quota != nil || model.fiveHourQuota != nil || model.sevenDayQuota != nil,
+            directQuotaPresent: model.tokenHubQuotaIsDirect && projection.snapshotFresh,
             directQuotaStatus: model.tokenHubQuotaStatusText,
-            fiveHourPresent: snapshot?.fiveHour != nil,
-            sevenDayPresent: snapshot?.sevenDay != nil,
+            fiveHourPresent: projection.fiveHourCurrent != nil,
+            sevenDayPresent: projection.sevenDayCurrent != nil,
             fiveHourResetPresent: fiveHourResetPresent,
             sevenDayResetPresent: sevenDayResetPresent,
             resetTimePresent: resetTimePresent,
-            monthlyUsagePresent: snapshot?.monthly != nil || model.quota?.used != nil,
+            monthlyUsagePresent: projection.monthlyCurrent != nil || model.quota?.used != nil,
             liveTokenSpeedPresent: model.config.dataSource == "localCodex"
-                ? model.freshLocalLiveTurn != nil : model.stats.active > 0,
+                ? model.freshLocalLiveTurn(at: now) != nil : model.stats.active > 0,
             sourceStatus: model.sourceStatus,
             backgroundServiceResources: model.backgroundServiceResources)
         if let data = try? JSONEncoder().encode(report) {

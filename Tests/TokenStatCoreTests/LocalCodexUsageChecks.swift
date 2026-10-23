@@ -4,7 +4,11 @@ import Foundation
 
 extension CoreChecks {
     static func localCodexUsageChecks() throws {
+#if TOKENSTAT_BP38_C01
+        try bp38C01LocalRefreshChecks()
+#endif
         let now = Date(timeIntervalSince1970: 1_797_000_000)
+        try bp39D01TypedChecks(now: now)
 
         // Seasun production mode must fail closed when the active Codex route
         // cannot be tied to Token Hub.  The legacy no-context scan below is
@@ -116,8 +120,9 @@ extension CoreChecks {
         let reflectedFields = Set(Mirror(reflecting: aggregate).children.compactMap(\.label))
         check(reflectedFields == Set(["input", "output", "total", "sessionCount", "filesScanned",
             "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn", "liveTurn", "knownThreadCount",
-            "unknownThreadCount", "unidentifiedFileCount", "subagentCount", "forkCount"]),
-            "local Codex snapshot reflection exposes only the bounded metadata fields")
+            "unknownThreadCount", "unidentifiedFileCount", "subagentCount", "forkCount", "readAt", "details",
+            "cacheCoverage", "detailLimited", "quotaDate"]),
+            "DM-A06 local Codex snapshot reflection exposes only the bounded metadata plus four DM-A fields")
 
         let exactZeroRoot = try fixtureDirectory("metadata-backed-exact-zero")
         try writeSession(in: exactZeroRoot, uuid: "12121212-1212-4212-8212-121212121213",
@@ -1371,6 +1376,55 @@ extension CoreChecks {
         check(defaultLocalDirectory.standardizedFileURL.path == syntheticHome.appendingPathComponent(".codex/sessions").standardizedFileURL.path
             && overrideLocalDirectory.standardizedFileURL.path == syntheticCodex.appendingPathComponent("sessions").standardizedFileURL.path,
             "local source resolves only the synthetic home or explicit absolute CODEX_HOME sessions path")
+        let archiveRoot = try fixtureDirectory("archived-sibling")
+        let active = archiveRoot.appendingPathComponent("sessions", isDirectory: true)
+        let archived = archiveRoot.appendingPathComponent("archived_sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: active, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: archived, withIntermediateDirectories: true)
+        let activeID = "41414141-4141-4141-8141-414141414141"
+        let archivedID = "42424242-4242-4242-8242-424242424242"
+        try writeSession(in: active, uuid: activeID, events: [tokenEvent(at: now, input: 3, output: 4)], modified: now)
+        try writeSession(in: archived, uuid: archivedID, events: [tokenEvent(at: now, input: 5, output: 6)], modified: now)
+        let combined = try LocalCodexUsageReader.scanCodexHome(sessions: active, now: now)
+        check(combined.input == 8 && combined.output == 10 && combined.knownThreadCount == 2,
+              "archived sibling sessions contribute to the local total without replacing active files")
+        let activeOnly = try LocalCodexUsageReader.scan(directory: active, now: now)
+        check(activeOnly.input == 3 && activeOnly.knownThreadCount == 1,
+              "scanning the active directory alone does not invent archived usage")
+        let sameUsageID = "43434343-4343-4343-8343-434343434343"
+        try writeSession(in: archived, uuid: sameUsageID, events: [tokenEvent(at: now, input: 3, output: 4)], modified: now)
+        let equalTotals = try LocalCodexUsageReader.scanCodexHome(sessions: active, now: now)
+        check(equalTotals.input == 11 && equalTotals.knownThreadCount == 3
+            && equalTotals.details.count == 3,
+              "equal token totals in different archived threads are not collapsed")
+        // Codex may hard-link a rollout into the archive before removing it
+        // from the active directory. Both paths then name one physical file
+        // and must contribute one total, not two.
+        let linkedID = "44444444-4444-4444-8444-444444444444"
+        try writeSession(in: active, uuid: linkedID, events: [tokenEvent(at: now, input: 7, output: 2)], modified: now)
+        try FileManager.default.linkItem(at: sessionURL(in: active, uuid: linkedID),
+                                         to: sessionURL(in: archived, uuid: linkedID))
+        let hardLinked = try LocalCodexUsageReader.scanCodexHome(sessions: active, now: now)
+        check(hardLinked.input == 18 && hardLinked.output == 16 && hardLinked.knownThreadCount == 4
+            && hardLinked.details.count == 4,
+              "a rollout hard-linked into the archive is one physical history and is counted once")
+        let sharedCache = LocalCodexUsageReader.Cache()
+        let warm = try LocalCodexUsageReader.scanCodexHome(sessions: active, now: now, cache: sharedCache)
+        let hardLinkedOnce = try LocalCodexUsageReader.scanCodexHome(sessions: active, now: now, cache: sharedCache)
+        check(warm.input == 18 && hardLinkedOnce.input == 18 && hardLinkedOnce.output == 16
+            && hardLinkedOnce.details.count == 4,
+              "cached scans keep the sibling hard-link exclusion stable")
+        // A *copy* (distinct inode, same thread identity) in the archive must
+        // not double-count either: it is one logical history under two paths.
+        let copiedID = "55555555-5555-5555-8555-555555555555"
+        try writeSession(in: active, uuid: copiedID, events: [tokenEvent(at: now, input: 11, output: 1)], modified: now)
+        try FileManager.default.copyItem(at: sessionURL(in: active, uuid: copiedID),
+                                         to: sessionURL(in: archived, uuid: copiedID))
+        let copied = try LocalCodexUsageReader.scanCodexHome(sessions: active, now: now)
+        check(copied.input == 29 && copied.output == 17 && copied.knownThreadCount == 5
+            && copied.details.count == 5,
+              "a rollout copied into the archive is one logical thread and is counted once")
+        try? FileManager.default.removeItem(at: archiveRoot)
         let legacyPlist: [String: Any] = ["endpoint": "https://gateway.example/v1/chat/completions",
             "usageURL": "https://gateway.example/usage", "port": 18888]
         let legacyData = try PropertyListSerialization.data(fromPropertyList: legacyPlist, format: .xml, options: 0)
@@ -1453,11 +1507,13 @@ extension CoreChecks {
         _ = try LocalCodexUsageReader.scan(directory: futureRoot, now: now, cache: futureCache)
         let caughtUp = try LocalCodexUsageReader.scan(directory: futureRoot, now: now.addingTimeInterval(2), cache: futureCache)
         let caughtUpCold = try LocalCodexUsageReader.scan(directory: futureRoot, now: now.addingTimeInterval(2))
-        check(caughtUp == caughtUpCold && caughtUp.hasCompleteAccounting && caughtUp.liveTurn != nil,
+        check(bp39SemanticProjection(caughtUp) == bp39SemanticProjection(caughtUpCold)
+            && caughtUp.hasCompleteAccounting && caughtUp.liveTurn != nil,
             "unchanged cached file is rejudged when a future counter becomes current")
         let rewound = try LocalCodexUsageReader.scan(directory: futureRoot, now: now, cache: futureCache)
         let rewoundCold = try LocalCodexUsageReader.scan(directory: futureRoot, now: now)
-        check(rewound == rewoundCold && rewound.liveTurn == nil && !rewound.hasCompleteAccounting,
+        check(bp39SemanticProjection(rewound) == bp39SemanticProjection(rewoundCold)
+            && rewound.liveTurn == nil && !rewound.hasCompleteAccounting,
             "clock rollback cannot reuse counters or live estimates that are now in the future")
 
         let aggregateRoot = try fixtureDirectory("live-integrity-aggregate-expiry")
@@ -1600,4 +1656,853 @@ extension CoreChecks {
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.string(from: date)
     }
+
+    /// DM-A typed checks are intentionally behind a source flag.  The first
+    /// D39-01 run exercises the reflection contract on the pre-implementation
+    /// API; the flag is enabled only after the coder adds the frozen r4 API.
+    private enum BP39CacheLiteral {
+        case missing
+        case null
+        case raw(String)
+    }
+
+    private static func bp39TokenEvent(at timestamp: Date, input: Int, output: Int,
+                                       total: Int? = nil, cache: BP39CacheLiteral = .missing) -> Data {
+        let total = total ?? input + output
+        let cacheField: String
+        switch cache {
+        case .missing: cacheField = ""
+        case .null: cacheField = ",\"cached_input_tokens\":null"
+        case .raw(let literal): cacheField = ",\"cached_input_tokens\":\(literal)"
+        }
+        return Data("{\"timestamp\":\"\(iso(timestamp))\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":\(input),\"output_tokens\":\(output),\"total_tokens\":\(total)\(cacheField)}}}}".utf8)
+    }
+
+    private static func bp39Detail(_ snapshot: LocalCodexSnapshot,
+                                   input: Int? = nil,
+                                   output: Int? = nil) -> LocalCodexThreadDetail? {
+        snapshot.details.first { detail in
+            (input == nil || detail.usage.input == input) &&
+            (output == nil || detail.usage.output == output)
+        }
+    }
+
+    private static func bp39CacheState(_ usage: LocalCodexUsageDetail) -> LocalCacheInput {
+        usage.cache
+    }
+
+    /// Separate Cache lifecycles do not share opaque-key identity. This
+    /// comparison-only projection preserves every value except scoped keys.
+    private static func bp39SemanticProjection(_ snapshot: LocalCodexSnapshot) -> LocalCodexSnapshot {
+        let details: [LocalCodexThreadDetail] = snapshot.details.map { thread in
+            let turns: [LocalCodexTurnDetail] = thread.turns.map { turn in
+                LocalCodexTurnDetail(opaqueKey: 0, ordinal: turn.ordinal, usage: turn.usage,
+                                    durationSeconds: turn.durationSeconds, completedAt: turn.completedAt)
+            }
+            return LocalCodexThreadDetail(opaqueKey: 0, ordinal: thread.ordinal, kind: thread.kind,
+                                          usage: thread.usage, turns: turns)
+        }
+        return LocalCodexSnapshot(input: snapshot.input, output: snapshot.output, total: snapshot.total,
+            sessionCount: snapshot.sessionCount, filesScanned: snapshot.filesScanned,
+            isLimited: snapshot.isLimited, latestEventAt: snapshot.latestEventAt,
+            fiveHour: snapshot.fiveHour, sevenDay: snapshot.sevenDay,
+            knownThreadCount: snapshot.knownThreadCount, unknownThreadCount: snapshot.unknownThreadCount,
+            unidentifiedFileCount: snapshot.unidentifiedFileCount, subagentCount: snapshot.subagentCount,
+            forkCount: snapshot.forkCount, lastTurn: snapshot.lastTurn, liveTurn: snapshot.liveTurn,
+            readAt: snapshot.readAt, details: details, cacheCoverage: snapshot.cacheCoverage,
+            detailLimited: snapshot.detailLimited)
+    }
+
+    private static func bp39AssertWarmScan(_ root: URL, now: Date,
+                                           cache: LocalCodexUsageReader.Cache,
+                                           cold: LocalCodexSnapshot,
+                                           label: String,
+                                           routeContext: LocalCodexRouteContext? = nil) throws {
+        let warm = try LocalCodexUsageReader.scan(directory: root, now: now, cache: cache,
+                                                   routeContext: routeContext)
+        check(warm == cold, "\(label) warm scan preserves base/detail/cache state and coverage")
+    }
+
+    private static func bp39CompleteTurnEvents(now: Date, turnCount: Int,
+                                                inputBase: Int = 0,
+                                                outputBase: Int = 0,
+                                                cacheBase: Int = 0,
+                                                varyingOutput: Bool = false,
+                                                timeOffset: TimeInterval = 0) -> [Data] {
+        let origin = now.addingTimeInterval(-Double(turnCount * 4 + 4) + timeOffset)
+        var input = inputBase, output = outputBase, cache = cacheBase
+        var events: [Data] = [bp39TokenEvent(at: origin, input: input, output: output,
+                                              cache: .raw(String(cache)))]
+        for index in 0..<turnCount {
+            let start = origin.addingTimeInterval(Double(index * 4 + 1))
+            let token = start.addingTimeInterval(1)
+            let complete = start.addingTimeInterval(2)
+            input += 10
+            output += varyingOutput ? index + 1 : 20
+            cache += 5
+            events.append(try! turnBoundary(at: start, type: "task_started", id: "bp39-turn-\(index)"))
+            events.append(bp39TokenEvent(at: token, input: input, output: output,
+                                         cache: .raw(String(cache))))
+            events.append(try! turnBoundary(at: complete, type: "task_complete",
+                                             id: "bp39-turn-\(index)", durationMS: 1000))
+        }
+        return events
+    }
+
+    private static func bp39D01TypedChecks(now: Date) throws {
+        // DM-A01: explicit zero, inclusive input, null/missing/invalid and no
+        // stale-cache fallback all preserve independently valid base totals.
+        let typeRoot = try fixtureDirectory("bp39-a01-types")
+        defer { try? FileManager.default.removeItem(at: typeRoot.deletingLastPathComponent()) }
+        let validID = "a0010001-0001-4001-8001-000000000001"
+        let zeroID = "a0010001-0001-4001-8001-000000000002"
+        try writeSession(in: typeRoot, uuid: validID, events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-2), input: 100, output: 20, total: 120,
+                           cache: .raw("35"))], modified: now.addingTimeInterval(-1))
+        try writeSession(in: typeRoot, uuid: zeroID, events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 0, output: 0, total: 0,
+                           cache: .raw("0"))], modified: now)
+        let coldCache = LocalCodexUsageReader.Cache()
+        let typed = try LocalCodexUsageReader.scan(directory: typeRoot, now: now, cache: coldCache)
+        check(typed.input == 100 && typed.output == 20 && typed.total == 120,
+              "DM-A01 valid cached input retains inclusive base accounting")
+        check(typed.cacheCoverage.state == .complete && typed.cacheCoverage.baseRows == 2
+            && typed.cacheCoverage.cacheKnownRows == 2 && typed.cacheCoverage.cacheMissingRows == 0
+            && typed.cacheCoverage.cacheInvalidRows == 0 && typed.cacheCoverage.cachedInputTokens == 35
+            && typed.cacheCoverage.uncachedInputTokens == 65
+            && typed.cacheCoverage.hitRate.map { abs($0 - 0.35) < 0.000_001 } == true,
+              "DM-A01 coverage sums C/I and derives U without double-counting")
+        if let valid = bp39Detail(typed, input: 100), let zero = bp39Detail(typed, input: 0) {
+            if case .value(35) = bp39CacheState(valid.usage) {
+                check(valid.usage.uncachedInput == 65, "DM-A01 valid row derives uncached input")
+            } else { check(false, "DM-A01 valid row has value(35) cache state") }
+            if case .value(0) = bp39CacheState(zero.usage) {
+                check(zero.usage.uncachedInput == 0, "DM-A01 explicit zero is known and derives U=0")
+            } else { check(false, "DM-A01 explicit zero is not missing") }
+        } else { check(false, "DM-A01 keeps both known thread detail rows") }
+        try bp39AssertWarmScan(typeRoot, now: now, cache: coldCache, cold: typed,
+                               label: "DM-A01 valid cache coverage")
+        check(coldCache.diagnostics.cacheHits == 2 && coldCache.diagnostics.bytesRead == 0,
+              "DM-A01 cold and warm scans keep file-cache reuse separate from model cache")
+
+        let invalidCases: [(String, BP39CacheLiteral, LocalCacheInput, LocalCacheAggregateState)] = [
+            ("missing", .missing, .notReported, .missing),
+            ("null", .null, .notReported, .missing),
+            ("bool", .raw("true"), .invalid, .invalid),
+            ("fraction", .raw("35.5"), .invalid, .invalid),
+            ("negative", .raw("-1"), .invalid, .invalid),
+            ("overflow", .raw("9223372036854775808"), .invalid, .invalid),
+            ("greater", .raw("101"), .invalid, .invalid)
+        ]
+        for (label, literal, expectedRow, expectedAggregate) in invalidCases {
+            let root = try fixtureDirectory("bp39-a01-\(label)")
+            let cache = LocalCodexUsageReader.Cache()
+            try writeSession(in: root, uuid: "a0010001-0001-4001-8001-\(String(format: "%012d", invalidCases.firstIndex { $0.0 == label }! + 10))",
+                events: [bp39TokenEvent(at: now, input: 100, output: 20, total: 120, cache: literal)], modified: now)
+            let snapshot = try LocalCodexUsageReader.scan(directory: root, now: now, cache: cache)
+            let detail = bp39Detail(snapshot, input: 100)
+            check(snapshot.input == 100 && snapshot.output == 20 && snapshot.total == 120,
+                  "DM-A01 (label) retains valid base counters")
+            check(detail.map { bp39CacheState($0.usage) == expectedRow } == true,
+                  "DM-A01 (label) maps to the exact row cache state")
+            check(snapshot.cacheCoverage.state == expectedAggregate
+                && snapshot.cacheCoverage.cachedInputTokens == nil
+                && snapshot.cacheCoverage.uncachedInputTokens == nil,
+                  "DM-A01 (label) does not treat unknown cache as zero")
+            let warm = try LocalCodexUsageReader.scan(directory: root, now: now, cache: cache)
+            check(warm.input == snapshot.input && warm.output == snapshot.output && warm.total == snapshot.total
+                && warm.details == snapshot.details && warm.cacheCoverage == snapshot.cacheCoverage
+                && cache.diagnostics.cacheHits == 1 && cache.diagnostics.bytesRead == 0,
+                  "DM-A01 (label) warm scan preserves all metrics, not only a cache-hit counter")
+            try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
+        }
+        let staleRoot = try fixtureDirectory("bp39-a01-no-forward-fill")
+        defer { try? FileManager.default.removeItem(at: staleRoot.deletingLastPathComponent()) }
+        try writeSession(in: staleRoot, uuid: "a0010001-0001-4001-8001-000000000099", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-2), input: 100, output: 20, total: 120, cache: .raw("35")),
+            bp39TokenEvent(at: now, input: 110, output: 25, total: 135, cache: .missing)], modified: now)
+        let staleCache = LocalCodexUsageReader.Cache()
+        let stale = try LocalCodexUsageReader.scan(directory: staleRoot, now: now, cache: staleCache)
+        check(stale.cacheCoverage.state == .missing && stale.cacheCoverage.cachedInputTokens == nil
+            && bp39Detail(stale, input: 110).map { bp39CacheState($0.usage) == .notReported } == true,
+              "DM-A01 missing latest cache never forward-fills an earlier value")
+        try bp39AssertWarmScan(staleRoot, now: now, cache: staleCache, cold: stale,
+                               label: "DM-A01 missing latest cache")
+
+        // DM-A02: cumulative cache chains are independently validated and only
+        // mixed known/unknown aggregate coverage becomes partial.
+        let chainRoot = try fixtureDirectory("bp39-a02-chains")
+        defer { try? FileManager.default.removeItem(at: chainRoot.deletingLastPathComponent()) }
+        try writeSession(in: chainRoot, uuid: "a0020002-0002-4002-8002-000000000001", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 20, cache: .raw("40")),
+            bp39TokenEvent(at: now.addingTimeInterval(-2), input: 120, output: 30, cache: .raw("50")),
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 120, output: 30, cache: .raw("50"))], modified: now)
+        let chainCache = LocalCodexUsageReader.Cache()
+        let chain = try LocalCodexUsageReader.scan(directory: chainRoot, now: now, cache: chainCache)
+        check(chain.cacheCoverage.state == .complete && chain.cacheCoverage.cachedInputTokens == 50
+            && bp39Detail(chain, input: 120).map { bp39CacheState($0.usage) == .value(50) } == true,
+              "DM-A02 monotonic and equal cache increments end at the final cumulative value")
+        try bp39AssertWarmScan(chainRoot, now: now, cache: chainCache, cold: chain,
+                               label: "DM-A02 monotonic chain")
+        check(chainCache.diagnostics.cacheHits == 1 && chainCache.diagnostics.bytesRead == 0,
+              "DM-A02 warm scan reuses complete chain file summaries")
+        let missingThenInvalidRoot = try fixtureDirectory("bp39-a02-missing-invalid-priority")
+        defer { try? FileManager.default.removeItem(at: missingThenInvalidRoot.deletingLastPathComponent()) }
+        try writeSession(in: missingThenInvalidRoot, uuid: "a0020002-0002-4002-8002-000000000030", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 20, cache: .raw("40")),
+            bp39TokenEvent(at: now.addingTimeInterval(-2), input: 110, output: 25, cache: .missing),
+            bp39TokenEvent(at: now, input: 120, output: 30, cache: .raw("true"))], modified: now)
+        let missingThenInvalidCache = LocalCodexUsageReader.Cache()
+        let missingThenInvalid = try LocalCodexUsageReader.scan(directory: missingThenInvalidRoot, now: now,
+                                                                 cache: missingThenInvalidCache)
+        check(missingThenInvalid.input == 120 && missingThenInvalid.output == 30
+            && missingThenInvalid.cacheCoverage.state == .invalid
+            && bp39Detail(missingThenInvalid, input: 120).map { bp39CacheState($0.usage) == .invalid } == true,
+              "DM-A02 an invalid cache later in a chain takes priority over an earlier missing value")
+        try bp39AssertWarmScan(missingThenInvalidRoot, now: now, cache: missingThenInvalidCache,
+                               cold: missingThenInvalid, label: "DM-A02 missing then invalid")
+        let missingOnlyRoot = try fixtureDirectory("bp39-a02-mid-chain-missing")
+        defer { try? FileManager.default.removeItem(at: missingOnlyRoot.deletingLastPathComponent()) }
+        try writeSession(in: missingOnlyRoot, uuid: "a0020002-0002-4002-8002-000000000031", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-2), input: 100, output: 20, cache: .raw("40")),
+            bp39TokenEvent(at: now, input: 110, output: 25, cache: .missing)], modified: now)
+        let missingOnlyCache = LocalCodexUsageReader.Cache()
+        let missingOnly = try LocalCodexUsageReader.scan(directory: missingOnlyRoot, now: now,
+                                                          cache: missingOnlyCache)
+        check(missingOnly.cacheCoverage.state == .missing
+            && bp39Detail(missingOnly, input: 110).map { bp39CacheState($0.usage) == .notReported } == true,
+              "DM-A02 a mid-chain missing cache stays notReported when no invalid value exists")
+        try bp39AssertWarmScan(missingOnlyRoot, now: now, cache: missingOnlyCache,
+                               cold: missingOnly, label: "DM-A02 mid-chain missing")
+        for (label, records) in [
+            ("rollback", [
+                bp39TokenEvent(at: now.addingTimeInterval(-2), input: 100, output: 20, cache: .raw("40")),
+                bp39TokenEvent(at: now, input: 110, output: 25, cache: .raw("30"))]),
+            ("delta-too-large", [
+                bp39TokenEvent(at: now.addingTimeInterval(-2), input: 100, output: 20, cache: .raw("40")),
+                bp39TokenEvent(at: now, input: 110, output: 25, cache: .raw("60"))])
+        ] {
+            let root = try fixtureDirectory("bp39-a02-\(label)")
+            defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+            try writeSession(in: root, uuid: "a0020002-0002-4002-8002-\(label == "rollback" ? "000000000010" : "000000000011")",
+                events: records, modified: now)
+            let cache = LocalCodexUsageReader.Cache()
+            let result = try LocalCodexUsageReader.scan(directory: root, now: now, cache: cache)
+            check(result.input == 110 && result.output == 25 && result.cacheCoverage.state == .invalid
+                && bp39Detail(result, input: 110).map { bp39CacheState($0.usage) == .invalid } == true,
+                  "DM-A02 \(label) invalidates only the cache chain and preserves base counters")
+            try bp39AssertWarmScan(root, now: now, cache: cache, cold: result,
+                                   label: "DM-A02 \(label)")
+        }
+        let partialRoot = try fixtureDirectory("bp39-a02-partial")
+        defer { try? FileManager.default.removeItem(at: partialRoot.deletingLastPathComponent()) }
+        try writeSession(in: partialRoot, uuid: "a0020002-0002-4002-8002-000000000020",
+            events: [bp39TokenEvent(at: now.addingTimeInterval(-1), input: 100, output: 20, cache: .raw("90"))], modified: now.addingTimeInterval(-1))
+        try writeSession(in: partialRoot, uuid: "a0020002-0002-4002-8002-000000000021",
+            events: [bp39TokenEvent(at: now, input: 900, output: 30, cache: .missing)], modified: now)
+        let partialCache = LocalCodexUsageReader.Cache()
+        let partial = try LocalCodexUsageReader.scan(directory: partialRoot, now: now, cache: partialCache)
+        check(partial.input == 1000 && partial.cacheCoverage.state == .partial
+            && partial.cacheCoverage.matchedInputTokens == 100
+            && partial.cacheCoverage.matchedCachedInputTokens == 90
+            && partial.cacheCoverage.cachedInputTokens == nil,
+              "DM-A02 aggregate partial coverage exposes only its matched C/I subset")
+        try bp39AssertWarmScan(partialRoot, now: now, cache: partialCache, cold: partial,
+                               label: "DM-A02 partial aggregate")
+
+        // DM-A03: fork contribution and complete-turn cache baselines are
+        // separate; old R12 input rollback compatibility remains explicit.
+        let forkRoot = try fixtureDirectory("bp39-a03-fork")
+        defer { try? FileManager.default.removeItem(at: forkRoot.deletingLastPathComponent()) }
+        let parentID = "a0030003-0003-4003-8003-000000000001"
+        let childID = "a0030003-0003-4003-8003-000000000002"
+        try writeSession(in: forkRoot, uuid: parentID, events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-5), input: 100, output: 20, total: 120, cache: .raw("40"))], modified: now.addingTimeInterval(-4))
+        let source: [String: Any] = ["subagent": ["thread_spawn": ["parent_thread_id": parentID, "depth": 1]]]
+        try writeSession(in: forkRoot, uuid: childID, events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-4), input: 100, output: 20, total: 120, cache: .raw("40")),
+            ordinaryEvent(at: now.addingTimeInterval(-3), type: "user_message"),
+            bp39TokenEvent(at: now.addingTimeInterval(-2), input: 120, output: 30, total: 150, cache: .raw("50")),
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 160, output: 50, total: 210, cache: .raw("70"))], modified: now,
+            metadataID: childID, metadataSource: source,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 3])
+        let forkCache = LocalCodexUsageReader.Cache()
+        let fork = try LocalCodexUsageReader.scan(directory: forkRoot, now: now, cache: forkCache)
+        check(fork.input == 160 && fork.output == 50 && fork.total == 210
+            && fork.cacheCoverage.cachedInputTokens == 70
+            && bp39Detail(fork, input: 60).map { $0.usage.output == 30 && bp39CacheState($0.usage) == .value(30) } == true,
+              "DM-A03 fork contribution subtracts one cache baseline and does not subtract parent twice")
+        try bp39AssertWarmScan(forkRoot, now: now, cache: forkCache, cold: fork,
+                               label: "DM-A03 fork contribution")
+
+        let forkMissingCacheRoot = try fixtureDirectory("bp39-a03-fork-missing-cache-baseline")
+        defer { try? FileManager.default.removeItem(at: forkMissingCacheRoot.deletingLastPathComponent()) }
+        let missingChildID = "a0030003-0003-4003-8003-000000000006"
+        try writeSession(in: forkMissingCacheRoot, uuid: parentID, events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 20, total: 120,
+                           cache: .raw("40"))], modified: now.addingTimeInterval(-3))
+        try writeSession(in: forkMissingCacheRoot, uuid: missingChildID, events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-4), input: 100, output: 20, total: 120,
+                           cache: .missing),
+            try turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "bp39-fork-missing-cache"),
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 160, output: 50, total: 210,
+                           cache: .raw("70"))], modified: now,
+            metadataID: missingChildID, metadataSource: source,
+            metadataFields: ["parent_thread_id": parentID, "subagent_history_start_ordinal": 3])
+        let forkMissingCacheCache = LocalCodexUsageReader.Cache()
+        let forkMissingCache = try LocalCodexUsageReader.scan(directory: forkMissingCacheRoot, now: now,
+                                                               cache: forkMissingCacheCache)
+        check(bp39Detail(forkMissingCache, input: 60).map { bp39CacheState($0.usage) == .notReported } == true
+            && forkMissingCache.cacheCoverage.cachedInputTokens == nil
+            && forkMissingCache.input == 160 && forkMissingCache.output == 50
+            && forkMissingCache.total == 210,
+              "DM-A03 missing fork cache baseline stays unknown and never substitutes zero")
+        try bp39AssertWarmScan(forkMissingCacheRoot, now: now, cache: forkMissingCacheCache,
+                               cold: forkMissingCache, label: "DM-A03 missing fork cache baseline")
+
+        let turnRoot = try fixtureDirectory("bp39-a03-turn-baseline")
+        defer { try? FileManager.default.removeItem(at: turnRoot.deletingLastPathComponent()) }
+        try writeSession(in: turnRoot, uuid: "a0030003-0003-4003-8003-000000000003", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 20, total: 120, cache: .raw("40")),
+            try turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "bp39-turn-baseline"),
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 160, output: 50, total: 210, cache: .raw("70")),
+            try turnBoundary(at: now, type: "task_complete", id: "bp39-turn-baseline", durationMS: 1000)], modified: now)
+        let turnCache = LocalCodexUsageReader.Cache()
+        let turnBaseline = try LocalCodexUsageReader.scan(directory: turnRoot, now: now, cache: turnCache)
+        check(turnBaseline.lastTurn?.outputTokens == 30
+            && turnBaseline.details.flatMap { $0.turns }.first.map { $0.usage.input == 60 && bp39CacheState($0.usage) == .value(30) } == true,
+              "DM-A03 complete-turn cache uses its own baseline and shares lastTurn projection")
+        try bp39AssertWarmScan(turnRoot, now: now, cache: turnCache, cold: turnBaseline,
+                               label: "DM-A03 complete-turn baseline")
+
+        let turnInChainMissingRoot = try fixtureDirectory("bp39-a03-turn-in-chain-missing")
+        defer { try? FileManager.default.removeItem(at: turnInChainMissingRoot.deletingLastPathComponent()) }
+        try writeSession(in: turnInChainMissingRoot, uuid: "a0030003-0003-4003-8003-000000000009", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-4), input: 100, output: 20, total: 120,
+                           cache: .raw("40")),
+            try turnBoundary(at: now.addingTimeInterval(-3), type: "task_started", id: "bp39-turn-missing-cache"),
+            bp39TokenEvent(at: now.addingTimeInterval(-2), input: 120, output: 30, total: 150,
+                           cache: .missing),
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 160, output: 50, total: 210,
+                           cache: .raw("70")),
+            try turnBoundary(at: now, type: "task_complete", id: "bp39-turn-missing-cache", durationMS: 1000)], modified: now)
+        let turnInChainMissingStore = LocalCodexUsageReader.Cache()
+        let turnInChainMissing = try LocalCodexUsageReader.scan(directory: turnInChainMissingRoot, now: now,
+                                                                cache: turnInChainMissingStore)
+        let turnInChainMissingDetail = bp39Detail(turnInChainMissing, input: 160)
+        check(turnInChainMissingDetail.map { bp39CacheState($0.usage) == .notReported
+                && $0.usage.input == 160 && $0.usage.output == 50 && $0.usage.total == 210 } == true
+            && turnInChainMissingDetail?.turns.first.map { $0.usage.input == 60
+                && $0.usage.output == 30 && $0.usage.total == 90
+                && bp39CacheState($0.usage) == .notReported } == true,
+              "DM-A03 an in-turn missing cache marks both the root chain and turn unknown while preserving base totals")
+        try bp39AssertWarmScan(turnInChainMissingRoot, now: now, cache: turnInChainMissingStore,
+                               cold: turnInChainMissing, label: "DM-A03 in-turn missing cache")
+
+        let rootMissingTurnKnownRoot = try fixtureDirectory("bp39-a03-root-missing-turn-known-cache")
+        defer { try? FileManager.default.removeItem(at: rootMissingTurnKnownRoot.deletingLastPathComponent()) }
+        try writeSession(in: rootMissingTurnKnownRoot, uuid: "a0030003-0003-4003-8003-000000000010", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-4), input: 80, output: 10, total: 90,
+                           cache: .missing),
+            bp39TokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 20, total: 120,
+                           cache: .raw("40")),
+            try turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "bp39-root-missing-turn-known"),
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 160, output: 50, total: 210,
+                           cache: .raw("70")),
+            try turnBoundary(at: now, type: "task_complete", id: "bp39-root-missing-turn-known", durationMS: 1000)], modified: now)
+        let rootMissingTurnKnownStore = LocalCodexUsageReader.Cache()
+        let rootMissingTurnKnown = try LocalCodexUsageReader.scan(directory: rootMissingTurnKnownRoot, now: now,
+                                                                   cache: rootMissingTurnKnownStore)
+        let rootMissingTurnKnownDetail = bp39Detail(rootMissingTurnKnown, input: 160)
+        check(rootMissingTurnKnownDetail.map { bp39CacheState($0.usage) == .notReported } == true
+            && rootMissingTurnKnownDetail?.turns.first.map { $0.usage.input == 60
+                && $0.usage.output == 30 && $0.usage.total == 90
+                && bp39CacheState($0.usage) == .value(30) } == true,
+              "DM-A03 an early root cache gap does not poison a later complete turn cache baseline")
+        try bp39AssertWarmScan(rootMissingTurnKnownRoot, now: now, cache: rootMissingTurnKnownStore,
+                               cold: rootMissingTurnKnown, label: "DM-A03 root missing with known turn")
+
+        let turnBaselineMissingRoot = try fixtureDirectory("bp39-a03-turn-baseline-missing")
+        defer { try? FileManager.default.removeItem(at: turnBaselineMissingRoot.deletingLastPathComponent()) }
+        try writeSession(in: turnBaselineMissingRoot, uuid: "a0030003-0003-4003-8003-000000000011", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-4), input: 80, output: 10, total: 90,
+                           cache: .raw("40")),
+            bp39TokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 20, total: 120,
+                           cache: .missing),
+            try turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "bp39-turn-baseline-missing"),
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 160, output: 50, total: 210,
+                           cache: .raw("70")),
+            try turnBoundary(at: now, type: "task_complete", id: "bp39-turn-baseline-missing", durationMS: 1000)], modified: now)
+        let turnBaselineMissingStore = LocalCodexUsageReader.Cache()
+        let turnBaselineMissing = try LocalCodexUsageReader.scan(directory: turnBaselineMissingRoot, now: now,
+                                                                   cache: turnBaselineMissingStore)
+        let turnBaselineMissingDetail = bp39Detail(turnBaselineMissing, input: 160)
+        check(turnBaselineMissingDetail.map { bp39CacheState($0.usage) == .notReported } == true
+            && turnBaselineMissingDetail?.turns.first.map { $0.usage.input == 60
+                && $0.usage.output == 30 && $0.usage.total == 90
+                && $0.durationSeconds == 1 && bp39CacheState($0.usage) == .notReported } == true
+            && turnBaselineMissing.lastTurn?.outputTokens == 30,
+              "DM-A03 a missing turn baseline keeps legal input/output/elapsed evidence while cache stays unknown")
+        try bp39AssertWarmScan(turnBaselineMissingRoot, now: now, cache: turnBaselineMissingStore,
+                               cold: turnBaselineMissing, label: "DM-A03 missing turn baseline")
+
+        let rollbackRoot = try fixtureDirectory("bp39-a03-input-rollback")
+        defer { try? FileManager.default.removeItem(at: rollbackRoot.deletingLastPathComponent()) }
+        try writeSession(in: rollbackRoot, uuid: "a0030003-0003-4003-8003-000000000004", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 20, total: 120, cache: .raw("40")),
+            try turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "bp39-turn-rollback"),
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 90, output: 30, total: 150, cache: .raw("40")),
+            try turnBoundary(at: now, type: "task_complete", id: "bp39-turn-rollback", durationMS: 1000)], modified: now)
+        let rollbackCache = LocalCodexUsageReader.Cache()
+        let rolledInput = try LocalCodexUsageReader.scan(directory: rollbackRoot, now: now, cache: rollbackCache)
+        let rolledTurn: LocalCodexTurnDetail? = rolledInput.details.flatMap { $0.turns }.first
+        let rolledUsageMatches: Bool = rolledTurn.map {
+            $0.usage.input == nil && $0.usage.output == 10 && $0.usage.total == 30
+        } == true
+        check(rolledInput.lastTurn?.outputTokens == 10
+            && rolledUsageMatches,
+              "DM-A03 legal input rollback preserves old output/total/duration turn evidence")
+        try bp39AssertWarmScan(rollbackRoot, now: now, cache: rollbackCache, cold: rolledInput,
+                               label: "DM-A03 input rollback")
+
+        let missingInputRoot = try fixtureDirectory("bp39-a03-input-missing")
+        defer { try? FileManager.default.removeItem(at: missingInputRoot.deletingLastPathComponent()) }
+        try writeSession(in: missingInputRoot, uuid: "a0030003-0003-4003-8003-000000000005", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 20, total: 120, cache: .raw("40")),
+            try turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "bp39-turn-missing"),
+            rawTokenEvent(at: now.addingTimeInterval(-1), inputLiteral: "null", outputLiteral: "30", totalLiteral: "150"),
+            try turnBoundary(at: now, type: "task_complete", id: "bp39-turn-missing", durationMS: 1000)], modified: now)
+        let missingInputCache = LocalCodexUsageReader.Cache()
+        let missingInput = try LocalCodexUsageReader.scan(directory: missingInputRoot, now: now,
+                                                           cache: missingInputCache)
+        check(missingInput.lastTurn == nil,
+              "DM-A03 missing input keeps the existing whole-usage parser rejection")
+        try bp39AssertWarmScan(missingInputRoot, now: now, cache: missingInputCache, cold: missingInput,
+                               label: "DM-A03 missing input")
+
+        let crossChainRoot = try fixtureDirectory("bp39-a03-cross-chain-isolation")
+        defer { try? FileManager.default.removeItem(at: crossChainRoot.deletingLastPathComponent()) }
+        let validRootID = "a0030003-0003-4003-8003-000000000007"
+        let invalidTurnID = "a0030003-0003-4003-8003-000000000008"
+        try writeSession(in: crossChainRoot, uuid: validRootID, events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-2), input: 100, output: 20, cache: .raw("40")),
+            bp39TokenEvent(at: now, input: 110, output: 25, cache: .raw("50"))], modified: now)
+        try writeSession(in: crossChainRoot, uuid: invalidTurnID, events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 20, cache: .raw("40")),
+            try turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "bp39-cross-chain"),
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 120, output: 30, cache: .raw("true")),
+            try turnBoundary(at: now, type: "task_complete", id: "bp39-cross-chain", durationMS: 1000)], modified: now)
+        let crossChainCache = LocalCodexUsageReader.Cache()
+        let crossChain = try LocalCodexUsageReader.scan(directory: crossChainRoot, now: now,
+                                                         cache: crossChainCache)
+        let validRootDetail = crossChain.details.first { $0.turns.isEmpty && $0.usage.input == 110 }
+        let invalidTurnDetail = crossChain.details.first { !$0.turns.isEmpty }
+        check(validRootDetail.map { bp39CacheState($0.usage) == .value(50) } == true
+            && invalidTurnDetail?.turns.first.map { bp39CacheState($0.usage) == .invalid } == true,
+              "DM-A03 root and complete-turn cache chains retain independent baselines and coverage")
+        try bp39AssertWarmScan(crossChainRoot, now: now, cache: crossChainCache, cold: crossChain,
+                               label: "DM-A03 cross-chain isolation")
+
+        // A source that cannot establish root contribution must not gate an
+        // independently complete turn. Pair the same chain with a known root.
+        for (label, source, uuid, isKnownRoot) in [
+            ("root", "cli", "a0030003-0003-4003-8003-000000000012", true),
+            ("unknown-source", "futureSource", "a0030003-0003-4003-8003-000000000013", false)
+        ] {
+            let independentTurnRoot = try fixtureDirectory("bp39-a03-independent-turn-\(label)")
+            defer { try? FileManager.default.removeItem(at: independentTurnRoot.deletingLastPathComponent()) }
+            try writeSession(in: independentTurnRoot, uuid: uuid, events: [
+                bp39TokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 20,
+                               total: 120, cache: .raw("40")),
+                try turnBoundary(at: now.addingTimeInterval(-2), type: "task_started",
+                                 id: "bp39-independent-turn"),
+                bp39TokenEvent(at: now.addingTimeInterval(-1), input: 160, output: 50,
+                               total: 210, cache: .raw("70")),
+                try turnBoundary(at: now, type: "task_complete", id: "bp39-independent-turn",
+                                 durationMS: 1000)], modified: now, metadataSource: source)
+            let independentTurnCache = LocalCodexUsageReader.Cache()
+            let independentTurn = try LocalCodexUsageReader.scan(directory: independentTurnRoot,
+                                                                  now: now, cache: independentTurnCache)
+            let independentDetail = independentTurn.details.first
+            if isKnownRoot {
+                check(independentTurn.input == 160 && independentTurn.output == 50
+                    && independentTurn.total == 210 && independentTurn.knownThreadCount == 1
+                    && independentTurn.unknownThreadCount == 0 && independentTurn.hasCompleteAccounting,
+                      "DM-A03 paired root source preserves known base contribution")
+                check(independentTurn.details.count == 1 && independentDetail?.kind == .root
+                    && independentDetail?.usage.input == 160 && independentDetail?.usage.output == 50
+                    && independentDetail?.usage.total == 210,
+                      "DM-A03 paired root source retains its known base detail")
+            } else {
+                check(independentTurn.input == 0 && independentTurn.output == 0
+                    && independentTurn.total == 0 && independentTurn.knownThreadCount == 0
+                    && independentTurn.unknownThreadCount == 1 && !independentTurn.hasCompleteAccounting,
+                      "DM-A03 unknown source keeps base contribution unknown without borrowing the turn")
+                check(independentTurn.details.count == 1 && independentDetail?.kind == .unknown
+                    && independentDetail?.usage.input == nil && independentDetail?.usage.output == nil
+                    && independentDetail?.usage.total == nil,
+                      "DM-A03 unknown source retains an unknown base detail row")
+            }
+            let independentCompleteTurn = independentDetail?.turns.first
+            check(independentDetail?.turns.count == 1
+                && independentCompleteTurn.map { $0.usage.input == 60 && $0.usage.output == 30
+                    && $0.usage.total == 90 && bp39CacheState($0.usage) == .value(30)
+                    && $0.usage.uncachedInput == 30 && $0.durationSeconds == 1
+                    && $0.outputTPS == 30 && $0.completedAt == now } == true,
+                  "DM-A03 \(label) independently complete turn preserves input/output/total/cache/elapsed")
+            check(independentTurn.lastTurn?.outputTokens == 30
+                && independentTurn.lastTurn?.durationSeconds == 1
+                && independentTurn.lastTurn?.outputTPS == 30
+                && independentTurn.lastTurn?.completedAt == independentCompleteTurn?.completedAt,
+                  "DM-A03 \(label) lastTurn aliases the same independent complete-turn projection")
+            try bp39AssertWarmScan(independentTurnRoot, now: now, cache: independentTurnCache,
+                                   cold: independentTurn, label: "DM-A03 independent turn \(label)")
+        }
+
+        // DM-A04: aggregate ratio-of-sums, zero denominator, exact integer
+        // controls and matched-subset disclosure.
+        let ratioRoot = try fixtureDirectory("bp39-a04-ratio")
+        defer { try? FileManager.default.removeItem(at: ratioRoot.deletingLastPathComponent()) }
+        try writeSession(in: ratioRoot, uuid: "a0040004-0004-4004-8004-000000000001", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 100, output: 1, cache: .raw("90"))], modified: now.addingTimeInterval(-1))
+        try writeSession(in: ratioRoot, uuid: "a0040004-0004-4004-8004-000000000002", events: [
+            bp39TokenEvent(at: now, input: 900, output: 1, cache: .raw("90"))], modified: now)
+        let ratioCache = LocalCodexUsageReader.Cache()
+        let ratio = try LocalCodexUsageReader.scan(directory: ratioRoot, now: now, cache: ratioCache)
+        check(ratio.cacheCoverage.cachedInputTokens == 180 && ratio.cacheCoverage.uncachedInputTokens == 820
+            && ratio.cacheCoverage.hitRate.map { abs($0 - 0.18) < 0.000_001 } == true,
+              "DM-A04 cache hit rate is weighted by exact input sums")
+        try bp39AssertWarmScan(ratioRoot, now: now, cache: ratioCache, cold: ratio,
+                               label: "DM-A04 weighted ratio")
+        let zeroRateRoot = try fixtureDirectory("bp39-a04-zero-rate")
+        defer { try? FileManager.default.removeItem(at: zeroRateRoot.deletingLastPathComponent()) }
+        try writeSession(in: zeroRateRoot, uuid: "a0040004-0004-4004-8004-000000000003", events: [
+            bp39TokenEvent(at: now, input: 0, output: 1, cache: .raw("0"))], modified: now)
+        let zeroRateCache = LocalCodexUsageReader.Cache()
+        let zeroRate = try LocalCodexUsageReader.scan(directory: zeroRateRoot, now: now, cache: zeroRateCache)
+        check(zeroRate.cacheCoverage.cachedInputTokens == 0 && zeroRate.cacheCoverage.uncachedInputTokens == 0
+            && zeroRate.cacheCoverage.hitRate == nil,
+              "DM-A04 zero input has no applicable ratio while preserving known zero")
+        try bp39AssertWarmScan(zeroRateRoot, now: now, cache: zeroRateCache, cold: zeroRate,
+                               label: "DM-A04 zero denominator")
+        let extremeRoot = try fixtureDirectory("bp39-a04-extreme")
+        defer { try? FileManager.default.removeItem(at: extremeRoot.deletingLastPathComponent()) }
+        try writeSession(in: extremeRoot, uuid: "a0040004-0004-4004-8004-000000000004", events: [
+            bp39TokenEvent(at: now, input: Int.max, output: 0, total: Int.max,
+                           cache: .raw(String(Int.max - 1)))], modified: now)
+        let extremeCache = LocalCodexUsageReader.Cache()
+        let extreme = try LocalCodexUsageReader.scan(directory: extremeRoot, now: now, cache: extremeCache)
+        check(extreme.cacheCoverage.cachedInputTokens == Int.max - 1
+            && extreme.cacheCoverage.uncachedInputTokens == 1
+            && extreme.cacheCoverage.matchedInputTokens == Int.max
+            && extreme.cacheCoverage.matchedCachedInputTokens == Int.max - 1
+            && extreme.cacheCoverage.hitRate != nil,
+              "DM-A04 Int.max minus one is not exact full hit")
+        try bp39AssertWarmScan(extremeRoot, now: now, cache: extremeCache, cold: extreme,
+                               label: "DM-A04 Int.max boundary")
+        let fullHitRoot = try fixtureDirectory("bp39-a04-full-hit")
+        defer { try? FileManager.default.removeItem(at: fullHitRoot.deletingLastPathComponent()) }
+        try writeSession(in: fullHitRoot, uuid: "a0040004-0004-4004-8004-000000000007", events: [
+            bp39TokenEvent(at: now, input: 10, output: 1, total: 11, cache: .raw("10"))], modified: now)
+        let fullHitCache = LocalCodexUsageReader.Cache()
+        let fullHit = try LocalCodexUsageReader.scan(directory: fullHitRoot, now: now, cache: fullHitCache)
+        check(fullHit.cacheCoverage.cachedInputTokens == 10
+            && fullHit.cacheCoverage.uncachedInputTokens == 0
+            && fullHit.cacheCoverage.hitRate == 1,
+              "DM-A04 exact full-hit control remains 100 percent rather than an approximate near-one")
+        try bp39AssertWarmScan(fullHitRoot, now: now, cache: fullHitCache, cold: fullHit,
+                               label: "DM-A04 full hit")
+        let partialRatioRoot = try fixtureDirectory("bp39-a04-matched-subset")
+        defer { try? FileManager.default.removeItem(at: partialRatioRoot.deletingLastPathComponent()) }
+        try writeSession(in: partialRatioRoot, uuid: "a0040004-0004-4004-8004-000000000005", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 100, output: 1, cache: .raw("90"))], modified: now.addingTimeInterval(-1))
+        try writeSession(in: partialRatioRoot, uuid: "a0040004-0004-4004-8004-000000000006", events: [
+            bp39TokenEvent(at: now, input: 900, output: 1, cache: .missing)], modified: now)
+        let matchedSubsetCache = LocalCodexUsageReader.Cache()
+        let matchedSubset = try LocalCodexUsageReader.scan(directory: partialRatioRoot, now: now,
+                                                            cache: matchedSubsetCache)
+        check(matchedSubset.input == 1000 && matchedSubset.cacheCoverage.state == .partial
+            && matchedSubset.cacheCoverage.matchedInputTokens == 100
+            && matchedSubset.cacheCoverage.matchedCachedInputTokens == 90
+            && matchedSubset.cacheCoverage.hitRate == nil,
+              "DM-A04 partial cache never borrows a denominator from unknown rows")
+        try bp39AssertWarmScan(partialRatioRoot, now: now, cache: matchedSubsetCache,
+                               cold: matchedSubset, label: "DM-A04 matched subset")
+
+        // DM-A05: eligibility is calculated before deterministic per-thread and
+        // global display caps; latest lastTurn survives both caps.
+        let perThreadRoot = try fixtureDirectory("bp39-a05-per-thread")
+        defer { try? FileManager.default.removeItem(at: perThreadRoot.deletingLastPathComponent()) }
+        try writeSession(in: perThreadRoot, uuid: "a0050005-0005-4005-8005-000000000001",
+            events: bp39CompleteTurnEvents(now: now, turnCount: 17, varyingOutput: true), modified: now)
+        let perThreadCache = LocalCodexUsageReader.Cache()
+        let perThread = try LocalCodexUsageReader.scan(directory: perThreadRoot, now: now, cache: perThreadCache)
+        check(perThread.details.count == 1 && perThread.details[0].turns.count == 16
+            && perThread.input == 170 && perThread.output == 153 && perThread.total == 323
+            && perThread.detailLimited && perThread.lastTurn?.outputTokens == 17,
+              "DM-A05 per-thread 16-row cap keeps the newest complete turn and marks detailLimited")
+        check(perThread.details[0].turns == perThread.details[0].turns.sorted {
+            $0.completedAt == $1.completedAt ? $0.ordinal < $1.ordinal : $0.completedAt < $1.completedAt
+        }, "DM-A05 detail turns return in completed-time/source-order ascending")
+        let retainedPerThreadTurns = perThread.details[0].turns
+        check(retainedPerThreadTurns.first?.usage.output == 2
+            && retainedPerThreadTurns.last?.usage.output == 17
+            && retainedPerThreadTurns.allSatisfy { $0.usage.output != 1 }
+            && retainedPerThreadTurns.map(\.completedAt).min() == now.addingTimeInterval(-65)
+            && retainedPerThreadTurns.map(\.completedAt).max() == now.addingTimeInterval(-5),
+              "DM-A05 per-thread cap drops the oldest dated row while preserving distinct numeric rows and base totals")
+        try bp39AssertWarmScan(perThreadRoot, now: now, cache: perThreadCache, cold: perThread,
+                               label: "DM-A05 per-thread cap")
+
+        let globalRoot = try fixtureDirectory("bp39-a05-global")
+        defer { try? FileManager.default.removeItem(at: globalRoot.deletingLastPathComponent()) }
+        for thread in 0..<9 {
+            let uuid = String(format: "a0050005-0005-4005-8005-%012d", thread + 10)
+            try writeSession(in: globalRoot, uuid: uuid,
+                events: bp39CompleteTurnEvents(now: now, turnCount: 16, varyingOutput: true,
+                                               timeOffset: Double(thread) - 8),
+                modified: now.addingTimeInterval(Double(thread) - 8))
+        }
+        let globalCache = LocalCodexUsageReader.Cache()
+        let global = try LocalCodexUsageReader.scan(directory: globalRoot, now: now, cache: globalCache)
+        check(global.details.reduce(0) { $0 + $1.turns.count } == 128 && global.detailLimited
+            && global.input == 1440 && global.output == 1224 && global.total == 2664
+            && global.lastTurn?.outputTokens == 16,
+              "DM-A05 global 128-row cap is independent of base accounting and lastTurn")
+        for detail in global.details { check(detail.turns.count <= 16, "DM-A05 each global-cap thread remains within 16 rows") }
+        let globalTurns = global.details.flatMap(\.turns)
+        check(globalTurns.map(\.completedAt).min() == now.addingTimeInterval(-64)
+            && globalTurns.map(\.completedAt).max() == now.addingTimeInterval(-5)
+            && globalTurns.allSatisfy { $0.usage.output != 1 }
+            && globalTurns.contains { $0.usage.output == 16 }
+            && globalTurns.contains { $0.completedAt == now.addingTimeInterval(-64) && $0.usage.output == 3 }
+            && !globalTurns.contains { $0.completedAt == now.addingTimeInterval(-64) && $0.usage.output == 2 },
+              "DM-A05 global cap keeps the newest 128 interleaved rows and resolves the -64 tie by source order")
+        try bp39AssertWarmScan(globalRoot, now: now, cache: globalCache, cold: global,
+                               label: "DM-A05 global cap")
+
+        let exactFilesRoot = try fixtureDirectory("bp39-a05-exact-32-files")
+        defer { try? FileManager.default.removeItem(at: exactFilesRoot.deletingLastPathComponent()) }
+        for index in 0..<32 {
+            let uuid = String(format: "a0050005-0005-4005-8005-%012d", index + 100)
+            try writeSession(in: exactFilesRoot, uuid: uuid,
+                events: bp39CompleteTurnEvents(now: now, turnCount: 1),
+                modified: now.addingTimeInterval(-Double(index)))
+        }
+        let exactFilesCache = LocalCodexUsageReader.Cache()
+        let exactFiles = try LocalCodexUsageReader.scan(directory: exactFilesRoot, now: now,
+                                                         cache: exactFilesCache)
+        check(exactFiles.filesScanned == 32 && exactFiles.details.count <= 32 && !exactFiles.isLimited,
+              "DM-A05 exactly 32 physical files does not invent a 33rd limitation")
+        try bp39AssertWarmScan(exactFilesRoot, now: now, cache: exactFilesCache, cold: exactFiles,
+                               label: "DM-A05 exact 32 files")
+
+        let overFilesRoot = try fixtureDirectory("bp39-a05-33-files")
+        defer { try? FileManager.default.removeItem(at: overFilesRoot.deletingLastPathComponent()) }
+        for index in 0..<33 {
+            let uuid = String(format: "a0050005-0005-4005-8005-%012d", index + 200)
+            try writeSession(in: overFilesRoot, uuid: uuid,
+                events: bp39CompleteTurnEvents(now: now, turnCount: 1),
+                modified: now.addingTimeInterval(-Double(index)))
+        }
+        let overFilesCache = LocalCodexUsageReader.Cache()
+        let overFiles = try LocalCodexUsageReader.scan(directory: overFilesRoot, now: now,
+                                                        cache: overFilesCache)
+        check(overFiles.isLimited && overFiles.filesScanned <= 32 && overFiles.details.count <= 32
+            && Set(overFiles.details.map(\.opaqueKey)).count == overFiles.details.count
+            && !overFiles.detailLimited,
+              "DM-A05 33rd physical file sets existing isLimited without fabricating detail coverage")
+        try bp39AssertWarmScan(overFilesRoot, now: now, cache: overFilesCache, cold: overFiles,
+                               label: "DM-A05 33 files")
+
+        let opaqueBatchRoot = try fixtureDirectory("bp39-a06-opaque-batch-a")
+        defer { try? FileManager.default.removeItem(at: opaqueBatchRoot.deletingLastPathComponent()) }
+        for index in 0..<32 {
+            let uuid = String(format: "a0060006-0006-4006-8006-%012d", index + 100)
+            try writeSession(in: opaqueBatchRoot, uuid: uuid, events: [
+                bp39TokenEvent(at: now.addingTimeInterval(-Double(index + 1)), input: index + 1,
+                               output: 2, total: index + 3, cache: .raw("0"))],
+                modified: now.addingTimeInterval(-Double(index + 1)))
+        }
+        let opaqueCache = LocalCodexUsageReader.Cache()
+        let opaqueBatch = try LocalCodexUsageReader.scan(directory: opaqueBatchRoot, now: now, cache: opaqueCache)
+        let batchKeys = Set(opaqueBatch.details.map(\.opaqueKey))
+        check(opaqueBatch.details.count == 32 && batchKeys.count == 32
+            && opaqueBatch.knownThreadCount == 32
+            && opaqueBatch.input == 528 && opaqueBatch.output == 64 && opaqueBatch.total == 592,
+              "DM-A06 opaque mapping keeps 32 known positive base rows with unique bounded keys")
+        check(bp39MirrorContainsString(opaqueCache, "a0060006-0006-4006-8006-000000000100")
+            && bp39MirrorContainsString(opaqueCache, "a0060006-0006-4006-8006-000000000101"),
+              "DM-A06 private cache mapping retains current synthetic identities for bounded lookup")
+        try bp39AssertWarmScan(opaqueBatchRoot, now: now, cache: opaqueCache, cold: opaqueBatch,
+                               label: "DM-A06 opaque mapping")
+        let removedURL = sessionURL(in: opaqueBatchRoot,
+            uuid: "a0060006-0006-4006-8006-000000000100")
+        try FileManager.default.removeItem(at: removedURL)
+        let afterDelete = try LocalCodexUsageReader.scan(directory: opaqueBatchRoot, now: now, cache: opaqueCache)
+        check(afterDelete.details.count == 31
+            && bp39Detail(afterDelete, input: 1) == nil
+            && Set(afterDelete.details.map(\.opaqueKey)).count == 31,
+              "DM-A06 deleting a physical file removes its detail and opaque mapping on replacement")
+        check(!bp39MirrorContainsString(opaqueCache, "a0060006-0006-4006-8006-000000000100")
+            && bp39MirrorContainsString(opaqueCache, "a0060006-0006-4006-8006-000000000101"),
+              "DM-A06 deleting a file releases its private synthetic identity while retaining a live control")
+        try bp39AssertWarmScan(opaqueBatchRoot, now: now, cache: opaqueCache, cold: afterDelete,
+                               label: "DM-A06 deleted opaque mapping")
+        let opaqueBatchRootB = try fixtureDirectory("bp39-a06-opaque-batch-b")
+        defer { try? FileManager.default.removeItem(at: opaqueBatchRootB.deletingLastPathComponent()) }
+        try writeSession(in: opaqueBatchRootB, uuid: "a0060006-0006-4006-8006-000000000200", events: [
+            bp39TokenEvent(at: now, input: 77, output: 8, total: 85, cache: .raw("7"))], modified: now,
+            metadataFields: ["model_provider": "synthetic"])
+        let switchedRoot = try LocalCodexUsageReader.scan(directory: opaqueBatchRootB, now: now, cache: opaqueCache)
+        check(switchedRoot.details.count == 1 && bp39Detail(switchedRoot, input: 77) != nil
+            && Set(switchedRoot.details.map(\.opaqueKey)).count == 1
+            && switchedRoot.details.allSatisfy { $0.usage.input != 1 },
+              "DM-A06 changing the synthetic root drops the prior batch without retaining stale rows")
+        check(!bp39MirrorContainsString(opaqueCache, "a0060006-0006-4006-8006-000000000101")
+            && bp39MirrorContainsString(opaqueCache, "a0060006-0006-4006-8006-000000000200"),
+              "DM-A06 changing roots releases the old private batch and retains the current identity")
+        try bp39AssertWarmScan(opaqueBatchRootB, now: now, cache: opaqueCache, cold: switchedRoot,
+                               label: "DM-A06 switched synthetic root")
+        let switchedRoute = try LocalCodexUsageReader.scan(directory: opaqueBatchRootB, now: now,
+            cache: opaqueCache, routeContext: .verified(provider: "synthetic", origin: "https://synthetic.example"))
+        check(bp39MirrorContainsString(opaqueCache, "a0060006-0006-4006-8006-000000000200"),
+              "DM-A06 matching route retains the current private identity before route rejection")
+        try bp39AssertWarmScan(opaqueBatchRootB, now: now, cache: opaqueCache, cold: switchedRoute,
+                               label: "DM-A06 matching route", routeContext: .verified(provider: "synthetic", origin: "https://synthetic.example"))
+        let mismatchedRoute = try LocalCodexUsageReader.scan(directory: opaqueBatchRootB, now: now,
+            cache: opaqueCache, routeContext: .verified(provider: "other", origin: "https://other.example"))
+        check(switchedRoute.details.count == 1 && bp39Detail(switchedRoute, input: 77) != nil
+            && mismatchedRoute.knownThreadCount == 0 && mismatchedRoute.total == 0,
+              "DM-A06 route changes clear opaque state and cannot restore rows from another source")
+        check(mismatchedRoute.details.isEmpty,
+              "DM-A06 mismatched route exposes no stale detail rows")
+        try bp39AssertWarmScan(opaqueBatchRootB, now: now, cache: opaqueCache, cold: mismatchedRoute,
+                               label: "DM-A06 mismatched route", routeContext: .verified(provider: "other", origin: "https://other.example"))
+        check(!bp39MirrorContainsString(opaqueCache, "a0060006-0006-4006-8006-000000000200"),
+              "DM-A06 mismatched route releases the prior private identity")
+
+        // DM-A06: snapshot/detail reflection and serialized descriptions cannot
+        // expose raw source identity, path, body, account or tool canaries.
+        let privacyRoot = try fixtureDirectory("bp39-a06-privacy")
+        defer { try? FileManager.default.removeItem(at: privacyRoot.deletingLastPathComponent()) }
+        try writeSession(in: privacyRoot, uuid: "a0060006-0006-4006-8006-000000000001", events: [
+            bp39TokenEvent(at: now.addingTimeInterval(-3), input: 100, output: 20, total: 120,
+                           cache: .raw("40")),
+            try turnBoundary(at: now.addingTimeInterval(-2), type: "task_started", id: "bp39-privacy-turn"),
+            bp39TokenEvent(at: now.addingTimeInterval(-1), input: 160, output: 50, total: 210,
+                           cache: .raw("70")),
+            try turnBoundary(at: now, type: "task_complete", id: "bp39-privacy-turn", durationMS: 1000)], modified: now,
+            metadataFields: ["account": "bp39-account-canary", "tool": "bp39-tool-canary",
+                             "body": "bp39-body-canary", "origin": "bp39-origin-canary"])
+        let privacyCache = LocalCodexUsageReader.Cache()
+        let privacy = try LocalCodexUsageReader.scan(directory: privacyRoot, now: now, cache: privacyCache)
+        let printed = String(describing: privacy)
+        for canary in ["a0060006-0006-4006-8006-000000000001", "bp39-account-canary",
+                       "bp39-tool-canary", "bp39-body-canary", "bp39-origin-canary", privacyRoot.path] {
+            check(!printed.contains(canary), "DM-A06 public snapshot omits (canary) privacy canary")
+        }
+        check(!bp39MirrorContainsForbiddenValue(privacy),
+              "DM-A06 public snapshot/detail mirror contains no String, URL, Data or raw JSON")
+        try bp39AssertWarmScan(privacyRoot, now: now, cache: privacyCache, cold: privacy,
+                               label: "DM-A06 privacy reflection")
+
+        let snapshotFields = Set(Mirror(reflecting: privacy).children.compactMap(\.label))
+        check(snapshotFields == Set(["input", "output", "total", "sessionCount", "filesScanned",
+            "isLimited", "latestEventAt", "fiveHour", "sevenDay", "lastTurn", "liveTurn",
+            "knownThreadCount", "unknownThreadCount", "unidentifiedFileCount", "subagentCount",
+            "forkCount", "readAt", "details", "cacheCoverage", "detailLimited", "quotaDate"]),
+              "DM-A06 snapshot reflection exposes only the exact bounded public fields")
+        if let thread = privacy.details.first, let turn = thread.turns.first {
+            let threadFields = Set(Mirror(reflecting: thread).children.compactMap(\.label))
+            let turnFields = Set(Mirror(reflecting: turn).children.compactMap(\.label))
+            let usageFields = Set(Mirror(reflecting: thread.usage).children.compactMap(\.label))
+            check(threadFields == Set(["opaqueKey", "ordinal", "kind", "usage", "turns"])
+                && turnFields == Set(["opaqueKey", "ordinal", "usage", "durationSeconds", "completedAt"])
+                && usageFields == Set(["input", "output", "total", "cache"]),
+                  "DM-A06 thread, turn and usage reflection exposes only opaque numeric bounded fields")
+            check(privacy.input == 160 && privacy.output == 50 && privacy.total == 210
+                && thread.usage.input == 160 && thread.usage.output == 50 && thread.usage.total == 210
+                && thread.usage.uncachedInput == 90
+                && turn.usage.input == 60 && turn.usage.output == 30 && turn.usage.total == 90
+                && turn.usage.uncachedInput == 30 && turn.durationSeconds == 1
+                && turn.outputTPS == 30 && turn.opaqueKey != 0 && thread.opaqueKey != 0,
+                  "DM-A06 privacy fixture carries a non-empty positive thread and complete-turn control")
+        } else {
+            check(false, "DM-A06 privacy fixture carries a complete public turn row")
+            check(false, "DM-A06 privacy fixture carries a complete positive numeric control")
+        }
+
+        // DM-A07/A08: UI consumes source/coverage/unknown labels, while the
+        // existing completion-relative scheduler remains the only refresh path.
+        check(privacy.readAt == now && privacy.details.allSatisfy { $0.kind == .root },
+              "DM-A07 snapshot carries observation time and finite lineage only")
+        var scheduler = LocalRefreshScheduler()
+        if let generation = scheduler.begin(monotonicNow: 10) {
+            check(scheduler.complete(generation: generation, monotonicNow: 20)
+                && scheduler.begin(monotonicNow: 24.999) == nil
+                && scheduler.begin(monotonicNow: 25) != nil,
+                  "DM-A08 detailed metrics retains the existing five-second serial schedule")
+        } else { check(false, "DM-A08 detailed metrics retains the existing five-second serial schedule") }
+    }
+
+    private static func bp39MirrorContainsForbiddenValue(_ value: Any) -> Bool {
+        if value is String || value is URL || value is Data { return true }
+        return Mirror(reflecting: value).children.contains { bp39MirrorContainsForbiddenValue($0.value) }
+    }
+
+    private static func bp39MirrorContainsString(_ value: Any, _ needle: String) -> Bool {
+        if let string = value as? String { return string.contains(needle) }
+        return Mirror(reflecting: value).children.contains {
+            bp39MirrorContainsString($0.value, needle)
+        }
+    }
+
+#if TOKENSTAT_BP38_C01
+    /// Exercises the production scheduler's monotonic API directly. The test
+    /// controls both clocks; no wall-clock sleep or external session path is used.
+    private static func bp38C01LocalRefreshChecks() throws {
+        var scheduler = LocalRefreshScheduler()
+        let generation = scheduler.begin(monotonicNow: 10.0)
+        check(generation != nil, "BP38 C01 starts a due local read")
+        check(scheduler.begin(monotonicNow: 11.0) == nil,
+              "BP38 C01 refuses overlapping local reads while one generation is in flight")
+        if let generation {
+            check(scheduler.complete(generation: generation, monotonicNow: 20.0),
+                  "BP38 C01 accepts completion of the active generation")
+            check(scheduler.begin(monotonicNow: 24.999) == nil,
+                  "BP38 C01 completion plus 4.999 monotonic seconds remains throttled")
+            let nextGeneration = scheduler.begin(monotonicNow: 25.0)
+            check(nextGeneration != nil,
+                  "BP38 C01 permits the next read at completion plus five monotonic seconds")
+            if let nextGeneration {
+                check(scheduler.complete(generation: nextGeneration, monotonicNow: 30.0),
+                      "BP38 C01 releases the second completed generation")
+            }
+        }
+
+        var canceled = LocalRefreshScheduler()
+        let canceledGeneration = canceled.begin(monotonicNow: 100.0)
+        _ = canceled.invalidate()
+        let newerGeneration = canceled.begin(monotonicNow: 200.0)
+        if let canceledGeneration {
+            check(!canceled.complete(generation: canceledGeneration, monotonicNow: 200.0),
+                  "BP38 C01 old completion cannot complete after invalidation")
+        }
+        check(newerGeneration != nil && canceled.begin(monotonicNow: 201.0) == nil,
+              "BP38 C01 old completion leaves a newer in-flight generation locked")
+        if let newerGeneration {
+            check(canceled.complete(generation: newerGeneration, monotonicNow: 202.0),
+                  "BP38 C01 the newer generation completes only on its own completion")
+        }
+
+        var rolledBackWall = Date(timeIntervalSince1970: 2_000_000_000)
+        let wallBefore = rolledBackWall
+        rolledBackWall = rolledBackWall.addingTimeInterval(-3_600)
+        check(rolledBackWall < wallBefore && scheduler.begin(monotonicNow: 34.999) == nil,
+              "BP38 C01 wall-clock rollback does not make the monotonic deadline due before +5s")
+        check(scheduler.begin(monotonicNow: 35.0) != nil,
+              "BP38 C01 monotonic deadline becomes due at +5s despite wall-clock rollback")
+    }
+#endif
 }

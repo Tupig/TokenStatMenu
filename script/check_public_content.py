@@ -12,6 +12,18 @@ import subprocess
 from pathlib import Path
 from package_source import PUBLIC_FILES, ROOT
 
+# Kept independent from the packager: allowlisting a local path cannot bypass
+# this publication boundary.
+LOCAL_ONLY_FILES = frozenset({
+    "docs/FULL_SOURCE.md",
+    "docs/superpowers/specs/2026-10-18-accuracy-and-validation-optimization-design.md",
+    "docs/superpowers/plans/2026-10-18-accuracy-and-validation-optimization.md",
+})
+LOCAL_ONLY_PREFIXES = (
+    "docs/superpowers/", "docs/local/", "governance/",
+    "reports/", "artifacts/", ".local/",
+)
+
 SYNTHETIC_PNG_SHA256 = {
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "ead24ba5ff05e81ddb9f042e1e601725a052e3835ca5c8b980ab70ce7f516617",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "9819e254364e4ba2bc5c60ff2e4574fa4828264aa341b05920349333b253b91d",
@@ -26,6 +38,10 @@ REVIEWED_ICON_ASSETS = {
     "Resources/AppIcon.png": ("png-rgba-1024", "664e54034f49380b3dc60d72841ec8c7d9bae142e5e20f154c8e5dfcbae1e16f"),
     "Resources/AppIcon.icns": ("icns", "edfc3aa520be04f987cc6c8a273995f57bafca68603d89f8265c640d0009e980"),
 }
+
+
+def is_local_only(name: str) -> bool:
+    return name in LOCAL_ONLY_FILES or name.startswith(LOCAL_ONLY_PREFIXES)
 
 
 def reviewed_icon_failure(name: str, data: bytes):
@@ -54,6 +70,11 @@ def main():
         names = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode().strip("\0").split("\0")
     else:
         names = PUBLIC_FILES
+    denied = sorted({name for name in names if is_local_only(name)})
+    if denied:
+        for name in denied:
+            print(f"FAIL {name}: local-only publication path")
+        raise SystemExit(1)
     patterns = {
         "private key": r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
         "access token": r"\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})",
@@ -62,7 +83,7 @@ def main():
         "sensitive query value": r"[?&](?:api_key|access_token|token|password|secret)=[^\s\"'<>]+",
     }
     # Synthetic fixtures intentionally include invalid credential URLs to test rejection.
-    fixture_files = {"Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/DirectQuotaChecks.swift", "docs/FULL_SOURCE.md"}
+    fixture_files = {"Tests/TokenStatCoreTests/GatewayDiscoveryChecks.swift", "Tests/TokenStatCoreTests/DirectQuotaChecks.swift"}
     failures = []
     for name in names:
         if name not in PUBLIC_FILES:

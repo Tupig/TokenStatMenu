@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<!-- The menu-bar app reads ~/.codex and the local Codex sessions directory.
+     A sandboxed app cannot reach those paths, so only the embedded extension
+     is sandboxed. The app still declares the shared App Group for the widget
+     snapshot channel. -->
+<key>com.apple.security.application-groups</key><array>
+<string>$(TOKENSTAT_WIDGET_GROUP)</string>
+</array>
+</dict></plist>

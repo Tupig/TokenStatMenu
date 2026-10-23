@@ -14,6 +14,8 @@ public enum TokenHubDirectQuotaFailure: Error, Equatable, Sendable {
     case connectionMalformed
     case databaseUnsafe
     case sessionUnavailable
+    case loginRejected
+    case exchangeRejected
     case exchangeFailed
     case redirectMissing
     case accessTokenMissing
@@ -305,7 +307,21 @@ public struct TokenHubDirectQuotaClient: Sendable {
 
     public func fetch(identity: TokenHubIdentity, now: Date = Date(),
                       home: URL = FileManager.default.homeDirectoryForCurrentUser) async throws -> TokenHubQuotaSnapshot {
-        let settings = try TokenHubConnectionDiscovery.readDefaultStoredSettings(home: home, now: now)
+        let fixedObservation = now
+        return try await fetch(identity: identity, nowProvider: { fixedObservation }, home: home)
+    }
+
+    public func fetch(identity: TokenHubIdentity, nowProvider: @Sendable () -> Date,
+                      home: URL = FileManager.default.homeDirectoryForCurrentUser) async throws -> TokenHubQuotaSnapshot {
+        let observedAt = nowProvider()
+        return try await fetch(identity: identity, nowProvider: nowProvider,
+                               observationAt: observedAt, home: home)
+    }
+
+    public func fetch(identity: TokenHubIdentity, nowProvider: @Sendable () -> Date,
+                      observationAt observedAt: Date,
+                      home: URL = FileManager.default.homeDirectoryForCurrentUser) async throws -> TokenHubQuotaSnapshot {
+        let settings = try TokenHubConnectionDiscovery.readDefaultStoredSettings(home: home, now: nowProvider())
         let endpoint = try TokenHubDirectQuotaEndpoint(baseURL: settings.aiManagerBaseURL,
                                                        organizationURL: settings.ssoBaseURL)
         let callbackURL = try Self.callbackURL(baseURL: settings.aiManagerBaseURL, session: settings.session)
@@ -313,7 +329,7 @@ public struct TokenHubDirectQuotaClient: Sendable {
         do { access = try await callbackRequest(callbackURL) }
         catch let error as TokenHubDirectQuotaFailure { throw error }
         catch { throw TokenHubDirectQuotaFailure.exchangeFailed }
-        try Self.requireUnchangedSettings(settings, home: home, now: now)
+        try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
         var response = try await quotaResponse(endpoint: endpoint.url, access: access)
         // Token Hub's own business flow refreshes the broker token once after
         // a 401. Never retry other statuses and never persist the new token.
@@ -321,21 +337,21 @@ public struct TokenHubDirectQuotaClient: Sendable {
             // Re-read once before the second exchange. If the Hub session or
             // endpoints changed, let the next refresh start a new transaction
             // rather than combine data from two identities in this one.
-            let refreshed = try TokenHubConnectionDiscovery.readDefaultStoredSettings(home: home, now: now)
+            let refreshed = try TokenHubConnectionDiscovery.readDefaultStoredSettings(home: home, now: nowProvider())
             guard refreshed == settings else { throw TokenHubDirectQuotaFailure.identityChanged }
             let refreshedCallbackURL = try Self.callbackURL(baseURL: refreshed.aiManagerBaseURL, session: refreshed.session)
             do { access = try await callbackRequest(refreshedCallbackURL) }
             catch let error as TokenHubDirectQuotaFailure { throw error }
             catch { throw TokenHubDirectQuotaFailure.exchangeFailed }
-            try Self.requireUnchangedSettings(settings, home: home, now: now)
+            try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
             response = try await quotaResponse(endpoint: endpoint.url, access: access)
         }
         guard (200..<300).contains(response.statusCode) else {
             throw TokenHubDirectQuotaFailure.httpStatus(response.statusCode)
         }
         guard response.data.count <= 1_048_576 else { throw TokenHubDirectQuotaFailure.responseTooLarge }
-        try Self.requireUnchangedSettings(settings, home: home, now: now)
-        return try TokenHubDirectQuotaDecoder.decode(response.data, identity: identity, now: now)
+        try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
+        return try TokenHubDirectQuotaDecoder.decode(response.data, identity: identity, now: observedAt)
     }
 
     private static func requireUnchangedSettings(_ expected: TokenHubStoredSettings, home: URL, now: Date) throws {
@@ -430,11 +446,29 @@ public struct TokenHubDirectQuotaClient: Sendable {
               let items = fragmentComponents.queryItems else {
             throw TokenHubDirectQuotaFailure.accessTokenMissing
         }
-        let tokens = items.filter { $0.name == "access_token" }
         let redirects = items.filter { $0.name == "redirect" }
-        guard tokens.count == 1, redirects.count <= 1,
-              redirects.first.map({ $0.value == "/me/api-key" }) ?? true,
-              let token = tokens.first?.value, !token.isEmpty, token.count <= 16_384,
+        guard redirects.count <= 1,
+              redirects.first.map({ $0.value == "/me/api-key" }) ?? true else {
+            throw TokenHubDirectQuotaFailure.accessTokenMissing
+        }
+        let errors = items.filter { $0.name == "error" }
+        if !errors.isEmpty {
+            guard errors.count == 1, let value = errors.first?.value else {
+                throw TokenHubDirectQuotaFailure.malformedResponse
+            }
+            let scalars = Array(value.unicodeScalars)
+            var first = 0, last = scalars.count
+            while first < last && scalars[first].properties.isWhitespace { first += 1 }
+            while first < last && scalars[last - 1].properties.isWhitespace { last -= 1 }
+            guard first < last else { throw TokenHubDirectQuotaFailure.malformedResponse }
+            let ascii = scalars[first..<last].map { (65...90).contains($0.value) ? $0.value + 32 : $0.value }
+            if ascii == "token_verify_failed".unicodeScalars.map(\.value) {
+                throw TokenHubDirectQuotaFailure.loginRejected
+            }
+            throw TokenHubDirectQuotaFailure.exchangeRejected
+        }
+        let tokens = items.filter { $0.name == "access_token" }
+        guard tokens.count == 1, let token = tokens.first?.value, !token.isEmpty, token.count <= 16_384,
               token.unicodeScalars.allSatisfy({ !$0.properties.isWhitespace && !CharacterSet.controlCharacters.contains($0) }) else {
             throw TokenHubDirectQuotaFailure.accessTokenMissing
         }
