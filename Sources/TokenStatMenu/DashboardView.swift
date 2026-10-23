@@ -3,7 +3,7 @@ import SwiftUI
 import TokenStatCore
 #endif
 
-// Select the property wrapper explicitly for SDKs that also expose a State macro.
+// SDK 同时提供 State 宏时，显式选择属性包装器。
 typealias ValueState<Value> = SwiftUI.State<Value>
 
 @MainActor struct DashboardView: View {
@@ -48,8 +48,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
         .groupBoxStyle(PanelCardStyle())
         .tint(PanelPalette.blue)
     }
-    /// Shared with full-content rendering checks, including the actual card
-    /// styles and insets rather than a reconstruction outside the ScrollView.
+    /// 与完整渲染测试共用实际卡片样式和内边距，不在 ScrollView 外重建一份布局。
     var overviewContent: some View {
         VStack(alignment: .leading, spacing: 12) {
             tokenHubCard
@@ -64,8 +63,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                     localQuotaCard
                 }
             } else {
-                // The generic enterprise branch is available to synthetic
-                // previews only; production local history has its own section.
+                // 通用企业分支仅供模拟预览，本地历史在正式界面有独立区域。
                 HStack(alignment: .top, spacing: 10) {
                     WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
                         color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
@@ -110,12 +108,11 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private var localUsageCard: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 10) {
-                metric("已核验小计 · 输入 Token", localCount(model.localSnapshot.input))
-                metric("已核验小计 · 输出 Token", localCount(model.localSnapshot.output))
-                metric(model.localSnapshot.hasCompleteAccounting ? "本次扫描记录量 · Token" : "已核验记录小计 · 总 Token",
-                    model.localSnapshot.knownThreadCount > 0 ? count(model.localSnapshot.total) : "未知")
-                metric("已核验线程", "\(model.localSnapshot.knownThreadCount)")
-                metric("未核验线程", "\(model.localSnapshot.unknownThreadCount)")
+                metric("输入 Token", localCount(model.localSnapshot.input))
+                metric("输出 Token", localCount(model.localSnapshot.output))
+                metric("总 Token", model.localSnapshot.knownThreadCount > 0 ? count(model.localSnapshot.total) : "未知")
+                metric("线程", "\(model.localSnapshot.knownThreadCount)")
+                metric("其他线程", "\(model.localSnapshot.unknownThreadCount)")
                 metric("未识别物理文件", "\(model.localSnapshot.unidentifiedFileCount)")
                 metric("已识别顶层对话", "\(model.localSnapshot.sessionCount)")
                 metric("已识别子代理 / 分叉", "\(model.localSnapshot.subagentCount) / \(model.localSnapshot.forkCount)")
@@ -138,7 +135,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 } else {
                     metric("上轮记录均速", "未知")
                 }
-                Text("汇总与当前配置关联的本机 Codex 记录；历史路由未核验，无法核算的记录不计入小计。实时值来自活动 token_count 的短窗口估算，事件停止推进时会变为未知；上轮均速含工具、网络和等待。\(model.localSnapshot.isLimited ? "已达到扫描范围限制。" : "")")
+                Text("汇总与当前配置关联的本机 Codex 记录；无法核算的记录不计入合计。实时值来自活动 token_count 的短窗口估算，事件停止推进时会变为未知；上轮均速含工具、网络和等待。\(model.localSnapshot.isLimited ? "已达到扫描范围限制。" : "")")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
         } label: { Label("本地记录用量", systemImage: "doc.text.magnifyingglass") }
@@ -152,7 +149,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 if let at = model.fiveHourQuota?.fetchedAt ?? model.sevenDayQuota?.fetchedAt { Text("额度事件时间：\(at.formatted(date: .abbreviated, time: .shortened))").font(.system(size: 10)).foregroundStyle(.secondary) }
             }
-        } label: { Label("本地 Codex 历史 · 账号/组织未核验", systemImage: "clock") }
+        } label: { Label("本地 Codex 历史", systemImage: "clock") }
     }
     private var localDetailedMetricsCard: some View {
         GroupBox {
@@ -265,9 +262,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private func count(_ n: Double) -> String { n.formatted(.number.precision(.fractionLength(0))) }
 }
 
-/// Expansion belongs to this installed view, never to the model or preferences.
-/// Keeping the State here also lets a detached overview be hosted for rendering
-/// without accessing a State projection on an uninstalled DashboardView value.
+/// 展开状态由已挂载视图持有，不进入模型或偏好设置，也便于独立托管概览进行渲染测试。
 private struct LocalHistoryDisclosure<Content: View>: View {
     @ValueState private var expanded: Bool
     private let content: Content
@@ -288,8 +283,7 @@ private struct LocalHistoryDisclosure<Content: View>: View {
     }
 }
 
-/// The detailed projection is opt-in and remains view-local; expanding it
-/// never triggers a scan or changes the retained snapshot.
+/// 明细按需展开，仅改变视图状态，不触发扫描或修改快照。
 private struct LocalDetailsDisclosure<Content: View>: View {
     @ValueState private var expanded: Bool
     private let content: Content
@@ -306,7 +300,7 @@ private struct LocalDetailsDisclosure<Content: View>: View {
             Label("缓存与线程轮次明细", systemImage: "list.bullet.rectangle")
                 .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
         }
-        .accessibilityHint("仅展开本次扫描已核验的本地缓存与完整轮次明细")
+        .accessibilityHint("展开本次扫描的本地缓存与完整轮次明细")
     }
 }
 

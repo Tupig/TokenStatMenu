@@ -30,7 +30,6 @@ import package_source as packaging
 import check_public_content as public_guard
 import release_assets as release
 
-
 PROJECT = Path(__file__).resolve().parents[1]
 TAG = "v1.1.3"
 VERSION = "1.1.3"
@@ -1412,15 +1411,11 @@ class NativeReleaseChecks(unittest.TestCase):
 class CleanupChecks(unittest.TestCase):
     """C40 uses only synthetic publication roots, never local user material."""
 
-    LOCAL_ONLY_FILES = (
-        "docs/FULL_SOURCE.md",
-        "docs/superpowers/specs/2026-10-18-accuracy-and-validation-optimization-design.md",
-        "docs/superpowers/plans/2026-10-18-accuracy-and-validation-optimization.md",
-    )
+    LOCAL_ONLY_FILES = ("docs/FULL_SOURCE.md",)
     LOCAL_ONLY_PREFIXES = (
         "docs/superpowers/",
-        "docs/local/",
         "governance/",
+        "docs/local/",
         "reports/",
         "artifacts/",
         ".local/",

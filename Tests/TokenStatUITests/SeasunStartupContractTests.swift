@@ -351,22 +351,22 @@ final class SeasunStartupContractTests: XCTestCase {
                 lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
                     completedAt: Date(timeIntervalSince1970: 1_797_000_000))),
              ["输入 120", "输出 80", "总计 200 tokens", "本次扫描记录量 200 tokens",
-              "已核验线程 2", "子代理 1", "分叉 1", "顶层对话 2", "上轮记录均速：15.0 tok/s",
+              "线程 2", "子代理 1", "分叉 1", "顶层对话 2", "上轮记录均速：15.0 tok/s",
               "5 小时额度：本地", "7 天额度：本地"]),
             ("partial", LocalCodexSnapshot(input: 30, output: 20, total: 50,
                 sessionCount: 1, filesScanned: 4, isLimited: false,
                 latestEventAt: nil, fiveHour: nil, sevenDay: nil,
                 knownThreadCount: 1, unknownThreadCount: 2, unidentifiedFileCount: 1,
                 subagentCount: 1, forkCount: 2),
-             ["输入 30", "输出 20", "总计 50 tokens", "已核验记录小计 50 tokens",
-              "已核验线程 1", "未核验线程 2", "未识别文件 1", "子代理 1", "分叉 2", "最多32个物理文件"]),
+             ["输入 30", "输出 20", "总计 50 tokens", "本次记录合计 50 tokens",
+              "线程 1", "其他线程 2", "未识别文件 1", "子代理 1", "分叉 2", "最多32个物理文件"]),
             ("unknown", LocalCodexSnapshot(input: 0, output: 0, total: 0,
                 sessionCount: 0, filesScanned: 2, isLimited: false,
                 latestEventAt: nil, fiveHour: nil, sevenDay: nil,
                 knownThreadCount: 0, unknownThreadCount: 2, unidentifiedFileCount: 0,
                 subagentCount: 0, forkCount: 0),
-             ["输入 未知", "输出 未知", "总计 未知 tokens", "已核验记录小计 未知 tokens",
-              "未核验线程 2", "上轮记录均速：未知"])
+             ["输入 未知", "输出 未知", "总计 未知 tokens", "本次记录合计 未知 tokens",
+              "其他线程 2", "上轮记录均速：未知"])
         ]
 
         for (name, snapshot, expectedLocalDetails) in cases {

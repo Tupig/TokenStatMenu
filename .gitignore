@@ -4,9 +4,6 @@ dist/
 .integration/
 .release-staging/
 .codex/
-.agents/
-/.specify/
-/specs/
 .env
 .env.*
 *.log
@@ -23,11 +20,11 @@ auth.json
 *.key
 *.pem
 
-# Local-only repository workflow material is never published.
-/docs/FULL_SOURCE.md
+# 本地工作资料不参与发布。
 /docs/superpowers/
-/docs/local/
 /governance/
+/docs/FULL_SOURCE.md
+/docs/local/
 /reports/
 /artifacts/
 /.local/

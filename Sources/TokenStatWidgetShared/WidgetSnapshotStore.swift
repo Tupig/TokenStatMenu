@@ -1,37 +1,30 @@
 import Foundation
 import Darwin
 
-/// App Group container access for the shared widget snapshot.
+/// 通过 App Group 容器读写小组件共享快照。
 ///
-/// The container is only reachable when both processes carry a matching
-/// `com.apple.security.application-groups` entitlement from a real signing
-/// identity. Under an ad-hoc signature the system refuses the container, so
-/// every entry point reports `.unavailable` instead of falling back to a
-/// user-private directory. That keeps a development build honest: it can build
-/// and run, but it cannot pretend the shared channel works.
+/// 应用与扩展需要匹配的 `com.apple.security.application-groups` 授权。
+/// 系统拒绝容器访问时直接返回错误，不改用私有目录。
 public enum WidgetSnapshotStore {
 
-    /// Group name shared by the app and its embedded extension.
+    /// 应用与内嵌扩展共用的组名配置键。
     ///
-    /// The distribution build replaces this placeholder through the
-    /// `TOKENSTAT_WIDGET_GROUP` build setting; a bundle that still carries the
-    /// placeholder has no usable channel.
+    /// 构建时通过 `TOKENSTAT_WIDGET_GROUP` 替换占位符；未替换时不可用。
     public static let groupIdentifierKey = "TokenStatWidgetGroup"
     public static let fileName = "widget-snapshot-v1.json"
     public static let temporaryName = "widget-snapshot-v1.json.tmp"
 
     public enum StoreError: Error, Equatable {
-        /// No App Group container: unsigned, ad-hoc signed, or wrong entitlement.
+        /// 未取得 App Group 容器，可能是签名或授权配置不正确。
         case unavailable
-        /// A pre-existing object this process did not author; it is never read.
+        /// 已有对象缺少当前进程持有的归属凭据，不予读取。
         case existingObject
-        /// A path component or file metadata violated the accepted shape.
+        /// 路径组成或文件元数据不符合安全要求。
         case unsafeObject
         case ioFailure
     }
 
-    /// A file identity frozen after this process created it, so a later write
-    /// can prove it is replacing its own previous output.
+    /// 创建文件后记录的身份，用于后续写入时确认替换的是原文件。
     public struct Ownership: Equatable, Sendable {
         public let device: UInt64
         public let inode: UInt64
@@ -39,11 +32,9 @@ public enum WidgetSnapshotStore {
         public let digest: String
     }
 
-    // MARK: - Group resolution
+    // MARK: - 组名解析
 
-    /// Reads the configured group from the bundle's Info.plist. Only a plain
-    /// Team-prefixed or `group.` name is accepted; build variables that never
-    /// resolved, and placeholders, are rejected.
+    /// 从包内 Info.plist 读取组名，拒绝未展开的构建变量和占位符。
     public static func configuredGroup(bundle: Bundle = .main) -> String? {
         guard let raw = bundle.object(forInfoDictionaryKey: groupIdentifierKey) as? String else {
             return nil
@@ -51,8 +42,7 @@ public enum WidgetSnapshotStore {
         return acceptedGroup(raw)
     }
 
-    /// The only accepted App Group spelling. Exposed so tests can reject a
-    /// third-party bundle identifier without touching a real container.
+    /// 校验 App Group 名称，测试可在不访问容器的情况下检查非法包标识符。
     public static func acceptedGroup(_ raw: String) -> String? {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, value.count <= 128,
@@ -60,13 +50,12 @@ public enum WidgetSnapshotStore {
               !value.hasPrefix("UNRESOLVED"), !value.hasPrefix("FICTEAM") else { return nil }
         let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-")
         guard value.unicodeScalars.allSatisfy(allowed.contains) else { return nil }
-        // A bare dotted name such as another app's bundle identifier is not an
-        // App Group. Accept only the `group.` form this project publishes.
+        // 普通包标识符不是 App Group，只接受本项目使用的 `group.` 前缀。
         guard value.hasPrefix("group.") else { return nil }
         return value
     }
 
-    /// Resolves the group container, or nil when the system denies it.
+    /// 解析组容器路径，系统未返回路径时为 nil。
     public static func containerURL(bundle: Bundle = .main) -> URL? {
         guard let group = configuredGroup(bundle: bundle) else { return nil }
         guard let url = FileManager.default
@@ -75,24 +64,18 @@ public enum WidgetSnapshotStore {
         return url
     }
 
-    /// True when a real App Group channel is available in this process.
+    /// 当前进程是否能解析出 App Group 容器路径。
     public static func isAvailable(bundle: Bundle = .main) -> Bool {
         containerURL(bundle: bundle) != nil
     }
 
-    // MARK: - Reading
+    // MARK: - 读取
 
-    /// Claims an existing file written by an earlier run, so a restart can keep
-    /// replacing it instead of failing forever on the "unknown pre-existing
-    /// object" guard.
+    /// 接管上次运行留下的快照，使应用重启后仍能替换该文件。
     ///
-    /// The claim only succeeds after the same safety checks a read performs:
-    /// owned by this user, a single link, and mode 0600. It never reads or
-    /// rewrites a file that fails them, and it proves nothing about who wrote
-    /// it before this process; it only establishes the identity needed to
-    /// replace it going forward.
-    /// - Returns: the identity to pass to `write(replacing:)`, or nil when no
-    ///   claimable file is present.
+    /// 文件须归当前用户所有、仅有一个硬链接且权限为 0600。
+    /// 此检查仅建立后续替换凭据，不证明最初由哪个进程写入。
+    /// - Returns: 传给 `write(replacing:)` 的文件身份，无法接管时返回 nil。
     public static func claimExisting(bundle: Bundle = .main) -> Ownership? {
         guard let url = containerURL(bundle: bundle) else { return nil }
         var metadata = stat()
@@ -118,8 +101,7 @@ public enum WidgetSnapshotStore {
                          digest: digest(data))
     }
 
-    /// Reads the shared snapshot. A missing file is reported as `nil` so the
-    /// widget can show "no data" rather than an error.
+    /// 读取共享快照。文件不存在时返回 nil，小组件显示无数据。
     public static func read(bundle: Bundle = .main) throws -> WidgetQuotaSnapshot? {
         let dirfd = try openContainer(bundle: bundle)
         defer { close(dirfd) }
@@ -136,13 +118,11 @@ public enum WidgetSnapshotStore {
         return try? WidgetSnapshotCodec.decode(data)
     }
 
-    // MARK: - Writing
+    // MARK: - 写入
 
-    /// Atomically replaces the shared snapshot and returns its frozen identity.
+    /// 原子替换共享快照并返回文件身份。
     ///
-    /// The write is a temporary file plus `renameat`, so a reader never sees a
-    /// half-written payload. An existing file that this process cannot prove it
-    /// authored is left untouched.
+    /// 通过临时文件与 `renameat` 避免读到半成品；缺少替换凭据时保留原文件。
     @discardableResult
     public static func write(_ data: Data,
                              replacing expected: Ownership? = nil,
@@ -152,8 +132,7 @@ public enum WidgetSnapshotStore {
         return try write(data, replacing: expected, directory: dirfd)
     }
 
-    /// Writes into an already opened directory. Tests use a temporary directory
-    /// so the ownership, mode and replacement rules can run without an App Group.
+    /// 向已打开的目录写入。测试使用临时目录检查归属、权限和替换规则。
     static func write(_ data: Data, replacing expected: Ownership?,
                       directory dirfd: Int32) throws -> Ownership {
         guard !data.isEmpty, data.count <= WidgetSnapshotCodec.maximumBytes else {
@@ -163,14 +142,13 @@ public enum WidgetSnapshotStore {
         var existing = stat()
         let present = fstatat(dirfd, fileName, &existing, AT_SYMLINK_NOFOLLOW) == 0
         if present {
-            // Without an ownership proof we do not open, read or replace an
-            // object of unknown origin.
+            // 没有归属凭据时，不打开、读取或替换已有对象。
             guard let expected else { throw StoreError.existingObject }
             try requireOwned(dirfd, expected: expected)
         } else if errno != ENOENT {
             throw StoreError.ioFailure
         } else if expected != nil {
-            // The caller promised to replace its own file, but it is gone.
+            // 调用方要求替换的原文件已不存在。
             throw StoreError.existingObject
         }
 
@@ -201,7 +179,7 @@ public enum WidgetSnapshotStore {
         }
     }
 
-    // MARK: - Container
+    // MARK: - 容器
 
     private static func openContainer(bundle: Bundle) throws -> Int32 {
         guard let url = containerURL(bundle: bundle) else { throw StoreError.unavailable }
@@ -288,10 +266,8 @@ public enum WidgetSnapshotStore {
         guard unlinkat(dirfd, temporaryName, 0) == 0 else { throw StoreError.existingObject }
     }
 
-    /// Proves the named file is the object the caller previously authored,
-    /// without reading an unknown pre-existing payload.
-    /// Removes a leftover temporary file only when it is a regular file this
-    /// user owns. A symlink, hard link or foreign owner is left untouched.
+    /// 仅清理归当前用户所有的普通临时文件。
+    /// 保留符号链接、多硬链接文件及其他用户的文件。
     private static func discardStaleTemporary(_ dirfd: Int32) {
         var metadata = stat()
         guard fstatat(dirfd, temporaryName, &metadata, AT_SYMLINK_NOFOLLOW) == 0,

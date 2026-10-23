@@ -25,7 +25,7 @@ struct WindowQuotaCard: View {
     let source: QuotaSource
     static func presentation(for quota: WindowQuota?, at now: Date = Date(), refreshSeconds: Double,
                              source: QuotaSource = .enterprise) -> WindowQuotaPresentation {
-        let sourceLabel = source == .localCodex ? "本地 Codex 历史快照 · 账号/组织未核验" : "已配置企业用量接口数据"
+        let sourceLabel = source == .localCodex ? "本地 Codex 历史快照" : "已配置企业用量接口数据"
         guard let quota else {
             return WindowQuotaPresentation(sourceLabel: sourceLabel, isFresh: false, usedPercent: nil,
                 resetsAt: nil, recordedAt: nil, statusLabel: source == .localCodex ? "本地历史额度未提供" : "企业额度未提供")

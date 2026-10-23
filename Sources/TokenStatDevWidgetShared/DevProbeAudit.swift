@@ -7,8 +7,7 @@ enum DevProbeBoundary: String, CaseIterable {
     case permissions, environmentReads
 }
 
-// The wrappers increment before invoking their operation. A pure-memory
-// caller may pass a trap closure, so a test can prove each counter is wired.
+// 包装器在执行操作前递增计数；纯内存测试可传入失败闭包，检查计数器是否实际接入。
 final class DevProbeAudit {
     private var counts: [DevProbeBoundary: UInt64] = [:]
 
@@ -25,8 +24,7 @@ final class DevProbeAudit {
     }
 }
 
-// Count logical I/O at the operation entry, never by predicting the result.
-// A failed container lookup therefore cannot claim a snapshot read or write.
+// 在操作入口统计逻辑 I/O，不根据预期结果计数；容器查找失败不算快照读写。
 final class DevProbeIOAudit {
     private(set) var containerLookups: UInt64 = 0
     private(set) var snapshotWrites: UInt64 = 0
@@ -56,8 +54,7 @@ enum DevGroupGuard {
         return nil
     }
 
-    // Only the signed process's own entitlement is inspected. This does not
-    // read a profile or claim to prove its authorization; C51c-S01 is separate.
+    // 只检查签名进程自身的权限，不读取描述文件，也不据此认定授权有效；C51c-S01 单独验证。
     static func currentEntitlements() -> [String]? {
         guard let task = SecTaskCreateFromSelf(nil),
               let value = SecTaskCopyValueForEntitlement(
@@ -97,8 +94,7 @@ enum DevProbeController {
                              authorizationMatches: authorizationMatches)
     }
 
-    // Lazy identity providers ensure malformed argv is rejected before any
-    // bundle or signing lookup. The real host and memory adapter call this.
+    // 身份信息延迟加载，参数错误时先拒绝，再进行包或签名查找；宿主和内存适配器共用此入口。
     static func decide(_ arguments: [String], configured: () -> String?,
                        entitlements: () -> [String]?,
                        authorizationMatches: Bool) -> DevProbeDecision {
@@ -139,8 +135,7 @@ enum DevProbeController {
                                counts: counts, io: io, payloadMatched: false)
     }
 
-    // The injected path contains no AppKit, URL lookup, filesystem, network,
-    // preferences or environment operation. IO counts represent logical calls.
+    // 注入路径不访问 AppKit、URL、文件、网络、偏好或环境，I/O 计数仅表示逻辑调用。
     static func memoryRun(_ arguments: [String], actor: String,
                           configuredGroup: String, entitlements: [String]?,
                           authorizationMatches: Bool, incoming: Data?,

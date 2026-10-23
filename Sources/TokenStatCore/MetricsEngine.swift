@@ -34,7 +34,7 @@ public struct MetricsSnapshot: Codable {
     public init() {}
 }
 
-/// All request mutations are protected by one short lock. No I/O occurs under it.
+/// 所有请求的变更都由一把短锁保护。锁内不进行任何 I/O。
 public final class MetricsEngine {
     private struct Active {
         var start: Double
@@ -84,7 +84,7 @@ public final class MetricsEngine {
             r.window.add(tokens: Double(max(0, newCount - r.output)), at: now)
             r.output = newCount
         }
-        // Replace cumulative usage; don't add it, and don't manufacture a speed spike.
+        // 替换累计用量；不要累加，也不要制造速度尖峰。
         if let usage = observation.usage { r.usage = usage }
         r.serverInputTPS = observation.serverInputTPS ?? r.serverInputTPS
         r.serverOutputTPS = observation.serverOutputTPS ?? r.serverOutputTPS
@@ -92,7 +92,7 @@ public final class MetricsEngine {
     }
     @discardableResult public func finish(_ id: UUID, success: Bool, error: String? = nil, now: Double = ProcessInfo.processInfo.systemUptime) -> RequestRecord? {
         lock.lock(); defer { lock.unlock() }
-        guard let r = active.removeValue(forKey: id) else { return nil } // Exactly once, even on cancellation races.
+        guard let r = active.removeValue(forKey: id) else { return nil } // 恰好一次，即使发生取消竞争。
         let elapsed = max(0, now - r.start) * 1000
         let first = r.firstByte.map { max(0, $0 - r.start) * 1000 }
         let inputRate = r.firstOutput.map { Double(r.count.input) / max(0.001, $0 - r.start) }
@@ -112,7 +112,7 @@ public final class MetricsEngine {
         lock.lock(); defer { lock.unlock() }
         var s = completed
         s.active = active.count
-        // Windows belong to requests: a completed request cannot inflate a new one.
+        // 窗口属于请求：一个已完成的请求不能放大一个新请求。
         for (id, var r) in active {
             s.outputTPS += r.window.rate(at: now)
             s.input += r.count.input; s.output += r.count.output; s.costUSD += r.cost

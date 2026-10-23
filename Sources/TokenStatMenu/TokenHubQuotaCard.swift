@@ -50,7 +50,7 @@ enum TokenHubDecimalFormatter {
             VStack(alignment: .leading, spacing: 7) {
                 Text(directSource
                     ? "只读后台额度；仅向 Hub 既有来源交换会话，短期令牌仅存内存。与本机 Token 统计和费用分开。"
-                    : "仅读取 Token Hub 界面显示；账号与组织未核验，币种未核验。与本机 Token 统计、企业 API 配额和费用分开。")
+                    : "仅读取 Token Hub 界面显示；账号、组织与币种来源待确认。与本机 Token 统计、企业 API 配额和费用分开。")
                     .font(.system(size: 9)).foregroundStyle(.secondary)
                 Text(directSource ? "本次后台读取时间已记录。" : "Token Hub 后台更新时间未提供。")
                     .font(.system(size: 9)).foregroundStyle(.secondary)

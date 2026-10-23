@@ -2,8 +2,7 @@ import AppKit
 import Combine
 import SwiftUI
 
-/// Native content factories keep expensive view construction at the UI
-/// boundary; tests can wrap the real builders using synthetic models.
+/// 将视图构建留在 UI 层，测试可用模拟模型包装实际构建器。
 struct StatusBarContentFactories {
     let dashboard: @MainActor (AppModel) -> NSViewController
     let tooltip: @MainActor (AppModel) -> String
@@ -39,7 +38,7 @@ struct StatusBarContentFactories {
         self.model = model
         self.factories = factories
         self.diagnosticsURL = diagnosticsURL
-        // Keep a strong reference: a local NSStatusItem vanishes when deallocated.
+        // 保留强引用，否则 NSStatusItem 释放时会从菜单栏消失。
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
         item.autosaveName = "TokenStatMenu.Metrics"
@@ -50,8 +49,7 @@ struct StatusBarContentFactories {
             button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
             button.setAccessibilityLabel("TokenStatMenu 实时 Token 速度")
         }
-        // Published measurements/preferences invalidate the expensive tooltip;
-        // the half-second timer separately checks cheap freshness boundaries.
+        // 数据或偏好变化时重建提示文本，半秒定时器只检查低开销的时效边界。
         model.objectWillChange.sink { [weak self] in self?.tooltipNeedsRefresh = true }
             .store(in: &presentationObservers)
         NotificationCenter.default.publisher(for: NSLocale.currentLocaleDidChangeNotification)
@@ -87,8 +85,7 @@ struct StatusBarContentFactories {
     func show() {
         guard let button = item.button else { return }
         model.pruneHistoryBeforePanelDisplay()
-        // Do not allocate SwiftUI's dashboard/layout graph for users who only
-        // need the menu title. Keep it after first open so settings state lives.
+        // 首次打开前不创建 SwiftUI 概览，创建后复用，以保留设置状态。
         if popover.contentViewController == nil {
             popover.contentViewController = factories.dashboard(model)
         }
@@ -97,13 +94,12 @@ struct StatusBarContentFactories {
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         if let window = popover.contentViewController?.view.window {
             window.makeKey()
-            // Avoid a green default-button focus ring on open. Native keyboard
-            // traversal still establishes and displays focus when the user tabs.
+            // 打开时不显示绿色默认按钮焦点环，按 Tab 后仍由原生导航设置焦点。
             window.makeFirstResponder(nil)
         }
     }
     func popoverDidClose(_ notification: Notification) { model.panelVisible = false }
-    /// Opt-in local diagnostic output for integration tests; contains only approved booleans and resource counts.
+    /// 集成测试可显式启用本地诊断，只输出允许的布尔值和资源计数。
     private func writeDiagnosticsIfRequested(at now: Date, projection: TokenHubQuotaPresentation) {
         guard let url = diagnosticsURL, now.timeIntervalSince(lastDiagnostic) >= 1 else { return }
         lastDiagnostic = now

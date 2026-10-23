@@ -257,7 +257,7 @@ final class DashboardHistoryTests: XCTestCase {
                 XCTAssertEqual(presentation.usedPercent, value.usedPercent)
                 XCTAssertEqual(presentation.recordedAt, value.fetchedAt)
                 XCTAssertEqual(presentation.resetsAt, value.resetsAt)
-                XCTAssertTrue(presentation.sourceLabel.contains("账号/组织未核验"))
+                XCTAssertTrue(presentation.sourceLabel.contains("本地 Codex 历史快照"))
                 XCTAssertTrue(presentation.statusLabel.contains("历史"))
                 if future { XCTAssertTrue(presentation.statusLabel.contains("异常时间戳")) }
                 if noReset { XCTAssertTrue(presentation.statusLabel.contains("重置时间未知")) }
@@ -273,13 +273,12 @@ final class DashboardHistoryTests: XCTestCase {
             sessionCount: 2, filesScanned: 32, isLimited: true, latestEventAt: nil,
             fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
             unknownThreadCount: 2)
-        XCTAssertTrue(f.model.title.contains("小计"))
-        XCTAssertTrue(f.model.title.contains("未核验"))
+        XCTAssertTrue(f.model.title.contains("Σ"))
         XCTAssertTrue(f.model.menuTooltip.contains("实时估算：未知"))
         XCTAssertTrue(f.model.menuTooltip.contains("当前配置关联的本机 Codex 记录"))
-        XCTAssertTrue(f.model.menuTooltip.contains("已核验记录小计"))
+        XCTAssertTrue(f.model.menuTooltip.contains("本次记录合计"))
         XCTAssertTrue(f.model.menuTooltip.contains("本次达到扫描上限"))
-        XCTAssertTrue(f.model.menuTooltip.contains("未核验线程 2"))
+        XCTAssertTrue(f.model.menuTooltip.contains("其他线程 2"))
         for dark in [false, true] {
             let image = try render(DashboardView(model: f.model).overviewContent, dark: dark)
             XCTAssertGreaterThan(image.png.count, 4000)
@@ -293,7 +292,7 @@ final class DashboardHistoryTests: XCTestCase {
         XCTAssertTrue(f.model.title.contains("顶层对话"))
         XCTAssertTrue(f.model.menuTooltip.contains("本次扫描记录量"))
         XCTAssertTrue(f.model.menuTooltip.contains("本次安全检查 3 个物理文件"))
-        XCTAssertTrue(f.model.menuTooltip.contains("未核验线程 0"))
+        XCTAssertTrue(f.model.menuTooltip.contains("其他线程 0"))
         for dark in [false, true] {
             let image = try render(DashboardView(model: f.model).overviewContent, dark: dark)
             XCTAssertGreaterThan(image.png.count, 4000)

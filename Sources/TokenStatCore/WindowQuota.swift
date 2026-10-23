@@ -13,8 +13,8 @@ public struct WindowQuota: Codable, Equatable, Sendable {
     }
 }
 
-/// Monthly and rolling-window quotas are independent facts; missing one must not
-/// erase the others. No quota is inferred from local token/request counters.
+/// 月度与滚动窗口额度是相互独立的事实；缺失其一不应
+/// 抹掉其余。不会从本地 token/请求计数器推断任何额度。
 public struct QuotaReport {
     public let monthly: QuotaSnapshot?
     public let monthlyMessage: String
@@ -40,8 +40,8 @@ public struct QuotaReport {
                 return WindowQuota(minutes: minutes, usedPercent: percent,
                     resetsAt: resetDate(value(resetPath)), fetchedAt: now)
             }
-            // Also accept the published Codex rateLimits shape from this same configured
-            // endpoint. Duration, not primary/secondary order, determines the window.
+            // 同时也接受来自同一已配置 endpoint 的 Codex 发布的 rateLimits 结构。
+            // 由时长而非 primary/secondary 顺序决定窗口。
             let root = object as? [String: Any] ?? [:]
             let payload = root["result"] as? [String: Any] ?? root
             guard let limits = payload["rateLimits"] as? [String: Any] else { return nil }
@@ -68,7 +68,7 @@ public struct QuotaReport {
         return result
     }
     private static func resetDate(_ value: Any?) -> Date? {
-        // Numeric timestamps are Unix seconds, never guessed as milliseconds.
+        // 数字时间戳为 Unix 秒，绝不会被猜测成毫秒。
         if let seconds = number(value), seconds > 0, seconds < 100_000_000_000 {
             return Date(timeIntervalSince1970: seconds)
         }

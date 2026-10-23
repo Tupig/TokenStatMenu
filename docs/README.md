@@ -1,18 +1,20 @@
-# 文档入口
+# 项目文档
 
-TokenStatMenu 是面向 Seasun Token Hub 的原生 macOS 菜单栏统计工具。首次使用请进入 [文档中心](wiki/Home.md)，按自己的目的选择阅读路径。
+安装、使用、构建与测试说明统一见 [文档中心](wiki/Home.md)。数据处理方式见 [隐私说明](../PRIVACY.md)。
 
-| 我想做什么 | 从这里开始 |
+## 目录
+
+| 路径 | 用途 |
 | --- | --- |
-| 安装、启动并确认数据来源 | [安装与使用](wiki/安装与使用.md) |
-| 理解 token/s、会话小计、5 小时与 7 天额度 | [统计口径](wiki/统计口径.md) |
-| 排查无数据、权限、菜单栏或构建问题 | [常见问题](wiki/常见问题.md) |
-| 从源码构建 | [编译指南](wiki/编译指南.md) |
-| 执行回归、界面检查或本机验收 | [测试指南](wiki/测试指南.md) |
-| 提交问题、文档或代码改进 | [贡献指南](wiki/贡献指南.md) |
+| `Sources/` | 核心逻辑、菜单栏应用、Widget 及独立开发探针 |
+| `Tests/` | 核心检查、界面回归、Widget 协议测试与图像基线 |
+| `Resources/` | 图标、Info.plist、签名权限与配置示例 |
+| `script/` | 构建、测试、预览、打包与发布工具 |
+| `TokenStatMenu.xcodeproj/` | 原生应用及扩展的 Xcode 工程 |
+| `docs/wiki/` | 使用与维护指南 |
+| `.build/` | 可重新生成的构建缓存，不提交 |
+| `dist/` | 本机构建与打包产物，不提交 |
 
-本文档保存在源码仓库的 `docs/wiki/` 中，链接可直接在 GitHub 源码页访问。目录名称沿用 Wiki 的阅读习惯，不表示已经配置 GitHub Wiki 同步。
-
-更深入的资料见 [可选偏好](CONFIGURATION.md)、[实现范围](IMPLEMENTATION.md)、[设计说明](DESIGN.md)、[性能与基准](PERFORMANCE.md)、[UI 测试说明](UI_TESTING.md) 和 [验证记录](VALIDATION.md)。数据与会话处理方式见 [隐私说明](../PRIVACY.md)。仓库源文件是维护与阅读的权威内容；源码 ZIP 按显式文件白名单构建，详情见[编译指南](wiki/编译指南.md)和 [CI/CD](wiki/CI-CD.md)。
+实现细节见 [实现范围](IMPLEMENTATION.md)、[设计说明](DESIGN.md) 和 [性能与基准](PERFORMANCE.md)。测试结果见 [验证记录](VALIDATION.md)。
 
 相关页面：[项目首页](../README.md) · [文档中心](wiki/Home.md)

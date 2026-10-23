@@ -1,7 +1,6 @@
 import Foundation
 
-// This file is compiled into the isolated development host and extension only.
-// It has no dependency on the normal collector or on an account credential.
+// 仅编译到独立开发宿主和扩展，不依赖正式采集器或账号凭据。
 enum DevProbeArguments {
     enum Mode { case normal, sample(Int), reject }
 
@@ -21,8 +20,7 @@ enum DevWidgetIdentity {
 
     static func hasExactGroupShape(_ value: String, allowSynthetic: Bool = false) -> Bool {
         let suffix = ".com.tupig.TokenStatMenu.DevWidgetTest"
-        // Team ID is exactly 10 characters. Anything between it and the fixed
-        // suffix, including an extra dotted segment, is a different group.
+        // Team ID 固定为 10 个字符，它与固定后缀之间不能插入其他段。
         return value.count == 10 + suffix.count
               && value.dropFirst(10) == suffix
               && !value.contains("$(") && !value.hasPrefix("UNRESOLVED")
@@ -30,7 +28,7 @@ enum DevWidgetIdentity {
               && value.prefix(10).allSatisfy({ $0.isASCII && ($0.isUppercase || $0.isNumber) })
     }
 
-    // Never use an unresolved build variable as an actual App Group.
+    // 未展开的构建变量不能作为 App Group 使用。
     static func group(in bundle: Bundle = .main) -> String? {
         guard let value = bundle.object(forInfoDictionaryKey: "C51CDevGroup") as? String,
               hasExactGroupShape(value)
@@ -61,8 +59,7 @@ struct DevWidgetSnapshot {
         return Data(json.utf8)
     }
 
-    // The development extension deliberately accepts only the exact synthetic
-    // projection. It cannot turn a production gateway response into a display.
+    // 开发扩展只接受指定的模拟数据结构，不将真实网关响应转换为显示数据。
     static func decode(_ data: Data, nowMs: Int64) -> DevWidgetSnapshot? {
         guard nowMs >= 0, nowMs <= 253_402_300_799_999,
               data.count <= 8192, data.count > 0,
@@ -256,8 +253,7 @@ private extension Dictionary where Key == String, Value == DevJSON {
     }
 }
 
-// Decimal is a 128-bit coefficient with an 8-bit exponent. Normalize the
-// lexical value first, then verify Foundation has preserved that exact value.
+// Decimal 使用 128 位系数和 8 位指数；先规范化数字文本，再确认 Foundation 精确保留其值。
 private struct DecimalLexeme {
     let digits: String
     let exponent: Int
@@ -317,8 +313,7 @@ private struct DecimalLexeme {
     }
 }
 
-// Small strict JSON reader: duplicate names, arrays, trailing bytes, and free
-// strings are rejected before a snapshot can reach the view.
+// 严格 JSON 读取器，在快照进入视图前拒绝重复字段、数组、尾随字节和任意字符串。
 private struct DevJSONParser {
     private let bytes: [UInt8]
     private var offset = 0

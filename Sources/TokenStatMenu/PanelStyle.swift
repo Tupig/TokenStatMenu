@@ -1,8 +1,7 @@
 import Foundation
 import SwiftUI
 
-// Original native components inspired by compact translucent desktop dashboards.
-// Semantic foregrounds/materials keep both system appearances legible.
+// 紧凑的半透明原生组件，使用语义化前景色和材质适配深浅外观。
 enum PanelPalette {
     static let blue = Color(red: 0.24, green: 0.43, blue: 0.96)
     static let violet = Color(red: 0.55, green: 0.39, blue: 0.89)
@@ -24,9 +23,7 @@ enum HeaderActionMetrics {
     static let actionSize: CGFloat = 30
 }
 
-/// Header actions intentionally ignore the dashboard's accent tint. This
-/// keeps the settings and quit hit targets visually neutral and symmetric,
-/// including when the popover opens with keyboard focus.
+/// 顶部操作不使用强调色，使设置和退出按钮在获取键盘焦点时仍保持中性、对称。
 struct NeutralHeaderActionButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label

@@ -1,16 +1,14 @@
 import SwiftUI
 import WidgetKit
 
-/// One decoded timeline entry. A nil snapshot means "no shared channel or no
-/// data", which the views must render as unknown rather than as zero.
+/// 已解码的时间线条目。快照为 nil 表示通道或数据缺失，视图显示未知而非零。
 struct WidgetEntry: TimelineEntry {
     let date: Date
     let snapshot: WidgetQuotaSnapshot?
     let channelAvailable: Bool
 }
 
-/// Reads the App Group snapshot. The read performs no network access and no
-/// preference lookup; it only decodes the last payload the app published.
+/// 读取应用最近发布的 App Group 快照，不访问网络或偏好设置。
 struct WidgetProvider: TimelineProvider {
     func placeholder(in context: Context) -> WidgetEntry {
         WidgetEntry(date: .now, snapshot: nil, channelAvailable: true)
@@ -22,8 +20,7 @@ struct WidgetProvider: TimelineProvider {
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<WidgetEntry>) -> Void) {
         let entry = currentEntry()
-        // Refresh in five minutes; the app also asks WidgetKit to reload right
-        // after it publishes a new snapshot.
+        // 五分钟后刷新；应用发布新快照时也会向 WidgetKit 请求重载。
         let next = Date().addingTimeInterval(300)
         completion(Timeline(entries: [entry], policy: .after(next)))
     }

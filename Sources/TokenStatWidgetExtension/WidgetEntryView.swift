@@ -1,9 +1,7 @@
 import SwiftUI
 import WidgetKit
 
-/// Widget presentation. Every value falls back to an explicit "未知" state:
-/// the widget never shows 0%, never borrows another window's number and never
-/// presents stale hub data as current.
+/// 小组件视图：数据缺失时显示“未知”，不借用其他窗口的值或将过期数据当作当前值。
 struct WidgetEntryView: View {
     let entry: WidgetEntry
     @Environment(\.widgetFamily) private var family
@@ -56,8 +54,7 @@ struct WidgetEntryView: View {
 
     @ViewBuilder
     private func content(_ snapshot: WidgetQuotaSnapshot) -> some View {
-        // Evaluate freshness at render time. `entry.date` is frozen when the
-        // timeline is built and can stay "current" long after the window reset.
+        // 渲染时判断有效期；`entry.date` 在时间线创建时固定，不能反映后续重置。
         let five = snapshot.currentWindow(snapshot.fiveHour, at: .now)
         let seven = snapshot.currentWindow(snapshot.sevenDay, at: .now)
         if family == .systemSmall {
@@ -167,7 +164,7 @@ struct WidgetEntryView: View {
         }
     }
 
-    // MARK: - Formatting
+    // MARK: - 格式化
 
     private func percentText(_ value: Double) -> String {
         String(format: "%.2f", value)

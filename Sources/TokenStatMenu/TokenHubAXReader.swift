@@ -11,8 +11,7 @@ protocol TokenHubPermissionProviding {
     func requestOnceAndOpenSystemSettings()
 }
 
-/// Only immutable values cross the native AX actor boundary. AppKit process
-/// references, AXUIElement objects and the mutable traversal map stay inside it.
+/// 只有不可变值跨 AX actor 边界，AppKit 进程引用、AXUIElement 和可变遍历表留在内部。
 struct TokenHubAXRequest: Sendable {
     let now: Date
     let permissionTrusted: Bool
@@ -25,8 +24,7 @@ actor NativeTokenHubAXWorker {
     private let reader = TokenHubAXReader()
 
     func scan(_ request: TokenHubAXRequest) -> TokenHubQuotaResult {
-        // No suspension point while the native reader owns AX references.
-        // Core still rejects an untrusted or inactive request before discovery.
+        // 持有 AX 引用期间不挂起；核心仍会在发现目标前拒绝未授权或非活动请求。
         reader.scan(now: request.now, monotonicNow: { ProcessInfo.processInfo.systemUptime },
                     permissionTrusted: request.permissionTrusted,
                     refreshSeconds: request.refreshSeconds, mode: request.mode,
@@ -34,8 +32,7 @@ actor NativeTokenHubAXWorker {
     }
 }
 
-/// Immutable constructor injection keeps the native actor as the sole AX owner.
-/// The marker survives closure wrapping so fixture launches cannot read real UI.
+/// 通过不可变构造器注入，使原生 actor 独占 AX 对象；标记在闭包包装后仍保留，防止测试读取真实界面。
 struct TokenHubAXSource {
     enum Kind { case native, synthetic }
     let kind: Kind
@@ -56,7 +53,7 @@ struct TokenHubAXSource {
     }
 }
 
-/// Production boundary for one scan. AX objects live only in this instance's one scan call.
+/// 单次原生扫描的边界，AX 对象仅在本次调用期间存活。
 final class TokenHubAXReader: TokenHubQuotaScanning {
     private let tree = TokenHubNativeTreeReader()
     private let scanner = TokenHubQuotaScanner()
@@ -207,8 +204,7 @@ private final class TokenHubNativeTreeReader: TokenHubBoundedTreeReading {
         return element
     }
     private func prepare(_ element: AXUIElement, timeout: TimeInterval) throws {
-        // Set timeout on this exact element before each AX message; never on the application root
-        // as a substitute for an element-specific limit.
+        // 每次发送 AX 消息前为当前元素设置超时，不能以应用根元素的超时替代逐元素限制。
         guard AXUIElementSetMessagingTimeout(element, Float(timeout)) == .success else {
             throw TokenHubNativeReadError.timeout
         }

@@ -7,8 +7,8 @@ public struct LocalRequest {
     public let body: Data
 }
 
-/// One HTTP/1.1 request per connection. Responses advertise Connection: close.
-/// Content-Length and chunked request bodies are supported; ambiguous framing is rejected.
+/// 每个连接只处理一个 HTTP/1.1 请求。响应会声明 Connection: close。
+/// 支持 Content-Length 和 chunked 请求体；模糊的分帧会被拒绝。
 public struct HTTPDecoder {
     private var buffer = Data()
     private var head: (String, String, [String: String])?

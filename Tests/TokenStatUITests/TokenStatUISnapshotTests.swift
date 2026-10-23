@@ -37,7 +37,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
             lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
                 completedAt: Date(timeIntervalSince1970: 1_797_000_000)))
         XCTAssertEqual(model.title, "上轮均:15.0tok/s · Σ425 · 2顶层对话")
-        XCTAssertTrue(model.dataNotice.contains("当前扫描范围记录小计"))
+        XCTAssertTrue(model.dataNotice.contains("当前扫描范围记录合计"))
         XCTAssertTrue(model.menuTooltip.contains("425"))
         XCTAssertTrue(model.menuTooltip.contains("顶层对话 2"))
         XCTAssertTrue(model.menuTooltip.contains("含工具、网络和等待"))
@@ -74,13 +74,11 @@ final class TokenStatUISnapshotTests: XCTestCase {
             subagentCount: 0, forkCount: 0)
         XCTAssertFalse(known.hasCompleteAccounting)
         model.localSnapshot = known
-        XCTAssertTrue(model.title.contains("小计50"))
-        XCTAssertTrue(model.title.contains("未核验3"))
-        XCTAssertFalse(model.title.contains("Σ50"))
+        XCTAssertTrue(model.title.contains("Σ50"))
         XCTAssertTrue(model.menuTooltip.contains("输入 30"))
         XCTAssertTrue(model.menuTooltip.contains("输出 20"))
         XCTAssertTrue(model.menuTooltip.contains("总计 50"))
-        XCTAssertTrue(model.menuTooltip.contains("未核验线程 2"))
+        XCTAssertTrue(model.menuTooltip.contains("其他线程 2"))
         XCTAssertTrue(model.menuTooltip.contains("未识别文件 1"))
         XCTAssertFalse(model.menuTooltip.contains("本次扫描记录量 50"))
 
@@ -89,8 +87,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
             knownThreadCount: 1, unknownThreadCount: 0, unidentifiedFileCount: 0,
             subagentCount: 0, forkCount: 0)
         XCTAssertFalse(model.localSnapshot.hasCompleteAccounting, "a scan limit prevents complete accounting")
-        XCTAssertTrue(model.title.contains("小计10"))
-        XCTAssertFalse(model.title.contains("Σ10"))
+        XCTAssertTrue(model.title.contains("Σ10"))
 
         model.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
             filesScanned: 2, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
@@ -105,6 +102,17 @@ final class TokenStatUISnapshotTests: XCTestCase {
         XCTAssertTrue(model.localSnapshot.hasCompleteAccounting)
         XCTAssertTrue(model.title.contains("Σ50"), "complete metadata-backed accounting may show exact total")
         XCTAssertTrue(model.menuTooltip.contains("本次扫描记录量 50"))
+
+        for snapshot in [known, model.localSnapshot,
+            LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
+                filesScanned: 1, isLimited: false, latestEventAt: nil,
+                fiveHour: nil, sevenDay: nil, unidentifiedFileCount: 1)] {
+            model.localSnapshot = snapshot
+            for text in [model.title, model.menuTooltip, model.dataNotice] {
+                XCTAssertFalse(text.contains("未核验"))
+                XCTAssertFalse(text.contains("小计"))
+            }
+        }
     }
 
     func testC12AccountingDashboardExportsSyntheticReviewRenders() throws {

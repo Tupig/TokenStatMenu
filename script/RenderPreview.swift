@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// Offline rendering of the actual SwiftUI views, not a screen capture.
+/// 离线渲染实际 SwiftUI 视图，不截取桌面内容。
 @main struct RenderPreview {
     @MainActor static func main() throws {
         guard CommandLine.arguments.contains("--test-fixture"), CommandLine.arguments.count > 2 else { exit(2) }
@@ -24,8 +24,6 @@ import SwiftUI
             "seven_day": ["used_percent": 70, "resets_at": Date().addingTimeInterval(172800).timeIntervalSince1970]
         ]]), config: model.config)
         model.fiveHourQuota = windows.fiveHour; model.sevenDayQuota = windows.sevenDay
-        model.gateways = [GatewayDiscovery.candidate(baseURL: "https://gateway.example/route", provider: "示例网关", source: "虚构本机配置", model: "example-model", isActive: true)!]
-        model.discoveryStatus = "模拟候选 · 不读取实际配置"
         model.history = (0..<60).map { i in SpeedPoint(date: Date().addingTimeInterval(Double(i - 60)), value: 20 + sin(Double(i) * 0.3) * 6) }
         if CommandLine.arguments.contains("--focus-diagnostic") {
             try renderFocusedPopovers(model, to: output)
@@ -56,7 +54,7 @@ import SwiftUI
         model.config.dataSource = "localCodex"
         model.localSnapshot = LocalCodexSnapshot(input: 12_345, output: 6_789, total: 19_134,
             sessionCount: 3, filesScanned: 3, isLimited: false, latestEventAt: Date(),
-            fiveHour: normalWindows.0, sevenDay: normalWindows.1)
+            fiveHour: normalWindows.0, sevenDay: normalWindows.1, knownThreadCount: 3)
         for (name, scheme, appearance) in [("light", ColorScheme.light, NSAppearance.Name.aqua), ("dark", .dark, .darkAqua)] {
             NSApp.appearance = NSAppearance(named: appearance)
             try render(model, settings: false, scheme: scheme, appearance: appearance,

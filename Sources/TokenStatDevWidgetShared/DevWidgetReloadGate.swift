@@ -1,8 +1,7 @@
 import Foundation
 
-// Pure scheduling decision for the later host integration. The caller must
-// supply a digest of the DTO projection excluding writtenAtMs and use a
-// monotonic millisecond clock. This class performs no timer or WidgetCenter I/O.
+// 供宿主接入的纯调度决策。调用方提供去除 writtenAtMs 后的 DTO 摘要及单调毫秒时钟。
+// 本类不创建计时器，也不调用 WidgetCenter。
 final class DevWidgetReloadGate {
     private struct Pending {
         let firstAtMs: UInt64
@@ -28,7 +27,7 @@ final class DevWidgetReloadGate {
         if let pending {
             self.pending?.digest = projectionDigest
             self.pending?.generation = generation
-            return pending.deadlineMs // Replacement never pushes the first deadline.
+            return pending.deadlineMs // 替换数据不推迟首次设定的截止时间。
         }
         guard projectionDigest != lastRequestedDigest else { return nil }
         let coalesced = saturatedAdd(now, 1_000)
@@ -39,8 +38,7 @@ final class DevWidgetReloadGate {
         return deadline
     }
 
-    // Returns only the frozen Widget kind. The caller owns its single one-shot
-    // timer and may call WidgetCenter.reloadTimelines only for this result.
+    // 仅返回固定的小组件类型；调用方管理单次计时器，并只对该结果请求时间线重载。
     func fire(atMs now: UInt64, currentGeneration: UInt64) -> String? {
         guard let candidate = pending, now >= candidate.deadlineMs else { return nil }
         pending = nil

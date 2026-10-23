@@ -121,9 +121,7 @@ public struct LocalCodexSnapshot: Equatable, Sendable {
     public let details: [LocalCodexThreadDetail]
     public let cacheCoverage: LocalCacheCoverage
     public let detailLimited: Bool
-    /// When the five-hour and seven-day rate windows were last reported. Both
-    /// windows come from one record; carrying the timestamp lets a merged scan
-    /// pick the fresher record as a pair instead of mixing two different ones.
+    /// 五小时和七天窗口的最近上报时间。合并扫描时按此时间成对选取窗口，避免混用记录。
     public let quotaDate: Date?
     public var hasCompleteAccounting: Bool {
         knownThreadCount > 0 && unknownThreadCount == 0 && unidentifiedFileCount == 0 && !isLimited
@@ -156,9 +154,8 @@ public struct LocalTurnSummary: Equatable, Sendable {
     }
 }
 
-/// A short-lived estimate derived from two recent cumulative `token_count`
-/// events while a Codex task is still active. It expires quickly when the
-/// rollout stops advancing and is kept separate from completed-turn averages.
+/// 根据活跃 Codex 任务最近两次累计 `token_count` 事件计算短时速率。
+/// 记录停止更新后即过期，与已完成轮次的均速分开保存。
 public struct LocalLiveTurnSummary: Equatable, Sendable {
     public let inputTPS: Double
     public let outputTPS: Double
@@ -169,8 +166,8 @@ public struct LocalLiveTurnSummary: Equatable, Sendable {
     }
 }
 
-/// A verified association between the active Codex provider and Seasun Token
-/// Hub. The origin is proved by the caller and is not retained in public state.
+/// 当前 Codex 提供商与 Seasun Token Hub 的关联。
+/// 源站由调用方验证，不保留在公开状态中。
 public struct LocalCodexRouteContext: Equatable, Sendable {
     public let provider: String?
     public let isVerified: Bool
@@ -198,7 +195,7 @@ public struct LocalCodexRouteContext: Equatable, Sendable {
     }
 }
 
-/// Completion-relative, generation-aware schedule for local usage scans.
+/// 本地扫描调度：按上次完成时间计时，用代次区分已失效的扫描。
 public struct LocalRefreshScheduler {
     private(set) public var generation = 0
     private var inFlight: Int?
@@ -233,7 +230,7 @@ public struct LocalRefreshScheduler {
     }
 }
 
-/// Reads bounded Codex usage records; unknown identity or lineage stays unknown.
+/// 限量读取 Codex 用量记录；无法判断的身份与派生关系保持未知。
 public enum LocalCodexUsageReader {
     private static let maxEntries = 5_000
     private static let maxFiles = 32
@@ -267,8 +264,7 @@ public enum LocalCodexUsageReader {
             ctimeSec = Int64(st.st_ctimespec.tv_sec); ctimeNSec = Int64(st.st_ctimespec.tv_nsec)
         }
     }
-    /// Physical identity only. A hard link keeps the same device and inode while
-    /// its size or timestamps may advance between two directory scans.
+    /// 文件的物理身份。硬链接的设备和 inode 不变，大小和时间戳可在扫描间发生变化。
     private struct FileIdentity: Hashable {
         let device: UInt64; let inode: UInt64
         init(_ st: stat) { device = UInt64(st.st_dev); inode = UInt64(st.st_ino) }
@@ -378,13 +374,10 @@ public enum LocalCodexUsageReader {
         try scanDirectory(directory: directory, now: now, cache: cache, routeContext: routeContext).snapshot
     }
 
-    /// Reads the active sessions directory and, when it sits beside an
-    /// `archived_sessions` sibling, that archive as well.
+    /// 读取活跃会话目录及同级的 `archived_sessions` 归档目录。
     ///
-    /// Codex moves finished rollouts out of `sessions/` without deleting them.
-    /// Scanning only the active directory then reports an empty local total
-    /// even though the files are still on disk. The archive is optional: a
-    /// missing sibling is not an error and is not treated as zero usage.
+    /// 已归档记录可能不再位于 `sessions/`，因此两个目录都需要扫描。
+    /// 归档目录可选，缺失时不报错，也不据此认定用量为零。
     public static func scanCodexHome(sessions directory: URL, now: Date = Date(), cache: Cache? = nil,
                                      archiveCache: Cache? = nil,
                                      routeContext: LocalCodexRouteContext? = nil) throws -> LocalCodexSnapshot {
@@ -394,11 +387,8 @@ public enum LocalCodexUsageReader {
         var archiveIsDirectory = ObjCBool(false)
         guard FileManager.default.fileExists(atPath: archive.path, isDirectory: &archiveIsDirectory),
               archiveIsDirectory.boolValue else { return active.snapshot }
-        // A rollout that still sits in both directories is one physical file
-        // (a hard link) or one logical thread (a copy with a different inode).
-        // Skip the archive copy in either case instead of adding the same
-        // history twice. The archive keeps its own cache so a quiet archive is
-        // not re-read on every active-directory refresh.
+        // 按物理文件和逻辑线程排除归档副本，避免硬链接或复制文件重复计数。
+        // 归档使用独立缓存，未变化时不重复读取。
         let archived = try scanDirectory(directory: archive, now: now, cache: archiveCache,
                                          routeContext: routeContext,
                                          excluding: active.identities,
@@ -406,17 +396,12 @@ public enum LocalCodexUsageReader {
         return merge(active.snapshot, archived.snapshot)
     }
 
-    /// Combines two scans of sibling directories.
+    /// 合并两个同级目录的扫描结果。
     ///
-    /// `opaqueKey` is assigned independently by each scan. Primary keys stay
-    /// untouched so a single-directory refresh keeps its SwiftUI identity; the
-    /// archive keys move into a disjoint high range. Every detail is kept: two
-    /// different rollouts can legitimately report the same usage, and collapsing
-    /// them would make the detail list disagree with the totals.
+    /// 主目录的 `opaqueKey` 保持不变，归档键移入不重叠的高位范围，保持 SwiftUI 身份稳定。
+    /// 不按用量数值合并明细：不同会话可能恰好有相同用量。
     static func merge(_ primary: LocalCodexSnapshot, _ extra: LocalCodexSnapshot) -> LocalCodexSnapshot {
-        // Opaque keys are small allocation counters; this offset keeps the two
-        // independently assigned key spaces disjoint without renumbering the
-        // active directory on every refresh.
+        // 键由较小的计数器分配，偏移后两组键不重叠，无需每次刷新都重新编号。
         let extraKeyOffset: UInt64 = 1 << 32
         func shifted(_ detail: LocalCodexThreadDetail) -> LocalCodexThreadDetail {
             assert(detail.opaqueKey < extraKeyOffset, "active directory keys must stay below the archive offset")
@@ -439,9 +424,7 @@ public enum LocalCodexUsageReader {
             return overflow ? Int.max : sum
         }
         let latest = [primary.latestEventAt, extra.latestEventAt].compactMap { $0 }.max()
-        // A live estimate is additive: two sessions finishing turns at once
-        // contribute their rates together, and the aggregate expires when the
-        // oldest included component expires (matching single-directory scans).
+        // 多个会话的实时速率相加，最旧分量过期时整体过期，与单目录扫描一致。
         let live: LocalLiveTurnSummary? = {
             switch (primary.liveTurn, extra.liveTurn) {
             case let (p?, e?):
@@ -454,7 +437,7 @@ public enum LocalCodexUsageReader {
             }
         }()
         let turn = [primary.lastTurn, extra.lastTurn].compactMap { $0 }.max { $0.completedAt < $1.completedAt }
-        // The rate windows travel as a pair: pick the fresher record whole.
+        // 限额窗口成对保留，整条选取较新的记录。
         let rateWinner: LocalCodexSnapshot = {
             switch (primary.quotaDate, extra.quotaDate) {
             case let (p?, e?): return p >= e ? primary : extra
@@ -485,11 +468,9 @@ public enum LocalCodexUsageReader {
             detailLimited: primary.detailLimited || extra.detailLimited)
     }
 
-    /// Scans one directory and reports the physical file identities it used.
+    /// 扫描一个目录并返回实际使用的文件身份。
     ///
-    /// `excluding` lets `scanCodexHome` skip files that the active directory
-    /// already consumed. Hard links are the same physical history and must not
-    /// be counted twice merely because Codex shows them under two paths.
+    /// `excluding` 用于跳过活跃目录已读取的文件，避免同一硬链接被计入两次。
     private static func scanDirectory(directory: URL, now: Date, cache: Cache?,
                                       routeContext: LocalCodexRouteContext?,
                                       excluding: Set<FileIdentity> = [],
@@ -513,8 +494,7 @@ public enum LocalCodexUsageReader {
         guard lstat(directory.path, &st) == 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; cache?.clearOpaqueState(); return empty() }
         guard (st.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; cache?.clearOpaqueState(); return empty() }
         let rootFD = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-        // A directory that exists but cannot be opened is an incomplete read,
-        // not an empty one: report it so the UI never shows zero as truth.
+        // 目录存在但打不开表示读取不完整，不能按空目录处理。
         guard rootFD >= 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; cache?.clearOpaqueState(); return empty(limited: true) }
         defer { close(rootFD) }
         var opened = stat()
@@ -538,8 +518,7 @@ public enum LocalCodexUsageReader {
                 if (fst.st_mode & S_IFMT) == S_IFDIR { directories.append(name); continue }
                 guard (fst.st_mode & S_IFMT) == S_IFREG, name.lowercased().hasSuffix(".jsonl") else { continue }
                 let identity = FileIdentity(fst)
-                // Already consumed by the sibling directory: the same inode is
-                // one physical history, not two sessions.
+                // 同级目录已读取该 inode，不重复计数。
                 if excluding.contains(identity) { continue }
                 candidates.append(Candidate(name: name,
                     modified: Date(timeIntervalSince1970: Double(fst.st_mtimespec.tv_sec)),
@@ -553,9 +532,7 @@ public enum LocalCodexUsageReader {
 
         var usedBytes = 0, filesScanned = 0, unidentified = 0, unsafeCandidate = false, coverageLimited = false
         var summaries: [FileSummary] = [], liveSignatures = Set<FileSignature>()
-        // Only files whose bytes actually entered a summary may exclude a
-        // sibling copy. A file skipped for budget or read failure must not make
-        // the archive copy disappear as well.
+        // 仅排除已纳入摘要的文件；预算不足或读取失败时，归档副本仍可参与扫描。
         var usedIdentities = Set<FileIdentity>()
         for candidate in candidates {
             let fd = openRelative(rootFD, candidate.name); guard fd >= 0 else { unsafeCandidate = true; continue }
@@ -564,8 +541,7 @@ public enum LocalCodexUsageReader {
             var fst = stat(); guard fstat(fd, &fst) == 0, (fst.st_mode & S_IFMT) == S_IFREG, fst.st_size >= 0 else { unsafeCandidate = true; continue }
             guard isContained(fd: fd, rootFD: rootFD) else { unsafeCandidate = true; continue }
             let signature = FileSignature(fst)
-            // The entry can be replaced between discovery and open; re-check
-            // the sibling exclusion against the inode actually opened.
+            // 目录项可能在发现和打开之间被替换，按实际打开的 inode 重新检查。
             if excluding.contains(FileIdentity(fst)) { continue }
             liveSignatures.insert(signature)
             if let cache, let old = cache.entries.keys.first(where: { $0.device == signature.device && $0.inode == signature.inode && $0 != signature }) {
@@ -576,8 +552,7 @@ public enum LocalCodexUsageReader {
                 }
             }
             if fst.st_size < 0 { unsafeCandidate = true; continue }
-            // A clock rollback can turn previously current evidence into future
-            // evidence. Reparse it rather than reusing a time-dependent result.
+            // 时钟回拨后，旧结果可能落在未来，需重新解析而非复用缓存。
             if let cached = cache?.entries[signature], now >= cached.evaluatedAt {
                 cache?.hit()
                 let cachedSummary = cached.summary
@@ -625,9 +600,7 @@ public enum LocalCodexUsageReader {
             cache?.parsed()
             let parsed = parseFile(bytes: bytes, size: size, now: now, signature: signature,
                                    routeContext: routeContext)
-            // The same logical thread already entered the sibling directory as
-            // a copy with a different inode. Skip it without counting it toward
-            // the archive's file or thread totals.
+            // 同级目录已纳入同一逻辑线程，跳过 inode 不同的副本。
             if let threadID = parsed.identity, excludingThreads.contains(threadID) { continue }
             filesScanned += 1
             if parsed.identity == nil { unidentified += 1 }
@@ -638,8 +611,7 @@ public enum LocalCodexUsageReader {
                 cache.entries[signature] = CachedFileSummary(summary: parsed, evaluatedAt: now)
                 if cache.entries.count > maxFiles { cache.entries.removeValue(forKey: cache.entries.keys.first!) }
             } else {
-                // Future lifecycle/counter evidence must be rejudged as time
-                // catches up, including when the file itself remains unchanged.
+                // 即使文件未变化，也需随时间推进重新判断未来的生命周期或计数器事件。
                 cache?.entries.removeValue(forKey: signature)
             }
         }
@@ -650,7 +622,7 @@ public enum LocalCodexUsageReader {
         }
         _ = discoveryLimited
 
-        // Same inode is one physical history. Same ID is one logical thread only if whole bytes match.
+        // 相同 inode 是同一物理文件；相同 ID 仅在全部字节一致时才视为同一逻辑线程。
         var physicalSeen = Set<FileSignature>()
         summaries = summaries.filter { physicalSeen.insert($0.signature).inserted }
         let allRates = summaries.compactMap { summary -> (Date, Record?)? in summary.quotaDate.map { ($0, summary.rate) } }
@@ -681,16 +653,13 @@ public enum LocalCodexUsageReader {
                 if let contribution = summary.contribution { known.append(contribution) } else { unknownThreads += 1 }
             }
             if let sourceOrder = summaries.firstIndex(where: { $0.signature == summary.signature }) {
-                // A verified identity with an unknown lineage still gets a
-                // detail row. Its base contribution remains unknown, while
-                // independently validated complete turns remain visible.
+                // 身份可确认但派生关系未知时仍显示明细；基础用量未知，完整轮次可独立显示。
                 detailCandidates.append(DetailCandidate(summary: summary, sourceOrder: sourceOrder))
             }
             if let event = summary.latestEventAt, latestEvent == nil || event > latestEvent! { latestEvent = event }
             if let live = summary.live, live.observedAt <= now {
                 liveInputTPS += live.inputTPS; liveOutputTPS += live.outputTPS
-                // The aggregate expires when its oldest included component
-                // expires; a newer session cannot extend an older one's rate.
+                // 汇总按最旧分量的时间过期，新会话不能延长旧速率的有效期。
                 if latestLiveAt == nil || live.observedAt < latestLiveAt! { latestLiveAt = live.observedAt }
             }
         }
@@ -890,11 +859,8 @@ public enum LocalCodexUsageReader {
         let tailLimited = size > headLimit + tailLimit
         let wholeFileRead = size <= headLimit + tailLimit
         let headComplete = wholeFileRead || size <= headLimit || head.last == 10
-        // `endsAtFileEnd` means the bounded read reached EOF; it does not mean
-        // that EOF was terminated by a newline. A final non-empty segment is a
-        // candidate complete record when the bytes cover the whole file. The
-        // parser below decides whether malformed JSON makes it a continuity
-        // barrier.
+        // `endsAtFileEnd` 表示读到 EOF，不要求文件以换行结尾。
+        // 完整读取时末尾非空片段可作为记录，解析器负责判断 JSON 是否有效。
         let headLines = wholeFileRead ? completeLines(Data(bytes), startsAtFileStart: true, endsAtFileEnd: size <= bytes.count) : completeLines(Data(head), startsAtFileStart: true, endsAtFileEnd: false)
         let tailLines = !wholeFileRead && tailLength > 0 ? completeLines(Data(tail), startsAtFileStart: false, endsAtFileEnd: true) : []
         let headSlots = headLines.enumerated().map { parseLine($0.element, fallbackOrdinal: $0.offset) }
@@ -907,9 +873,7 @@ public enum LocalCodexUsageReader {
         let continuousRead = wholeFileRead
         let finalLineWithoutLF: Data.SubSequence? = bytes.last == 10 ? nil :
             bytes[(bytes.lastIndex(of: 10).map { bytes.index(after: $0) } ?? bytes.startIndex)...]
-        // A no-final-LF line is complete when it parsed as a valid JSON event.
-        // Keep malformed fragments as continuity barriers so they cannot make
-        // a bounded history look complete.
+        // 末行没有 LF 但 JSON 有效时仍是完整记录；格式错误的片段则中断连续性。
         let hasIncompleteTailFragment: Bool = {
             guard let finalLineWithoutLF else { return false }
             return parseLine(finalLineWithoutLF, fallbackOrdinal: -1) == nil
@@ -1010,8 +974,7 @@ public enum LocalCodexUsageReader {
             if $0.sourceOrdinal != $1.sourceOrdinal { return $0.sourceOrdinal > $1.sourceOrdinal }
             return $0.stableKey < $1.stableKey
         }.first.map { LocalTurnSummary(outputTokens: $0.outputTokens, durationSeconds: $0.durationSeconds, completedAt: $0.completedAt) }
-        // Live lifecycle evidence must be in the final continuous segment. A
-        // corrupt record, unread middle, or incomplete tail cannot be bridged.
+        // 活跃任务的生命周期事件须位于末尾连续片段，不跨越损坏记录、未读中段或残缺尾部。
         let live: LocalLiveTurnSummary?
         if !hasIncompleteTailFragment, let finalSlots = observedLineSegments.last,
            finalSlots.last.flatMap({ $0 }) != nil,
@@ -1038,7 +1001,7 @@ public enum LocalCodexUsageReader {
         else if payload["subagent_history_start_ordinal"] != nil && !(payload["subagent_history_start_ordinal"] is NSNull) { return nil }
         else if let inferred { boundary = inferred }
         else { return nil }
-        // Ordinals are zero-based record positions. Ensure every record through final counter was read.
+        // 序号从零开始，用于确认直到最后一次计数器事件的记录均已读取。
         guard boundary >= 0, events.contains(where: { $0.rawOrdinal == boundary }), events.allSatisfy({ $0.rawOrdinal >= 0 }) else { return nil }
         let before = events.filter { $0.rawOrdinal >= 0 && $0.rawOrdinal < boundary && $0.type == "token_count" && $0.hasCumulativePayload }
         let after = events.filter { $0.rawOrdinal >= boundary && $0.type == "token_count" && $0.hasCumulativePayload }
@@ -1060,8 +1023,7 @@ public enum LocalCodexUsageReader {
               let type = root["type"] as? String else { return nil }
         let payload = root["payload"] as? [String: Any] ?? [:]
         let date = parseDate(root["timestamp"]) ?? .distantPast
-        // A malformed event envelope is a continuity barrier, just like broken
-        // JSON; otherwise it could silently hide a lifecycle boundary.
+        // 无效的事件封装与损坏 JSON 一样会中断连续性，避免遗漏生命周期边界。
         if type == "event_msg" {
             guard let kind = payload["type"] as? String, !kind.isEmpty else { return nil }
         }
@@ -1097,9 +1059,8 @@ public enum LocalCodexUsageReader {
         guard !data.isEmpty else { return [] }
         var lines = data.split(separator: 10, omittingEmptySubsequences: false)
         if !startsAtFileStart { lines.removeFirst() }
-        // A trailing LF creates an empty terminator; a nonempty final segment
-        // is complete only when this read reached EOF. For head chunks that do
-        // not reach EOF, retain only newline-terminated records.
+        // 末尾 LF 产生空的终止片段；非空末片段只有读到 EOF 时才算完整。
+        // 头部未读到 EOF 时，只保留以换行结尾的记录。
         if let last = lines.last, last.isEmpty || !endsAtFileEnd { lines.removeLast() }
         return lines
     }
@@ -1114,8 +1075,7 @@ public enum LocalCodexUsageReader {
         return segments
     }
 
-    /// Derive a short-lived output/input rate only from a still-open task and
-    /// two monotonic cumulative counters. A missing or stale tail is unknown.
+    /// 根据未结束任务和两次单调累计计数推导短时速率，尾部缺失或过期时为未知。
     private static func liveTurn(in events: [ParsedEvent], now: Date) -> LocalLiveTurnSummary? {
         let freshnessLimit: TimeInterval = 15
         var activeID: String?
@@ -1135,8 +1095,7 @@ public enum LocalCodexUsageReader {
                     lastDate = event.date
                     counters.removeAll(keepingCapacity: true)
                 } else {
-                    // Keep all open IDs so closing one overlapping task cannot
-                    // make the other task appear independently attributable.
+                    // 保留所有未结束任务的 ID，不能因关闭一个重叠任务就认定另一个可独立归因。
                     ambiguous = true
                 }
                 openIDs[id, default: 0] += 1
@@ -1161,8 +1120,7 @@ public enum LocalCodexUsageReader {
                    usage.input < previous.input || usage.output < previous.output || usage.total < previous.total {
                     ambiguous = true
                 }
-                // Keep just the last pair after validating every observed
-                // counter, so a prior reset cannot be hidden by two good ones.
+                // 先验证所有计数器再保留最后一对，避免正常尾部掩盖此前的重置。
                 if counters.count == 2 { counters.removeFirst() }
                 counters.append(usage)
             default: break
@@ -1231,7 +1189,7 @@ public enum LocalCodexUsageReader {
             guard activeIDs.isEmpty else { continue }
             let completes = events.enumerated().filter { $0.element.type == "task_complete" && $0.element.turnID == id && $0.offset > startIndex }
             guard let (endIndex, complete) = completes.first else { continue }
-            // Reused identifiers and overlapping turns make token attribution ambiguous.
+            // 标识符复用或轮次重叠时无法明确 token 归属。
             guard !events.enumerated().contains(where: { $0.offset > startIndex && $0.offset < endIndex && $0.element.type == "task_started" }) else { continue }
             guard !events.enumerated().contains(where: { $0.offset > startIndex && $0.offset < endIndex && $0.element.type == "task_complete" && $0.element.turnID != id }) else { continue }
             guard !events[startIndex..<endIndex].contains(where: { $0.type == "turn_aborted" && ($0.turnID == nil || $0.turnID == id) }) else { continue }
@@ -1332,10 +1290,8 @@ public enum LocalCodexUsageReader {
     private static func uint(_ value: Any?) -> UInt64? {
         guard let n = integer(value), let u = UInt64(exactly: n) else { return nil }; return u
     }
-    /// Validate one physical root's cumulative evidence before publishing its
-    /// final counter. JSONL order is authoritative when timestamps are equal;
-    /// strict reversals, future/invalid lifecycle timestamps, counter resets,
-    /// and totals smaller than input+output make the whole thread unknown.
+    /// 发布根线程的最终计数前先校验累计记录。时间戳相同时以 JSONL 顺序为准。
+    /// 时间逆序、未来或无效的生命周期时间、计数器重置、总量小于 input+output 均判为未知。
     private static func validCumulativeSequence(_ events: [ParsedEvent], now: Date) -> Bool {
         guard !events.isEmpty else { return false }
         var previousDate: Date?
@@ -1362,10 +1318,8 @@ public enum LocalCodexUsageReader {
         return .value(cached)
     }
 
-    /// Validate cache counters independently from the inclusive I/O/T chain.
-    /// Missing values break the cache chain without becoming zero; invalid
-    /// values take precedence over missing values so a later malformed record
-    /// cannot be hidden by an earlier omission.
+    /// 缓存计数独立于输入、输出和总量链校验，缺失值中断缓存链但不按零处理。
+    /// 无效值优先于缺失值，避免较早的缺失掩盖后续错误。
     private static func cacheChainState(_ records: [Record]) -> LocalCacheInput {
         var previous: (input: Int, cached: Int)?
         var final: Int?

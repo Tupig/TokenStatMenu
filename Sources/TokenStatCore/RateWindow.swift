@@ -1,7 +1,7 @@
 import Foundation
 
 public struct RateWindow {
-    // 100ms buckets cap memory to ~51 entries, regardless of SSE chunk frequency.
+    // 100ms 的桶将内存限制在约 51 个条目，与 SSE chunk 频率无关。
     private var buckets: [Int: Double] = [:]
     public init() {}
     public mutating func add(tokens: Double, at time: Double) {

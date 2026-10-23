@@ -10,7 +10,7 @@ import AppKit
         if CommandLine.arguments.contains("--request-accessibility") {
             model.requestTokenHubAccessibilityAccess()
         }
-        // Explicit inspection option only. Normal launches never open a window/popover.
+        // 仅显式检查参数会打开界面，正常启动不打开窗口或弹出面板。
         if CommandLine.arguments.contains("--show-panel") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.status?.show() }
         }

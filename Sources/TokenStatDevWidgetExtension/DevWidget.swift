@@ -35,7 +35,7 @@ private struct DevProvider: TimelineProvider {
                 DevProbeTelemetry.writeTerminalToOSLog(event)
             }
         }
-        // The extension checks its own exact group entitlement before lookup.
+        // 查找容器前，扩展先检查自身的组授权是否完全匹配。
         if let reason = DevGroupGuard.currentReason() {
             record(77, reason: reason)
             return DevEntry(date: now, snapshot: nil)

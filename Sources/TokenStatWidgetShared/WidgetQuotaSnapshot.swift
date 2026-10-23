@@ -1,19 +1,15 @@
 import Foundation
 
-/// The single projection shared between the menu-bar app and its WidgetKit
-/// extension. Only fields that both processes may display are represented;
-/// account identity, credentials and raw session text never enter this type.
+/// 菜单栏应用与 WidgetKit 扩展共用的显示数据，不包含账号身份、凭据或会话原文。
 ///
-/// Every value is optional because a missing source must stay visibly unknown.
-/// Publishing does not treat absence as zero and does not substitute another
-/// window or a historical snapshot.
+/// 可选值缺失时显示未知，不用零、其他窗口或历史快照补齐。
 public struct WidgetQuotaSnapshot: Equatable, Sendable {
 
-    /// A rolling or fixed quota window as the menu bar currently presents it.
+    /// 菜单栏当前显示的滚动或固定额度窗口。
     public struct Window: Equatable, Sendable {
-        /// Remaining share of the window, 0...100.
+        /// 窗口剩余比例，范围为 0...100。
         public let remainingPercent: Double
-        /// Window reset instant, when the source supplied one.
+        /// 来源提供的窗口重置时间。
         public let resetsAt: Date?
 
         public init(remainingPercent: Double, resetsAt: Date?) {
@@ -22,8 +18,7 @@ public struct WidgetQuotaSnapshot: Equatable, Sendable {
         }
     }
 
-    /// Monthly usage. `limitAmount` stays nil when the source omits a cap, so
-    /// the widget shows "unknown" instead of inventing a percentage.
+    /// 月度用量。来源未提供上限时，`limitAmount` 为 nil，小组件不计算百分比。
     public struct Monthly: Equatable, Sendable {
         public let usedAmount: Double
         public let limitAmount: Double?
@@ -45,7 +40,7 @@ public struct WidgetQuotaSnapshot: Equatable, Sendable {
         }
     }
 
-    /// Local Codex accounting subtotals for the current scan scope.
+    /// 当前扫描范围内可计算的本地 Codex 用量。
     public struct Local: Equatable, Sendable {
         public let inputTokens: Int
         public let outputTokens: Int
@@ -73,8 +68,7 @@ public struct WidgetQuotaSnapshot: Equatable, Sendable {
         case ready, unavailable, disabled, stale, invalid
     }
 
-    /// Fixed schema identity. A decoder that does not recognise this value
-    /// must reject the payload rather than guess at its meaning.
+    /// 固定的协议版本；解码器拒绝不支持的版本。
     public static let schemaVersion = 1
 
     public let writtenAt: Date
@@ -101,29 +95,24 @@ public struct WidgetQuotaSnapshot: Equatable, Sendable {
         self.local = local
     }
 
-    /// Hub figures are only current while the snapshot is inside its own
-    /// validity interval and the window has not reset.
+    /// 快照仍在有效期内且窗口尚未重置时，Hub 数据才有效。
     ///
-    /// A `writtenAt` that is still in the future means the wall clock moved
-    /// backwards since the write. That is not corruption, so it degrades to
-    /// "not current" here rather than failing the whole decode: the `local`
-    /// subtotals do not depend on absolute time and stay readable.
+    /// `writtenAt` 晚于当前时间时按时钟回拨处理，Hub 数据失效；
+    /// 不依赖绝对时间的 `local` 用量仍可读取。
     public func hubIsCurrent(at now: Date) -> Bool {
         guard hubState == .ready, let validUntil, let observedAt else { return false }
         guard observedAt <= writtenAt, writtenAt <= now, now <= validUntil else { return false }
         return true
     }
 
-    /// A window is displayable only while the hub evidence is current and its
-    /// reported reset instant is still in the future.
+    /// 仅显示仍有效且尚未到重置时间的窗口。
     public func currentWindow(_ window: Window?, at now: Date) -> Window? {
         guard hubIsCurrent(at: now), let window else { return nil }
         if let resetsAt = window.resetsAt, resetsAt <= now { return nil }
         return window
     }
 
-    /// Monthly usage follows the same freshness rule as the windows. An expired
-    /// or reset hub must not keep showing the last percentage.
+    /// 月度用量采用相同的有效期规则，过期或重置后不再显示旧百分比。
     public func currentMonthly(at now: Date) -> Monthly? {
         hubIsCurrent(at: now) ? monthly : nil
     }

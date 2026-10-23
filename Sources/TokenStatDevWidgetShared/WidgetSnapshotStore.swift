@@ -2,12 +2,11 @@ import Darwin
 import CryptoKit
 import Foundation
 
-// The development candidate never searches for another container or file.
+// 开发探针只使用指定的容器和文件，不搜索其他位置。
 enum DevWidgetSnapshotStore {
     enum StoreError: Error { case unavailable, existingObject, unsafeObject, ioFailure }
 
-    // Only an independently frozen, previously owned file may be replaced.
-    // This value is not inferred by reading an arbitrary pre-existing object.
+    // 只替换已有独立归属凭据的文件，不通过读取任意已有对象来推断凭据。
     struct Ownership: Equatable {
         let device: UInt64
         let inode: UInt64
@@ -33,8 +32,7 @@ enum DevWidgetSnapshotStore {
         return read.data
     }
 
-    // First-generation, no-clobber write only. A later authorized system
-    // driver must freeze ownership before any second-generation replacement.
+    // 仅首次写入，不覆盖已有文件；后续替换前，已授权的调用方须保存归属凭据。
     @discardableResult
     static func writeIfAbsent(_ data: Data,
                               io: DevProbeIOAudit = DevProbeIOAudit()) throws -> Ownership {
@@ -44,9 +42,7 @@ enum DevWidgetSnapshotStore {
         return try writeIfAbsent(data, directory: dirfd, io: io)
     }
 
-    // Directory variants let tests exercise the two-generation handoff in a
-    // private temporary directory. Production callers always use the container
-    // entry point above, so the App Group lookup stays on the real path.
+    // 目录变体供测试在临时目录中检查两代替换；实际调用仍使用上方的容器入口。
     @discardableResult
     static func writeIfAbsent(_ data: Data, directory dirfd: Int32,
                               io: DevProbeIOAudit = DevProbeIOAudit()) throws -> Ownership {
@@ -71,17 +67,14 @@ enum DevWidgetSnapshotStore {
             return pending.ownership
         } catch {
             defer { close(pending.fd) }
-            // After a rename, there is no owned temporary name to clean up.
-            // A failed directory sync leaves the final state uncertain.
+            // 重命名后不再有可清理的临时文件名；目录同步失败时最终状态不确定。
             guard !moved else { throw StoreError.existingObject }
             try cleanupPending(pending, directory: dirfd)
             throw error
         }
     }
 
-    // Claims a snapshot this user can safely replace. The proof is the same
-    // metadata and byte validation a read performs; it does not claim to know
-    // which process wrote the file.
+    // 按读取时相同的元数据和内容校验接管快照，不据此判断最初的写入进程。
     static func claimExisting(io: DevProbeIOAudit = DevProbeIOAudit()) throws -> Ownership? {
         let dirfd = try openContainerDirectory(io: io)
         defer { close(dirfd) }
@@ -105,9 +98,7 @@ enum DevWidgetSnapshotStore {
         return read.ownership
     }
 
-    // One container lookup for the whole first-or-second generation decision.
-    // Two separate entry points would trip the host's single-lookup audit even
-    // though only one file operation is intended.
+    // 首次写入和后续替换共用一次容器查找，符合宿主的单次查找审计。
     @discardableResult
     static func writeFirstOrReplace(_ data: Data,
                                     io: DevProbeIOAudit = DevProbeIOAudit()) throws -> Ownership {
@@ -160,8 +151,7 @@ enum DevWidgetSnapshotStore {
     }
 
     private static func checkExisting(_ expected: Ownership, directory: Int32) throws {
-        // A manifest-provided identity must match metadata before opening or
-        // reading any pre-existing bytes. Unknown objects remain untouched.
+        // 打开或读取已有文件前，清单提供的身份须匹配元数据；未知对象保持不变。
         try requireName(DevWidgetIdentity.file, matches: expected, directory: directory)
         let fd = openat(directory, DevWidgetIdentity.file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw StoreError.existingObject }
@@ -204,8 +194,7 @@ enum DevWidgetSnapshotStore {
             handedOff = true
             return pending!
         } catch {
-            // A partially written or changed temporary file is preserved.
-            // Never unlink solely because this process still holds its FD.
+            // 保留部分写入或已变化的临时文件，不能仅凭仍持有文件描述符就删除。
             guard let pending else { throw StoreError.existingObject }
             try cleanupPending(pending, directory: directory)
             throw error
@@ -213,8 +202,7 @@ enum DevWidgetSnapshotStore {
     }
 
     private static func cleanupPending(_ pending: Pending, directory: Int32) throws {
-        // Deletion requires the complete owned after-image, including mode,
-        // exact size and hash. A changed name or byte is a fixed conflict.
+        // 删除前须匹配完整写后状态，包括权限、精确大小和摘要；名称或内容变化均视为冲突。
         do {
             try validatePending(pending, directory: directory)
             guard unlinkat(directory, DevWidgetIdentity.temporaryFile, 0) == 0 else {
@@ -317,8 +305,7 @@ enum DevWidgetSnapshotStore {
     }
 
     private static func openContainerDirectory(io: DevProbeIOAudit) throws -> Int32 {
-        // This is the real logical lookup entry; subsequent failures may not
-        // be recorded as a snapshot read or write.
+        // 这是实际的逻辑查找入口，后续失败不记作快照读写。
         io.enteringContainerLookup()
         guard let group = DevWidgetIdentity.group(),
               let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group),

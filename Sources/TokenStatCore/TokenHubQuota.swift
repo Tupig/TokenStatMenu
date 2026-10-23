@@ -27,8 +27,8 @@ public struct TokenHubWindowQuota: Equatable, Sendable {
     public let usedPercent: Decimal
     public var remainingPercent: Decimal { Decimal(100) - usedPercent }
     public let resetDisplay: String
-    /// Source reset timestamp, when the direct endpoint supplied one. AX
-    /// display-only rows leave this nil rather than guessing a date.
+    /// 来源重置时间戳，当直连接口提供了该值时。AX
+    /// 仅显示的行将此值留空，而不是猜测一个日期。
     public let resetAt: Date?
 
     public init(kind: TokenHubWindowKind, usedAmount: Decimal, limitAmount: Decimal,
@@ -43,8 +43,8 @@ public struct TokenHubWindowQuota: Equatable, Sendable {
 public struct TokenHubMonthlyUsage: Equatable, Sendable {
     public let usedAmount: Decimal
     public let sourceSymbol: String
-    /// Monthly total is optional because some enterprise responses expose
-    /// usage without a quota. Derived values stay unknown in that case.
+    /// 月度总量是可选的，因为部分企业响应会
+    /// 只暴露用量而不含额度。此时派生值保持未知。
     public let limitAmount: Decimal?
     public var remainingAmount: Decimal? {
         guard let limitAmount, limitAmount > 0, usedAmount >= 0, usedAmount <= limitAmount else { return nil }

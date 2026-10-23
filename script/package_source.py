@@ -53,6 +53,7 @@ PUBLIC_FILES = [
     "Tests/TokenStatWidgetSharedTests/WidgetSnapshotCodecTests.swift",
     "Tests/TokenStatWidgetSharedTests/WidgetSnapshotStoreTests.swift",
     "Tests/TokenStatWidgetSharedTests/WidgetPublishDecisionTests.swift",
+    "Tests/TokenStatWidgetSharedTests/WidgetPublisherFailureTests.swift",
     "Tests/TokenStatDevWidgetSharedTests/DevWidgetProbeTests.swift",
     "Resources/Info.plist",
     "Resources/config.example.plist",
@@ -85,7 +86,6 @@ PUBLIC_FILES = [
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png",
     "script/build_and_run.sh",
     "script/test.sh",
-    "script/mock_server.py",
     "script/integration.py",
     "script/release_assets.py",
     "script/test_release_assets.py",
@@ -124,14 +124,12 @@ PUBLIC_FILES = [
 LOCAL_ONLY_FILES = frozenset(
     {
         "docs/FULL_SOURCE.md",
-        "docs/superpowers/specs/2026-10-18-accuracy-and-validation-optimization-design.md",
-        "docs/superpowers/plans/2026-10-18-accuracy-and-validation-optimization.md",
     }
 )
 LOCAL_ONLY_PREFIXES = (
     "docs/superpowers/",
-    "docs/local/",
     "governance/",
+    "docs/local/",
     "reports/",
     "artifacts/",
     ".local/",

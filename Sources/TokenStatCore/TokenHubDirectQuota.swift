@@ -3,9 +3,7 @@ import SQLite3
 import CoreFoundation
 import Darwin
 
-/// Failures from the direct Seasun Token Hub path intentionally carry no
-/// response body, URL, account, or credential.  They are safe to surface in
-/// diagnostics and logs.
+/// 直读 Seasun Token Hub 的错误不携带响应正文、URL、账号或凭据，可用于诊断和日志。
 public enum TokenHubDirectQuotaFailure: Error, Equatable, Sendable {
     case endpointRejected
     case identityChanged
@@ -28,10 +26,8 @@ public enum TokenHubDirectQuotaFailure: Error, Equatable, Sendable {
     case duplicateMonthly
 }
 
-/// The direct endpoint is derived from Token Hub's read-only connection
-/// settings.  It accepts only HTTPS, credential-free URLs and can require the
-/// AI Manager and SSO hosts to share the same organization suffix.  No host
-/// name is embedded in the public source tree.
+/// 根据 Token Hub 的只读连接配置推导接口，仅接受不含凭据的 HTTPS URL。
+/// 可要求 AI Manager 与 SSO 主机拥有相同的组织域名后缀，源码不内嵌主机名。
 public struct TokenHubDirectQuotaEndpoint: Equatable, Sendable {
     public let url: URL
 
@@ -72,9 +68,8 @@ public struct TokenHubDirectQuotaEndpoint: Equatable, Sendable {
         return leftDomain == rightDomain
     }
 
-    /// This compatibility heuristic recognizes only the suffixes listed below;
-    /// it is not a complete Public Suffix List or a redirect trust boundary.
-    /// Callback Locations must match the original verified origin exactly.
+    /// 兼容规则只识别下列后缀，不是完整公共后缀列表，也不用于判定重定向可信度。
+    /// 回调 Location 必须与原先确认的源站完全匹配。
     private static let multiLabelPublicSuffixes: Set<String> = [
         "ac.uk", "co.uk", "gov.uk", "org.uk",
         "com.au", "net.au", "org.au",
@@ -109,8 +104,7 @@ private enum TokenHubTimestamp {
     }
 }
 
-/// Reads only the connection and session fields owned by Token Hub. SQLite is
-/// opened read-only and queried with fixed keys; no other rows are retained.
+/// 仅读取 Token Hub 的连接和会话字段。SQLite 以只读方式打开，按固定键查询，不保留其他行。
 public enum TokenHubConnectionDiscovery {
     public static func defaultDatabaseURL(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
         home.appendingPathComponent(".seasun-token-hub", isDirectory: true).appendingPathComponent("tokenhub.db")
@@ -136,9 +130,8 @@ public enum TokenHubConnectionDiscovery {
         return try readAIManagerBaseURL(at: url)
     }
 
-    /// Reads only the credential-free connection origins used to prove that
-    /// the active Codex provider is managed by this Token Hub installation.
-    /// The SSO session row is never touched by this discovery call.
+    /// 仅读取不含凭据的连接源站，用于确认当前 Codex 提供商由此 Token Hub 管理。
+    /// 此发现调用不访问 SSO 会话行。
     public static func readDefaultConnectionBaseURLs(home: URL = FileManager.default.homeDirectoryForCurrentUser) throws -> [URL] {
         let url = defaultDatabaseURL(home: home)
         let expected = home.appendingPathComponent(".seasun-token-hub", isDirectory: true).appendingPathComponent("tokenhub.db")
@@ -225,9 +218,7 @@ public enum TokenHubConnectionDiscovery {
             sqlite3_close(db)
             throw TokenHubDirectQuotaFailure.databaseUnsafe
         }
-        // Carry the identity verified against the actual open descriptor into
-        // the request transaction. Equal JSON from a replacement inode is not
-        // the same trusted local database.
+        // 将实际打开的文件身份带入请求事务；inode 被替换后即使 JSON 相同也不再信任。
         return (db, TokenHubDatabaseIdentity(device: info.st_dev, inode: info.st_ino))
     }
 
@@ -288,8 +279,7 @@ public struct TokenHubDirectQuotaHTTPResponse: Sendable {
     public init(statusCode: Int, data: Data) { self.statusCode = statusCode; self.data = data }
 }
 
-/// A small injectable client keeps network access out of parsing tests and
-/// lets the app hold the exchanged access token only for this refresh.
+/// 可注入客户端使解析测试无需联网，换取的访问令牌仅在本次刷新期间保留。
 public struct TokenHubDirectQuotaClient: Sendable {
     public typealias Request = @Sendable (URL, String) async throws -> TokenHubDirectQuotaHTTPResponse
     public typealias CallbackRequest = @Sendable (URL) async throws -> String
@@ -331,12 +321,9 @@ public struct TokenHubDirectQuotaClient: Sendable {
         catch { throw TokenHubDirectQuotaFailure.exchangeFailed }
         try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
         var response = try await quotaResponse(endpoint: endpoint.url, access: access)
-        // Token Hub's own business flow refreshes the broker token once after
-        // a 401. Never retry other statuses and never persist the new token.
+        // 按 Token Hub 的业务流程，在 401 后刷新一次代理令牌；其他状态不重试，令牌不落盘。
         if response.statusCode == 401 {
-            // Re-read once before the second exchange. If the Hub session or
-            // endpoints changed, let the next refresh start a new transaction
-            // rather than combine data from two identities in this one.
+            // 再次换取令牌前重新读取配置；若会话或接口变化，留待下次刷新，避免混用身份。
             let refreshed = try TokenHubConnectionDiscovery.readDefaultStoredSettings(home: home, now: nowProvider())
             guard refreshed == settings else { throw TokenHubDirectQuotaFailure.identityChanged }
             let refreshedCallbackURL = try Self.callbackURL(baseURL: refreshed.aiManagerBaseURL, session: refreshed.session)
@@ -419,12 +406,10 @@ public struct TokenHubDirectQuotaClient: Sendable {
         return try accessToken(fromCallbackLocation: location, callbackURL: url)
     }
 
-    /// Decodes a captured Location without navigating to it. Keeping this pure
-    /// makes the redirect trust boundary testable without a session or network.
+    /// 只解析捕获的 Location，不实际跳转，可离线测试重定向校验。
     public static func accessToken(fromCallbackLocation location: String, callbackURL: URL) throws -> String {
-        // The Location carries a bearer token. A common organization suffix is
-        // insufficient: do not accept even a sibling host, query, userinfo, or
-        // nondefault port. No request is sent to this URL.
+        // Location 携带 bearer 令牌，仅同组织后缀不足以信任；
+        // 拒绝同级主机、查询参数、userinfo 和非默认端口，不向此 URL 发请求。
         guard location.utf8.count <= 65_536,
               !location.unicodeScalars.contains(where: { $0.properties.isWhitespace || CharacterSet.controlCharacters.contains($0) }),
               callbackURL.scheme?.lowercased() == "https",
@@ -508,10 +493,8 @@ private final class TokenHubRedirectCapture: NSObject, URLSessionTaskDelegate {
     }
 }
 
-/// Decodes the response returned by `/api/v1/auth/me/quota-usage` without
-/// guessing from local token counters.  The endpoint's `kind` is required to
-/// identify a window; unknown kinds are ignored and never assigned to a known
-/// 5-hour or 7-day slot.
+/// 解码 `/api/v1/auth/me/quota-usage` 响应，不从本地 token 计数推算额度。
+/// 通过 `kind` 识别窗口，未知类型不分配到五小时或七天窗口。
 public enum TokenHubDirectQuotaDecoder {
     public static func decode(_ data: Data, identity: TokenHubIdentity, now: Date = Date(),
                               timeZone: TimeZone = .current) throws -> TokenHubQuotaSnapshot {
@@ -520,9 +503,7 @@ public enum TokenHubDirectQuotaDecoder {
               let object = root as? [String: Any] else {
             throw TokenHubDirectQuotaFailure.malformedResponse
         }
-        // Current Token Hub responses wrap usage in `data`; accepting the
-        // equivalent root shape keeps this decoder forward-compatible with the
-        // unwrapped response used by older gateway deployments.
+        // 当前响应将用量放在 `data` 中，同时接受旧网关直接返回根对象的结构。
         let dataObject = (object["data"] as? [String: Any]) ?? object
         guard let currency = (dataObject["currency"] as? String) ?? (object["currency"] as? String),
               let windows = (dataObject["windows"] as? [[String: Any]]) ?? (object["windows"] as? [[String: Any]]) else {
@@ -612,16 +593,13 @@ public enum TokenHubDirectQuotaDecoder {
         if let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() { raw = n.stringValue }
         else if let text = value as? String { raw = text }
         else { return nil }
-        // Decimal(string:) accepts numeric prefixes, whitespace and even some
-        // incomplete forms. Require a bounded, complete JSON-number spelling
-        // before conversion; anchors reject trailing newlines as well as junk.
+        // Decimal(string:) 接受数字前缀、空白和部分残缺格式。
+        // 转换前限制长度并匹配完整 JSON 数字，连末尾换行也拒绝。
         guard raw.utf8.count <= 128,
               raw.range(of: #"\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z"#,
                         options: .regularExpression) != nil else { return nil }
-        // Decimal can silently discard low-order significant digits. Bound
-        // the original string's meaningful mantissa to a conservative 38
-        // digits; leading/trailing zeroes do not change its numeric value.
-        // Native JSON numbers may already be normalized by JSONSerialization.
+        // Decimal 可能丢失低位有效数字，故尾数有效位保守限制为 38 位，不计前导和末尾零。
+        // 原生 JSON 数字可能已被 JSONSerialization 规范化。
         let digits = raw.utf8.prefix { $0 != 69 && $0 != 101 }.filter { (48...57).contains($0) }
         let significantDigits = digits.drop(while: { $0 == 48 }).reversed().drop(while: { $0 == 48 }).count
         guard significantDigits <= 38,

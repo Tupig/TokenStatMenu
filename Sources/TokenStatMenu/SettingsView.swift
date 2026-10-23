@@ -9,8 +9,7 @@ import SwiftUI
         _draft = State(initialValue: model.preferences)
     }
 
-    /// The Settings status follows the same fresh direct observation as the
-    /// dashboard; optional AX compatibility cannot declare a backend connected.
+    /// 设置状态与概览使用同一份有效后台响应，不能因 AX 兼容读取成功就标记后台已连接。
     var sourceStatusText: String {
         if model.tokenHubQuotaIsDirect {
             return model.freshTokenHubQuota(at: model.tokenHubNow()) != nil

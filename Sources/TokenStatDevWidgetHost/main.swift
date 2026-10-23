@@ -1,8 +1,7 @@
 import AppKit
 import SwiftUI
 
-// The same decision function is used by the memory check. Its lazy identity
-// inputs are not evaluated for a malformed argv or for normal startup.
+// 与内存测试共用决策函数；参数错误或正常启动时，不求值延迟加载的身份信息。
 let decision = DevProbeController.decide(Array(CommandLine.arguments.dropFirst()),
                                          configured: { DevWidgetIdentity.group() },
                                          entitlements: { DevGroupGuard.currentEntitlements() },
@@ -29,10 +28,8 @@ case let .sample(number):
         finishProbe(78, reason: "invalidSchema", sample: number)
     }
     do {
-        // First generation is no-clobber. A later run may replace only the
-        // snapshot whose ownership this process can still prove; an unknown or
-        // unsafe object is never opened for writing. Both decisions share one
-        // container lookup so the host audit stays at exactly one.
+        // 首次写入不覆盖文件，后续只替换归属仍可确认的快照。
+        // 两条路径共用一次容器查找，不打开未知或不安全的对象进行写入。
         try DevWidgetSnapshotStore.writeFirstOrReplace(sample, io: ioAudit)
         finishProbe(0, reason: "none", sample: number)
     } catch DevWidgetSnapshotStore.StoreError.unavailable {
@@ -45,8 +42,7 @@ case let .sample(number):
         finishProbe(74, reason: "ioFailure", sample: number)
     }
 case .normal:
-    // A LaunchServices start has no stdout consumer. Emit only the bounded
-    // safe event to the fixed OSLog channel before AppKit initialization.
+    // LaunchServices 启动时无人读取 stdout；AppKit 初始化前仅向固定 OSLog 通道写入安全事件。
     let now = Int64(floor(Date().timeIntervalSince1970 * 1000))
     if let event = DevProbeController.startEvent(actor: "host", counts: audit.snapshot(),
                                                   io: ioAudit.snapshot(), nowMs: now,

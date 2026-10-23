@@ -7,10 +7,10 @@ public struct AppConfiguration: Codable, Equatable {
     public var port = 18765
     public var includeUsage = true
     public var allowInsecureHTTP = false
-    public var inputPrice = 0.0       // USD per million input tokens
-    public var outputPrice = 0.0      // USD per million output tokens
+    public var inputPrice = 0.0       // 每百万输入 token 的美元价
+    public var outputPrice = 0.0      // 每百万输出 token 的美元价
     public var currency = "USD"
-    public var usdToCNY = 7.0        // User-supplied reference, never called a live FX quote.
+    public var usdToCNY = 7.0        // 用户填写的参考汇率，不作为实时汇率。
     public var monthlyLimit = 0.0
     public var usageURL = ""
     public var usedPath = "data.used_tokens"
@@ -23,7 +23,7 @@ public struct AppConfiguration: Codable, Equatable {
     public var refreshSeconds = 60.0
     public var loggingEnabled = false
     public var historyEnabled = true
-    /// Automatically reads the visible Token Hub quota panel in local Codex mode.
+    /// 本地 Codex 模式下自动读取可见的 Token Hub 额度面板。
     public var tokenHubAutomaticReadingEnabled = true
     public init() {}
     private enum CodingKeys: String, CodingKey { case dataSource, endpoint, model, port, includeUsage, allowInsecureHTTP, inputPrice, outputPrice, currency, usdToCNY, monthlyLimit, usageURL, usedPath, limitPath, periodPath, fiveHourUsedPercentPath, fiveHourResetPath, sevenDayUsedPercentPath, sevenDayResetPath, refreshSeconds, loggingEnabled, historyEnabled, tokenHubAutomaticReadingEnabled }
@@ -79,14 +79,14 @@ public struct AppConfiguration: Codable, Equatable {
         return url
     }
 
-    /// Map the four supported local paths onto the configured upstream prefix.
+    /// 把四个支持的本地路径映射到配置的上游前缀。
     public func upstreamURL(for path: String) throws -> URL {
         let known = ["/v1/chat/completions", "/v1/responses", "/api/chat", "/api/generate"]
         guard known.contains(path) else { throw StatError.message("不支持的请求路径") }
         var parts = URLComponents(url: try checkedURL(endpoint), resolvingAgainstBaseURL: false)!
         let openAI = ["/chat/completions", "/responses"]
         if let suffix = openAI.first(where: { parts.path.hasSuffix($0) }) {
-            // A provider base may be /v1 OR /enterprise/route. Preserve it exactly.
+            // 上游基础路径可能是 /v1 或 /enterprise/route，需原样保留。
             let base = String(parts.path.dropLast(suffix.count))
             if path.hasPrefix("/v1/") { parts.path = base + String(path.dropFirst(3)) }
             else { parts.path = (base.hasSuffix("/v1") ? String(base.dropLast(3)) : base) + path }

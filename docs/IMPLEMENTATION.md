@@ -28,7 +28,7 @@ Dashboard 默认折叠该明细区；展开只读取已经发布的快照，不�
 
 ### 阶段 1 数据口径修正（2026-10-18）
 
-本阶段让 Dashboard 额度新鲜度与 `AppModel` 使用同一份 model clock；可选诊断输出路径在 `StatusBarController` 初始化时解析一次，刷新菜单时不会反复扫描命令行参数，诊断路径继续使用其现有的节流时钟。C29 合成回归同时锁定完整扫描与达到上限时的展示标签（`Σ`、`小计`、`未核验`、顶层对话和文件范围）。
+Dashboard 额度有效期与 `AppModel` 使用同一时钟。可选诊断路径在 `StatusBarController` 初始化时解析一次，刷新菜单不再重复扫描启动参数，诊断输出仍独立限频。C29 回归覆盖完整扫描与达到上限时的显示：菜单栏统一使用 `Σ`，无可计算记录时显示 `Σ—`，详情保留线程分类和文件范围。
 
 数据口径保持分层。5 小时、7 天和月度值仍来自 Token Hub 的只读额度来源；本机 Codex 输入/输出/总量和会话分类仍是有界扫描的小计或完整扫描量；活动 token/s 只能在有新鲜累计事件时显示本机短窗口估算。当前没有企业网关提供的权威瞬时 token/s 时间序列，因此 `liveTokenSpeedPresent` 在缺少新鲜活动证据时继续为 `false`，界面显示未知，不用刷新间隔或历史差值代替。真实 Settings AX 树验收仍属于 [Issue #33](https://github.com/Tupig/TokenStatMenu/issues/33) 的后续环境阶段；CLT linker warning 继续由 [Issue #52](https://github.com/Tupig/TokenStatMenu/issues/52) 跟踪。
 

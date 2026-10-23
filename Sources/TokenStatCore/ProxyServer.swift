@@ -1,8 +1,8 @@
 import Foundation
 import Network
 
-/// Public local API: POST supported inference routes, GET /health, authenticated GET /tokenstat/status.
-/// No CONNECT, TLS interception, global proxy settings, or enterprise credential discovery.
+/// 公开的本地 API：POST 受支持的推理路由，GET /health，以及带认证的 GET /tokenstat/status。
+/// 不做 CONNECT、TLS 拦截、全局代理设置或企业凭据发现。
 public final class ProxyServer {
     private let queue = DispatchQueue(label: "TokenStatMenu.proxy", qos: .utility)
     private var listener: NWListener?
@@ -102,8 +102,8 @@ private final class ProxyPeer: NSObject, URLSessionDataDelegate, URLSessionTaskD
                 if let request = try self.decoder.feed(data ?? Data()) {
                     self.headerDeadline?.cancel(); self.headerDeadline = nil
                     self.handle(request)
-                    self.decoder = HTTPDecoder() // Release the buffered request after forwarding it.
-                    // Observe a client disconnect while URLSession is still producing data.
+                    self.decoder = HTTPDecoder() // 转发后释放缓存的请求。
+                    // 观察客户端在 URLSession 仍在产出数据时断开连接。
                     self.observeDisconnect(); return
                 }
                 if complete || error != nil { self.close(reason: "请求不完整") }
@@ -115,7 +115,7 @@ private final class ProxyPeer: NSObject, URLSessionDataDelegate, URLSessionTaskD
         connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] _, _, complete, error in
             guard let self, !self.closed else { return }
             if error != nil { self.close(reason: "调用方断开") }
-            // A clean TCP write-half-close is legal. Sending detects full-close failure.
+            // 干净的 TCP 写半关闭是合法的。发送端通过检测完整关闭的失败来发现断开。
             else if !complete { self.observeDisconnect() }
         }
     }
@@ -153,7 +153,7 @@ private final class ProxyPeer: NSObject, URLSessionDataDelegate, URLSessionTaskD
         } catch { respond(400, message: error.localizedDescription) }
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
-        completionHandler(nil) // Never forward a bearer token to a redirected host.
+        completionHandler(nil) // 绝不将 bearer token 转发给重定向后的主机。
     }
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         guard !closed, let response = response as? HTTPURLResponse else { completionHandler(.cancel); return }
@@ -163,7 +163,7 @@ private final class ProxyPeer: NSObject, URLSessionDataDelegate, URLSessionTaskD
             if type.contains("text/event-stream") { parser = StreamParser(format: .sse) }
             else if type.contains("ndjson") || type.contains("jsonl") { parser = StreamParser(format: .ndjson) }
         }
-        // Only forward safe response headers. URLSession may already have decompressed the body.
+        // 仅转发安全的响应头。URLSession 可能已经解压了正文。
         let safeType = type.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")
         enqueue(Data("HTTP/1.1 \(status) Response\r\nContent-Type: \(safeType)\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n".utf8))
         completionHandler(.allow)
@@ -202,7 +202,7 @@ private final class ProxyPeer: NSObject, URLSessionDataDelegate, URLSessionTaskD
         if let id = requestID, let record = engine.finish(id, success: success, error: reason) { onRecord(record) }
         requestID = nil
         if status == 0 { respond(502, message: "上游连接失败，请检查 Endpoint 和网络") }
-        else if error != nil { close(reason: "上游传输失败") } // Leave chunk framing incomplete: caller must see transport failure.
+        else if error != nil { close(reason: "上游传输失败") } // 保持 chunk 分帧不完整：调用方必须看到传输失败。
         else { enqueue(Data("0\r\n\r\n".utf8)); finishWhenDrained = true; drain() }
         session.finishTasksAndInvalidate(); self.session = nil
     }

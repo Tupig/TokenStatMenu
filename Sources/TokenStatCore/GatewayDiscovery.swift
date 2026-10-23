@@ -1,6 +1,6 @@
 import Foundation
 
-/// Deliberately contains no authentication fields. Results stay in local UI memory.
+/// 有意不包含任何认证字段。结果仅保存在本地 UI 内存中。
 public struct GatewayCandidate: Identifiable, Codable, Equatable {
     public var id: String { source + "|" + provider + "|" + endpoint }
     public let source: String
@@ -10,9 +10,9 @@ public struct GatewayCandidate: Identifiable, Codable, Equatable {
     public let isActive: Bool
 }
 
-/// A small, fail-closed reader for common Codex scalar TOML settings, not a general
-/// TOML parser. Only model/provider/profile/base_url/wire_api are retained. It does
-/// not open auth.json, shell profiles, browser storage, databases or keychains.
+/// 一个面向常见 Codex 标量 TOML 设置的小型、失败即关闭的读取器，而非通用
+/// TOML 解析器。仅保留 model/provider/profile/base_url/wire_api。它不会
+/// 打开 auth.json、shell 配置文件、浏览器存储、数据库或钥匙串。
 public enum GatewayDiscovery {
     public static func readCodexConfig(at url: URL, source: String) -> [GatewayCandidate] {
         guard let file = try? FileHandle(forReadingFrom: url) else { return [] }
@@ -41,7 +41,7 @@ public enum GatewayDiscovery {
             guard let equals = line.firstIndex(of: "=") else { continue }
             let key = String(line[..<equals]).trimmingCharacters(in: .whitespaces)
             let value = String(line[line.index(after: equals)...]).trimmingCharacters(in: .whitespaces)
-            // Skip multiline bodies even for unrecognized keys; their contents are not config.
+            // 即使是对未识别的 key，也跳过多行正文；其内容不属于配置。
             if let delimiter = ["\"\"\"", "'''"].first(where: { value.hasPrefix($0) }) {
                 if !value.dropFirst(3).contains(delimiter) { multiline = delimiter }
                 continue
@@ -50,7 +50,7 @@ public enum GatewayDiscovery {
                 : table.first == "model_providers" && table.count == 2 ? ["base_url", "wire_api"]
                 : table.first == "profiles" && table.count == 2 ? ["model", "model_provider"] : []
             guard allowed.contains(key) else { continue }
-            // Duplicate values are ambiguous. Never guess which upstream should receive a key.
+            // 重复的值是模糊的。绝不猜测哪个上游应该接收某个 key。
             let identity = table.joined(separator: ".") + ":" + key
             if !seen.insert(identity).inserted { duplicates.insert(identity) }
             guard let scalar = quotedString(value) else { duplicates.insert(identity); continue }
@@ -71,9 +71,8 @@ public enum GatewayDiscovery {
         }.sorted { a, b in a.isActive != b.isActive ? a.isActive : a.provider < b.provider }
     }
 
-    /// Returns the selected Codex provider and the credential-free origin of
-    /// its configured endpoint. Only the origin is used for Seasun route
-    /// verification; paths, query strings, and credentials are discarded.
+    /// 返回选中的 Codex provider 及其已配置 endpoint 的不含凭据的 origin。
+    /// 仅使用 origin 进行 Seasun 路由校验；路径、查询字符串和凭据都会被丢弃。
     public static func activeCodexProvider(at url: URL) -> (provider: String, origin: String)? {
         guard let active = readCodexConfig(at: url, source: "local").first(where: \.isActive),
               let origin = originKey(active.endpoint) else { return nil }
@@ -109,8 +108,8 @@ public enum GatewayDiscovery {
     public static func candidate(baseURL: String, provider: String, source: String,
         model: String = "", wireAPI: String = "responses", isActive: Bool = false) -> GatewayCandidate? {
         let base = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Reject entire URLs with embedded credentials/query/fragment, rather than stripping
-        // credentials and silently turning a signed URL into a different endpoint.
+        // 拒绝内嵌凭据/查询串/片段的完整 URL，而不是剥离凭据
+        // 并将一个签名 URL 悄然变成不同的 endpoint。
         guard var url = URLComponents(string: base), ["http", "https"].contains(url.scheme ?? ""),
               let host = url.host, !host.isEmpty, url.user == nil, url.password == nil,
               url.query == nil, url.fragment == nil,

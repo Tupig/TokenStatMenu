@@ -1,11 +1,9 @@
 import Foundation
 
-/// Encodes and decodes `WidgetQuotaSnapshot` with an explicit, closed key set.
+/// 使用固定字段集合编解码 `WidgetQuotaSnapshot`。
 ///
-/// Hand-written coding keeps the wire format stable and reviewable: the widget
-/// and the app must agree byte-for-byte, and an unrecognised shape must be
-/// rejected rather than half-parsed. Optional values encode as explicit JSON
-/// `null` so a missing source is never confused with a malformed payload.
+/// 手动编解码以保持应用与小组件的格式一致。拒绝未知结构，
+/// 可选值显式编码为 JSON `null`，区分数据缺失与格式错误。
 public enum WidgetSnapshotCodec {
 
     public static let maximumBytes = 8192
@@ -29,13 +27,10 @@ public enum WidgetSnapshotCodec {
         "knownThreads", "unknownThreads", "isLimited"
     ]
 
-    // MARK: - Encoding
+    // MARK: - 编码
 
     public static func encode(_ snapshot: WidgetQuotaSnapshot) throws -> Data {
-        // Validate before serialising. Writing a payload that this decoder
-        // would later reject makes the app report "published" while the widget
-        // silently shows nothing, which is the exact failure mode the shared
-        // protocol exists to prevent.
+        // 序列化前先校验，避免应用写出小组件无法解码的数据。
         try validate(snapshot)
         var root: [String: Any] = [
             "schemaVersion": WidgetQuotaSnapshot.schemaVersion,
@@ -49,15 +44,13 @@ public enum WidgetSnapshotCodec {
         root["sevenDay"] = snapshot.sevenDay.map(encodeWindow) ?? NSNull()
         root["monthly"] = snapshot.monthly.map(encodeMonthly) ?? NSNull()
         root["local"] = snapshot.local.map(encodeLocal) ?? NSNull()
-        // Sorted keys plus no pretty printing keeps the bytes deterministic so
-        // the app can skip a write when nothing changed.
+        // 字段排序且不添加排版空白，使相同数据生成相同字节，便于跳过重复写入。
         let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
         guard data.count <= maximumBytes else { throw CodecError.tooLarge }
         return data
     }
 
-    /// Mirror of the decoder's range rules, applied before a write so the app
-    /// can never claim to have published bytes the widget would refuse.
+    /// 写入前使用与解码器相同的取值范围校验。
     private static func validate(_ snapshot: WidgetQuotaSnapshot) throws {
         func validateWindow(_ window: WidgetQuotaSnapshot.Window?, _ label: String) throws {
             guard let window else { return }
@@ -86,9 +79,7 @@ public enum WidgetSnapshotCodec {
                     throw CodecError.outOfRange("monthly.limitAmount")
                 }
             }
-            // Keep the symbol short: it is rendered inside the widget's
-            // bounded area, and an unexpected long string would be a payload
-            // error rather than a layout problem.
+            // 限制货币符号长度，避免异常字符串挤占小组件空间。
             guard monthly.sourceSymbol.count <= 4 else {
                 throw CodecError.outOfRange("monthly.sourceSymbol")
             }
@@ -103,12 +94,12 @@ public enum WidgetSnapshotCodec {
         }
     }
 
-    /// Encoded payloads must stay within the widget's byte budget.
+    /// 编码后的数据不能超出小组件的字节上限。
     private static func validatePayloadSize(_ data: Data) throws {
         guard data.count <= maximumBytes else { throw CodecError.tooLarge }
     }
 
-    /// Milliseconds since the epoch as used on the wire.
+    /// 协议使用的 Unix 毫秒时间戳。
     private static func milliseconds(_ date: Date) -> Int64 {
         Int64((date.timeIntervalSince1970 * 1000).rounded())
     }
@@ -140,7 +131,7 @@ public enum WidgetSnapshotCodec {
          "isLimited": local.isLimited]
     }
 
-    // MARK: - Decoding
+    // MARK: - 解码
 
     public static func decode(_ data: Data, now: Date = Date()) throws -> WidgetQuotaSnapshot {
         guard !data.isEmpty else { throw CodecError.empty }
@@ -151,16 +142,13 @@ public enum WidgetSnapshotCodec {
               let root = object as? [String: Any] else { throw CodecError.notAnObject }
 
         try requireClosed(root, keys: rootKeys)
-        // Compare the exact value, not `intValue`: truncating 1.5 to 1 would
-        // accept a payload from a schema this decoder does not understand.
+        // 比较精确值，不能用 `intValue` 把 1.5 截断为版本 1。
         guard let version = root["schemaVersion"] as? NSNumber,
               CFGetTypeID(version) != CFBooleanGetTypeID(),
               version.doubleValue == Double(WidgetQuotaSnapshot.schemaVersion) else {
             throw CodecError.wrongSchemaVersion
         }
-        // `writtenAtMs` must be a whole millisecond value: it is the only
-        // absolute-time anchor the widget trusts, so a fractional literal is a
-        // malformed payload rather than a rounding candidate.
+        // `writtenAtMs` 是小组件的绝对时间基准，必须为整数毫秒，不做舍入。
         guard let written = root["writtenAtMs"] else {
             throw CodecError.missingKey("writtenAtMs")
         }
@@ -186,10 +174,8 @@ public enum WidgetSnapshotCodec {
             writtenAt: writtenAt, observedAt: observedAt, validUntil: validUntil,
             hubSource: hubSource, hubState: hubState,
             fiveHour: fiveHour, sevenDay: sevenDay, monthly: monthly, local: local)
-        // Only reject structurally impossible intervals. A future `writtenAt`
-        // means the wall clock moved backwards, not that the bytes are corrupt,
-        // so that case degrades to "not current" in `hubIsCurrent` instead of
-        // discarding `local` subtotals that carry no absolute-time dependency.
+        // 这里只拒绝不可能的时间区间。未来的 `writtenAt` 由 `hubIsCurrent`
+        // 按时钟回拨处理，不丢弃与绝对时间无关的 `local` 用量。
         if let validUntil, let observedAt, validUntil < observedAt {
             throw CodecError.outOfRange("validUntilMs")
         }
@@ -253,7 +239,7 @@ public enum WidgetSnapshotCodec {
             isLimited: limited)
     }
 
-    // MARK: - Field helpers
+    // MARK: - 字段辅助方法
 
     private static func requireClosed(_ object: [String: Any], keys: Set<String>) throws {
         for key in object.keys where !keys.contains(key) {
@@ -283,8 +269,7 @@ public enum WidgetSnapshotCodec {
         return Int(rounded)
     }
 
-    /// Returns nil for an explicit JSON null and for an absent key, and throws
-    /// for any other non-integer representation.
+    /// JSON null 或字段缺失时返回 nil，其他非整数值抛出错误。
     private static func date(_ object: [String: Any], _ key: String) throws -> Date? {
         guard let raw = object[key], !(raw is NSNull) else { return nil }
         let value = try number(object, key)

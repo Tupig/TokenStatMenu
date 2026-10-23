@@ -36,7 +36,7 @@ enum ConfigStore {
     }
 }
 
-/// Historical identity helper retained for a pure regression test; it performs no Keychain I/O.
+/// 为旧回归测试保留的身份辅助工具，不访问 Keychain。
 enum KeychainStore {
     static func accountName(_ purpose: String, validatedURL: String) throws -> String {
         guard ["upstream", "usage"].contains(purpose),

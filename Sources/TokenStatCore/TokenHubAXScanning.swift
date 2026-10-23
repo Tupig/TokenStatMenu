@@ -127,8 +127,8 @@ public struct TokenHubQuotaScanner {
             }
             func children(_ node: TokenHubNodeID) throws -> [TokenHubNodeID] {
                 events.append(.children(node))
-                // The native children operation performs separate bounded count and copy AX messages;
-                // each receives a 0.15s timeout, while this wrapper enforces the shared 3s scan limit.
+                // 原生的 children 操作会分别执行有界的 count 和 copy AX 消息；
+                // 每次超时为 0.15 秒，而本包装器负责执行共享的 3 秒扫描上限。
                 let page = try message(node, event: .children(node), enforceSingleMessageLimit: false) {
                     try reader.children(of: node, maximum: 64, timeout: 0.15)
                 }
@@ -245,7 +245,7 @@ public struct TokenHubQuotaScanner {
                         return false
                     }
                     if kind == .fiveHour { fiveProgressMarkers += progress.count } else { sevenProgressMarkers += progress.count }
-                    // Require one ordered amount -> matching progress -> reset label -> reset value chain.
+                    // 要求一条有序链：金额 -> 匹配的进度 -> 重置标签 -> 重置值。
                     let validChains = amounts.filter { amount in
                         guard amounts.count == 1, progress.count == 1,
                               resetLabels.count == 1, resetValues.count == 1,
@@ -272,7 +272,7 @@ public struct TokenHubQuotaScanner {
                 if fiveMarkers > 1 || fiveProgressMarkers > 1 { throw ScanIssue.failure(.duplicateWindow(.fiveHour)) }
                 if sevenMarkers > 1 || sevenProgressMarkers > 1 { throw ScanIssue.failure(.duplicateWindow(.sevenDay)) }
                 if !monthlyGroups.isEmpty {
-                    // Only extract amount text whose node is directly or indirectly under the unique monthly group.
+                    // 只提取其节点直接或间接位于唯一月度分组之下的金额文本。
                     let values = records.enumerated().compactMap { index, record -> String? in
                         guard record.role == .staticText, isWithinMonthly(record.node),
                               let text = record.text, text.hasPrefix("$") else { return nil }

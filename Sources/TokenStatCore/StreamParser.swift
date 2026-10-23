@@ -1,8 +1,8 @@
 import Foundation
 import CoreFoundation
 
-/// Incremental framing operates on bytes: a UTF-8 scalar can span network callbacks.
-/// SSE data lines join with newline; comments/event/id fields never count as tokens.
+/// 增量分帧按字节操作：一个 UTF-8 标量可能跨越多个网络回调。
+/// SSE 的 data 行以换行符拼接；comments/event/id 字段从不计入 token。
 public struct StreamParser {
     public enum Format { case sse, ndjson }
     private let format: Format
@@ -65,7 +65,7 @@ public struct Observation {
 }
 
 public enum TokenEstimator {
-    /// Heuristic only. Additive weights ensure changing chunk boundaries doesn't change totals.
+    /// 仅作启发式估算。可加的权重确保改变 chunk 边界不会改变总量。
     public static func units(_ text: String) -> Double {
         text.unicodeScalars.reduce(0) { total, s in
             total + (s.value < 128 ? 0.25 : 1.0)
@@ -93,7 +93,7 @@ public enum UsageDecoder {
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw StatError.message("流返回非 JSON 对象") }
         if let error = obj["error"], !(error is NSNull) { result.failed = true; result.terminal = true }
         if let usage = obj["usage"] as? [String: Any] { result.usage = tokens(usage) }
-        // OpenAI Chat: only deltas while streaming, never count the full final message twice.
+        // OpenAI Chat：流式时只统计 delta，绝不将完整的最终消息重复统计两次。
         if let choices = obj["choices"] as? [[String: Any]] {
             for choice in choices {
                 let message = choice[streaming ? "delta" : "message"] as? [String: Any] ?? [:]
@@ -105,7 +105,7 @@ public enum UsageDecoder {
                 if let reason = choice["finish_reason"] as? String, !reason.isEmpty { result.terminal = true }
             }
         }
-        // OpenAI Responses: aggregate usage is nested in response.completed.
+        // OpenAI Responses：累计用量嵌套在 response.completed 中。
         if let type = obj["type"] as? String {
             if ["response.output_text.delta", "response.reasoning_text.delta", "response.reasoning_summary_text.delta", "response.function_call_arguments.delta"].contains(type) {
                 result.output += obj["delta"] as? String ?? ""
@@ -123,7 +123,7 @@ public enum UsageDecoder {
             }
             if let status = obj["status"] as? String, ["failed", "incomplete"].contains(status) { result.failed = true }
         }
-        // Ollama native NDJSON: authoritative counts and durations arrive on the final object.
+        // Ollama 原生 NDJSON：权威的计数与耗时出现在最后一个对象上。
         if let message = obj["message"] as? [String: Any] {
             result.output += message["content"] as? String ?? ""
             result.output += message["thinking"] as? String ?? ""

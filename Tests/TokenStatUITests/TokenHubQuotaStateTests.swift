@@ -824,8 +824,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
             sessionCount: 2, filesScanned: 32, isLimited: true, latestEventAt: nil,
             fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
             unknownThreadCount: 2)
-        XCTAssertTrue(model.title.contains("小计"))
-        XCTAssertTrue(model.title.contains("未核验"))
+        XCTAssertTrue(model.title.contains("Σ"))
 
         model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
             sessionCount: 2, filesScanned: 3, isLimited: false, latestEventAt: nil,
@@ -1293,7 +1292,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let text = model.menuTooltip + " " + model.dataNotice
         XCTAssertTrue(text.contains("Token Hub 界面快照"))
         XCTAssertTrue(text.contains("后台更新时间未提供"))
-        XCTAssertTrue(text.contains("币种未核验"))
+        XCTAssertTrue(text.contains("币种来源待确认"))
         XCTAssertFalse(model.message.contains("3.75"), "raw quota amount must not enter diagnostics")
         XCTAssertFalse(model.message.contains("37.5"), "raw percentage must not enter diagnostics")
     }
@@ -1506,7 +1505,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         print("Synthetic Token Hub dashboard renders: \(output.path)/synthetic-tokenhub-light.png and synthetic-tokenhub-dark.png")
         print("Synthetic full-card renders: \(output.path)/synthetic-tokenhub-full-card-light.png and synthetic-tokenhub-full-card-dark.png")
         XCTAssertTrue(model.menuTooltip.contains("界面显示剩余"))
-        XCTAssertTrue(model.menuTooltip.contains("币种未核验"))
+        XCTAssertTrue(model.menuTooltip.contains("币种来源待确认"))
     }
 }
 
@@ -2156,7 +2155,6 @@ extension TokenHubQuotaStateTests {
 }
 #endif
 
-
 extension TokenHubQuotaStateTests {
     func testDashboardDirectFailureIsVisibleWhenAXCompatibilityIsDisabled() async {
         let harness = HubDirectHarness()
@@ -2191,7 +2189,6 @@ extension TokenHubQuotaStateTests {
         XCTAssertEqual(TokenHubQuotaCard.resetLabel("01-15 08:00"), "重置 01-15 08:00")
     }
 }
-
 
 private actor ControlledLocalScan {
     private var pending: [(Int, CheckedContinuation<LocalCodexScanWorker.Result, Error>)] = []

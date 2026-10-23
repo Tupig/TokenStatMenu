@@ -4,12 +4,9 @@ import WidgetKit
 import TokenStatWidgetShared
 #endif
 
-/// Publishes the current presentation values to the shared App Group container
-/// so the embedded widget can render them.
+/// 将当前显示数据发布到 App Group，供内嵌小组件读取。
 ///
-/// Publishing is best effort and never blocks the menu bar: a missing channel,
-/// unchanged values or a rejected write all leave existing app behaviour
-/// untouched. It never fabricates a value: absent sources publish as unknown.
+/// 通道缺失、值未变或写入失败不影响菜单栏；来源缺失时发布为未知。
 @MainActor
 public final class WidgetSnapshotPublisher {
 
@@ -17,12 +14,10 @@ public final class WidgetSnapshotPublisher {
     private var lastPayload: Data?
     private var lastWriteAt: Date?
     private var lastReloadAt: Date?
-    /// A failed write drops the inode proof, so the next attempt must claim the
-    /// current file again before it may replace it.
+    /// 写入失败后丢弃 inode 凭据，下次替换前重新接管当前文件。
     private var needsClaim = true
     private var lastWriteFailed = false
-    /// A reload that was due while the 60-second gate was still closed. It is
-    /// retried on later ticks instead of being dropped after the write landed.
+    /// 暂受 60 秒间隔限制的重载，后续刷新时补发，不因写入完成而丢失。
     private var pendingReload = false
     private let now: @MainActor () -> Date
     private let channelAvailable: @MainActor () -> Bool
@@ -30,9 +25,7 @@ public final class WidgetSnapshotPublisher {
     private let write: @MainActor (Data, WidgetSnapshotStore.Ownership?) throws -> WidgetSnapshotStore.Ownership
     private let reload: @MainActor () -> Void
 
-    /// Shortest gap between `reloadAllTimelines()` calls. WidgetKit enforces a
-    /// daily reload budget, so one reload per half-second tick would exhaust it
-    /// within a minute and later requests would be dropped without notice.
+    /// `reloadAllTimelines()` 的最短调用间隔，避免频繁请求耗尽 WidgetKit 重载预算。
     nonisolated static let minimumReloadInterval: TimeInterval = 60
 
     public init(now: @escaping @MainActor () -> Date = { Date() }) {
@@ -43,8 +36,7 @@ public final class WidgetSnapshotPublisher {
         self.reload = { WidgetCenter.shared.reloadAllTimelines() }
     }
 
-    /// Test seam: replaces the container, WidgetKit and write side effects
-    /// while keeping the production decision path identical.
+    /// 测试注入点：替换容器、WidgetKit 和写入操作，保留相同的决策路径。
     init(now: @escaping @MainActor () -> Date,
          channelAvailable: @escaping @MainActor () -> Bool,
          claim: @escaping @MainActor () -> WidgetSnapshotStore.Ownership?,
@@ -57,14 +49,12 @@ public final class WidgetSnapshotPublisher {
         self.reload = reload
     }
 
-    /// True when a real App Group channel exists. Under an ad-hoc signature this
-    /// is false and the publisher becomes a no-op.
+    /// 当前是否能解析出 App Group 通道；写入仍可能因权限失败。
     public var isChannelAvailable: Bool {
         channelAvailable()
     }
 
-    /// True once the channel was found missing, so callers can surface a single
-    /// honest notice instead of retrying silently on every tick.
+    /// 发现通道缺失后置为 true，调用方可据此提示一次，避免每次刷新都提示。
     public private(set) var channelUnavailable: Bool {
         get { channelReportedUnavailable }
         set { channelReportedUnavailable = newValue }
@@ -72,13 +62,10 @@ public final class WidgetSnapshotPublisher {
 
     private var channelReportedUnavailable = false
 
-    /// Publishes the snapshot, skipping the write while the displayed values are
-    /// unchanged and inside the current refresh horizon.
+    /// 发布快照，显示值未变且仍在刷新周期内时跳过写入。
     ///
-    /// Displayed values, not the write clock, decide whether a write is needed.
-    /// `writtenAt` advances on every tick, so comparing the raw bytes would
-    /// never skip and would exhaust WidgetKit's reload budget.
-    /// - Returns: true when new bytes reached the container.
+    /// 根据显示值而非写入时间决定是否更新；`writtenAt` 每次都会变化，不能直接比较原始字节。
+    /// - Returns: 数据写入容器成功时返回 true。
     @discardableResult
     public func publish(_ snapshot: WidgetQuotaSnapshot) -> Bool {
         guard channelAvailable() else {
@@ -98,8 +85,7 @@ public final class WidgetSnapshotPublisher {
                                           now: now(),
                                           recoveringFromFailure: lastWriteFailed)
         guard decision.shouldWrite else {
-            // A reload that was throttled earlier must not be lost just
-            // because no further value change arrives.
+            // 即使后续数值未变化，也需补发先前被限流的重载。
             if pendingReload { reloadTimelinesIfAllowed() }
             return false
         }
@@ -113,11 +99,8 @@ public final class WidgetSnapshotPublisher {
             if decision.shouldReload || pendingReload { reloadTimelinesIfAllowed() }
             return true
         } catch {
-            // The inode proof is stale, but the attempted values and the retry
-            // clock are not. Keeping the attempted payload lets the next
-            // identical tick wait for the interval instead of retrying on every
-            // half-second tick; a real value change still writes immediately.
-            // The next attempt must claim the current file before replacing it.
+            // inode 凭据已失效，但保留本次数值和计时，使相同值等待重试间隔，变化时仍立即写入。
+            // 下次尝试前须重新接管文件。
             ownership = nil
             needsClaim = true
             lastPayload = data
@@ -132,12 +115,10 @@ public final class WidgetSnapshotPublisher {
         var shouldReload: Bool
     }
 
-    /// Decides a write without touching WidgetKit or the App Group.
+    /// 纯写入决策，不访问 WidgetKit 或 App Group。
     ///
-    /// Unchanged values still refresh the written-at clock once a minute so the
-    /// widget can tell a live idle snapshot from a process that exited. A reload
-    /// is requested when the displayed values changed, or when a retry finally
-    /// succeeds after a failure, and at most once per `minimumReloadInterval`.
+    /// 数值未变时每分钟更新写入时间，以区分空闲与进程退出。
+    /// 值变化或失败恢复后请求重载，调用间隔不小于 `minimumReloadInterval`。
     nonisolated static func decidePublish(sameValues: Bool,
                                           lastWriteAt: Date?,
                                           lastReloadAt: Date?,
@@ -152,8 +133,7 @@ public final class WidgetSnapshotPublisher {
                                shouldReload: shouldWrite && needsReload && reloadDue)
     }
 
-    /// Bytes with `writtenAtMs` removed. That field is the only one that moves
-    /// on an idle tick.
+    /// 移除 `writtenAtMs` 后的字节；空闲刷新时仅此字段变化。
     nonisolated static func displayIdentity(of data: Data) -> Data {
         guard var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return data
@@ -162,9 +142,7 @@ public final class WidgetSnapshotPublisher {
         return (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? data
     }
 
-    /// Asks WidgetKit for a reload at most once per `minimumReloadInterval`.
-    /// The extension keeps its own five-minute timeline, so a dropped request
-    /// never leaves the widget stale for long.
+    /// 每个 `minimumReloadInterval` 内最多请求一次重载，扩展另有五分钟时间线刷新。
     private func reloadTimelinesIfAllowed() {
         let current = now()
         if let lastReloadAt, current.timeIntervalSince(lastReloadAt) < Self.minimumReloadInterval {
@@ -175,7 +153,7 @@ public final class WidgetSnapshotPublisher {
         reload()
     }
 
-    /// Drops the in-memory identity so the next publish re-reads the container.
+    /// 清除内存中的文件身份，使下次发布重新读取容器。
     public func resetOwnership() {
         ownership = nil
         lastPayload = nil

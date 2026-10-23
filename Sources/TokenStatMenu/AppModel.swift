@@ -99,10 +99,8 @@ struct AppModelTimingDependencies {
     }
 }
 
-/// The only direct-quota value allowed to cross the worker boundary.  It
-/// deliberately contains no process identity, URL, database path, session,
-/// bearer token, or response body.  The worker validates the target identity
-/// before and after the request and returns only these displayable facts.
+/// 后台任务仅返回可显示的额度数据，不携带进程身份、URL、数据库路径、会话、令牌或响应正文。
+/// 目标身份由后台任务在请求前后校验。
 struct DirectQuotaTransportSnapshot: Sendable {
     let fiveHour: TokenHubWindowQuota?
     let sevenDay: TokenHubWindowQuota?
@@ -110,11 +108,7 @@ struct DirectQuotaTransportSnapshot: Sendable {
     let observedAt: Date
 
     func materializedSnapshot() -> TokenHubQuotaSnapshot {
-        // The model keeps the historical snapshot shape for compatibility with
-        // synthetic tests. Production never exposes the real PID or executable
-        // path; worker-side identity checks already completed this transaction.
-        // Keep the legacy snapshot shape for UI/tests, but never carry the
-        // worker's real PID or executable path across the actor boundary.
+        // 保留旧快照结构以兼容界面和测试；真实 PID 和可执行路径不跨 actor 边界。
         let sanitizedIdentity = TokenHubIdentity(pid: 0, bundleID: TokenHubTarget.bundleID,
                                                   executablePath: "sanitized")
         return TokenHubQuotaSnapshot(identity: sanitizedIdentity, fiveHour: fiveHour,
@@ -128,8 +122,7 @@ struct DirectQuotaTransportSnapshot: Sendable {
     }
 }
 
-/// Owns process discovery, settings/SQLite reads and the authenticated direct
-/// fetch away from the main actor. No identity or credential leaves this actor.
+/// 在主 actor 之外执行进程发现、设置与 SQLite 读取及认证请求，身份和凭据不离开此 actor。
 private actor TokenHubDirectQuotaWorker {
     private let client = TokenHubDirectQuotaClient()
 
@@ -147,21 +140,17 @@ private actor TokenHubDirectQuotaWorker {
         let snapshot = try await client.fetch(identity: identity, nowProvider: nowProvider,
                                               observationAt: observedAt)
         try Task.checkCancellation()
-        // TokenHubDirectQuotaClient revalidates its settings/database identity
-        // around the network exchange. Do not return the target identity.
+        // TokenHubDirectQuotaClient 在网络交换前后校验配置和数据库身份，不返回目标身份。
         return DirectQuotaTransportSnapshot(snapshot: snapshot)
     }
 }
 
-/// Keep external process discovery and authenticated I/O outside lifecycle
-/// handling. Explicit injection also lets previews exercise the direct path
-/// using entirely synthetic identities and responses.
+/// 将进程发现和认证 I/O 与生命周期处理分开，通过注入支持使用模拟数据的预览。
 struct TokenHubDirectQuotaDependencies {
     let discoverTarget: () throws -> TokenHubIdentity
     let identityIsCurrent: (TokenHubIdentity) -> Bool
     let fetch: (TokenHubIdentity, Date) async throws -> TokenHubQuotaSnapshot
-    /// Production uses this worker closure. The three actor-isolated closures
-    /// remain as a compatibility seam for synthetic tests only.
+    /// 正式运行使用此后台闭包，其余三个 actor 隔离闭包仅保留为测试注入点。
     let workerFetch: (@Sendable (@Sendable () -> Date) async throws -> DirectQuotaTransportSnapshot)?
 
     init(discoverTarget: @escaping () throws -> TokenHubIdentity,
@@ -176,8 +165,7 @@ struct TokenHubDirectQuotaDependencies {
 
     static var production: TokenHubDirectQuotaDependencies {
         let worker = TokenHubDirectQuotaWorker()
-        // These compatibility closures are intentionally inert in production;
-        // all discovery/settings/network work is owned by the actor above.
+        // 正式运行不执行这些兼容闭包，发现、设置读取和网络操作均由上述 actor 负责。
         return TokenHubDirectQuotaDependencies(discoverTarget: { throw TokenHubQuotaFailure.noTarget },
             identityIsCurrent: { _ in false },
             fetch: { _, _ in throw TokenHubDirectQuotaFailure.transportFailed },
@@ -185,8 +173,7 @@ struct TokenHubDirectQuotaDependencies {
     }
 }
 
-/// Owns the non-Sendable mutable cache on one checked executor. Only numeric
-/// value snapshots cross back to the main actor; no cache reference escapes.
+/// 在单一执行器中管理非 Sendable 可变缓存，仅向主 actor 返回数值快照，不传递缓存引用。
 actor LocalCodexScanWorker {
     struct Result: Sendable {
         let snapshot: LocalCodexSnapshot
@@ -222,16 +209,14 @@ actor LocalCodexScanWorker {
     func scan(directory: URL, nowProvider: @Sendable () -> Date, generation: Int,
               routeContext: LocalCodexRouteContext?) throws -> Result {
         try prepareCache(for: generation)
-        // This method has no suspension point while the cache is in use:
-        // actor isolation serializes complete reads, including invalidation.
+        // 使用缓存期间无挂起点，actor 隔离保证读取和失效处理串行执行。
         let now = nowProvider()
         let snapshot = try LocalCodexUsageReader.scan(directory: directory, now: now,
                                                        cache: cache, routeContext: routeContext)
         return Result(snapshot: snapshot, diagnostics: cache.diagnostics)
     }
 
-    /// Production discovery stays inside the same worker as file scanning so
-    /// session paths and route origins never cross back through the main actor.
+    /// 发现与扫描在同一后台任务中执行，会话路径和路由源站不传回主 actor。
     func scanDefault(nowProvider: @Sendable () -> Date, generation: Int) throws -> Result {
         try prepareCache(for: generation)
         let now = nowProvider()
@@ -259,17 +244,13 @@ actor LocalCodexScanWorker {
     }
 }
 
-/// Resolve the same permitted inputs on the main actor, then run bounded file
-/// I/O in the cache owner. Injection replaces external I/O in lifecycle checks.
+/// 在主 actor 解析允许的输入，由缓存持有者限量读取文件；生命周期测试通过注入替代外部 I/O。
 struct LocalCodexScanDependencies {
     struct Inputs: Sendable {
         let directory: URL
         let routeContext: LocalCodexRouteContext
     }
-    /// Legacy injected seams are optional so production can expose only the
-    /// worker-owned `scanDefault` path. Keeping these seams available for
-    /// synthetic tests does not make a real sessions URL cross the actor
-    /// boundary in the production configuration.
+    /// 旧测试注入点可选；正式运行仅使用后台 `scanDefault`，真实会话 URL 不跨 actor 边界。
     let resolveInputs: (@MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext))?
     let scan: (@Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result)?
     let scanDefault: (@Sendable (@Sendable () -> Date, Int) async throws -> LocalCodexScanWorker.Result)?
@@ -297,9 +278,7 @@ struct LocalCodexScanDependencies {
 
     @MainActor static var production: LocalCodexScanDependencies {
         let worker = LocalCodexScanWorker()
-        // Do not retain a production closure that resolves the real sessions
-        // URL on the main actor. Discovery and route reading remain inside the
-        // same worker that owns the cache and performs the bounded file scan.
+        // 不在主 actor 解析真实会话 URL，发现和路由读取留在持有缓存的扫描任务中。
         return LocalCodexScanDependencies(resolveInputs: nil, scan: nil,
             scanDefault: { nowProvider, generation in try await worker.scanDefault(nowProvider: nowProvider, generation: generation) },
             invalidate: { generation in await worker.invalidate(generation: generation) })
@@ -314,9 +293,7 @@ struct BackgroundServiceResources: Equatable, Encodable {
     let axScanInFlightCount: Int
 }
 
-/// Clock-derived presentation changes are distinct from new measurements.
-/// Comparing these cheap booleans keeps the half-second menu cadence without
-/// formatting dates or invalidating every SwiftUI view when nothing changed.
+/// 将时钟引起的显示变化与新数据分开，用布尔值维持半秒刷新，避免重复格式化日期和重绘视图。
 struct PresentationTimeState: Equatable {
     struct Window: Equatable {
         let futureObservation: Bool
@@ -331,9 +308,7 @@ struct PresentationTimeState: Equatable {
     let sevenDay: Window?
 }
 
-/// A single clock-bound view of the raw Token Hub observation. Keeping the
-/// decisions here lets the status item, diagnostics and SwiftUI card agree
-/// without repeating date or Decimal formatting on timer ticks.
+/// 按同一时刻计算 Token Hub 的显示状态，使菜单、诊断和卡片一致，避免重复格式化日期和 Decimal。
 struct TokenHubQuotaPresentation: Equatable, Sendable {
     enum AlertLevel: Equatable, Sendable { case none, warning, critical }
 
@@ -386,7 +361,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
 }
 
 @MainActor final class AppModel: ObservableObject {
-    // Explicit launch-only flag: fixtures never masquerade as enterprise measurements.
+    // 仅启动时显式设置，测试数据不作为企业实测数据。
     let isTestFixture = CommandLine.arguments.contains("--test-fixture")
     private let isPreview: Bool
     private let startup: AppModelStartupDependencies
@@ -469,7 +444,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     private var tokenHubAXGeneration: UInt64 = 0
     private var lastPresentationTimeState: PresentationTimeState?
     private var lastHistorySampleMonotonic: TimeInterval?
-    /// Publishes presentation values to the embedded widget's App Group.
+    /// 将显示数据发布到内嵌小组件的 App Group。
     private let widgetPublisher = WidgetSnapshotPublisher()
     var onTick: (() -> Void)?
 
@@ -555,13 +530,10 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     func tick() {
         let now = tokenHubNow()
         updateLocalHistory(at: now, monotonicNow: timing.monotonicNow())
-        // The formal local-history mode never consumes proxy engine metrics.
-        // Publishing its identical empty snapshot would redraw a hidden or
-        // open dashboard twice a second. Legacy proxy previews keep sampling.
+        // 本地历史模式不使用代理指标，跳过相同空快照，避免每秒重绘两次；旧代理预览仍采样。
         if config.dataSource != "localCodex" { stats = engine.snapshot() }
         var publishedTransition = false
-        // Check presence first: creating a date formatter for an absent quota
-        // was otherwise part of every idle menu tick.
+        // 先检查额度是否存在，避免空闲刷新为缺失额度创建日期格式化器。
         if let quota, quota.month != QuotaSnapshot.currentMonth(at: now) {
             self.quota = nil; quotaError = "已跨月，等待本月用量"
             publishedTransition = true
@@ -582,14 +554,11 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         onTick?()
     }
 
-    /// Projects the values the menu bar already shows into the shared snapshot.
+    /// 将菜单栏当前显示的值映射到共享快照。
     ///
-    /// Only displayed results are projected, so the widget cannot disagree with
-    /// the menu: a window that presentation reports as reset or stale becomes
-    /// unknown here too, and a missing source stays unknown instead of zero.
+    /// 过期、重置或缺失的窗口同样输出为未知，使小组件与菜单一致。
     private func publishWidgetSnapshot(at now: Date) {
-        // Previews and test fixtures never publish: they would otherwise expose
-        // synthetic numbers through a real system surface.
+        // 预览和测试不发布快照，避免模拟数值出现在真实系统界面。
         guard !isPreview, !isTestFixture else { return }
         let presentation = quotaPresentation(at: now)
         let source: WidgetQuotaSnapshot.HubSource
@@ -610,9 +579,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         }
         if presentation.snapshot == nil { state = .unavailable }
 
-        // `fiveHourCurrent` is already nil when the projection is stale or the
-        // window has reset, so projecting it keeps the widget aligned with the
-        // menu without re-deriving freshness here.
+        // 过期或重置时 `fiveHourCurrent` 已为 nil，直接映射，无需再次判断有效期。
         func window(_ quota: TokenHubWindowQuota?) -> WidgetQuotaSnapshot.Window? {
             guard let quota else { return nil }
             let percent = NSDecimalNumber(decimal: quota.remainingPercent).doubleValue
@@ -645,9 +612,8 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         widgetPublisher.publish(published)
     }
 
-    /// Keep only the closed ten-minute wall-clock interval on every tick,
-    /// including while hidden or when the current mode cannot sample. A
-    /// successful append is independently throttled by monotonic time.
+    /// 每次刷新只保留最近十分钟闭区间内的样本，界面隐藏或无法采样时也清理。
+    /// 追加样本另由单调时间限频。
     private func updateLocalHistory(at now: Date, monotonicNow: TimeInterval) {
         var retained = retainedHistory(at: now)
         defer { publishHistoryIfChanged(retained) }
@@ -685,8 +651,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         history = updated
     }
 
-    /// The panel can be opened between timer ticks, so discard any expired or
-    /// future samples before SwiftUI first renders its history chart.
+    /// 面板可能在两次定时器回调之间打开，首次绘图前先清除过期和未来样本。
     func pruneHistoryBeforePanelDisplay() {
         let now = tokenHubNow()
         publishHistoryIfChanged(retainedHistory(at: now))
@@ -698,9 +663,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
               now.timeIntervalSince(quota.fetchedAt) < max(120, config.refreshSeconds * 2) else { return nil }
         return quota
     }
-    /// A measurement can arrive and expire between timer ticks. Remember
-    /// its time state after the input mutation, since SwiftUI may render that
-    /// intervening published value even if the previous tick had no live data.
+    /// 数据可能在定时器回调间到达并过期，输入变化后需保存时间状态，以匹配 SwiftUI 实际显示的值。
     private func capturePresentationTimeBaseline() {
         lastPresentationTimeState = presentationTimeState
     }
@@ -759,11 +722,10 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             }
             return "企业后台直接来源尚未连接；本地 Codex 历史记录与 Token Hub 额度分别展示。"
         }
-        if config.dataSource == "localCodex" { return "当前配置关联的本机 Codex 记录，历史路由未核验；当前扫描范围记录小计，实时速度为活动事件短窗口估算" }
+        if config.dataSource == "localCodex" { return "当前配置关联的本机 Codex 记录，当前扫描范围记录合计，实时速度为活动事件短窗口估算" }
         return hasRequestData ? "本次启动 · 仅统计经过本机代理的请求" : "未采集到请求数据 · 尚未观测到客户端流量"
     }
-    /// Presentation checks freshness on every menu update, even if the local
-    /// file scan stalls. A future or invalid observation is never called live.
+    /// 每次菜单更新都检查有效期，不依赖文件扫描进度；未来或无效的观测不作为实时数据。
     var freshLocalLiveTurn: LocalLiveTurnSummary? { freshLocalLiveTurn(at: tokenHubNow()) }
     func freshLocalLiveTurn(at now: Date) -> LocalLiveTurnSummary? {
         guard let live = localSnapshot.liveTurn,
@@ -786,9 +748,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             } else {
                 rate = "上轮均:—"
             }
-            let uncertainty = localSnapshot.unknownThreadCount + localSnapshot.unidentifiedFileCount
-            let total = localSnapshot.hasCompleteAccounting ? "Σ\(formatCompactCount(localSnapshot.total))"
-                : localSnapshot.knownThreadCount > 0 ? "小计\(formatCompactCount(localSnapshot.total)) · 未核验\(uncertainty)" : "Σ— · 未核验\(uncertainty)"
+            let total = localSnapshot.knownThreadCount > 0 ? "Σ\(formatCompactCount(localSnapshot.total))" : "Σ—"
             let sessions = localSnapshot.hasCompleteAccounting ? " · \(localSnapshot.sessionCount)顶层对话" : ""
             let quotaSuffix = tokenHubMenuSuffix(quotaPresentation)
             return (isTestFixture ? "测试 " : "") + "\(rate) · \(total)\(sessions)\(quotaSuffix)"
@@ -812,10 +772,10 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         let coverage = "扫描范围最多32个物理文件；不是全部对话；每文件头64KiB与尾256KiB，总计10MiB；" + (localSnapshot.isLimited ? "本次达到扫描上限" : "本次安全检查 \(localSnapshot.filesScanned) 个物理文件")
         let input = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.input) : "未知"
         let output = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.output) : "未知"
-        let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "已核验记录小计"
+        let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "本次记录合计"
         let total = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.total) : "未知"
         let hub = tokenHubTooltipDetail(quotaPresentation)
-        return "\(userFacingStatus)\n当前配置关联的本机 Codex 记录，历史路由未核验；当前扫描范围：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(localDetailedMetricsTooltip)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+        return "\(userFacingStatus)\n当前配置关联的本机 Codex 记录；当前扫描范围：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(localDetailedMetricsTooltip)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
     }
     var localCacheReadout: String {
         guard localSnapshot.cacheCoverage.state == .complete,
@@ -843,7 +803,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         if cached == input { return "100.00%" }
         let percent = Decimal(cached) * Decimal(100) / Decimal(input)
         let rendered = Self.localCachePercentFormatter.string(from: NSDecimalNumber(decimal: percent)) ?? "未知（比例不可用）"
-        // A non-full integer ratio must never round up to the exact-full label.
+        // 未满的比例不能因舍入而显示为全满。
         return rendered == "100.00" ? "99.99%" : "\(rendered)%"
     }
     var localCacheCoverageReadout: String {
@@ -861,7 +821,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         guard coverage.state == .partial,
               let input = coverage.matchedInputTokens,
               let cached = coverage.matchedCachedInputTokens else { return nil }
-        return "同覆盖匹配小计：缓存读取 \(formatCount(cached)) / 输入 \(formatCount(input)) tokens"
+        return "同覆盖匹配合计：缓存读取 \(formatCount(cached)) / 输入 \(formatCount(input)) tokens"
     }
     var localReadAtReadout: String {
         localSnapshot.readAt.map { "本次扫描/核对时间：\($0.formatted())" }
@@ -904,7 +864,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         let seven = presentation.sevenDayCurrent.map { "界面显示剩余 \(percentText($0.remainingPercent))（7 天）" } ?? "7 天未知"
         let source = tokenHubQuotaIsDirect ? "Token Hub 后台直接响应" : "Token Hub 界面快照"
         let timing = tokenHubQuotaIsDirect ? "后台响应已提供" : "后台更新时间未提供"
-        let currency = tokenHubQuotaIsDirect ? "币种来自后台响应" : "币种未核验"
+        let currency = tokenHubQuotaIsDirect ? "币种来自后台响应" : "币种来源待确认"
         return "\(source)：\(five) · \(seven)；\(tokenHubQuotaStatusText)；\(timing)；\(currency)"
     }
     private func percentText(_ value: Decimal) -> String {
@@ -943,7 +903,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         }
     }
     private var accountingDetail: String {
-        "已核验线程 \(localSnapshot.knownThreadCount) · 未核验线程 \(localSnapshot.unknownThreadCount) · 未识别文件 \(localSnapshot.unidentifiedFileCount) · 子代理 \(localSnapshot.subagentCount) · 分叉 \(localSnapshot.forkCount) · 顶层对话 \(localSnapshot.sessionCount)"
+        "线程 \(localSnapshot.knownThreadCount) · 其他线程 \(localSnapshot.unknownThreadCount) · 未识别文件 \(localSnapshot.unidentifiedFileCount) · 子代理 \(localSnapshot.subagentCount) · 分叉 \(localSnapshot.forkCount) · 顶层对话 \(localSnapshot.sessionCount)"
     }
     private func quotaDescription(_ quota: WindowQuota?, source: QuotaSource) -> String {
         let presentation = WindowQuotaCard.presentation(for: quota, at: tokenHubNow(), refreshSeconds: config.refreshSeconds, source: source)
@@ -970,7 +930,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         guard let ratio = (windows + [freshQuota?.fraction].compactMap { $0 }).max() else { return .labelColor }
         return ratio >= 0.95 ? .systemRed : ratio >= 0.8 ? .systemYellow : .labelColor
     }
-    /// Kept for the synthetic legacy core-state regression only; never used by the formal Settings path.
+    /// 仅供旧核心状态的模拟回归测试使用，正式设置流程不调用。
     static func configurationForApplying(_ draft: AppConfiguration,
                                          automaticReadingEnabled: Bool) -> AppConfiguration {
         var configuration = draft
@@ -1005,8 +965,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     }
 
     private func applyPreferencesToPresentationConfig() {
-        // This compatibility projection exists for the local-history views and synthetic tests.
-        // No integration field is loaded from the old plist or used to activate an app service.
+        // 兼容本地历史视图和测试，不从旧 plist 加载集成字段或据此启用服务。
         var safe = AppConfiguration()
         safe.dataSource = "localCodex"
         safe.refreshSeconds = preferences.refreshSeconds
@@ -1080,7 +1039,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             subagentCount: 0, forkCount: 0)
         fiveHourQuota = nil; sevenDayQuota = nil
     }
-    /// Clears quota values at a source transition without performing I/O.
+    /// 切换来源时清空额度，不执行 I/O。
     func resetQuotaState() {
         quota = nil
         fiveHourQuota = nil
@@ -1165,9 +1124,8 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         }
     }
 
-    /// Associates the current Codex provider with this local Token Hub's
-    /// configured origin. Historical rollout routes are not independently
-    /// verifiable from the current provider name and configuration alone.
+    /// 关联当前 Codex provider 与本机 Token Hub 的源站配置。
+    /// 仅凭当前配置无法确认历史会话的实际路由。
     nonisolated fileprivate static func seasunRouteContext() -> LocalCodexRouteContext {
         let configURL = LocalCodexUsageReader.defaultConfigURL()
         guard let active = GatewayDiscovery.activeCodexProvider(at: configURL),
@@ -1178,9 +1136,8 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         }
         return .verified(provider: active.provider, origin: activeOrigin)
     }
-    /// Production refresh first uses Token Hub's own read-only connection and
-    /// in-memory SSO exchange. Preview and synthetic tests retain the
-    /// bounded AX scanner path without touching real local credentials.
+    /// 正式刷新优先只读 Hub 连接并在内存中交换 SSO 令牌。
+    /// 预览和模拟测试使用限量 AX 扫描，不接触真实凭据。
     func refreshTokenHubQuota(observationNow: Date? = nil) {
         guard !isShuttingDown else { return }
         guard config.dataSource == "localCodex", tokenHubQuotaReadingEnabled else {
@@ -1198,9 +1155,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         let now = observationNow ?? tokenHubNow()
         let source = directQuota
         let interval = config.refreshSeconds
-        // Production resolves the target, reads settings and performs the
-        // direct request inside its worker actor. Only the sanitized DTO
-        // returns to this main-actor model.
+        // 在后台 actor 解析目标、读取配置并请求接口，仅将脱敏数据传回主 actor。
         if let workerFetch = source.workerFetch {
             tokenHubDirectScanInFlight = true
             let nowProvider = timing.wallNow
@@ -1223,9 +1178,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             return
         }
 
-        // Compatibility path for injected synthetic tests. Production never
-        // reaches this branch, so its discovery and settings reads stay off
-        // the main actor.
+        // 此兼容分支只供注入式模拟测试使用；正式发现和配置读取不在主 actor 执行。
         let identity: TokenHubIdentity
         do { identity = try directQuota.discoverTarget() }
         catch {
@@ -1243,8 +1196,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             do { result = .success(try await source.fetch(identity, now)) }
             catch { result = .failure(error) }
             guard let self else { return }
-            // Invalidation already released the old generation. Its late
-            // completion must not unlock a newer generation's active request.
+            // 旧代次已释放，迟到的完成回调不能解锁新代次的活动请求。
             guard !self.isShuttingDown, self.tokenHubGeneration == version else { return }
             self.tokenHubDirectScanInFlight = false
             guard self.config.dataSource == "localCodex", self.tokenHubQuotaReadingEnabled else { return }
@@ -1299,8 +1251,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         tokenHubQuotaStatus = .accessFailed
         tokenHubQuotaFailure = nil
         sourceReadinessText = "企业后台直接来源：\(directFailureText(failure))"
-        // AX is an optional compatibility fallback only when the user has
-        // already granted trust; it never gates direct reading.
+        // 已有授权时才使用 AX 兼容回退，不影响后台直读。
         if tokenHubAutomaticReadingEnabled, cachedTokenHubPermission, !isFixtureUsingNativeTokenHubReader {
             refreshTokenHubQuotaUsingAccessibility()
         } else {
@@ -1318,8 +1269,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         checkTokenHubPermissionIfDue(scheduleIfGranted: false)
         guard cachedTokenHubPermission else {
             invalidateAccessibilityQuota(status: .permissionRequired)
-            // Trust can be revoked while the direct request is in flight.
-            // Its optional fallback must not cancel the unattended retry loop.
+            // 请求期间授权可能被撤销，可选回退不能取消自动重试。
             if usesDirectQuotaSource { scheduleTokenHubRefresh(after: config.refreshSeconds) }
             return
         }
@@ -1332,8 +1282,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         let request = TokenHubAXRequest(now: now, permissionTrusted: cachedTokenHubPermission,
             refreshSeconds: interval, mode: mode, generation: version)
         Task(priority: .utility) { [weak self] in
-            // The main actor only awaits a value. Native traversal runs as one
-            // non-suspending operation on its private worker actor.
+            // 主 actor 仅等待返回值，原生遍历在私有后台 actor 中同步执行，不中途挂起。
             let result = await source.scan(request)
             guard let self else { return }
             self.tokenHubScanInFlight = false
@@ -1357,8 +1306,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         tokenHubAXGeneration &+= 1
         config.tokenHubAutomaticReadingEnabled = enabled
         if usesDirectQuotaSource {
-            // This preference controls only AX compatibility; it cannot turn
-            // off the unattended enterprise source or discard its snapshot.
+            // 此偏好只控制 AX 兼容读取，不关闭自动企业来源或丢弃其快照。
             if !tokenHubQuotaIsDirect {
                 tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
                 tokenHubQuotaStatus = .targetNotRunning
@@ -1393,8 +1341,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             invalidateTokenHubQuota(status: status)
         } else if !tokenHubQuotaIsDirect, !tokenHubDirectScanInFlight {
             tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil
-            // Keep a direct failure (if any) visible; missing AX trust is not
-            // a failure of the automatic source.
+            // 保留后台直读错误；缺少 AX 授权不代表自动来源失败。
             if tokenHubDirectFailure == nil { tokenHubQuotaStatus = .targetNotRunning }
         }
     }
@@ -1500,14 +1447,14 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         }
     }
 
-    /// Metadata-only lifecycle seam; no AX values or target contents are read here.
+    /// 生命周期接入点，仅处理元数据，不读取 AX 值或目标内容。
     func tokenHubApplicationDidTerminate(bundleIdentifier: String) {
         guard isPreview || backgroundServicesStarted else { return }
         guard bundleIdentifier == TokenHubTarget.bundleID, !isShuttingDown else { return }
         invalidateTokenHubQuota(status: config.dataSource == "localCodex" ? .targetNotRunning : .disabled)
     }
 
-    /// Metadata-only lifecycle seam; a launch never makes an old snapshot current.
+    /// 生命周期接入点，仅处理元数据；启动不使旧快照重新有效。
     func tokenHubApplicationDidLaunch(bundleIdentifier: String) {
         guard isPreview || backgroundServicesStarted else { return }
         guard bundleIdentifier == TokenHubTarget.bundleID, !isShuttingDown else { return }
