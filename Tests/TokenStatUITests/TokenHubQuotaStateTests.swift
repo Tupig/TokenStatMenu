@@ -3020,7 +3020,9 @@ extension TokenHubQuotaStateTests {
         let host = NSHostingView(rootView: content)
         host.frame = NSRect(x: 0, y: 0, width: 460, height: 700)
         host.layoutSubtreeIfNeeded()
-        let height = max(700, ceil(host.fittingSize.height))
+        // 部分 macOS 的 GroupBox/disclosure 在挂到窗口后才完成 intrinsic
+        // 尺寸计算；预留底部空间，避免完整轮次的最后几行被截入边界。
+        let height = max(700, ceil(host.fittingSize.height) + 24)
         guard height.isFinite, height <= 8_000 else { throw NSError(domain: "BP39OverviewRender", code: 1) }
         let bounds = NSRect(x: 0, y: 0, width: 460, height: height)
         let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
@@ -3033,8 +3035,8 @@ extension TokenHubQuotaStateTests {
         host.layoutSubtreeIfNeeded()
         try await Task.sleep(for: .milliseconds(100))
         host.layoutSubtreeIfNeeded()
-        let pixelsWide = Int(bounds.width * 4)
-        let pixelsHigh = Int(bounds.height * 4)
+        let pixelsWide = Int(bounds.width * 6)
+        let pixelsHigh = Int(bounds.height * 6)
         let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil,
             pixelsWide: pixelsWide, pixelsHigh: pixelsHigh, bitsPerSample: 8,
             samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
@@ -3051,6 +3053,7 @@ extension TokenHubQuotaStateTests {
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["zh-Hans", "en-US"]
         request.usesLanguageCorrection = true
+        request.customWords = ["整轮用时", "整轮均速", "来源未提供", "未缓存输入"]
         request.minimumTextHeight = 0.002
         try VNImageRequestHandler(cgImage: try XCTUnwrap(bitmap.cgImage), options: [:]).perform([request])
         // Vision may return a metric's label/value as separate observations.
@@ -3092,7 +3095,7 @@ extension TokenHubQuotaStateTests {
                 output: artifacts.url.appendingPathComponent("\(appearance)-expanded.png"))
             let text = expanded.text.replacingOccurrences(of: " ", with: "")
             for marker in ["缓存", "未缓存", "命中率", "线程", "轮次", "整轮用时", "整轮均速"] {
-                XCTAssertTrue(text.contains(marker), "\(appearance) actual bitmap must display \(marker)")
+                XCTAssertTrue(text.contains(marker), "\(appearance) actual bitmap must display \(marker); OCR: \(text)")
             }
             XCTAssertTrue(text.contains("43.75%"), "the actual summary renders source C=70 / I=160")
             XCTAssertTrue(text.contains("线程1")); XCTAssertTrue(text.contains("轮次1"))
