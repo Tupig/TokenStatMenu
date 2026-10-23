@@ -20,37 +20,44 @@ final class WidgetPublisherFailureTests: XCTestCase {
         var now = start
         var reloads = 0
         var writes = 0
+        func value(_ percent: Double) -> WidgetQuotaSnapshot {
+            WidgetQuotaSnapshot(writtenAt: now, observedAt: start, validUntil: start.addingTimeInterval(300),
+                hubSource: .direct, hubState: .ready,
+                fiveHour: .init(remainingPercent: percent, resetsAt: nil),
+                sevenDay: nil, monthly: nil, local: nil)
+        }
         let publisher = WidgetSnapshotPublisher(now: { now }, channelAvailable: { true },
             claim: { WidgetSnapshotStore.claimExisting(directory: dirfd) },
             write: { data, owned in
                 writes += 1
                 return try WidgetSnapshotStore.write(data, replacing: owned, directory: dirfd)
             }, reload: { reloads += 1 })
-        XCTAssertTrue(publisher.publish(snapshot(50)))
+        XCTAssertTrue(publisher.publish(value(50)))
         XCTAssertEqual(try WidgetSnapshotStore.read(directory: dirfd)?.fiveHour?.remainingPercent, 50)
         now = start.addingTimeInterval(59)
-        XCTAssertFalse(publisher.publish(snapshot(50)))
+        XCTAssertFalse(publisher.publish(value(50)))
         XCTAssertEqual(writes, 1)
         now = start.addingTimeInterval(60)
-        XCTAssertTrue(publisher.publish(snapshot(50)))
+        XCTAssertTrue(publisher.publish(value(50)))
         XCTAssertEqual(writes, 2)
+        XCTAssertEqual(try WidgetSnapshotStore.read(directory: dirfd)?.writtenAt, now, "心跳更新时间但不触发重载")
         XCTAssertEqual(reloads, 1, "同值心跳不重载")
         now = start.addingTimeInterval(61)
-        XCTAssertTrue(publisher.publish(snapshot(40)))
+        XCTAssertTrue(publisher.publish(value(40)))
         XCTAssertEqual(reloads, 2)
         now = start.addingTimeInterval(62)
-        XCTAssertTrue(publisher.publish(snapshot(30)))
+        XCTAssertTrue(publisher.publish(value(30)))
         XCTAssertEqual(reloads, 2)
         now = start.addingTimeInterval(121)
-        XCTAssertFalse(publisher.publish(snapshot(30)))
+        XCTAssertFalse(publisher.publish(value(30)))
         XCTAssertEqual(reloads, 3)
         let owned = try XCTUnwrap(WidgetSnapshotStore.claimExisting(directory: dirfd))
         try WidgetSnapshotStore.write(WidgetSnapshotCodec.encode(snapshot(20)), replacing: owned, directory: dirfd)
         now = start.addingTimeInterval(122)
-        XCTAssertFalse(publisher.publish(snapshot(10)), "旧 inode 凭据不能覆盖新文件")
+        XCTAssertFalse(publisher.publish(value(10)), "旧 inode 凭据不能覆盖新文件")
         XCTAssertEqual(try WidgetSnapshotStore.read(directory: dirfd)?.fiveHour?.remainingPercent, 20)
         now = start.addingTimeInterval(182)
-        XCTAssertTrue(publisher.publish(snapshot(10)), "失败后重新接管实际文件")
+        XCTAssertTrue(publisher.publish(value(10)), "失败后重新接管实际文件")
         XCTAssertEqual(try WidgetSnapshotStore.read(directory: dirfd)?.fiveHour?.remainingPercent, 10)
         XCTAssertEqual(reloads, 4)
     }

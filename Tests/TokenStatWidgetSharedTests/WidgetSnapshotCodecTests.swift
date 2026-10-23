@@ -302,20 +302,29 @@ final class WidgetSnapshotCodecTests: XCTestCase {
         }
     }
 
-    func testDecodeRejectsOutOfRangePercentAndWindows() {
+    func testDecodeRejectsOutOfRangePercentAndWindows() throws {
         let cases = ["-1", "100.001", "1e9"]
         for literal in cases {
             let payload = validPayload(replacing: "\"fiveHour\":null",
                 with: "\"fiveHour\":{\"remainingPercent\":\(literal),\"resetsAtMs\":null}")
+            XCTAssertNoThrow(try JSONSerialization.jsonObject(with: Data(payload.utf8)))
             XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(payload.utf8), now: now),
-                                 "remainingPercent \(literal) must be rejected")
+                                 "remainingPercent \(literal) must be rejected") {
+                XCTAssertEqual($0 as? WidgetSnapshotCodec.CodecError, .outOfRange("remainingPercent"))
+            }
         }
         let unexpectedKey = validPayload(replacing: "\"fiveHour\":null",
             with: "\"fiveHour\":{\"remainingPercent\":50,\"resetsAtMs\":null,\"extra\":1}")
-        XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(unexpectedKey.utf8), now: now))
+        XCTAssertNoThrow(try JSONSerialization.jsonObject(with: Data(unexpectedKey.utf8)))
+        XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(unexpectedKey.utf8), now: now)) {
+            XCTAssertEqual($0 as? WidgetSnapshotCodec.CodecError, .unexpectedKey("extra"))
+        }
         let missingKey = validPayload(replacing: "\"fiveHour\":null",
             with: "\"fiveHour\":{\"remainingPercent\":50}")
-        XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(missingKey.utf8), now: now))
+        XCTAssertNoThrow(try JSONSerialization.jsonObject(with: Data(missingKey.utf8)))
+        XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(missingKey.utf8), now: now)) {
+            XCTAssertEqual($0 as? WidgetSnapshotCodec.CodecError, .missingKey("resetsAtMs"))
+        }
     }
 
     func testDecodeRejectsInvalidTimestamps() {
