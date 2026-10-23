@@ -36,10 +36,11 @@ VERSION = "1.1.3"
 BUILD = "5"
 PUBLISH_IF = (
     "$"
-    + "{{ github.repository == 'Tupig/TokenStatMenu' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
+    + "{{ vars.TOKENSTAT_CLOUD_RELEASE == 'enabled' && github.repository == 'Tupig/TokenStatMenu' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
 )
 TAG_ONLY_IF = (
-    "$" + "{{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
+    "$"
+    + "{{ vars.TOKENSTAT_CLOUD_RELEASE == 'enabled' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
 )
 APP_FILES = {
     "Contents/Info.plist": 0o644,
@@ -73,6 +74,10 @@ def run(*args: str, cwd: Path | None = None) -> str:
             "commit.gpgsign=false",
             "-c",
             "tag.gpgsign=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
             *args[1:],
         )
     result = subprocess.run(
@@ -317,6 +322,53 @@ class FakeClient:
 
 
 class ReleaseChecks(unittest.TestCase):
+    def test_widget_group_validation_matches_runtime_and_build(self):
+        valid = [
+            "group.tokenstat.menu",
+            "AB12CD34EF.com.example.TokenStatMenu",
+            "group." + "a" * 122,
+        ]
+        invalid = [
+            "",
+            "group.",
+            "group.a..b",
+            "group.a/../b",
+            "group.-a",
+            "group.a-",
+            "group.a.-b",
+            "group.a-.b",
+            "FICTEAM123.example",
+            "ab12cd34ef.example",
+            "AB12CD34E.example",
+            "AB12CD34EF.",
+            "com.seasun.tokenhub.desktop",
+            "$(TOKENSTAT_WIDGET_GROUP)",
+            "group." + "a" * 123,
+        ]
+        script = (PROJECT / "script/build_and_run.sh").read_text()
+        condition = next(
+            line.strip()[3:-6]
+            for line in script.splitlines()
+            if line.strip().startswith('if ! [[ "$GROUP" =~')
+        )
+        for value in valid + invalid:
+            expected = value in valid
+            self.assertEqual(
+                release.GROUP_PATTERN.fullmatch(value) is not None, expected, value
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'GROUP="$1"; if ' + condition + "; then exit 1; fi",
+                    "check",
+                    value,
+                ],
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0 if expected else 1, value)
+
     def setUp(self) -> None:
         self.fixture = Fixture()
         self.addCleanup(self.fixture.close)

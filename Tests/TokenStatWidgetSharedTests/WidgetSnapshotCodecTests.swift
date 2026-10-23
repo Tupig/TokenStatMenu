@@ -30,7 +30,8 @@ final class WidgetSnapshotCodecTests: XCTestCase {
                                                  sourceSymbol: "$"),
             local: WidgetQuotaSnapshot.Local(inputTokens: 10, outputTokens: 20,
                                              totalTokens: 30, knownThreads: 2,
-                                             unknownThreads: 1, isLimited: false))
+                                             unknownThreads: 1, isLimited: false),
+            resetVoucherCount: 3)
         let decoded = try WidgetSnapshotCodec.decode(try WidgetSnapshotCodec.encode(snapshot),
                                                      now: now)
         XCTAssertEqual(decoded.writtenAt, snapshot.writtenAt)
@@ -47,6 +48,34 @@ final class WidgetSnapshotCodecTests: XCTestCase {
         XCTAssertEqual(decoded.local?.totalTokens, 30)
         XCTAssertEqual(decoded.local?.unknownThreads, 1)
         XCTAssertFalse(decoded.local?.isLimited ?? true)
+        XCTAssertEqual(decoded.resetVoucherCount, 3)
+    }
+
+    /// 1.1.5 及更早的快照没有券字段；升级瞬间必须解码为未知，而不是整份快照失败。
+    func testDecodeAcceptsPayloadWithoutResetVoucherCount() throws {
+        let decoded = try WidgetSnapshotCodec.decode(Data(validPayload(replacing: "\"local\":null",
+                                                                       with: "\"local\":null").utf8), now: now)
+        XCTAssertNil(decoded.resetVoucherCount)
+    }
+
+    func testResetVoucherCountRejectsOutOfRangeAndNonIntegerValues() {
+        for count in [-1, 1_000_001] {
+            let snapshot = WidgetQuotaSnapshot(
+                writtenAt: now, observedAt: nil, validUntil: nil,
+                hubSource: .none, hubState: .unavailable,
+                fiveHour: nil, sevenDay: nil, monthly: nil, local: nil,
+                resetVoucherCount: count)
+            XCTAssertThrowsError(try WidgetSnapshotCodec.encode(snapshot)) { error in
+                XCTAssertEqual(error as? WidgetSnapshotCodec.CodecError,
+                               .outOfRange("resetVoucherCount"))
+            }
+        }
+        for literal in ["-1", "1000001", "1.5", "\"2\"", "true"] {
+            let payload = validPayload(replacing: "\"local\":null",
+                                       with: "\"local\":null,\"resetVoucherCount\":\(literal)")
+            XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(payload.utf8), now: now),
+                                 "resetVoucherCount \(literal) must be rejected")
+        }
     }
 
     /// A missing source must decode as nil, never as zero.

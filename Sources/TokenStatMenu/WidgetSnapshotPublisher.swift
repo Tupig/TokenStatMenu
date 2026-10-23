@@ -17,6 +17,8 @@ public final class WidgetSnapshotPublisher {
     /// 写入失败后丢弃 inode 凭据，下次替换前重新接管当前文件。
     private var needsClaim = true
     private var lastWriteFailed = false
+    /// 仅实际成功写入后置为 true，不把容器路径存在当作发布成功。
+    public private(set) var lastPublishSucceeded = false
     /// 暂受 60 秒间隔限制的重载，后续刷新时补发，不因写入完成而丢失。
     private var pendingReload = false
     private let now: @MainActor () -> Date
@@ -70,9 +72,13 @@ public final class WidgetSnapshotPublisher {
     public func publish(_ snapshot: WidgetQuotaSnapshot) -> Bool {
         guard channelAvailable() else {
             channelReportedUnavailable = true
+            lastPublishSucceeded = false
             return false
         }
-        guard let data = try? WidgetSnapshotCodec.encode(snapshot) else { return false }
+        guard let data = try? WidgetSnapshotCodec.encode(snapshot) else {
+            lastPublishSucceeded = false
+            return false
+        }
         let identity = Self.displayIdentity(of: data)
         if ownership == nil, needsClaim {
             ownership = claim()
@@ -95,6 +101,8 @@ public final class WidgetSnapshotPublisher {
             lastWriteAt = now()
             let recovering = lastWriteFailed
             lastWriteFailed = false
+            lastPublishSucceeded = true
+            channelReportedUnavailable = false
             if !sameValues || recovering { pendingReload = true }
             if decision.shouldReload || pendingReload { reloadTimelinesIfAllowed() }
             return true
@@ -106,6 +114,7 @@ public final class WidgetSnapshotPublisher {
             lastPayload = data
             lastWriteAt = now()
             lastWriteFailed = true
+            lastPublishSucceeded = false
             return false
         }
     }
@@ -161,5 +170,7 @@ public final class WidgetSnapshotPublisher {
         needsClaim = true
         lastWriteFailed = false
         pendingReload = false
+        lastPublishSucceeded = false
+        channelReportedUnavailable = false
     }
 }

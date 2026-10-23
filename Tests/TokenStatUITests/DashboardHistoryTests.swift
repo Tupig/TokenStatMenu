@@ -273,7 +273,7 @@ final class DashboardHistoryTests: XCTestCase {
             sessionCount: 2, filesScanned: 32, isLimited: true, latestEventAt: nil,
             fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
             unknownThreadCount: 2)
-        XCTAssertTrue(f.model.title.contains("Σ"))
+        XCTAssertFalse(f.model.title.contains("Σ"))
         XCTAssertTrue(f.model.menuTooltip.contains("实时估算：未知"))
         XCTAssertTrue(f.model.menuTooltip.contains("当前配置关联的本机 Codex 记录"))
         XCTAssertTrue(f.model.menuTooltip.contains("本次记录合计"))
@@ -288,8 +288,8 @@ final class DashboardHistoryTests: XCTestCase {
             sessionCount: 2, filesScanned: 3, isLimited: false, latestEventAt: nil,
             fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
             unknownThreadCount: 0)
-        XCTAssertTrue(f.model.title.contains("Σ"))
-        XCTAssertTrue(f.model.title.contains("顶层对话"))
+        XCTAssertFalse(f.model.title.contains("Σ"))
+        XCTAssertFalse(f.model.title.contains("顶层对话"))
         XCTAssertTrue(f.model.menuTooltip.contains("本次扫描记录量"))
         XCTAssertTrue(f.model.menuTooltip.contains("本次安全检查 3 个物理文件"))
         XCTAssertTrue(f.model.menuTooltip.contains("其他线程 0"))

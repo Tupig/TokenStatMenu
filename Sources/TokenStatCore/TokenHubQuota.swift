@@ -64,11 +64,14 @@ public struct TokenHubQuotaSnapshot: Equatable, Sendable {
     public let fiveHour: TokenHubWindowQuota?
     public let sevenDay: TokenHubWindowQuota?
     public let monthly: TokenHubMonthlyUsage?
+    /// 可用重置券数量；接口未提供或读取失败时为 nil，不猜测为 0。
+    public let resetVoucherCount: Int?
     public let observedAt: Date
     public init(identity: TokenHubIdentity, fiveHour: TokenHubWindowQuota?, sevenDay: TokenHubWindowQuota?,
-                monthly: TokenHubMonthlyUsage?, observedAt: Date) {
+                monthly: TokenHubMonthlyUsage?, resetVoucherCount: Int? = nil, observedAt: Date) {
         self.identity = identity; self.fiveHour = fiveHour; self.sevenDay = sevenDay
-        self.monthly = monthly; self.observedAt = observedAt
+        self.monthly = monthly; self.resetVoucherCount = resetVoucherCount
+        self.observedAt = observedAt
     }
 }
 

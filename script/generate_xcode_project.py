@@ -469,9 +469,6 @@ dev_scheme = (
 # the app bundle, so building the app is what actually ships it.
 widget_scheme = (
     scheme.replace("TokenStatMenu.app", "TokenStatMenuWidget.appex")
-    .replace(
-        'BuildableName="TokenStatMenu.app"', 'BuildableName="TokenStatMenuWidget.appex"'
-    )
     .replace('BlueprintName="TokenStatMenu"', 'BlueprintName="TokenStatMenuWidget"')
     .replace(
         f'BlueprintIdentifier="{target}"', f'BlueprintIdentifier="{widget_target}"'

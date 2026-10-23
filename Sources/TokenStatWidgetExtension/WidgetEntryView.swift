@@ -4,7 +4,6 @@ import WidgetKit
 /// 小组件视图：数据缺失时显示“未知”，不借用其他窗口的值或将过期数据当作当前值。
 struct WidgetEntryView: View {
     let entry: WidgetEntry
-    @Environment(\.widgetFamily) private var family
 
     private var snapshot: WidgetQuotaSnapshot? { entry.snapshot }
 
@@ -57,56 +56,71 @@ struct WidgetEntryView: View {
         // 渲染时判断有效期；`entry.date` 在时间线创建时固定，不能反映后续重置。
         let five = snapshot.currentWindow(snapshot.fiveHour, at: .now)
         let seven = snapshot.currentWindow(snapshot.sevenDay, at: .now)
-        if family == .systemSmall {
-            smallBody(snapshot, five: five, seven: seven)
-        } else {
-            mediumBody(snapshot, five: five, seven: seven)
-        }
+        let monthly = snapshot.currentMonthly(at: .now)
+        smallBody(five: five, seven: seven, monthly: monthly,
+                  vouchers: snapshot.resetVoucherCount)
     }
 
-    private func smallBody(_ snapshot: WidgetQuotaSnapshot,
-                           five: WidgetQuotaSnapshot.Window?,
-                           seven: WidgetQuotaSnapshot.Window?) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            quotaRow("5h", five)
-            quotaRow("7d", seven)
-            monthlySummary(snapshot.currentMonthly(at: .now))
+    private func smallBody(five: WidgetQuotaSnapshot.Window?,
+                           seven: WidgetQuotaSnapshot.Window?,
+                           monthly: WidgetQuotaSnapshot.Monthly?,
+                           vouchers: Int?) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            compactQuotaRow("5h", five)
+            compactQuotaRow("7d", seven)
+            HStack(spacing: 6) {
+                Text("月度")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 2)
+                if let monthly {
+                    Text("\(monthly.sourceSymbol)\(amountText(monthly.usedAmount))")
+                        .font(.caption.bold())
+                        .monospacedDigit()
+                } else {
+                    Text("未知")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            HStack(spacing: 6) {
+                Text("重置券")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 2)
+                if let vouchers {
+                    Text("\(vouchers) 张")
+                        .font(.caption.bold())
+                        .monospacedDigit()
+                } else {
+                    Text("未知")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
             Spacer(minLength: 0)
-            localSummary(snapshot.local)
         }
     }
 
-    private func mediumBody(_ snapshot: WidgetQuotaSnapshot,
-                            five: WidgetQuotaSnapshot.Window?,
-                            seven: WidgetQuotaSnapshot.Window?) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            VStack(alignment: .leading, spacing: 5) {
-                quotaRow("5 小时", five)
-                quotaRow("7 天", seven)
-            }
-            Divider()
-            VStack(alignment: .leading, spacing: 5) {
-                localSummary(snapshot.local)
-                monthlySummary(snapshot.currentMonthly(at: .now))
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func quotaRow(_ label: String, _ window: WidgetQuotaSnapshot.Window?) -> some View {
-        HStack(spacing: 3) {
+    private func compactQuotaRow(_ label: String,
+                                 _ window: WidgetQuotaSnapshot.Window?) -> some View {
+        HStack(spacing: 6) {
             Text(label)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-                .frame(width: 34, alignment: .leading)
+                .frame(width: 22, alignment: .leading)
             if let window {
-                Text(percentText(window.remainingPercent))
+                quotaBar(usedPercent(window))
+                    .frame(width: 58)
+                Spacer(minLength: 2)
+                Text(usedText(window))
                     .font(.caption.bold())
                     .monospacedDigit()
-                Text("剩")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
             } else {
+                Capsule()
+                    .fill(Color.primary.opacity(0.08))
+                    .frame(width: 58, height: 6)
+                Spacer(minLength: 2)
                 Text("未知")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
@@ -114,73 +128,40 @@ struct WidgetEntryView: View {
         }
     }
 
-    @ViewBuilder
-    private func localSummary(_ local: WidgetQuotaSnapshot.Local?) -> some View {
-        if let local {
-            VStack(alignment: .leading, spacing: 1) {
-                Text("本机合计")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text(tokenText(local.totalTokens))
-                    .font(.caption.bold())
-                    .monospacedDigit()
-                if local.unknownThreads > 0 || local.isLimited {
-                    Text(local.isLimited ? "已到扫描上限" : "部分线程未核算")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
+    private func quotaBar(_ used: Double) -> some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.12))
+                Capsule()
+                    .fill(quotaTint(used))
+                    .frame(width: proxy.size.width * min(100, max(0, used)) / 100)
             }
-        } else {
-            Text("本机合计未知")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
         }
+        .frame(height: 6)
     }
 
-    @ViewBuilder
-    private func monthlySummary(_ monthly: WidgetQuotaSnapshot.Monthly?) -> some View {
-        if let monthly, let percent = monthly.usedPercent {
-            VStack(alignment: .leading, spacing: 1) {
-                Text("本月已用")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text("\(percentText(percent))%")
-                    .font(.caption.bold())
-                    .monospacedDigit()
-            }
-        } else if let monthly {
-            VStack(alignment: .leading, spacing: 1) {
-                Text("本月已用")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text("\(monthly.sourceSymbol)\(amountText(monthly.usedAmount))")
-                    .font(.caption.bold())
-                    .monospacedDigit()
-            }
-        } else {
-            Text("本月未知")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
+    private func quotaTint(_ used: Double) -> Color {
+        if used >= 90 { return .red }
+        if used >= 70 { return .orange }
+        return .green
+    }
+
+    private func usedPercent(_ window: WidgetQuotaSnapshot.Window) -> Double {
+        min(100, max(0, 100 - window.remainingPercent))
+    }
+
+    private func usedText(_ window: WidgetQuotaSnapshot.Window) -> String {
+        String(format: "%.1f%%", usedPercent(window))
     }
 
     // MARK: - 格式化
 
-    private func percentText(_ value: Double) -> String {
-        String(format: "%.2f", value)
-    }
-
     private func amountText(_ value: Double) -> String {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
         formatter.maximumFractionDigits = 2
-        formatter.minimumFractionDigits = 0
+        formatter.minimumFractionDigits = 2
         return formatter.string(from: NSNumber(value: value)) ?? String(format: "%.2f", value)
-    }
-
-    private func tokenText(_ value: Int) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: value)) ?? String(value)
     }
 }

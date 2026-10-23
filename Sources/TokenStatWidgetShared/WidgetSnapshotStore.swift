@@ -50,8 +50,12 @@ public enum WidgetSnapshotStore {
               !value.hasPrefix("UNRESOLVED"), !value.hasPrefix("FICTEAM") else { return nil }
         let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-")
         guard value.unicodeScalars.allSatisfy(allowed.contains) else { return nil }
-        // 普通包标识符不是 App Group，只接受本项目使用的 `group.` 前缀。
-        guard value.hasPrefix("group.") else { return nil }
+        // macOS 同时接受已注册的 group.* 与无需网站注册的 TEAMID.* 格式。
+        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 2, parts.allSatisfy({ !$0.isEmpty && $0.first != "-" && $0.last != "-" }) else { return nil }
+        let prefix = parts[0]
+        let isTeam = prefix.count == 10 && prefix.utf8.allSatisfy { (65...90).contains($0) || (48...57).contains($0) }
+        guard prefix == "group" || isTeam else { return nil }
         return value
     }
 
@@ -64,9 +68,11 @@ public enum WidgetSnapshotStore {
         return url
     }
 
-    /// 当前进程是否能解析出 App Group 容器路径。
+    /// 实际以只读方式打开容器，不能只凭系统返回路径认定可用。
     public static func isAvailable(bundle: Bundle = .main) -> Bool {
-        containerURL(bundle: bundle) != nil
+        guard let fd = try? openContainer(bundle: bundle) else { return false }
+        close(fd)
+        return true
     }
 
     // MARK: - 读取
@@ -185,18 +191,11 @@ public enum WidgetSnapshotStore {
         guard let url = containerURL(bundle: bundle) else { throw StoreError.unavailable }
         let components = url.standardizedFileURL.pathComponents
         guard components.first == "/", components.count > 1 else { throw StoreError.unsafeObject }
-        var current = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard current >= 0 else { throw StoreError.ioFailure }
+        // 系统只授予组容器访问权，不保证沙盒可逐层打开其祖先目录。
+        // 使用系统返回的固定路径，拒绝最终目录符号链接；文件仍通过 dirfd 安全读写。
+        let current = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard current >= 0 else { throw StoreError.unavailable }
         do {
-            for component in components.dropFirst() {
-                guard !component.isEmpty, component != ".", component != "..",
-                      !component.contains("/") else { throw StoreError.unsafeObject }
-                let next = openat(current, component,
-                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-                guard next >= 0 else { throw StoreError.unsafeObject }
-                close(current)
-                current = next
-            }
             var info = stat()
             guard fstat(current, &info) == 0,
                   info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),

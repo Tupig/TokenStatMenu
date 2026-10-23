@@ -20,6 +20,14 @@ import SwiftUI
         return "企业后台直接来源：尚未连接，等待自动读取"
     }
 
+    static func versionText(bundle: Bundle = .main) -> String {
+        guard bundle.bundleIdentifier == "com.tupig.TokenStatMenu",
+              let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+              let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+              !version.isEmpty, !build.isEmpty else { return "开发运行（未打包）" }
+        return "版本 \(version)（构建 \(build)）"
+    }
+
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 14) {
@@ -37,6 +45,11 @@ import SwiftUI
                     }
                 }
                 .accessibilityLabel("Seasun Token Hub")
+
+                Text(Self.versionText())
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("app-version")
 
                 GroupBox("可选偏好") {
                     VStack(alignment: .leading, spacing: 10) {

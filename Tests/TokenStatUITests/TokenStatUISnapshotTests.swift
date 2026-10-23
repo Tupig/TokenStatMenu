@@ -21,6 +21,34 @@ final class TokenStatUISnapshotTests: XCTestCase {
         assertDashboard(_appearance: .darkAqua, settings: true, name: "settings-dark")
     }
 
+    func testCompactPanelSizeMatchesPopover() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        XCTAssertEqual(PanelMetrics.size, NSSize(width: 320, height: 420))
+        for settings in [false, true] {
+            let host = NSHostingView(rootView: DashboardView(model: model, settings: settings))
+            host.frame = NSRect(origin: .zero, size: PanelMetrics.size)
+            host.layoutSubtreeIfNeeded()
+            XCTAssertEqual(host.fittingSize.width, PanelMetrics.size.width, accuracy: 0.5)
+            XCTAssertEqual(host.fittingSize.height, PanelMetrics.size.height, accuracy: 0.5)
+        }
+    }
+
+    func testVersionTextUsesBundleMetadataWithoutInventingARelease() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".bundle")
+        let contents = directory.appendingPathComponent("Contents")
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let data = try PropertyListSerialization.data(fromPropertyList: [
+            "CFBundleIdentifier": "com.tupig.TokenStatMenu",
+            "CFBundlePackageType": "BNDL", "CFBundleShortVersionString": "2.3.4", "CFBundleVersion": "17"
+        ], format: .xml, options: 0)
+        try data.write(to: contents.appendingPathComponent("Info.plist"))
+        let bundle = try XCTUnwrap(Bundle(url: directory))
+        XCTAssertEqual(SettingsView.versionText(bundle: bundle), "版本 2.3.4（构建 17）")
+        XCTAssertEqual(SettingsView.versionText(), "开发运行（未打包）")
+    }
+
     func testLocalStatusTitleUsesCompletedTurnAndRecordedSessionTotal() throws {
         let model = AppModel(preview: true)
         defer { model.shutdown() }
@@ -28,7 +56,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
             filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
             knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0,
             subagentCount: 0, forkCount: 0)
-        XCTAssertTrue(model.title.contains("上轮均:—"))
+        XCTAssertEqual(model.title, "— | — | —")
         model.localSnapshot = LocalCodexSnapshot(input: 125, output: 300, total: 425,
             sessionCount: 2, filesScanned: 2, isLimited: false,
             latestEventAt: Date(timeIntervalSince1970: 1_797_000_000), fiveHour: nil, sevenDay: nil,
@@ -36,7 +64,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
             subagentCount: 0, forkCount: 0,
             lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
                 completedAt: Date(timeIntervalSince1970: 1_797_000_000)))
-        XCTAssertEqual(model.title, "上轮均:15.0tok/s · Σ425 · 2顶层对话")
+        XCTAssertEqual(model.title, "— | — | —")
         XCTAssertTrue(model.dataNotice.contains("当前扫描范围记录合计"))
         XCTAssertTrue(model.menuTooltip.contains("425"))
         XCTAssertTrue(model.menuTooltip.contains("顶层对话 2"))
@@ -52,8 +80,8 @@ final class TokenStatUISnapshotTests: XCTestCase {
             lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
                 completedAt: Date(timeIntervalSince1970: 1_797_000_000)))
         let fullTotal = 1_234_567.formatted(.number)
-        XCTAssertTrue(model.title.hasPrefix("上轮均:15.0tok/s · Σ"))
-        XCTAssertFalse(model.title.contains("Σ" + fullTotal), "status title should compact large totals")
+        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertFalse(model.title.contains("Σ"))
         XCTAssertTrue(model.menuTooltip.contains(fullTotal), "tooltip should retain the full cumulative total")
         let futureQuotaData = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": [
             "primary": ["usedPercent": 88, "windowDurationMins": 300,
@@ -74,7 +102,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
             subagentCount: 0, forkCount: 0)
         XCTAssertFalse(known.hasCompleteAccounting)
         model.localSnapshot = known
-        XCTAssertTrue(model.title.contains("Σ50"))
+        XCTAssertEqual(model.title, "— | — | —")
         XCTAssertTrue(model.menuTooltip.contains("输入 30"))
         XCTAssertTrue(model.menuTooltip.contains("输出 20"))
         XCTAssertTrue(model.menuTooltip.contains("总计 50"))
@@ -87,20 +115,21 @@ final class TokenStatUISnapshotTests: XCTestCase {
             knownThreadCount: 1, unknownThreadCount: 0, unidentifiedFileCount: 0,
             subagentCount: 0, forkCount: 0)
         XCTAssertFalse(model.localSnapshot.hasCompleteAccounting, "a scan limit prevents complete accounting")
-        XCTAssertTrue(model.title.contains("Σ10"))
+        XCTAssertEqual(model.title, "— | — | —")
 
         model.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
             filesScanned: 2, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
             knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 2,
             subagentCount: 0, forkCount: 0)
-        XCTAssertTrue(model.title.contains("Σ—"), "without any known thread, zero is unknown rather than an exact total")
+        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertTrue(model.menuTooltip.contains("总计 未知"))
 
         model.localSnapshot = LocalCodexSnapshot(input: 30, output: 20, total: 50, sessionCount: 1,
             filesScanned: 1, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
             knownThreadCount: 1, unknownThreadCount: 0, unidentifiedFileCount: 0,
             subagentCount: 0, forkCount: 0)
         XCTAssertTrue(model.localSnapshot.hasCompleteAccounting)
-        XCTAssertTrue(model.title.contains("Σ50"), "complete metadata-backed accounting may show exact total")
+        XCTAssertEqual(model.title, "— | — | —")
         XCTAssertTrue(model.menuTooltip.contains("本次扫描记录量 50"))
 
         for snapshot in [known, model.localSnapshot,
@@ -108,6 +137,8 @@ final class TokenStatUISnapshotTests: XCTestCase {
                 filesScanned: 1, isLimited: false, latestEventAt: nil,
                 fiveHour: nil, sevenDay: nil, unidentifiedFileCount: 1)] {
             model.localSnapshot = snapshot
+            XCTAssertFalse(model.title.contains("Σ"))
+            XCTAssertFalse(model.title.contains("顶层对话"))
             for text in [model.title, model.menuTooltip, model.dataNotice] {
                 XCTAssertFalse(text.contains("未核验"))
                 XCTAssertFalse(text.contains("小计"))
@@ -520,7 +551,8 @@ final class TokenStatUISnapshotTests: XCTestCase {
                                  file: StaticString = #filePath, testName: String = #function, line: UInt = #line) {
         let model = AppModel(preview: true)
         defer { model.shutdown() }
-        let root = DashboardView(model: model, settings: settings)
+        // 沿用工具栏基线的画布尺寸；实际紧凑面板由独立布局测试覆盖。
+        let root = DashboardView(model: model, settings: settings, panelSize: NSSize(width: 460, height: 700))
         let hostingView = NSHostingView(rootView: root)
         hostingView.frame = NSRect(x: 0, y: 0, width: 460, height: 700)
         hostingView.appearance = NSAppearance(named: appearance)
@@ -804,7 +836,7 @@ extension TokenStatUISnapshotTests {
                     observedAt: observedAt)
                 observations.assertInitAndRefresh(state: state, expectedDirect: bp38C04UsesDirectSource(state),
                     model: model, permission: permission)
-                let root = DashboardView(model: model, quitAction: {})
+                let root = DashboardView(model: model, panelSize: NSSize(width: 460, height: 700), quitAction: {})
                     .environment(\.colorScheme, scheme)
                     .frame(width: 460, height: 700)
                 let host = NSHostingView(rootView: root)
@@ -1006,7 +1038,7 @@ extension TokenStatUISnapshotTests {
             observations.assertInitAndRefresh(state: .directCurrent, expectedDirect: bp38C04UsesDirectSource(.directCurrent),
                 model: model, permission: permission)
             var quitCalls = 0
-            let root = DashboardView(model: model, quitAction: { quitCalls += 1 })
+            let root = DashboardView(model: model, panelSize: NSSize(width: 460, height: 700), quitAction: { quitCalls += 1 })
                 .environment(\.colorScheme, scheme)
                 .frame(width: 460, height: 700)
             let bounds = NSRect(x: 0, y: 0, width: 460, height: 700)

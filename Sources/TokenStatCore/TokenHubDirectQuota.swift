@@ -338,7 +338,37 @@ public struct TokenHubDirectQuotaClient: Sendable {
         }
         guard response.data.count <= 1_048_576 else { throw TokenHubDirectQuotaFailure.responseTooLarge }
         try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
-        return try TokenHubDirectQuotaDecoder.decode(response.data, identity: identity, now: observedAt)
+        // 额度与重置券并行读取；券读取失败时只把券数量留为未知，不影响额度。
+        let voucherAccess = access
+        async let vouchers = resetVoucherCount(baseURL: settings.aiManagerBaseURL, access: voucherAccess)
+        let decoded = try TokenHubDirectQuotaDecoder.decode(response.data, identity: identity, now: observedAt)
+        let voucherCount = await vouchers
+        return TokenHubQuotaSnapshot(identity: decoded.identity, fiveHour: decoded.fiveHour,
+                                     sevenDay: decoded.sevenDay, monthly: decoded.monthly,
+                                     resetVoucherCount: voucherCount, observedAt: decoded.observedAt)
+    }
+
+    /// 读取当前可用的重置券数量；接口不可用或响应异常时返回 nil。
+    private func resetVoucherCount(baseURL: URL, access: String) async -> Int? {
+        guard let url = Self.resetVoucherURL(baseURL: baseURL) else { return nil }
+        do {
+            let response = try await Self.liveRequest(url: url, bearer: access)
+            guard (200..<300).contains(response.statusCode),
+                  response.data.count <= 1_048_576 else { return nil }
+            return TokenHubResetVoucherDecoder.decode(response.data)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func resetVoucherURL(baseURL: URL) -> URL? {
+        guard baseURL.scheme?.lowercased() == "https", baseURL.user == nil, baseURL.password == nil,
+              baseURL.query == nil, baseURL.fragment == nil,
+              let host = baseURL.host, !host.isEmpty else { return nil }
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        let prefix = baseURL.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        components?.path = prefix.isEmpty ? "/api/v1/me/reset-vouchers" : "/\(prefix)/api/v1/me/reset-vouchers"
+        return components?.url
     }
 
     private static func requireUnchangedSettings(_ expected: TokenHubStoredSettings, home: URL, now: Date) throws {
@@ -634,6 +664,24 @@ public enum TokenHubDirectQuotaDecoder {
         formatter.timeZone = timeZone
         formatter.dateFormat = "MM-dd HH:mm"
         return formatter.string(from: date)
+    }
+}
+
+/// 解码 `/api/v1/me/reset-vouchers` 的可用券总数。
+///
+/// 只接受非负整数 `data.total`；字段缺失、类型异常或超出上限时返回 nil。
+public enum TokenHubResetVoucherDecoder {
+    public static func decode(_ data: Data) -> Int? {
+        guard data.count <= 1_048_576,
+              let root = try? JSONSerialization.jsonObject(with: data, options: []),
+              let object = root as? [String: Any],
+              let payload = object["data"] as? [String: Any],
+              let raw = payload["total"] as? NSNumber,
+              CFGetTypeID(raw) != CFBooleanGetTypeID() else { return nil }
+        let value = raw.doubleValue
+        guard value.isFinite, value >= 0, value <= 1_000_000,
+              value == value.rounded() else { return nil }
+        return Int(value)
     }
 }
 

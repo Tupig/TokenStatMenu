@@ -80,10 +80,13 @@ public struct WidgetQuotaSnapshot: Equatable, Sendable {
     public let sevenDay: Window?
     public let monthly: Monthly?
     public let local: Local?
+    /// 可用重置券数量；来源未提供时为 nil。
+    public let resetVoucherCount: Int?
 
     public init(writtenAt: Date, observedAt: Date?, validUntil: Date?,
                 hubSource: HubSource, hubState: HubState,
-                fiveHour: Window?, sevenDay: Window?, monthly: Monthly?, local: Local?) {
+                fiveHour: Window?, sevenDay: Window?, monthly: Monthly?, local: Local?,
+                resetVoucherCount: Int? = nil) {
         self.writtenAt = writtenAt
         self.observedAt = observedAt
         self.validUntil = validUntil
@@ -93,6 +96,7 @@ public struct WidgetQuotaSnapshot: Equatable, Sendable {
         self.sevenDay = sevenDay
         self.monthly = monthly
         self.local = local
+        self.resetVoucherCount = resetVoucherCount
     }
 
     /// 快照仍在有效期内且窗口尚未重置时，Hub 数据才有效。

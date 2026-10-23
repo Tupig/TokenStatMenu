@@ -16,6 +16,15 @@
 | 构建与隔离集成 | `./script/test.sh` 退出码 0 | 上一轮结果，含只构建路径与七个隔离启动用例，未调用企业网关 |
 | 文档链接与公开内容 | 18 篇 Markdown 链接/锚点通过；110 个文件无禁止项 | 本轮实际执行 |
 
+### 2026-10-24 菜单栏三数与小组件四项
+
+- 菜单栏标题改为 `5 小时已用% | 7 天已用% | 月度金额`；实机截图确认 `38.1% | 74.4% | $3,488.22`，5 小时窗口重置后显示 `0.0%`，与后台 `used_amount=0` 一致。
+- 小组件仅保留 `systemSmall`，固定显示 5 小时、7 天（进度条 + 已用百分比）、月度金额、可用重置券四项；缺失值显示“未知”，不用 0 或旧值补齐。
+- 重置券读取 `GET {aiManagerBaseURL}/api/v1/me/reset-vouchers` 的 `data.total`；实测当前为 0，读取失败保持未知。
+- `swift test` 退出码 0（XCTest 151 项、Swift Testing 37 项）；Release arm64 构建成功，1.1.6/build 9 已安装到 `~/Applications`。
+- `check_docs.py --self-test`、`check_public_content.py`、`test_release_assets.py CleanupChecks ReleaseChecks WorkflowChecks`、`git diff --check` 均通过。
+- 未验收：系统小组件图库添加后的 small 实际布局、Developer ID/公证、Intel 实机。
+
 ### 本轮修正：BP38 条件检查原先从未执行
 
 `Tests/TokenStatUITests/TokenHubQuotaStateTests.swift` 中 C01/C02/C03 三组检查由 `TOKENSTAT_BP38_C01/C02/C03` 条件编译保护，但该标志此前未在任何配置中定义，导致这些检查被静默跳过，并使

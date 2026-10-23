@@ -48,7 +48,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 
 | 条件 | 工具行为 |
 | --- | --- |
-| 基线 | 从本地 Git 提取公开 1.1.0 提交 `4713f1ae465675056b18dbbb40c09c717bb171d1` 的两个菜单文件 |
+| 基线 | 从本地 Git 提取兼容的整理前提交 `a0d7e3ef5c916d3c0159221fe6f225a337511766` 的两个菜单文件；旧 1.1.0 已不兼容当前共享视图接口 |
 | 候选 | 工作区当前 `AppModel.swift` 与 `StatusBarController.swift` |
 | 共用代码 | 两组均使用同一份当前 Core 和其余 App 源码，隔离菜单改动的影响 |
 | 编译 | 同一 `xcrun swiftc`、同一 macOS SDK、同一主机架构 target、同一 `-Onone` 与模块参数 |

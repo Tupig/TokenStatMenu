@@ -13,11 +13,11 @@ if [ "$MODE" = "--universal" ]; then
     # Group placeholder in both Info.plists and entitlements.
     GROUP="${TOKENSTAT_WIDGET_GROUP:-}"
     if [ -z "$GROUP" ]; then
-        echo "error: --universal requires TOKENSTAT_WIDGET_GROUP=group.<name>" >&2
+        echo "error: --universal requires TOKENSTAT_WIDGET_GROUP=group.<name> or TEAMID.<name>" >&2
         exit 2
     fi
-    if ! [[ "$GROUP" =~ ^group\.[A-Za-z0-9.-]{1,120}$ ]] || [[ "$GROUP" == *..* ]]; then
-        echo "error: TOKENSTAT_WIDGET_GROUP must look like group.<name>" >&2
+    if ! [[ "$GROUP" =~ ^(group|[A-Z0-9]{10})(\.[A-Za-z0-9]+([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] || [[ "$GROUP" == FICTEAM* ]] || [ "${#GROUP}" -gt 128 ]; then
+        echo "error: TOKENSTAT_WIDGET_GROUP must look like group.<name> or TEAMID.<name>" >&2
         exit 2
     fi
     if ! xcodebuild -version >/dev/null 2>&1 && [ -d /Applications/Xcode.app/Contents/Developer ]; then

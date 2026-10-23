@@ -80,7 +80,10 @@ TAG_PATTERN = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z"
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 SHA_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 # Same shape the runtime accepts in WidgetSnapshotStore.configuredGroup.
-GROUP_PATTERN = re.compile(r"group\.[A-Za-z0-9.-]{1,120}\Z")
+GROUP_PATTERN = re.compile(
+    r"(?=.{1,128}\Z)(?!FICTEAM)(?:group|[A-Z0-9]{10})"
+    r"(?:\.[A-Za-z0-9]+(?:[A-Za-z0-9-]*[A-Za-z0-9])?)+\Z"
+)
 
 
 @dataclass(frozen=True)

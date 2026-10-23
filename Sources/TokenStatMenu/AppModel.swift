@@ -228,14 +228,6 @@ actor LocalCodexScanWorker {
         return Result(snapshot: snapshot, diagnostics: cache.diagnostics)
     }
 
-    private func scan(directory: URL, fixedNow now: Date, generation: Int,
-                      routeContext: LocalCodexRouteContext?) throws -> Result {
-        try prepareCache(for: generation)
-        let snapshot = try LocalCodexUsageReader.scan(directory: directory, now: now,
-                                                       cache: cache, routeContext: routeContext)
-        return Result(snapshot: snapshot, diagnostics: cache.diagnostics)
-    }
-
     func scanInjected(directory: URL, nowProvider: @Sendable () -> Date, generation: Int,
                       routeContext: LocalCodexRouteContext,
                       operation: @Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> Result) async throws -> Result {
@@ -246,10 +238,6 @@ actor LocalCodexScanWorker {
 
 /// 在主 actor 解析允许的输入，由缓存持有者限量读取文件；生命周期测试通过注入替代外部 I/O。
 struct LocalCodexScanDependencies {
-    struct Inputs: Sendable {
-        let directory: URL
-        let routeContext: LocalCodexRouteContext
-    }
     /// 旧测试注入点可选；正式运行仅使用后台 `scanDefault`，真实会话 URL 不跨 actor 边界。
     let resolveInputs: (@MainActor () -> (directory: URL, routeContext: LocalCodexRouteContext))?
     let scan: (@Sendable (URL, Date, Int, LocalCodexRouteContext) async throws -> LocalCodexScanWorker.Result)?
@@ -396,7 +384,6 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     @Published var sevenDayQuota: WindowQuota? {
         didSet { capturePresentationTimeBaseline() }
     }
-    @Published var quotaError = "Token Hub 界面快照数据未知"
     @Published var sourceReadinessText = "企业后台直接来源未接通"
     @Published var message = ""
     @Published var history: [SpeedPoint] = []
@@ -446,6 +433,8 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     private var lastHistorySampleMonotonic: TimeInterval?
     /// 将显示数据发布到内嵌小组件的 App Group。
     private let widgetPublisher = WidgetSnapshotPublisher()
+    var widgetSnapshotPublished: Bool { widgetPublisher.lastPublishSucceeded }
+    var widgetChannelUnavailable: Bool { widgetPublisher.channelUnavailable }
     var onTick: (() -> Void)?
 
     private static let historyDuration: TimeInterval = 10 * 60
@@ -535,7 +524,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         var publishedTransition = false
         // 先检查额度是否存在，避免空闲刷新为缺失额度创建日期格式化器。
         if let quota, quota.month != QuotaSnapshot.currentMonth(at: now) {
-            self.quota = nil; quotaError = "已跨月，等待本月用量"
+            self.quota = nil
             publishedTransition = true
         }
         if tokenHubQuotaStatus == .connected,
@@ -608,7 +597,8 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             hubSource: source, hubState: state,
             fiveHour: window(presentation.fiveHourCurrent),
             sevenDay: window(presentation.sevenDayCurrent),
-            monthly: monthly, local: local)
+            monthly: monthly, local: local,
+            resetVoucherCount: presentation.snapshotFresh ? presentation.snapshot?.resetVoucherCount : nil)
         widgetPublisher.publish(published)
     }
 
@@ -707,8 +697,6 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             fiveHour: historical(projected.fiveHour), sevenDay: historical(projected.sevenDay),
             menuAlertLevel: .none)
     }
-    var currencyFactor: Double { config.currency == "CNY" ? config.usdToCNY : 1 }
-    var currencySymbol: String { config.currency == "CNY" ? "¥" : "$" }
     var quotaSource: QuotaSource { isPreview && config.dataSource != "localCodex" ? .enterprise : .localCodex }
     var hasRequestData: Bool { quotaSource == .localCodex ? localSnapshot.knownThreadCount > 0 : stats.requests > 0 }
     var dataNotice: String {
@@ -738,25 +726,30 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         let now = tokenHubNow()
         return title(at: now, quotaPresentation: quotaPresentation(at: now))
     }
+    /// 菜单栏只显示三个额度数字：5 小时已用、7 天已用、月度用量。
     func title(at now: Date, quotaPresentation: TokenHubQuotaPresentation) -> String {
-        if config.dataSource == "localCodex" {
-            let rate: String
-            if let live = freshLocalLiveTurn(at: now) {
-                rate = String(format: "实时≈%.1ftok/s", live.outputTPS)
-            } else if let turn = localSnapshot.lastTurn {
-                rate = String(format: "上轮均:%.1ftok/s", turn.outputTPS)
-            } else {
-                rate = "上轮均:—"
-            }
-            let total = localSnapshot.knownThreadCount > 0 ? "Σ\(formatCompactCount(localSnapshot.total))" : "Σ—"
-            let sessions = localSnapshot.hasCompleteAccounting ? " · \(localSnapshot.sessionCount)顶层对话" : ""
-            let quotaSuffix = tokenHubMenuSuffix(quotaPresentation)
-            return (isTestFixture ? "测试 " : "") + "\(rate) · \(total)\(sessions)\(quotaSuffix)"
-        }
-        let value = !hasRequestData ? "T:—" : stats.active > 0
-            ? String(format: "T:≈%.1ftok/s", stats.outputTPS) : "T:0.0tok/s"
-        let total = stats.requests > 0 ? formatCompactCount(stats.total) : "—"
-        return (isTestFixture ? "测试 " : "") + "\(value) · Σ\(total) · 请求\(stats.requests)"
+        let five = quotaPresentation.fiveHourCurrent.map { menuPercent($0.usedPercent) } ?? "—"
+        let seven = quotaPresentation.sevenDayCurrent.map { menuPercent($0.usedPercent) } ?? "—"
+        let monthly = quotaPresentation.monthlyCurrent.map {
+            "\($0.sourceSymbol)\(menuAmount($0.usedAmount))"
+        } ?? "—"
+        return (isTestFixture ? "测试 " : "") + "\(five) | \(seven) | \(monthly)"
+    }
+
+    private func menuPercent(_ value: Decimal) -> String {
+        let number = NSDecimalNumber(decimal: value).doubleValue
+        guard number.isFinite else { return "—" }
+        return String(format: "%.1f%%", min(100, max(0, number)))
+    }
+
+    private func menuAmount(_ value: Decimal) -> String {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        return formatter.string(from: NSDecimalNumber(decimal: value)) ?? "—"
     }
     var menuTooltip: String {
         let now = tokenHubNow()
@@ -858,7 +851,6 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     private var tokenHubMenuSuffix: String { tokenHubMenuSuffix(quotaPresentation) }
     var menuTitleContainsTokenHubSuffix: Bool { !tokenHubMenuSuffix.isEmpty }
     var tokenHubPermissionGrantedForDiagnostics: Bool { cachedTokenHubPermission }
-    var tokenHubPermissionRequiredForDiagnostics: Bool { tokenHubQuotaStatus == .permissionRequired }
     private func tokenHubTooltipDetail(_ presentation: TokenHubQuotaPresentation) -> String {
         let five = presentation.fiveHourCurrent.map { "界面显示剩余 \(percentText($0.remainingPercent))（5 小时）" } ?? "5 小时未知"
         let seven = presentation.sevenDayCurrent.map { "界面显示剩余 \(percentText($0.remainingPercent))（7 天）" } ?? "7 天未知"
@@ -925,7 +917,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             }
         }
         guard quotaSource == .enterprise else { return .labelColor }
-        let windows = (quotaSource == .enterprise ? [fiveHourQuota, sevenDayQuota].compactMap { $0 } : [])
+        let windows = [fiveHourQuota, sevenDayQuota].compactMap { $0 }
             .filter { $0.isFresh(at: tokenHubNow(), refreshSeconds: config.refreshSeconds) }.map { $0.usedPercent / 100 }
         guard let ratio = (windows + [freshQuota?.fraction].compactMap { $0 }).max() else { return .labelColor }
         return ratio >= 0.95 ? .systemRed : ratio >= 0.8 ? .systemYellow : .labelColor
@@ -1045,7 +1037,6 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         fiveHourQuota = nil
         sevenDayQuota = nil
         quotaLoading = false
-        quotaError = "Token Hub 界面快照数据未知"
     }
     private func cancelLocalScanSchedule() {
         localScanTicket &+= 1
@@ -1113,10 +1104,9 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             if self.config.dataSource == "localCodex" {
                 if let snapshot = result?.snapshot {
                     self.localSnapshot = snapshot; self.fiveHourQuota = snapshot.fiveHour; self.sevenDayQuota = snapshot.sevenDay
-                    self.quotaError = snapshot.latestEventAt == nil ? "未发现有效本地用量记录" : "额度来自 Codex 会话事件，可能已过期"
                 } else {
                     self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
-                    self.fiveHourQuota = nil; self.sevenDayQuota = nil; self.quotaError = "本地会话记录暂时无法读取"
+                    self.fiveHourQuota = nil; self.sevenDayQuota = nil
                 }
             }
             if self.config.dataSource == "localCodex", self.backgroundServicesStarted { self.scheduleLocalScan() }

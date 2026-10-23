@@ -18,7 +18,6 @@ import SwiftUI
         model.config.usageURL = "https://gateway.example/usage"
         let month = QuotaSnapshot.currentMonth()
         model.quota = try QuotaSnapshot.parse(Data("{\"data\":{\"used_tokens\":640000,\"total_tokens\":1000000,\"month\":\"\(month)\"}}".utf8), config: model.config)
-        model.quotaError = ""
         let windows = try QuotaReport.parse(JSONSerialization.data(withJSONObject: ["data": [
             "five_hour": ["used_percent": 25, "resets_at": Date().addingTimeInterval(7200).timeIntervalSince1970],
             "seven_day": ["used_percent": 70, "resets_at": Date().addingTimeInterval(172800).timeIntervalSince1970]
@@ -70,7 +69,7 @@ import SwiftUI
             .background(scheme == .dark ? Color(red: 0.13, green: 0.14, blue: 0.17) : Color(red: 0.96, green: 0.97, blue: 0.99))
         // NSHostingView also renders AppKit-backed ScrollView/TextField/Button,
         // which ImageRenderer intentionally omits. This window stays off screen.
-        let bounds = NSRect(x: 0, y: 0, width: 460, height: 700)
+        let bounds = NSRect(origin: .zero, size: PanelMetrics.size)
         let host = NSHostingView(rootView: content)
         let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -156,7 +155,7 @@ import SwiftUI
             let popover = NSPopover()
             popover.behavior = .transient
             popover.animates = false
-            popover.contentSize = NSSize(width: 460, height: 700)
+            popover.contentSize = PanelMetrics.size
             popover.contentViewController = NSHostingController(rootView:
                 DashboardView(model: model).environment(\.colorScheme, name == "dark" ? .dark : .light))
             popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)

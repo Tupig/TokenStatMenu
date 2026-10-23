@@ -26,6 +26,7 @@ final class WidgetPublisherFailureTests: XCTestCase {
 
         XCTAssertFalse(publisher.publish(value))
         XCTAssertEqual(attempts, 1)
+        XCTAssertFalse(publisher.lastPublishSucceeded)
 
         now = start.addingTimeInterval(30)
         XCTAssertFalse(publisher.publish(value))
@@ -100,7 +101,10 @@ final class WidgetPublisherFailureTests: XCTestCase {
         now = start.addingTimeInterval(60)
         XCTAssertTrue(publisher.publish(value))
         XCTAssertEqual(attempts, 2)
+        XCTAssertTrue(publisher.lastPublishSucceeded)
         XCTAssertEqual(reloads, 1, "a recovered write must refresh the widget")
+        publisher.resetOwnership()
+        XCTAssertFalse(publisher.lastPublishSucceeded, "reset cannot retain success from an earlier channel")
     }
 
     func testFailureReclaimsTheCurrentFileBeforeRetrying() {
@@ -171,6 +175,31 @@ final class WidgetPublisherFailureTests: XCTestCase {
         XCTAssertTrue(publisher.channelUnavailable)
         XCTAssertEqual(attempts, 0)
         XCTAssertEqual(reloads, 0)
+    }
+
+    func testDiagnosticStateTracksFailuresRecoveryAndReset() {
+        var available = true
+        let owned = WidgetSnapshotStore.Ownership(device: 1, inode: 1, size: 1, digest: "synthetic")
+        let publisher = WidgetSnapshotPublisher(now: { self.start },
+            channelAvailable: { available }, claim: { nil }, write: { _, _ in owned }, reload: {})
+        XCTAssertTrue(publisher.publish(snapshot(50)))
+        XCTAssertTrue(publisher.lastPublishSucceeded)
+        XCTAssertFalse(publisher.publish(snapshot(.nan)))
+        XCTAssertFalse(publisher.lastPublishSucceeded)
+        XCTAssertTrue(publisher.publish(snapshot(40)))
+        available = false
+        XCTAssertFalse(publisher.publish(snapshot(40)))
+        XCTAssertFalse(publisher.lastPublishSucceeded)
+        XCTAssertTrue(publisher.channelUnavailable)
+        available = true
+        XCTAssertTrue(publisher.publish(snapshot(30)))
+        XCTAssertTrue(publisher.lastPublishSucceeded)
+        XCTAssertFalse(publisher.channelUnavailable)
+        available = false
+        XCTAssertFalse(publisher.publish(snapshot(30)))
+        publisher.resetOwnership()
+        XCTAssertFalse(publisher.lastPublishSucceeded)
+        XCTAssertFalse(publisher.channelUnavailable)
     }
 
     private func snapshot(_ percent: Double) -> WidgetQuotaSnapshot {

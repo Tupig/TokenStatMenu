@@ -399,14 +399,14 @@ final class TokenHubQuotaStateTests: XCTestCase {
         now = observedAt.addingTimeInterval(15.001)
         model.tick()
         XCTAssertEqual(publications, 1, "expiry must notify an open dashboard once")
-        XCTAssertTrue(model.title.hasPrefix("上轮均:—"))
+        XCTAssertEqual(model.title, "— | — | —")
         for _ in 0..<100 { model.tick() }
         XCTAssertEqual(publications, 1)
         XCTAssertEqual(menuChecks, 102, "the menu cadence is independent of dashboard notifications")
         now = observedAt
         model.tick()
         XCTAssertEqual(publications, 2, "clock rollback must recompute time-dependent presentation")
-        XCTAssertTrue(model.title.hasPrefix("实时≈24.5tok/s"))
+        XCTAssertEqual(model.title, "— | — | —")
         withExtendedLifetime(observer) {}
     }
 
@@ -456,7 +456,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
             "directQuotaStatus", "fiveHourPresent", "sevenDayPresent",
             "fiveHourResetPresent", "sevenDayResetPresent", "resetTimePresent",
             "monthlyUsagePresent", "liveTokenSpeedPresent", "sourceStatus",
-            "backgroundServiceResources"
+            "backgroundServiceResources", "widgetSnapshotPublished", "widgetChannelUnavailable"
         ]
         XCTAssertEqual(Set(firstObject.keys), approvedKeys)
 
@@ -604,7 +604,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         harness.complete(1)
         await settle(model, status: .connected)
         model.tick()
-        XCTAssertTrue(model.title.contains("Hub 5h剩 70.00% / 7d剩 60.00%"))
+        XCTAssertTrue(model.title.contains("30.0%") && model.title.contains("40.0%"))
         XCTAssertTrue(displayedTooltip.contains("5 小时）"))
         let beforeBoundary = tooltipBuilds
         clock.now = observedAt.addingTimeInterval(120)
@@ -612,7 +612,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         XCTAssertEqual(tooltipBuilds, beforeBoundary, "the inclusive Hub freshness boundary does not rebuild")
         clock.now = observedAt.addingTimeInterval(120.001)
         model.tick()
-        XCTAssertFalse(model.title.contains("Hub 5h剩"))
+        XCTAssertFalse(model.title.contains("30.0%"))
         XCTAssertTrue(displayedTooltip.contains("5 小时未知"))
         XCTAssertEqual(model.tokenHubQuotaStatus, .stale)
         let afterExpiry = tooltipBuilds
@@ -659,14 +659,14 @@ final class TokenHubQuotaStateTests: XCTestCase {
             fiveHour: nil, sevenDay: nil, knownThreadCount: 1,
             liveTurn: LocalLiveTurnSummary(inputTPS: 10, outputTPS: 24.5,
                 observedAt: initial.addingTimeInterval(-14.9)))
-        XCTAssertTrue(model.title.hasPrefix("实时≈24.5tok/s"), "the intervening data publication can render live")
+        XCTAssertEqual(model.title, "— | — | —", "菜单栏不显示本地速度")
         var publicationsAfterData = 0
         let observer = model.objectWillChange.sink { publicationsAfterData += 1 }
         now = initial.addingTimeInterval(0.2)
         model.tick()
         XCTAssertEqual(publicationsAfterData, 1,
                        "expiry must compare against the presented new input, not only the last timer tick")
-        XCTAssertTrue(model.title.hasPrefix("上轮均:—"))
+        XCTAssertEqual(model.title, "— | — | —")
         for _ in 0..<100 { model.tick() }
         XCTAssertEqual(publicationsAfterData, 1, "expired input must not restore blanket redraws")
         withExtendedLifetime(observer) {}
@@ -785,15 +785,15 @@ final class TokenHubQuotaStateTests: XCTestCase {
             lastTurn: LocalTurnSummary(outputTokens: 50, durationSeconds: 2, completedAt: observedAt),
             liveTurn: LocalLiveTurnSummary(inputTPS: 10, outputTPS: 24.5, observedAt: observedAt))
 
-        XCTAssertTrue(model.title.hasPrefix("实时≈24.5tok/s ·"), "a live rate must not be prefixed with the completed-turn label")
+        XCTAssertEqual(model.title, "— | — | —", "菜单栏只显示额度，不显示本地速度")
         XCTAssertTrue(model.menuTooltip.contains("实时估算：输入 10.0 · 输出 24.5 tok/s"))
         now = observedAt.addingTimeInterval(15)
-        XCTAssertTrue(model.title.hasPrefix("实时≈24.5tok/s ·"), "the 15-second boundary is still fresh")
+        XCTAssertEqual(model.title, "— | — | —", "菜单栏不随本地速度变化")
         now = observedAt.addingTimeInterval(15.001)
-        XCTAssertTrue(model.title.hasPrefix("上轮均:25.0tok/s ·"), "a stalled scan cannot keep an old estimate live indefinitely")
+        XCTAssertEqual(model.title, "— | — | —", "菜单栏不显示本地速度")
         XCTAssertTrue(model.menuTooltip.contains("实时估算：未知"), "tooltip freshness must match menu freshness")
         now = observedAt.addingTimeInterval(-0.001)
-        XCTAssertTrue(model.title.hasPrefix("上轮均:25.0tok/s ·"), "a future observation is not fresh")
+        XCTAssertEqual(model.title, "— | — | —", "菜单栏不显示本地速度")
         XCTAssertTrue(model.menuTooltip.contains("实时估算：未知"))
     }
 
@@ -801,7 +801,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let model = AppModel(preview: true)
         defer { model.shutdown() }
         model.config.dataSource = "localCodex"
-        XCTAssertTrue(model.title.hasPrefix("上轮均:— ·"), "unknown speed must not duplicate its label")
+        XCTAssertEqual(model.title, "— | — | —", "无额度数据时三个位置都显示未知")
     }
 
     func testUnknownAndAccountingLabelsRemainExplicitWhenSourcesAreMissing() {
@@ -815,7 +815,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
             sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil,
             fiveHour: nil, sevenDay: nil, knownThreadCount: 0,
             unknownThreadCount: 0)
-        XCTAssertTrue(model.title.contains("上轮均:—"))
+        XCTAssertEqual(model.title, "— | — | —")
         XCTAssertTrue(model.menuTooltip.contains("实时估算：未知"))
         XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
         XCTAssertTrue(model.menuTooltip.contains("7 天未知"))
@@ -824,14 +824,14 @@ final class TokenHubQuotaStateTests: XCTestCase {
             sessionCount: 2, filesScanned: 32, isLimited: true, latestEventAt: nil,
             fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
             unknownThreadCount: 2)
-        XCTAssertTrue(model.title.contains("Σ"))
+        XCTAssertFalse(model.title.contains("Σ"))
 
         model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
             sessionCount: 2, filesScanned: 3, isLimited: false, latestEventAt: nil,
             fiveHour: nil, sevenDay: nil, knownThreadCount: 3,
             unknownThreadCount: 0)
-        XCTAssertTrue(model.title.contains("Σ"))
-        XCTAssertTrue(model.title.contains("顶层对话"))
+        XCTAssertFalse(model.title.contains("Σ"))
+        XCTAssertFalse(model.title.contains("顶层对话"))
     }
 
     private func directModel(_ harness: HubDirectHarness, clock: HubManualClock,
@@ -1297,12 +1297,28 @@ final class TokenHubQuotaStateTests: XCTestCase {
         XCTAssertFalse(model.message.contains("37.5"), "raw percentage must not enter diagnostics")
     }
 
+    func testMenuTitleShowsThreeQuotaNumbersInRequestedFormat() async {
+        let now = Date()
+        let (model, scanner, _) = configuredModel(result(now: now), clock: HubManualClock(now))
+        defer { model.shutdown() }
+        await refresh(model, scanner: scanner)
+        XCTAssertEqual(model.title, "37.5% | 40.0% | $12.50")
+        XCTAssertFalse(model.title.contains("tok/s"))
+        XCTAssertFalse(model.title.contains("Σ"))
+    }
+
+    func testMenuTitleShowsDashForMissingQuota() {
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        XCTAssertEqual(model.title, "— | — | —")
+    }
+
     func testTokenHubDecimalDisplayPreservesFractionsAtModelAndCardCallsites() async {
         let now = Date()
         let (model, scanner, _) = configuredModel(result(now: now), clock: HubManualClock(now))
         defer { model.shutdown() }
         await refresh(model, scanner: scanner)
-        XCTAssertTrue(model.title.contains("5h剩 62.50%"), "the actual menu title must retain a two-decimal remaining percent")
+        XCTAssertTrue(model.title.contains("37.5%"), "菜单栏显示一位小数的已用百分比")
         XCTAssertTrue(model.menuTooltip.contains("界面显示剩余 62.50%"), "the actual tooltip must retain a two-decimal remaining percent")
 
         let snapshot = try! XCTUnwrap(model.tokenHubQuotaSnapshot)
@@ -1693,7 +1709,7 @@ extension TokenHubQuotaStateTests {
             "C01 delayed response retains the actual worker-start observation time")
         XCTAssertNil(model.freshTokenHubQuota(at: model.tokenHubNow()),
             "C01 the existing freshness getter re-reads the model's injected current clock after the delayed response")
-        XCTAssertFalse(model.title.contains("5h剩"),
+        XCTAssertTrue(model.title.hasPrefix("— |"),
             "C01 menu title does not present a response older than its freshness horizon")
     }
 }
@@ -1761,8 +1777,8 @@ extension TokenHubQuotaStateTests {
         XCTAssertTrue(projected.sevenDay?.fresh == true)
         XCTAssertEqual(model.tokenHubQuotaSnapshot, source.value,
             "timer expiry projects current facts while retaining the raw source snapshot")
-        XCTAssertFalse(model.title.contains("5h剩 5.00%"))
-        XCTAssertTrue(model.title.contains("7d剩 20.00%"))
+        XCTAssertFalse(model.title.contains("95.0%"))
+        XCTAssertTrue(model.title.contains("80.0%"))
         XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
         XCTAssertTrue(model.menuTooltip.contains("7 天"))
         XCTAssertEqual(model.alertColor, .systemYellow,
@@ -1821,8 +1837,8 @@ extension TokenHubQuotaStateTests {
         XCTAssertNil(model.quotaPresentation.fiveHourCurrent)
         XCTAssertNotNil(model.quotaPresentation.sevenDayCurrent)
         XCTAssertEqual(model.alertColor, .labelColor)
-        XCTAssertFalse(model.title.contains("5h剩"))
-        XCTAssertTrue(model.title.contains("7d剩 50.00%"))
+        XCTAssertFalse(model.title.contains("60.0%"))
+        XCTAssertTrue(model.title.contains("50.0%"))
         XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
         XCTAssertTrue(model.menuTooltip.contains("7 天额度"))
         for _ in 0..<100 where !FileManager.default.fileExists(atPath: fiveHourOutput.path) { await Task.yield() }
@@ -1845,8 +1861,8 @@ extension TokenHubQuotaStateTests {
         XCTAssertNil(model.quotaPresentation.sevenDayCurrent,
             "the following tick expires the seven-day window at its own reset")
         XCTAssertNotNil(model.quotaPresentation.monthlyCurrent)
-        XCTAssertFalse(model.title.contains("5h剩"))
-        XCTAssertFalse(model.title.contains("7d剩"))
+        XCTAssertTrue(model.title.hasPrefix("— | — |"))
+        XCTAssertTrue(model.title.hasPrefix("— | — |"))
         XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
         XCTAssertTrue(model.menuTooltip.contains("7 天未知"))
         for _ in 0..<100 where !FileManager.default.fileExists(atPath: sevenDayOutput.path) { await Task.yield() }
@@ -2594,7 +2610,7 @@ extension TokenHubQuotaStateTests {
         XCTAssertEqual(current.monthly?.remainingAmount, Decimal(string: "62.5"))
         XCTAssertEqual(current.monthly?.usedPercent, Decimal(string: "37.5"))
         XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
-        XCTAssertTrue(model.title.contains("7d剩 60.00%"))
+        XCTAssertTrue(model.title.contains("40.0%"))
 
         let card = TokenHubQuotaCard(snapshot: current, status: model.tokenHubQuotaStatusText,
             enabled: true, refreshSeconds: 60, directSource: true)

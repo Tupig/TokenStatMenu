@@ -46,8 +46,8 @@ struct TokenStatWidget: Widget {
             }
         }
         .configurationDisplayName("Token 与额度")
-        .description("显示 Token 用量、5 小时与 7 天额度剩余。未获取到的值显示为未知。")
-        .supportedFamilies([.systemSmall, .systemMedium])
+        .description("显示 5 小时限额、7 天限额、月度用量与可用重置券。未获取到的值显示为未知。")
+        .supportedFamilies([.systemSmall])
     }
 }
 

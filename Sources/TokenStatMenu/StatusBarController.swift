@@ -43,7 +43,7 @@ struct StatusBarContentFactories {
         super.init()
         item.autosaveName = "TokenStatMenu.Metrics"
         popover.behavior = .transient; popover.animates = false; popover.delegate = self
-        popover.contentSize = NSSize(width: 460, height: 700)
+        popover.contentSize = PanelMetrics.size
         if let button = item.button {
             button.target = self; button.action = #selector(toggle)
             button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
@@ -119,6 +119,8 @@ struct StatusBarContentFactories {
             let monthlyUsagePresent: Bool
             let liveTokenSpeedPresent: Bool
             let sourceStatus: String
+            let widgetSnapshotPublished: Bool
+            let widgetChannelUnavailable: Bool
             let backgroundServiceResources: BackgroundServiceResources
         }
         let fiveHourResetPresent = projection.fiveHourCurrent.map { !$0.resetDisplay.isEmpty && $0.resetDisplay != "未知" } ?? false
@@ -142,6 +144,8 @@ struct StatusBarContentFactories {
             liveTokenSpeedPresent: model.config.dataSource == "localCodex"
                 ? model.freshLocalLiveTurn(at: now) != nil : model.stats.active > 0,
             sourceStatus: model.sourceStatus,
+            widgetSnapshotPublished: model.widgetSnapshotPublished,
+            widgetChannelUnavailable: model.widgetChannelUnavailable,
             backgroundServiceResources: model.backgroundServiceResources)
         if let data = try? JSONEncoder().encode(report) {
             DispatchQueue.global(qos: .utility).async { try? data.write(to: url, options: .atomic) }

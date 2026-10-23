@@ -15,6 +15,16 @@
 | `.build/` | 可重新生成的构建缓存，不提交 |
 | `dist/` | 本机构建与打包产物，不提交 |
 
+源码按编译目标保持平铺，避免目录移动破坏工程和测试入口：
+
+- `Sources/TokenStatCore/`：只读数据源、解析和统计，不依赖界面。
+- `Sources/TokenStatMenu/`：菜单栏、面板、设置和采集调度。
+- `Sources/TokenStatWidgetShared/`、`Sources/TokenStatWidgetExtension/`：正式共享快照协议与系统小组件。
+- `Sources/TokenStatDevWidget*/`：隔离的开发探针，不与正式采集和小组件协议混用。
+- `Tests/TokenStatCoreTests/`：由 `swift run TokenStatCoreChecks` 执行的检查程序；其余测试目录由 `swift test` 执行。
+
+构建入口统一见[编译指南](wiki/编译指南.md)，验证结果统一见[验证记录](VALIDATION.md)。
+
 实现细节见 [实现范围](IMPLEMENTATION.md)、[设计说明](DESIGN.md) 和 [性能与基准](PERFORMANCE.md)。测试结果见 [验证记录](VALIDATION.md)。
 
 相关页面：[项目首页](../README.md) · [文档中心](wiki/Home.md)

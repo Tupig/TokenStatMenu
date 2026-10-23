@@ -39,12 +39,18 @@ final class WidgetSnapshotStoreTests: XCTestCase {
         XCTAssertNil(WidgetSnapshotStore.claimExisting())
     }
 
-    func testAcceptedGroupRequiresGroupPrefix() {
+    func testAcceptedGroupSupportsRegisteredAndMacOSTeamFormats() {
         XCTAssertEqual(WidgetSnapshotStore.acceptedGroup(" group.tokenstat.menu "),
                        "group.tokenstat.menu")
         XCTAssertNil(WidgetSnapshotStore.acceptedGroup(""))
         XCTAssertNil(WidgetSnapshotStore.acceptedGroup("$(TOKENSTAT_WIDGET_GROUP)"))
         XCTAssertNil(WidgetSnapshotStore.acceptedGroup("com.seasun.tokenhub.desktop"))
+        XCTAssertEqual(WidgetSnapshotStore.acceptedGroup("AB12CD34EF.com.example.TokenStatMenu"),
+                       "AB12CD34EF.com.example.TokenStatMenu")
+        for invalid in ["group.", "group.a..b", "group.a/../b", "group.-a", "group.a-", "group.a.-b", "group.a-.b", "FICTEAM123.example",
+                        "ab12cd34ef.example", "AB12CD34E.example", "AB12CD34EF."] {
+            XCTAssertNil(WidgetSnapshotStore.acceptedGroup(invalid), invalid)
+        }
         XCTAssertNil(WidgetSnapshotStore.acceptedGroup(String(repeating: "a", count: 129)))
     }
 

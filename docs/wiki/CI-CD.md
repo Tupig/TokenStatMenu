@@ -4,7 +4,7 @@
 
 ## 当前自动化范围
 
-仓库只有一个 [TokenStatMenu CI 与发布工作流](../../.github/workflows/ci.yml)，在 `main` 的 push、pull request 和 `v*` 标签 push 上运行，使用 `macos-15` runner。工作流顶层仅有读取仓库内容的权限，checkout 关闭凭据持久化；只有标签触发且构建成功时，独立的 `publish` job 才取得 `contents: write`。当前 checkout 固定为官方 `v7.0.1` 的完整提交 `3d3c42e5aac5ba805825da76410c181273ba90b1`，其运行时为 Node 24；升级时重新核对官方 release/tag 与完整 SHA，不只移动标签。官方要求 Actions Runner 至少为 `v2.327.1`，自托管 runner 需同步满足此版本；GitHub 托管 runner 由平台维护。来源见 [checkout v7.0.1](https://github.com/actions/checkout/tree/v7.0.1)。
+仓库只有一个 [TokenStatMenu CI 与发布工作流](../../.github/workflows/ci.yml)，在 `main` 的 push、pull request 和 `v*` 标签 push 上运行，使用 `macos-15` runner。当前采用本地出包、验证后上传 Release；云端出包与发布默认关闭，避免推送标签时覆盖或抢先发布本地资产。只有显式设置仓库变量 `TOKENSTAT_CLOUD_RELEASE=enabled`，云端标签发布分支才启用。普通 CI 仅有读取仓库内容的权限，checkout 关闭凭据持久化。当前 checkout 固定为官方 `v7.0.1` 的完整提交 `3d3c42e5aac5ba805825da76410c181273ba90b1`，其运行时为 Node 24；升级时重新核对官方 release/tag 与完整 SHA，不只移动标签。官方要求 Actions Runner 至少为 `v2.327.1`，自托管 runner 需同步满足此版本；GitHub 托管 runner 由平台维护。来源见 [checkout v7.0.1](https://github.com/actions/checkout/tree/v7.0.1)。
 
 | 顺序 | 检查 | 当前实际覆盖 |
 | --- | --- | --- |
@@ -12,7 +12,7 @@
 | 2 | 公开内容防线 | 检查 Git index 中白名单文件的精确内容 |
 | 3 | Release 校验器测试 | 虚构发布材料、路径/版本/摘要错误、无网络写入及私有原生包装 fixture |
 | 4 | 核心与发现检查 | 运行 `TokenStatCoreChecks` 的合成回归 |
-| 5 | 原生测试目标编译及不依赖 OS 像素的检查 | 凭据用途/URL 绑定的纯身份检查，以及刻意图像差异可被检测的检查 |
+| 5 | 原生测试目标编译及不依赖 OS 像素的检查 | 三个指定过滤检查，以及排除受渲染环境约束项目后的完整测试步骤 |
 | 6 | Xcode Release 构建 | 使用明确绑定 App target 的共享 Scheme，禁用代码签名完成原生工程构建 |
 | 7 | 完整依赖锁未改动 | `git diff --exit-code -- Package.resolved`；任何隐式改写都会让 CI 失败 |
 
@@ -45,9 +45,28 @@ CI 绿色说明该提交完成了工作流声明的检查，不能据此声称�
 5. 审阅暂存内容并执行 `check_public_content.py --git-index`，本地验证完成后再推送。
 6. 创建可审查的 PR，写明问题、最终行为、测试结果和未覆盖范围；等待该提交的 CI 结果。
 
-## 标签触发的正式 Release
+## 本地出包与正式 Release
 
-[同一 TokenStatMenu CI 与发布工作流](../../.github/workflows/ci.yml) 在 `v*` 标签 push 时进入发布分支。宽触发模式不是版本校验：发布工具仍只接受数字稳定版本 `vMAJOR.MINOR.PATCH`，核对 Info.plist 的版本/构建号、标签实际提交、干净工作区及 `main` 祖先关系。分支名不能代替源码提交。
+本地使用 Xcode 构建 App 与内嵌 Widget，签名后核验版本、构建号、架构与安装行为。公开分发的有效签名与 App Group 权限未解决前不得宣称完整小组件可用；Apple Development 本机候选不是 Developer ID 发行包。完成回归并固定源码提交后，使用现有发布工具打包、复验、上传并回读远端资产，不覆盖旧版本。
+
+发布工具只接受数字稳定版本 `vMAJOR.MINOR.PATCH`，核对 Info.plist 的版本/构建号、标签实际提交、干净工作区及 `origin/main` 祖先关系。分支名不能代替源码提交。以下命令要求版本标签已经按发布授权固定到验收通过的提交；`APP` 必须指向同一提交构建并带公开源码身份的已验证 Universal App，不可填开发探针。
+
+```bash
+TAG=v1.1.6
+COMMIT=$(git rev-parse HEAD)
+APP=dist/TokenStatMenu.app
+python3 -B script/release_assets.py preflight --tag "$TAG" --commit "$COMMIT"
+python3 -B script/package_source.py
+python3 -B script/release_assets.py package --tag "$TAG" --commit "$COMMIT" --app "$APP" --source dist/TokenStatMenu-source.zip --directory dist/release
+python3 -B script/release_assets.py verify --tag "$TAG" --commit "$COMMIT" --directory dist/release
+python3 -B script/release_assets.py publish --tag "$TAG" --commit "$COMMIT" --directory dist/release
+```
+
+`publish` 会核对已有草稿/正式资产，逐一下载回读后才公开；遇到冲突立即停止，不使用 `--clobber`。发布后还需 Tap 跟进及真实 `brew upgrade` 验证，不能把上传成功当作 Brew 已升级。
+
+### 保留的可选云端发布路径
+
+仅在 `TOKENSTAT_CLOUD_RELEASE=enabled` 且推送版本标签时启用；本地出包期间保持关闭。该路径仍使用下列两阶段门禁。
 
 流水线分成 `build` 与 `publish` 两个 job：
 

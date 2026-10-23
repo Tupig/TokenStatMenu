@@ -18,7 +18,8 @@ public enum WidgetSnapshotCodec {
 
     private static let rootKeys: Set<String> = [
         "schemaVersion", "writtenAtMs", "observedAtMs", "validUntilMs",
-        "hubSource", "hubState", "fiveHour", "sevenDay", "monthly", "local"
+        "hubSource", "hubState", "fiveHour", "sevenDay", "monthly", "local",
+        "resetVoucherCount"
     ]
     private static let windowKeys: Set<String> = ["remainingPercent", "resetsAtMs"]
     private static let monthlyKeys: Set<String> = ["usedAmount", "limitAmount", "sourceSymbol"]
@@ -44,6 +45,7 @@ public enum WidgetSnapshotCodec {
         root["sevenDay"] = snapshot.sevenDay.map(encodeWindow) ?? NSNull()
         root["monthly"] = snapshot.monthly.map(encodeMonthly) ?? NSNull()
         root["local"] = snapshot.local.map(encodeLocal) ?? NSNull()
+        root["resetVoucherCount"] = snapshot.resetVoucherCount.map { $0 } ?? NSNull()
         // 字段排序且不添加排版空白，使相同数据生成相同字节，便于跳过重复写入。
         let data = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
         guard data.count <= maximumBytes else { throw CodecError.tooLarge }
@@ -70,6 +72,11 @@ public enum WidgetSnapshotCodec {
         }
         try validateWindow(snapshot.fiveHour, "fiveHour")
         try validateWindow(snapshot.sevenDay, "sevenDay")
+        if let vouchers = snapshot.resetVoucherCount {
+            guard (0...1_000_000).contains(vouchers) else {
+                throw CodecError.outOfRange("resetVoucherCount")
+            }
+        }
         if let monthly = snapshot.monthly {
             guard monthly.usedAmount.isFinite, monthly.usedAmount >= 0 else {
                 throw CodecError.outOfRange("monthly.usedAmount")
@@ -92,11 +99,6 @@ public enum WidgetSnapshotCodec {
                 }
             }
         }
-    }
-
-    /// 编码后的数据不能超出小组件的字节上限。
-    private static func validatePayloadSize(_ data: Data) throws {
-        guard data.count <= maximumBytes else { throw CodecError.tooLarge }
     }
 
     /// 协议使用的 Unix 毫秒时间戳。
@@ -141,7 +143,7 @@ public enum WidgetSnapshotCodec {
         guard let object = try? JSONSerialization.jsonObject(with: data),
               let root = object as? [String: Any] else { throw CodecError.notAnObject }
 
-        try requireClosed(root, keys: rootKeys)
+        try requireClosed(root, keys: rootKeys, optional: ["resetVoucherCount"])
         // 比较精确值，不能用 `intValue` 把 1.5 截断为版本 1。
         guard let version = root["schemaVersion"] as? NSNumber,
               CFGetTypeID(version) != CFBooleanGetTypeID(),
@@ -170,10 +172,12 @@ public enum WidgetSnapshotCodec {
         let sevenDay = try window(root, "sevenDay")
         let monthly = try monthlyValue(root, "monthly")
         let local = try localValue(root, "local")
+        let resetVoucherCount = try optionalInteger(root, "resetVoucherCount")
         let snapshot = WidgetQuotaSnapshot(
             writtenAt: writtenAt, observedAt: observedAt, validUntil: validUntil,
             hubSource: hubSource, hubState: hubState,
-            fiveHour: fiveHour, sevenDay: sevenDay, monthly: monthly, local: local)
+            fiveHour: fiveHour, sevenDay: sevenDay, monthly: monthly, local: local,
+            resetVoucherCount: resetVoucherCount)
         // 这里只拒绝不可能的时间区间。未来的 `writtenAt` 由 `hubIsCurrent`
         // 按时钟回拨处理，不丢弃与绝对时间无关的 `local` 用量。
         if let validUntil, let observedAt, validUntil < observedAt {
@@ -241,11 +245,12 @@ public enum WidgetSnapshotCodec {
 
     // MARK: - 字段辅助方法
 
-    private static func requireClosed(_ object: [String: Any], keys: Set<String>) throws {
+    private static func requireClosed(_ object: [String: Any], keys: Set<String>,
+                                      optional: Set<String> = []) throws {
         for key in object.keys where !keys.contains(key) {
             throw CodecError.unexpectedKey(key)
         }
-        for key in keys where object[key] == nil {
+        for key in keys where object[key] == nil && !optional.contains(key) {
             throw CodecError.missingKey(key)
         }
     }
@@ -267,6 +272,14 @@ public enum WidgetSnapshotCodec {
         guard rounded.isFinite, rounded >= 0, rounded <= 1e15,
               rounded == rounded.rounded() else { throw CodecError.outOfRange(key) }
         return Int(rounded)
+    }
+
+    /// JSON null 或字段缺失时返回 nil；其他非整数或越界值抛出错误。
+    private static func optionalInteger(_ object: [String: Any], _ key: String) throws -> Int? {
+        guard let raw = object[key], !(raw is NSNull) else { return nil }
+        let value = try integer(object, key)
+        guard value <= 1_000_000 else { throw CodecError.outOfRange(key) }
+        return value
     }
 
     /// JSON null 或字段缺失时返回 nil，其他非整数值抛出错误。

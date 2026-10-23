@@ -11,14 +11,16 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     @ValueState private var settings = false
     private let initialLocalHistoryExpanded: Bool
     private let initialDetailedMetricsExpanded: Bool
+    private let panelSize: CGSize
     private let quitAction: @MainActor () -> Void
     init(model: AppModel, settings: Bool = false, localHistoryExpanded: Bool = false,
-         detailedMetricsExpanded: Bool = false,
+         detailedMetricsExpanded: Bool = false, panelSize: CGSize = PanelMetrics.size,
          quitAction: @escaping @MainActor () -> Void = { NSApp.terminate(nil) }) {
         self.model = model
         _settings = State(initialValue: settings)
         initialLocalHistoryExpanded = localHistoryExpanded
         initialDetailedMetricsExpanded = detailedMetricsExpanded
+        self.panelSize = panelSize
         self.quitAction = quitAction
     }
     var body: some View {
@@ -42,7 +44,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             }
             footer
         }
-        .frame(width: 460, height: 700)
+        .frame(width: panelSize.width, height: panelSize.height)
         .background(.regularMaterial)
         .background(PanelPalette.gradient.opacity(0.09))
         .groupBoxStyle(PanelCardStyle())
@@ -59,11 +61,14 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 localDetailedMetricsCard
             }
             if model.quotaSource == .localCodex {
-                LocalHistoryDisclosure(initiallyExpanded: initialLocalHistoryExpanded) {
-                    localQuotaCard
+                // 正式界面隐藏本地历史额度，仅供显式开启的离线预览与回归测试使用。
+                if initialLocalHistoryExpanded {
+                    LocalHistoryDisclosure(initiallyExpanded: true) {
+                        localQuotaCard
+                    }
                 }
             } else {
-                // 通用企业分支仅供模拟预览，本地历史在正式界面有独立区域。
+                // 通用企业分支仅供模拟预览，正式界面不显示本地历史额度。
                 HStack(alignment: .top, spacing: 10) {
                     WindowQuotaCard(title: "5 小时额度", quota: model.fiveHourQuota,
                         color: PanelPalette.blue, refreshSeconds: model.config.refreshSeconds, source: model.quotaSource)
@@ -259,7 +264,6 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     }
     private func count(_ n: Int) -> String { n.formatted() }
     private func localCount(_ n: Int) -> String { model.localSnapshot.knownThreadCount == 0 ? "—" : count(n) }
-    private func count(_ n: Double) -> String { n.formatted(.number.precision(.fractionLength(0))) }
 }
 
 /// 展开状态由已挂载视图持有，不进入模型或偏好设置，也便于独立托管概览进行渲染测试。

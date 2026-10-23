@@ -46,7 +46,6 @@ PUBLIC_FILES = [
     "Sources/TokenStatWidgetExtension/WidgetEntryView.swift",
     "Sources/TokenStatDevWidgetShared/WidgetSnapshot.swift",
     "Sources/TokenStatDevWidgetShared/WidgetSnapshotStore.swift",
-    "Sources/TokenStatDevWidgetShared/DevWidgetReloadGate.swift",
     "Sources/TokenStatDevWidgetShared/DevProbeAudit.swift",
     "Sources/TokenStatDevWidgetHost/main.swift",
     "Sources/TokenStatDevWidgetExtension/DevWidget.swift",
