@@ -5,7 +5,7 @@ import SwiftUI
 let decision = DevProbeController.decide(Array(CommandLine.arguments.dropFirst()),
                                          configured: { DevWidgetIdentity.group() },
                                          entitlements: { DevGroupGuard.currentEntitlements() },
-                                         authorizationMatches: true)
+                                          authorizationMatches: DevGroupGuard.currentAuthorizationMatches())
 let audit = DevProbeAudit()
 let ioAudit = DevProbeIOAudit()
 func finishProbe(_ code: Int32, reason: String, sample: Int?) -> Never {

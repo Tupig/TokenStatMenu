@@ -66,7 +66,33 @@ enum DevGroupGuard {
     static func currentReason() -> String? {
         DevProbeController.groupRejection(configured: { DevWidgetIdentity.group() },
                                           entitlements: { currentEntitlements() },
-                                          authorizationMatches: true)
+                                          authorizationMatches: currentAuthorizationMatches())
+    }
+
+    /// 只检查本进程的签名身份，不读取用户凭据或其他应用。这个开发候选
+    /// 只接受 TEAMID.* 组名，因此签名团队必须与前缀一致；ad hoc 直接拒绝。
+    /// 静态签名检查不代替系统容器读回与分发授权验收。
+    static func currentAuthorizationMatches() -> Bool {
+        guard let group = DevWidgetIdentity.group() else { return false }
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
+              SecCodeCheckValidity(code, [], nil) == errSecSuccess else { return false }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
+              let staticCode else { return false }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation),
+                                           &information) == errSecSuccess,
+              let info = information as? [String: Any] else { return false }
+        return authorizationMatches(group: group,
+            team: info[kSecCodeInfoTeamIdentifier as String] as? String,
+            flags: (info[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value)
+    }
+
+    static func authorizationMatches(group: String, team: String?, flags: UInt32?) -> Bool {
+        guard DevWidgetIdentity.hasExactGroupShape(group), let team, let flags,
+              flags & 0x0002 == 0 else { return false } // CSCommon.h: kSecCodeSignatureAdhoc
+        return group.hasPrefix(team + ".") && team.count == 10
     }
 }
 
@@ -89,22 +115,26 @@ struct DevProbeResult {
 enum DevProbeController {
     static func groupRejection(configured: () -> String?,
                                entitlements: () -> [String]?,
-                               authorizationMatches: Bool) -> String? {
-        DevGroupGuard.reason(configured: configured(), entitlements: entitlements(),
-                             authorizationMatches: authorizationMatches)
+                               authorizationMatches: @autoclosure () -> Bool) -> String? {
+        let group = configured()
+        let groups = entitlements()
+        if let reason = DevGroupGuard.reason(configured: group, entitlements: groups,
+                                            authorizationMatches: true) { return reason }
+        return DevGroupGuard.reason(configured: group, entitlements: groups,
+                                    authorizationMatches: authorizationMatches())
     }
 
     // 身份信息延迟加载，参数错误时先拒绝，再进行包或签名查找；宿主和内存适配器共用此入口。
     static func decide(_ arguments: [String], configured: () -> String?,
                        entitlements: () -> [String]?,
-                       authorizationMatches: Bool) -> DevProbeDecision {
+                        authorizationMatches: @autoclosure () -> Bool) -> DevProbeDecision {
         switch DevProbeArguments.classify(arguments) {
         case .normal: return .normal
         case .reject: return .reject(64, "invalidArguments")
         case let .sample(number):
             if let reason = groupRejection(configured: configured,
                                            entitlements: entitlements,
-                                           authorizationMatches: authorizationMatches) {
+                                            authorizationMatches: authorizationMatches()) {
                 return .reject(77, reason)
             }
             return .sample(number)

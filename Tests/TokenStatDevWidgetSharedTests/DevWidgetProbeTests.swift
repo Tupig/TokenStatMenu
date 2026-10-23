@@ -6,6 +6,28 @@ final class DevWidgetProbeTests: XCTestCase {
     private let team = "ABCDE12345.com.tupig.TokenStatMenu.DevWidgetTest"
     private let nowMs: Int64 = 1_800_000_000_000
 
+    func testSignatureAuthorizationRejectsMissingAdhocAndWrongTeam() {
+        XCTAssertTrue(DevGroupGuard.authorizationMatches(group: team, team: "ABCDE12345", flags: 0))
+        XCTAssertFalse(DevGroupGuard.authorizationMatches(group: team, team: nil, flags: 0))
+        XCTAssertFalse(DevGroupGuard.authorizationMatches(group: team, team: "OTHER12345", flags: 0))
+        XCTAssertFalse(DevGroupGuard.authorizationMatches(group: team, team: "ABCDE12345", flags: 2))
+        XCTAssertFalse(DevGroupGuard.authorizationMatches(group: team, team: "ABCDE12345", flags: nil))
+        var checks = 0
+        func authorize() -> Bool { checks += 1; return false }
+        _ = DevProbeController.decide(["--widget-probe=9"], configured: { self.team },
+            entitlements: { [self.team] }, authorizationMatches: authorize())
+        XCTAssertEqual(checks, 0, "坏参数在签名查询前返回")
+        _ = DevProbeController.decide(["--widget-probe=1"], configured: { nil },
+            entitlements: { nil }, authorizationMatches: authorize())
+        XCTAssertEqual(checks, 0, "缺组不查询签名")
+        let result = DevProbeController.decide(["--widget-probe=1"], configured: { self.team },
+            entitlements: { [self.team] }, authorizationMatches: authorize())
+        guard case let .reject(code, reason) = result else { return XCTFail("授权不匹配必须拒绝") }
+        XCTAssertEqual(checks, 1)
+        XCTAssertEqual(code, 77)
+        XCTAssertEqual(reason, "profileAuthorizationMismatch")
+    }
+
     func testPercentEndpointsAndFreshnessBoundaries() throws {
         let sample = try XCTUnwrap(DevWidgetSnapshot.sample(1, atMs: nowMs))
         let text = try XCTUnwrap(String(data: sample, encoding: .utf8))

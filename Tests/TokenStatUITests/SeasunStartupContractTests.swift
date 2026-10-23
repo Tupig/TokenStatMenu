@@ -386,29 +386,33 @@ final class SeasunStartupContractTests: XCTestCase {
         }
     }
 
-    func testSettingsVisibleContentShowsSeasunPreferencesWithoutGenericIntegration() throws {
+    func testSettingsVisibleContentShowsSeasunPreferencesWithoutGenericIntegration() async throws {
         let isolated = try IsolatedConfig()
         defer { isolated.tearDown() }
         let model = makeModel(isolated)
         defer { model.shutdown() }
         let bounds = NSRect(x: 0, y: 0, width: 460, height: 700)
-        let hostingView = NSHostingView(rootView: SettingsView(model: model).frame(width: 460, height: 700))
+        let hostingView = NSHostingView(rootView: SettingsView(model: model)
+            .environment(\.colorScheme, .light)
+            .frame(width: 460, height: 700).background(Color.white))
         hostingView.frame = bounds
         let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         defer { window.close() }
         window.contentView = hostingView
-        window.makeKeyAndOrderFront(nil)
+        window.appearance = NSAppearance(named: .aqua)
+        window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
         window.displayIfNeeded()
         hostingView.layoutSubtreeIfNeeded()
-        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
-        let bitmap = try XCTUnwrap(hostingView.bitmapImageRepForCachingDisplay(in: bounds))
+        try await Task.sleep(for: .milliseconds(200))
+        hostingView.layoutSubtreeIfNeeded()
+        let bitmap = try settingsBitmap(bounds)
         hostingView.cacheDisplay(in: bounds, to: bitmap)
         let visibleText = try recognizedText(in: bitmap).joined(separator: "\n")
         XCTAssertTrue(visibleText.contains("Seasun Token Hub") || visibleText.contains("Token Hub"),
-                      "the rendered Settings surface names the intended source")
-        XCTAssertTrue(visibleText.contains("刷新"), "the rendered surface exposes an optional refresh preference")
-        XCTAssertTrue(visibleText.contains("兼容"), "the rendered surface exposes the optional compatibility preference")
+                       "the rendered Settings surface names the intended source; OCR: \(visibleText)")
+        XCTAssertTrue(visibleText.contains("刷新"), "the rendered surface exposes an optional refresh preference; OCR: \(visibleText)")
+        XCTAssertTrue(visibleText.contains("兼容"), "the rendered surface exposes the optional compatibility preference; OCR: \(visibleText)")
         for forbidden in ["上游完整 Endpoint", "API Key", "模型覆盖", "自定义价格", "企业额度接口", "手动月度 Token 上限"] {
             XCTAssertFalse(visibleText.contains(forbidden),
                            "the rendered Settings surface must not expose \(forbidden)")
@@ -462,7 +466,7 @@ final class SeasunStartupContractTests: XCTestCase {
         XCTAssertFalse(settings.sourceStatusText.contains("已直接读取"))
     }
 
-    func testSettingsLightAndDarkRendersAreAvailableForIndependentVisualReview() throws {
+    func testSettingsLightAndDarkRendersAreAvailableForIndependentVisualReview() async throws {
         let isolated = try IsolatedConfig()
         defer { isolated.tearDown() }
         let model = makeModel(isolated)
@@ -485,19 +489,18 @@ final class SeasunStartupContractTests: XCTestCase {
             hostingView.appearance = NSAppearance(named: appearance)
             let window = NSWindow(contentRect: bounds, styleMask: .borderless, backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
+            defer { window.close() }
             window.appearance = NSAppearance(named: appearance)
             window.contentView = hostingView
-            window.makeKeyAndOrderFront(nil)
+            window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
             hostingView.frame = bounds
             window.displayIfNeeded()
             hostingView.layoutSubtreeIfNeeded()
-            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            try await Task.sleep(for: .milliseconds(200))
             window.displayIfNeeded()
             hostingView.needsDisplay = true
             hostingView.layoutSubtreeIfNeeded()
-            guard let bitmap = hostingView.bitmapImageRepForCachingDisplay(in: bounds) else {
-                window.close(); XCTFail("Seasun Settings render should be available"); continue
-            }
+            let bitmap = try settingsBitmap(bounds)
             hostingView.cacheDisplay(in: bounds, to: bitmap)
             let renderedText = try recognizedText(in: bitmap).joined(separator: "\n")
             XCTAssertTrue(renderedText.contains("Seasun Token Hub") || renderedText.contains("Token Hub"),
@@ -507,9 +510,17 @@ final class SeasunStartupContractTests: XCTestCase {
             let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
             XCTAssertGreaterThan(png.count, 0)
             try png.write(to: output.appendingPathComponent("seasun-settings-\(name).png"), options: .atomic)
-            window.close()
         }
         print("BP10 Seasun Settings light/dark visual review files: \(output.path)")
+    }
+
+    private func settingsBitmap(_ bounds: NSRect) throws -> NSBitmapImageRep {
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil,
+            pixelsWide: Int(bounds.width * 4), pixelsHigh: Int(bounds.height * 4),
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+        bitmap.size = bounds.size
+        return bitmap
     }
 
     private func recognizedText(in bitmap: NSBitmapImageRep) throws -> [String] {
