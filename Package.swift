@@ -7,10 +7,10 @@ let package = Package(
     products: [.executable(name: "TokenStatMenu", targets: ["TokenStatMenu"])],
     dependencies: [
         .package(url: "https://github.com/pointfreeco/swift-snapshot-testing", exact: "1.19.6"),
-        // Keep both manifest branches in the graph rather than orphan pins
-        // which newer SwiftPM versions prune from Package.resolved.
-        .package(url: "https://github.com/pointfreeco/swift-issue-reporting", exact: "2.1.2"),
-        .package(url: "https://github.com/pointfreeco/xctest-dynamic-overlay", exact: "1.13.1"),
+        // 1.7.x switches package identities across toolchains, creating
+        // duplicate IssueReporting targets on older SwiftPM. Use one graph.
+        .package(url: "https://github.com/pointfreeco/swift-custom-dump", exact: "1.6.0"),
+        .package(url: "https://github.com/pointfreeco/xctest-dynamic-overlay", exact: "1.11.0"),
     ],
     targets: [
         .target(name: "TokenStatCore"),
