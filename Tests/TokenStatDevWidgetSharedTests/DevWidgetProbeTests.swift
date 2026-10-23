@@ -6,6 +6,72 @@ final class DevWidgetProbeTests: XCTestCase {
     private let team = "ABCDE12345.com.tupig.TokenStatMenu.DevWidgetTest"
     private let nowMs: Int64 = 1_800_000_000_000
 
+    func testPercentEndpointsAndFreshnessBoundaries() throws {
+        let sample = try XCTUnwrap(DevWidgetSnapshot.sample(1, atMs: nowMs))
+        let text = try XCTUnwrap(String(data: sample, encoding: .utf8))
+        for literal in ["0", "100", "12.34", "1e1"] {
+            let changed = Data(text.replacingOccurrences(of: "87.66", with: literal).utf8)
+            let value = try XCTUnwrap(DevWidgetSnapshot.decode(changed, nowMs: nowMs), literal)
+            XCTAssertEqual(value.remainingPercent, Decimal(string: literal), literal)
+        }
+        for literal in ["-1", "100.01", "true", "\"50\"", "1e999"] {
+            XCTAssertNil(DevWidgetSnapshot.decode(Data(text.replacingOccurrences(of: "87.66", with: literal).utf8), nowMs: nowMs), literal)
+        }
+        XCTAssertNotNil(DevWidgetSnapshot.decode(sample, nowMs: nowMs + 120_000))
+        XCTAssertNil(DevWidgetSnapshot.decode(sample, nowMs: nowMs + 120_001))
+        XCTAssertNil(DevWidgetSnapshot.decode(sample, nowMs: nowMs - 1))
+        let reset = text.replacingOccurrences(of: "\"atMs\":\(nowMs + 3_600_000)", with: "\"atMs\":\(nowMs)")
+        XCTAssertNil(try XCTUnwrap(DevWidgetSnapshot.decode(Data(reset.utf8), nowMs: nowMs)).remainingPercent)
+    }
+
+    func testSnapshotObjectsRejectEveryMissingAndExtraField() throws {
+        let sample = try XCTUnwrap(DevWidgetSnapshot.sample(1, atMs: nowMs))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: sample) as? [String: Any])
+        for section in ["root", "hub", "local", "fiveHour", "reset"] {
+            let hub = try XCTUnwrap(root["hub"] as? [String: Any])
+            let window = try XCTUnwrap(hub["fiveHour"] as? [String: Any])
+            let object: [String: Any]
+            switch section {
+            case "root": object = root
+            case "hub": object = hub
+            case "local": object = try XCTUnwrap(root["local"] as? [String: Any])
+            case "fiveHour": object = window
+            default: object = try XCTUnwrap(window["reset"] as? [String: Any])
+            }
+            for key in Array(object.keys) + ["extra"] {
+                var changed = object
+                if key == "extra" { changed[key] = 1 } else { changed.removeValue(forKey: key) }
+                var payload = root
+                if section == "root" { payload = changed }
+                else if section == "hub" || section == "local" { payload[section] = changed }
+                else {
+                    var changedHub = hub
+                    if section == "fiveHour" { changedHub["fiveHour"] = changed }
+                    else { var changedWindow = window; changedWindow["reset"] = changed; changedHub["fiveHour"] = changedWindow }
+                    payload["hub"] = changedHub
+                }
+                let data = try JSONSerialization.data(withJSONObject: payload)
+                XCTAssertNoThrow(try JSONSerialization.jsonObject(with: data))
+                XCTAssertNil(DevWidgetSnapshot.decode(data, nowMs: nowMs), "\(section).\(key)")
+            }
+        }
+    }
+
+    func testMissingGroupPathsRejectBeforeAnyContainerIO() {
+        for (configured, entitlements): (String?, [String]?) in [(nil, nil), (team, nil)] {
+            let decision = DevProbeController.decide(["--widget-probe=1"], configured: { configured },
+                entitlements: { entitlements }, authorizationMatches: true)
+            guard case let .reject(code, reason) = decision else { return XCTFail("必须早拒绝") }
+            XCTAssertEqual(code, 77)
+            XCTAssertEqual(reason, "missingGroupEntitlement")
+        }
+        let result = DevProbeController.memoryRun(["--widget-probe=1"], actor: "host",
+            configuredGroup: team, entitlements: nil, authorizationMatches: true, incoming: nil)
+        XCTAssertTrue(result.io.values.allSatisfy { $0 == 0 })
+        XCTAssertTrue(result.counts.values.allSatisfy { $0 == 0 })
+        XCTAssertNotNil(result.terminalEvent)
+    }
+
     func testGroupShapeRejectsAnExtraMiddleSegment() {
         XCTAssertTrue(DevWidgetIdentity.hasExactGroupShape(team, allowSynthetic: true))
         XCTAssertFalse(DevWidgetIdentity.hasExactGroupShape(

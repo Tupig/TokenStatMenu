@@ -3074,8 +3074,28 @@ extension TokenHubQuotaStateTests {
         }.joined(separator: "\n")
         // 不将 OCR 错字替换成预期文字。标签检查允许 Vision 的其他原始
         // 候选；数值、未知原因和泄露检查仍使用 top-1，避免词表掩盖问题。
-        let candidates = (request.results ?? []).flatMap { $0.topCandidates(10) }
-            .map(\.string).joined(separator: "\n")
+        var candidateLines = (request.results ?? []).flatMap { $0.topCandidates(10) }.map(\.string)
+        // 整页中文模型会把“整”识别成“蹩/堅”。对每个真实 observation
+        // 再取原位图的行区域识别，保留识别结果，不按预期词做纠错。
+        let image = try XCTUnwrap(bitmap.cgImage)
+        for observation in request.results ?? [] {
+            let recognized = observation.topCandidates(1).first?.string ?? ""
+            guard recognized.contains("轮用时") || recognized.contains("轮均速") else { continue }
+            let box = observation.boundingBox
+            let region = CGRect(x: box.minX * CGFloat(image.width) - 12,
+                y: (1 - box.maxY) * CGFloat(image.height) - 12,
+                width: box.width * CGFloat(image.width) + 24,
+                height: box.height * CGFloat(image.height) + 24)
+                .intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height)).integral
+            guard let crop = image.cropping(to: region) else { continue }
+            let lineRequest = VNRecognizeTextRequest()
+            lineRequest.recognitionLevel = .accurate
+            lineRequest.recognitionLanguages = ["zh-Hans", "en-US"]
+            lineRequest.usesLanguageCorrection = false
+            try VNImageRequestHandler(cgImage: crop, options: [:]).perform([lineRequest])
+            candidateLines += (lineRequest.results ?? []).flatMap { $0.topCandidates(10) }.map(\.string)
+        }
+        let candidates = candidateLines.joined(separator: "\n")
         return (text, candidates, png)
     }
 

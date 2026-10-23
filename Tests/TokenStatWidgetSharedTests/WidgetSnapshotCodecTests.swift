@@ -252,16 +252,38 @@ final class WidgetSnapshotCodecTests: XCTestCase {
         XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(), now: now))
     }
 
-    func testDecodeRejectsMalformedMonthlyAndLocalObjects() {
-        let extraMonthly = validPayload(replacing: "\"monthly\":null",
-                                        with: "{\"usedAmount\":1,\"limitAmount\":null,\"sourceSymbol\":\"$\",\"extra\":1}")
-        XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(extraMonthly.utf8), now: now))
-        let missingLocal = validPayload(replacing: "\"local\":null",
-                                        with: "{\"inputTokens\":1,\"outputTokens\":1,\"totalTokens\":2,\"knownThreads\":1,\"unknownThreads\":0}")
-        XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(missingLocal.utf8), now: now))
-        let numericBool = validPayload(replacing: "\"local\":null",
-                                       with: "{\"inputTokens\":1,\"outputTokens\":1,\"totalTokens\":2,\"knownThreads\":1,\"unknownThreads\":0,\"isLimited\":1}")
-        XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(numericBool.utf8), now: now))
+    func testDecodeRejectsMalformedMonthlyAndLocalObjects() throws {
+        let objects: [(String, [String: Any])] = [
+            ("monthly", ["usedAmount": 1, "limitAmount": NSNull(), "sourceSymbol": "$"]),
+            ("local", ["inputTokens": 1, "outputTokens": 1, "totalTokens": 2,
+                       "knownThreads": 1, "unknownThreads": 0, "isLimited": false]),
+        ]
+        func payload(_ key: String, _ object: [String: Any]) throws -> Data {
+            var root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(validPayload(replacing: "", with: "").utf8)) as? [String: Any])
+            root[key] = object
+            let data = try JSONSerialization.data(withJSONObject: root)
+            XCTAssertNoThrow(try JSONSerialization.jsonObject(with: data), "负例必须先是合法 JSON")
+            return data
+        }
+        for (key, object) in objects {
+            XCTAssertNoThrow(try WidgetSnapshotCodec.decode(payload(key, object), now: now))
+            for field in object.keys {
+                var missing = object; missing.removeValue(forKey: field)
+                XCTAssertThrowsError(try WidgetSnapshotCodec.decode(payload(key, missing), now: now)) {
+                    XCTAssertEqual($0 as? WidgetSnapshotCodec.CodecError, .missingKey(field))
+                }
+            }
+            var extra = object; extra["extra"] = 1
+            XCTAssertThrowsError(try WidgetSnapshotCodec.decode(payload(key, extra), now: now)) {
+                XCTAssertEqual($0 as? WidgetSnapshotCodec.CodecError, .unexpectedKey("extra"))
+            }
+        }
+        for value: Any in [0, 1, "true", NSNull()] {
+            var object = objects[1].1; object["isLimited"] = value
+            XCTAssertThrowsError(try WidgetSnapshotCodec.decode(payload("local", object), now: now)) {
+                XCTAssertEqual($0 as? WidgetSnapshotCodec.CodecError, .wrongType("isLimited"))
+            }
+        }
     }
 
     func testDecodeRejectsUnexpectedAndMissingKeys() {
@@ -284,15 +306,15 @@ final class WidgetSnapshotCodecTests: XCTestCase {
         let cases = ["-1", "100.001", "1e9"]
         for literal in cases {
             let payload = validPayload(replacing: "\"fiveHour\":null",
-                with: "{\"remainingPercent\":\(literal),\"resetsAtMs\":null}")
+                with: "\"fiveHour\":{\"remainingPercent\":\(literal),\"resetsAtMs\":null}")
             XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(payload.utf8), now: now),
                                  "remainingPercent \(literal) must be rejected")
         }
         let unexpectedKey = validPayload(replacing: "\"fiveHour\":null",
-            with: "{\"remainingPercent\":50,\"resetsAtMs\":null,\"extra\":1}")
+            with: "\"fiveHour\":{\"remainingPercent\":50,\"resetsAtMs\":null,\"extra\":1}")
         XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(unexpectedKey.utf8), now: now))
         let missingKey = validPayload(replacing: "\"fiveHour\":null",
-            with: "{\"remainingPercent\":50}")
+            with: "\"fiveHour\":{\"remainingPercent\":50}")
         XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(missingKey.utf8), now: now))
     }
 

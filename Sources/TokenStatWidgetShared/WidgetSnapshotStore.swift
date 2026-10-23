@@ -83,19 +83,23 @@ public enum WidgetSnapshotStore {
     /// 此检查仅建立后续替换凭据，不证明最初由哪个进程写入。
     /// - Returns: 传给 `write(replacing:)` 的文件身份，无法接管时返回 nil。
     public static func claimExisting(bundle: Bundle = .main) -> Ownership? {
-        guard let url = containerURL(bundle: bundle) else { return nil }
+        guard let dirfd = try? openContainer(bundle: bundle) else { return nil }
+        defer { close(dirfd) }
+        return claimExisting(directory: dirfd)
+    }
+
+    static func claimExisting(directory dirfd: Int32) -> Ownership? {
+        let fd = openat(dirfd, fileName, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
         var metadata = stat()
-        let path = url.appendingPathComponent(fileName, isDirectory: false).path
-        guard lstat(path, &metadata) == 0 else { return nil }
-        guard metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
-              metadata.st_uid == getuid(),
-              metadata.st_nlink == 1,
-              metadata.st_mode & 0o777 == 0o600,
-              metadata.st_size > 0,
-              metadata.st_size <= WidgetSnapshotCodec.maximumBytes else { return nil }
-        guard let data = FileManager.default.contents(atPath: path), !data.isEmpty else { return nil }
+        guard fstat(fd, &metadata) == 0,
+              isSafeMetadata(metadata, maximumBytes: WidgetSnapshotCodec.maximumBytes),
+              let data = try? readAll(fd, maximumBytes: WidgetSnapshotCodec.maximumBytes),
+              data.count == metadata.st_size else { return nil }
         var after = stat()
-        guard lstat(path, &after) == 0,
+        guard fstatat(dirfd, fileName, &after, AT_SYMLINK_NOFOLLOW) == 0,
+              isSafeMetadata(after, maximumBytes: WidgetSnapshotCodec.maximumBytes),
               after.st_dev == metadata.st_dev,
               after.st_ino == metadata.st_ino,
               after.st_mtimespec.tv_sec == metadata.st_mtimespec.tv_sec,
@@ -111,16 +115,33 @@ public enum WidgetSnapshotStore {
     public static func read(bundle: Bundle = .main) throws -> WidgetQuotaSnapshot? {
         let dirfd = try openContainer(bundle: bundle)
         defer { close(dirfd) }
+        return try read(directory: dirfd)
+    }
+
+    static func read(directory dirfd: Int32) throws -> WidgetQuotaSnapshot? {
         var metadata = stat()
         guard fstatat(dirfd, fileName, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
             if errno == ENOENT { return nil }
             throw StoreError.ioFailure
         }
-        let fd = openat(dirfd, fileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let fd = openat(dirfd, fileName, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw StoreError.unsafeObject }
         defer { close(fd) }
         try requireSafe(fd, maximumBytes: WidgetSnapshotCodec.maximumBytes)
         let data = try readAll(fd, maximumBytes: WidgetSnapshotCodec.maximumBytes)
+        var opened = stat()
+        var current = stat()
+        guard fstat(fd, &opened) == 0,
+              fstatat(dirfd, fileName, &current, AT_SYMLINK_NOFOLLOW) == 0,
+              isSafeMetadata(opened, maximumBytes: WidgetSnapshotCodec.maximumBytes),
+              isSafeMetadata(current, maximumBytes: WidgetSnapshotCodec.maximumBytes),
+              metadata.st_dev == opened.st_dev, metadata.st_ino == opened.st_ino,
+              current.st_dev == opened.st_dev, current.st_ino == opened.st_ino,
+              metadata.st_size == opened.st_size, data.count == opened.st_size,
+              metadata.st_mtimespec.tv_sec == opened.st_mtimespec.tv_sec,
+              metadata.st_mtimespec.tv_nsec == opened.st_mtimespec.tv_nsec else {
+            throw StoreError.existingObject
+        }
         return try? WidgetSnapshotCodec.decode(data)
     }
 
@@ -283,24 +304,47 @@ public enum WidgetSnapshotStore {
               UInt64(metadata.st_dev) == expected.device,
               UInt64(metadata.st_ino) == expected.inode,
               Int64(metadata.st_size) == expected.size else { throw StoreError.existingObject }
-        let fd = openat(dirfd, fileName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let fd = openat(dirfd, fileName, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw StoreError.existingObject }
         defer { close(fd) }
+        try requireSafe(fd, maximumBytes: WidgetSnapshotCodec.maximumBytes)
+        var opened = stat()
+        guard fstat(fd, &opened) == 0,
+              UInt64(opened.st_dev) == expected.device,
+              UInt64(opened.st_ino) == expected.inode,
+              Int64(opened.st_size) == expected.size else { throw StoreError.existingObject }
         let data = try readAll(fd, maximumBytes: WidgetSnapshotCodec.maximumBytes)
         guard digest(data) == expected.digest else { throw StoreError.existingObject }
+        // 读取过程中路径也可能被替换，不能只比较读到的旧 fd。
+        var after = stat()
+        guard fstatat(dirfd, fileName, &after, AT_SYMLINK_NOFOLLOW) == 0,
+              isSafeMetadata(after, maximumBytes: WidgetSnapshotCodec.maximumBytes),
+              after.st_dev == opened.st_dev, after.st_ino == opened.st_ino,
+              after.st_size == opened.st_size,
+              after.st_mtimespec.tv_sec == opened.st_mtimespec.tv_sec,
+              after.st_mtimespec.tv_nsec == opened.st_mtimespec.tv_nsec,
+              after.st_ctimespec.tv_sec == opened.st_ctimespec.tv_sec,
+              after.st_ctimespec.tv_nsec == opened.st_ctimespec.tv_nsec else {
+            throw StoreError.existingObject
+        }
     }
 
     private static func requireSafe(_ fd: Int32, maximumBytes: Int,
-                                    allowEmpty: Bool = false) throws {
+                                     allowEmpty: Bool = false) throws {
         var metadata = stat()
         guard fstat(fd, &metadata) == 0,
-              metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
-              metadata.st_uid == getuid(),
-              metadata.st_nlink == 1,
-              metadata.st_mode & 0o777 == 0o600,
-              metadata.st_size >= 0,
-              metadata.st_size <= maximumBytes,
-              allowEmpty || metadata.st_size > 0 else { throw StoreError.unsafeObject }
+              isSafeMetadata(metadata, maximumBytes: maximumBytes, allowEmpty: allowEmpty) else {
+            throw StoreError.unsafeObject
+        }
+    }
+
+    static func isSafeMetadata(_ metadata: stat, maximumBytes: Int,
+                               allowEmpty: Bool = false, owner: uid_t = getuid()) -> Bool {
+        metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG)
+            && metadata.st_uid == owner && metadata.st_nlink == 1
+            && metadata.st_mode & 0o777 == 0o600
+            && metadata.st_size >= 0 && metadata.st_size <= maximumBytes
+            && (allowEmpty || metadata.st_size > 0)
     }
 
     private static func readAll(_ fd: Int32, maximumBytes: Int) throws -> Data {

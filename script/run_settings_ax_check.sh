@@ -193,38 +193,13 @@ run_bounded "$test_log" -project "$project_real" -scheme "$scheme" -configuratio
   test-without-building -resultBundlePath "$tmp_dir/result.xcresult"
 test_exit=$?
 
-if grep -q 'Timed out while enabling automation mode' "$test_log" || grep -q 'automation mode' "$test_log" || grep -q 'existingInstance' "$test_log"; then
-  classification="automation_environment_blocked"
-else
-  summary_class="failed"
-  summary_file="$tmp_dir/summary.json"
-  if [[ -f "$tmp_dir/result.xcresult" ]] && "/usr/bin/xcrun" xcresulttool get test-results summary --path "$tmp_dir/result.xcresult" --format json >"$summary_file" 2>/dev/null; then
-    summary_class="$(python3 - "$summary_file" <<'PY'
-import json
-import sys
-summary = json.loads(open(sys.argv[1], encoding="utf-8").read())
-passed = summary.get("totalTestCount") == 1 and summary.get("passedTests") == 1 and summary.get("failedTests") == 0 and summary.get("skippedTests") == 0
-failures = " ".join(item.get("failureText", "") for item in summary.get("testFailures", []))
-if ("automation" in failures.lower() or "runner failed to initialize" in failures.lower()
-        or "existinginstance" in failures.lower()):
-    print("automation_environment_blocked")
-elif passed:
-    print("passed")
-else:
-    print("failed")
-PY
-    )"
-  fi
-  if [[ "$summary_class" == automation_environment_blocked ]]; then
-    classification="automation_environment_blocked"
-  elif (( test_exit == 65 )); then
-    classification="automation_environment_blocked"
-  elif [[ "$summary_class" == passed && "$test_exit" == 0 ]]; then
-    classification="passed"
-  else
-    classification="test_failed"
-  fi
+summary_file="$tmp_dir/summary.json"
+if [[ -d "$tmp_dir/result.xcresult" ]]; then
+  "/usr/bin/xcrun" xcresulttool get test-results summary --path "$tmp_dir/result.xcresult" --format json >"$summary_file" 2>/dev/null || true
 fi
+classification="$(python3 "$(dirname "$0")/classify_settings_ax.py" \
+  --summary "$summary_file" --log "$test_log" --exit-code "$test_exit")"
+case "$classification" in passed|test_failed|automation_environment_blocked) ;; *) classification=test_failed ;; esac
 
 if [[ "$classification" == passed ]]; then executed=true; else executed=false; fi
 printf '{"classification":"%s","build_exit":%d,"test_exit":%d,"fixture_manifest_verified":true,"fixture_bundle_identity_verified":true,"a01_a07_executed":%s}\n' \

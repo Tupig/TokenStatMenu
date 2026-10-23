@@ -101,6 +101,7 @@ PUBLIC_FILES = [
     "script/check_public_content.py",
     "script/diagnose_swift_toolchain.py",
     "script/run_settings_ax_check.sh",
+    "script/classify_settings_ax.py",
     "script/test_phase2_diagnostics.py",
     "docs/wiki/Home.md",
     "docs/wiki/_Sidebar.md",
