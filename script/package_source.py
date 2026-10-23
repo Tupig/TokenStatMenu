@@ -76,6 +76,7 @@ PUBLIC_FILES = [
     "Tests/TokenStatCoreTests/DirectQuotaChecks.swift",
     "Tests/TokenStatUITests/TokenStatUISnapshotTests.swift",
     "Tests/TokenStatCoreTests/TokenHubQuotaChecks.swift",
+    "Tests/TokenStatCoreTests/ResetVoucherDecoderTests.swift",
     "Tests/TokenStatUITests/TokenHubQuotaStateTests.swift",
     "Tests/TokenStatUITests/SeasunStartupContractTests.swift",
     "Tests/TokenStatUITests/DashboardHistoryTests.swift",
