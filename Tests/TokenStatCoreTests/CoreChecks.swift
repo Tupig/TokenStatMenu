@@ -100,6 +100,7 @@ import TokenStatCore
         try hubChecks()
         try hubScannerChecks()
         try directQuotaChecks()
+        resetVoucherChecks()
         print("\(checks - failures)/\(checks) checks passed")
         if failures > 0 { exit(1) }
     }

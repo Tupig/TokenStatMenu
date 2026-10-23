@@ -52,7 +52,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     }
     /// 与完整渲染测试共用实际卡片样式和内边距，不在 ScrollView 外重建一份布局。
     var overviewContent: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             tokenHubCard
             Text(model.userFacingStatus)
                 .font(.system(size: 10)).foregroundStyle(.secondary)
@@ -77,7 +77,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
                 }
             }
         }
-        .padding(.horizontal, 16).padding(.bottom, 14)
+        .padding(.horizontal, 14).padding(.bottom, 12)
         .groupBoxStyle(PanelCardStyle())
         .tint(PanelPalette.blue)
     }
@@ -91,11 +91,11 @@ typealias ValueState<Value> = SwiftUI.State<Value>
     private var header: some View {
         HStack(spacing: 10) {
             Image(systemName: "waveform.path")
-                .font(.system(size: 17, weight: .semibold)).foregroundStyle(.white)
-                .frame(width: 34, height: 34)
-                .background(PanelPalette.gradient, in: RoundedRectangle(cornerRadius: 10))
+                .font(.system(size: 16, weight: .semibold)).foregroundStyle(.white)
+                .frame(width: 30, height: 30)
+                .background(PanelPalette.gradient, in: RoundedRectangle(cornerRadius: 9))
             VStack(alignment: .leading, spacing: 3) {
-                Text("TokenStatMenu").font(.system(size: 16, weight: .bold, design: .rounded))
+                Text("TokenStatMenu").font(.system(size: 15, weight: .bold, design: .rounded))
                 Text(settings ? "Seasun Token Hub · 偏好设置" : "Seasun Token Hub · \(model.tokenHubQuotaIsDirect && model.freshTokenHubQuota(at: model.tokenHubNow()) != nil ? "后台额度已连接" : "后台额度等待连接")")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
@@ -108,7 +108,7 @@ typealias ValueState<Value> = SwiftUI.State<Value>
             Button { quitAction() } label: {
                 Image(systemName: "power").frame(width: HeaderActionMetrics.actionSize, height: HeaderActionMetrics.actionSize)
             }.buttonStyle(NeutralHeaderActionButtonStyle()).help("退出 TokenStatMenu").accessibilityLabel("退出")
-        }.padding(16)
+        }.padding(14)
     }
     private var localUsageCard: some View {
         GroupBox {

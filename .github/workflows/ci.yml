@@ -61,7 +61,7 @@ jobs:
           # A real App Group is repository configuration, never source. A
           # missing value fails the build instead of shipping a placeholder.
           TOKENSTAT_WIDGET_GROUP: ${{ vars.TOKENSTAT_WIDGET_GROUP }}
-        run: ./script/build_and_run.sh --universal
+        run: ./script/build_and_run.sh --arm64
       - name: Package reviewed source archive
         if: ${{ vars.TOKENSTAT_CLOUD_RELEASE == 'enabled' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: |
@@ -79,9 +79,9 @@ jobs:
           name: tokenstatmenu-release
           if-no-files-found: error
           path: |
-            dist/release/TokenStatMenu-${{ env.RELEASE_VERSION }}-universal.zip
-            dist/release/TokenStatMenu-${{ env.RELEASE_VERSION }}-source.zip
-            dist/release/TokenStatMenu-${{ env.RELEASE_VERSION }}-universal.dmg
+            dist/release/TokenStatMenu.zip
+            dist/release/TokenStatMenu-source.zip
+            dist/release/TokenStatMenu.dmg
             dist/release/release-manifest.json
             dist/release/SHA256SUMS
   publish:

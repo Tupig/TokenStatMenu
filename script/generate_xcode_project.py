@@ -85,7 +85,7 @@ for mode in ["Debug", "Release"]:
     project_configs.append(
         obj(
             "project-config:" + mode,
-            f"isa = XCBuildConfiguration; name = {mode}; buildSettings = {{ MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 5.0; }};",
+            f"isa = XCBuildConfiguration; name = {mode}; buildSettings = {{ ARCHS = arm64; MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 5.0; }};",
         )
     )
     optimization = "-Onone" if mode == "Debug" else "-O"

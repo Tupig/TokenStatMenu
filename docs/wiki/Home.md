@@ -1,50 +1,71 @@
 # TokenStatMenu 文档中心
 
-[返回文档入口](../README.md) · [项目首页](../../README.md)
+**简体中文** | [English](#documentation-hub-english)
 
-TokenStatMenu 使用 Swift、SwiftUI 和 AppKit，在 macOS 菜单栏展示当前活动记录的 Token 速度估算，并分开呈现本机 Codex 记录与 Seasun Token Hub 企业额度。正常使用无需填写 API Endpoint、API Key、模型或额度字段。
+[项目首页](../../README.md) · [下载](https://github.com/Tupig/TokenStatMenu/releases) · [问题反馈](https://github.com/Tupig/TokenStatMenu/issues)
 
-## 按角色阅读
+TokenStatMenu 在菜单栏、面板和小组件中展示 Seasun Token Hub 额度。仅支持 Apple Silicon（M 系列）。普通使用只需先登录 Hub，无需填写接口或密钥。
 
-| 读者 | 目标 | 建议阅读顺序 |
-| --- | --- | --- |
-| 首次使用者 | 启动应用，确认每项数据的来源 | [安装与使用](安装与使用.md) → [统计口径](统计口径.md) → [常见问题](常见问题.md) |
-| 需要调整显示的使用者 | 调整刷新与兼容读取 | [可选偏好](../CONFIGURATION.md) → [常见问题](常见问题.md) |
-| 开发者 | 构建、理解模块、执行验证 | [编译指南](编译指南.md) → [实现范围](../IMPLEMENTATION.md) → [测试指南](测试指南.md) → [CI/CD](CI-CD.md) |
-| 贡献者与维护者 | 报告问题、提交改动、维护公开材料 | [贡献指南](贡献指南.md) → [测试指南](测试指南.md) → [CI/CD](CI-CD.md) |
+## 快速开始
 
-## 使用文档
+```bash
+brew install Tupig/tokenstatmenu/tokenstatmenu
+tokenstatmenu
+```
 
-- [安装与使用](安装与使用.md)：系统要求、源码构建、首次启动、菜单栏与面板、退出和更新。
-- [统计口径](统计口径.md)：实时估算、上轮均速、记录小计、线程分类、企业窗口、未知与过期。
-- [可选偏好](../CONFIGURATION.md)：两项偏好、默认行为、旧配置兼容、保存和重载。
-- [常见问题](常见问题.md)：按现象排查，不要求提交真实配置、凭据或截图。
+Homebrew 需要完整 Xcode 15+。不想编译可下载 [Release DMG](https://github.com/Tupig/TokenStatMenu/releases)，将 App 拖到“应用程序”。两种方式都采用 ad hoc 签名，小组件的 App Group 分发授权仍有限制，见[安装与使用](安装与使用.md)。
 
-## 开发与维护文档
+## 文档导航
 
-- [编译指南](编译指南.md)：SwiftPM、Xcode、双架构 App、签名与构建身份。
-- [测试指南](测试指南.md)：核心检查、原生测试、隔离集成、视觉回归与真实本机验收的边界。
-- [命令行参数](命令行参数.md)：正式 App 参数、构建脚本模式、预览工具和环境变量的区别。
-- [CI/CD](CI-CD.md)：当前 GitHub Actions 的检查内容，以及尚未自动化的分发步骤。
-- [性能与基准](../PERFORMANCE.md)：已优化路径、可复现合成基准，以及与真实整机 CPU/内存的区别。
-- [贡献指南](贡献指南.md)：Issue、修改流程、隐私要求和提交前清单。
-
-## 设计与证据
-
-| 文档 | 适合什么时候读 |
+| 使用者 | 内容 |
 | --- | --- |
-| [实现范围](../IMPLEMENTATION.md) | 先确认正式 App 的能力、限制与模块分工 |
-| [设计说明](../DESIGN.md) | 深入理解来源校验、核算、刷新、失效和安全边界 |
-| [UI 测试说明](../UI_TESTING.md) | 维护合成快照、理解系统渲染环境差异 |
-| [性能与基准](../PERFORMANCE.md) | 了解菜单栏热路径的测量方法、结果与适用边界 |
-| [验证记录](../VALIDATION.md) | 查看已记录验证的时间、范围与限制；历史通过不代表当前工作区已验证 |
-| 源码归档 | 源码 ZIP 按显式白名单导出；见[编译指南](编译指南.md)与 [CI/CD](CI-CD.md) |
-| [隐私说明](../../PRIVACY.md) | 了解本机记录、Hub 登录会话、日志和公开内容边界 |
+| [安装与使用](安装与使用.md) | Homebrew、DMG、更新、偏好与小组件 |
+| [统计口径](统计口径.md) | 金额、百分比、本地 Token、速度与未知值 |
+| [常见问题](常见问题.md) | 无数据、不同步、签名与多副本排查 |
 
-## 阅读前须知
+| 开发者 | 内容 |
+| --- | --- |
+| [编译指南](编译指南.md) | SwiftPM、Xcode、签名与 arm64 发布 |
+| [命令行参数](命令行参数.md) | App 参数、脚本模式和环境变量 |
+| [测试指南](测试指南.md) | 回归、图像基线、安装与升级验证 |
+| [CI/CD](CI-CD.md) | 五项发布资产、GitHub Release 与 Tap |
+| [贡献指南](贡献指南.md) | 修改流程、双语文档与隐私要求 |
 
-企业 5 小时、7 天与月度数据是 Hub 返回的**金额额度**，本机 Token 是有限范围记录的**Token 小计**。这两类数据不能相互换算。菜单栏“实时≈”来自本机活动事件的区间差分，不能当作服务端逐 Token 的权威瞬时速度。没有可信数据时显示“未知”或“—”，不补零。
+文档只保留根 README 和 `docs/wiki/`，每页先中文、后英文。数字和命令以源码为准；当前发布版本以 Releases 和 Homebrew 配方为准。
 
-当前仓库提供源码和本地构建方式。正式 Release 资产、Developer ID 签名和 Apple 公证应以实际发布页及验证记录为准，不能从源码构建成功推断已经完成分发认证。
+---
 
-相关页面：[安装与使用](安装与使用.md) · [统计口径](统计口径.md) · [贡献指南](贡献指南.md)
+# Documentation Hub (English)
+
+[简体中文](#tokenstatmenu-文档中心) | **English**
+
+[Project](../../README.md#tokenstatmenu-english) · [Downloads](https://github.com/Tupig/TokenStatMenu/releases) · [Issues](https://github.com/Tupig/TokenStatMenu/issues)
+
+TokenStatMenu shows Seasun Token Hub quotas in the menu bar, panel and widget. Apple Silicon (M-series) only. Sign in to Hub first; no endpoint or API Key entry is needed.
+
+## Quick Start
+
+```bash
+brew install Tupig/tokenstatmenu/tokenstatmenu
+tokenstatmenu
+```
+
+Homebrew needs full Xcode 15+. For a prebuilt App, download the [Release DMG](https://github.com/Tupig/TokenStatMenu/releases) and drag the App to Applications. Both use ad hoc signing. Widget App Group authorization remains a distribution limitation; see [Installation](安装与使用.md#installation-and-usage-english).
+
+## Documentation
+
+| For Users | Contents |
+| --- | --- |
+| [Installation and Usage](安装与使用.md#installation-and-usage-english) | Homebrew, DMG, updates, preferences and widget |
+| [Metric Definitions](统计口径.md#metric-definitions-english) | Amounts, percentages, local Tokens, rates and unknown values |
+| [FAQ](常见问题.md#faq-english) | Missing data, stale widgets, signing and duplicate copies |
+
+| For Developers | Contents |
+| --- | --- |
+| [Build Guide](编译指南.md#build-guide-english) | SwiftPM, Xcode, signing and arm64 releases |
+| [CLI Options](命令行参数.md#cli-options-english) | App arguments, script modes and environment |
+| [Testing Guide](测试指南.md#testing-guide-english) | Regressions, image references, install and upgrade checks |
+| [CI/CD](CI-CD.md#cicd-english) | Five release assets, GitHub Release and Tap |
+| [Contributing](贡献指南.md#contributing-english) | Workflow, bilingual docs and privacy |
+
+Documentation lives only in the root README and `docs/wiki/`. Each page has Chinese first and English second. Source code defines behavior; Releases and the Homebrew formula identify what is publicly available.

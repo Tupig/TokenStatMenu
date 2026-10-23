@@ -16,6 +16,27 @@ final class WidgetSnapshotCodecTests: XCTestCase {
 
     // MARK: - Round trips
 
+    func testVoucherProjectionAndScheduledExpiryBoundaries() {
+        for state in [WidgetQuotaSnapshot.HubState.ready, .stale, .unavailable, .disabled, .invalid] {
+            for count: Int? in [nil, 0, 3] {
+                let snapshot = WidgetQuotaSnapshot(writtenAt: now, observedAt: now,
+                    validUntil: now.addingTimeInterval(120), hubSource: .direct, hubState: state,
+                    fiveHour: .init(remainingPercent: 50, resetsAt: now.addingTimeInterval(60)),
+                    sevenDay: .init(remainingPercent: 70, resetsAt: now.addingTimeInterval(60)),
+                    monthly: nil, local: nil, resetVoucherCount: count)
+                XCTAssertEqual(snapshot.currentResetVoucherCount(at: now), state == .ready ? count : nil)
+                XCTAssertEqual(snapshot.currentResetVoucherCount(at: now.addingTimeInterval(120)), state == .ready ? count : nil)
+                XCTAssertNil(snapshot.currentResetVoucherCount(at: now.addingTimeInterval(120.001)))
+                XCTAssertNil(snapshot.currentResetVoucherCount(at: now.addingTimeInterval(-1)))
+                let dates = snapshot.timelineDates(after: now)
+                XCTAssertEqual(dates.count, 2, "重复重置边界只生成一个条目")
+                XCTAssertNil(snapshot.currentWindow(snapshot.fiveHour, at: dates[0]))
+                XCTAssertNil(snapshot.currentResetVoucherCount(at: dates[1]))
+                XCTAssertTrue(snapshot.timelineDates(after: dates[1]).isEmpty)
+            }
+        }
+    }
+
     func testRoundTripKeepsEveryPresentField() throws {
         let snapshot = WidgetQuotaSnapshot(
             writtenAt: now,
@@ -24,7 +45,9 @@ final class WidgetSnapshotCodecTests: XCTestCase {
             hubSource: .direct,
             hubState: .ready,
             fiveHour: WidgetQuotaSnapshot.Window(remainingPercent: 87.66,
-                                                 resetsAt: now.addingTimeInterval(3_600)),
+                                                 resetsAt: now.addingTimeInterval(3_600),
+                                                 usedAmount: 61.7, limitAmount: 500,
+                                                 sourceSymbol: "$"),
             sevenDay: WidgetQuotaSnapshot.Window(remainingPercent: 43.22, resetsAt: nil),
             monthly: WidgetQuotaSnapshot.Monthly(usedAmount: 12.34, limitAmount: 100,
                                                  sourceSymbol: "$"),
@@ -40,8 +63,13 @@ final class WidgetSnapshotCodecTests: XCTestCase {
         XCTAssertEqual(decoded.hubSource, .direct)
         XCTAssertEqual(decoded.hubState, .ready)
         XCTAssertEqual(decoded.fiveHour?.remainingPercent, 87.66)
+        XCTAssertEqual(decoded.fiveHour?.usedAmount, 61.7)
+        XCTAssertEqual(decoded.fiveHour?.limitAmount, 500)
+        XCTAssertEqual(decoded.fiveHour?.sourceSymbol, "$")
+        XCTAssertEqual(decoded.fiveHour?.usedPercent ?? -1, 12.34, accuracy: 0.001)
         XCTAssertEqual(decoded.sevenDay?.remainingPercent, 43.22)
         XCTAssertNil(decoded.sevenDay?.resetsAt)
+        XCTAssertNil(decoded.sevenDay?.usedAmount)
         XCTAssertEqual(decoded.monthly?.usedAmount, 12.34)
         XCTAssertEqual(decoded.monthly?.limitAmount, 100)
         XCTAssertEqual(decoded.monthly?.sourceSymbol, "$")
@@ -340,6 +368,53 @@ final class WidgetSnapshotCodecTests: XCTestCase {
                                    with: "\"writtenAtMs\":0")
         let decoded = try WidgetSnapshotCodec.decode(Data(payload.utf8), now: now)
         XCTAssertEqual(decoded.writtenAt, Date(timeIntervalSince1970: 0))
+    }
+
+    /// 旧版快照的窗口只有剩余比例和重置时间；升级瞬间必须解码为未知金额。
+    func testDecodeAcceptsWindowWithoutAmountFields() throws {
+        let payload = validPayload(replacing: "\"fiveHour\":null",
+            with: "\"fiveHour\":{\"remainingPercent\":50,\"resetsAtMs\":null}")
+        let decoded = try WidgetSnapshotCodec.decode(Data(payload.utf8), now: now)
+        XCTAssertEqual(decoded.fiveHour?.remainingPercent, 50)
+        XCTAssertNil(decoded.fiveHour?.usedAmount)
+        XCTAssertNil(decoded.fiveHour?.limitAmount)
+        XCTAssertNil(decoded.fiveHour?.sourceSymbol)
+    }
+
+    func testWindowAmountsRejectInvalidValues() {
+        let negative = WidgetQuotaSnapshot(
+            writtenAt: now, observedAt: nil, validUntil: nil,
+            hubSource: .none, hubState: .unavailable,
+            fiveHour: WidgetQuotaSnapshot.Window(remainingPercent: 50, resetsAt: nil,
+                                                 usedAmount: -1, limitAmount: 500,
+                                                 sourceSymbol: "$"),
+            sevenDay: nil, monthly: nil, local: nil)
+        XCTAssertThrowsError(try WidgetSnapshotCodec.encode(negative)) { error in
+            XCTAssertEqual(error as? WidgetSnapshotCodec.CodecError,
+                           .outOfRange("fiveHour.usedAmount"))
+        }
+
+        let longSymbol = WidgetQuotaSnapshot(
+            writtenAt: now, observedAt: nil, validUntil: nil,
+            hubSource: .none, hubState: .unavailable,
+            fiveHour: WidgetQuotaSnapshot.Window(remainingPercent: 50, resetsAt: nil,
+                                                 usedAmount: 1, limitAmount: 500,
+                                                 sourceSymbol: "TOOLONG"),
+            sevenDay: nil, monthly: nil, local: nil)
+        XCTAssertThrowsError(try WidgetSnapshotCodec.encode(longSymbol)) { error in
+            XCTAssertEqual(error as? WidgetSnapshotCodec.CodecError,
+                           .outOfRange("fiveHour.sourceSymbol"))
+        }
+
+        for literal in ["-1", "\"1\"", "true"] {
+            let payload = validPayload(replacing: "\"fiveHour\":null",
+                with: "\"fiveHour\":{\"remainingPercent\":50,\"resetsAtMs\":null,\"usedAmount\":\(literal)}")
+            XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(payload.utf8), now: now),
+                                 "usedAmount \(literal) must be rejected")
+        }
+        let longSymbolPayload = validPayload(replacing: "\"fiveHour\":null",
+            with: "\"fiveHour\":{\"remainingPercent\":50,\"resetsAtMs\":null,\"sourceSymbol\":\"TOOLONG\"}")
+        XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(longSymbolPayload.utf8), now: now))
     }
 }
 

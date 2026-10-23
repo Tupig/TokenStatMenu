@@ -105,6 +105,8 @@ struct DirectQuotaTransportSnapshot: Sendable {
     let fiveHour: TokenHubWindowQuota?
     let sevenDay: TokenHubWindowQuota?
     let monthly: TokenHubMonthlyUsage?
+    /// 重置券数量；接口失败时为 nil，不能当作 0。
+    let resetVoucherCount: Int?
     let observedAt: Date
 
     func materializedSnapshot() -> TokenHubQuotaSnapshot {
@@ -113,12 +115,14 @@ struct DirectQuotaTransportSnapshot: Sendable {
                                                   executablePath: "sanitized")
         return TokenHubQuotaSnapshot(identity: sanitizedIdentity, fiveHour: fiveHour,
                                      sevenDay: sevenDay, monthly: monthly,
+                                     resetVoucherCount: resetVoucherCount,
                                      observedAt: observedAt)
     }
 
     init(snapshot: TokenHubQuotaSnapshot) {
         fiveHour = snapshot.fiveHour; sevenDay = snapshot.sevenDay
-        monthly = snapshot.monthly; observedAt = snapshot.observedAt
+        monthly = snapshot.monthly; resetVoucherCount = snapshot.resetVoucherCount
+        observedAt = snapshot.observedAt
     }
 }
 
@@ -433,6 +437,11 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     private var lastHistorySampleMonotonic: TimeInterval?
     /// 将显示数据发布到内嵌小组件的 App Group。
     private let widgetPublisher = WidgetSnapshotPublisher()
+    /// 只跳过首次读取尚未结束的空状态；后续失败必须发布未知。
+    private(set) var hasCompletedInitialQuotaRead = false
+    var shouldPublishWidgetState: Bool {
+        tokenHubQuotaSnapshot != nil || hasCompletedInitialQuotaRead
+    }
     var widgetSnapshotPublished: Bool { widgetPublisher.lastPublishSucceeded }
     var widgetChannelUnavailable: Bool { widgetPublisher.channelUnavailable }
     var onTick: (() -> Void)?
@@ -550,6 +559,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         // 预览和测试不发布快照，避免模拟数值出现在真实系统界面。
         guard !isPreview, !isTestFixture else { return }
         let presentation = quotaPresentation(at: now)
+        guard shouldPublishWidgetState else { return }
         let source: WidgetQuotaSnapshot.HubSource
         if tokenHubQuotaIsDirect, tokenHubQuotaStatus == .connected || tokenHubQuotaStatus == .stale {
             source = .direct
@@ -573,7 +583,13 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             guard let quota else { return nil }
             let percent = NSDecimalNumber(decimal: quota.remainingPercent).doubleValue
             guard percent.isFinite, (0...100).contains(percent) else { return nil }
-            return WidgetQuotaSnapshot.Window(remainingPercent: percent, resetsAt: quota.resetAt)
+            let used = NSDecimalNumber(decimal: quota.usedAmount).doubleValue
+            let limit = NSDecimalNumber(decimal: quota.limitAmount).doubleValue
+            return WidgetQuotaSnapshot.Window(
+                remainingPercent: percent, resetsAt: quota.resetAt,
+                usedAmount: used.isFinite && used >= 0 ? used : nil,
+                limitAmount: limit.isFinite && limit >= 0 ? limit : nil,
+                sourceSymbol: quota.sourceSymbol.count <= 4 ? quota.sourceSymbol : nil)
         }
 
         let monthly = presentation.monthlyCurrent.map { usage in
@@ -739,7 +755,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     private func menuPercent(_ value: Decimal) -> String {
         let number = NSDecimalNumber(decimal: value).doubleValue
         guard number.isFinite else { return "—" }
-        return String(format: "%.1f%%", min(100, max(0, number)))
+        return String(format: "%.2f%%", min(100, max(0, number)))
     }
 
     private func menuAmount(_ value: Decimal) -> String {
@@ -1172,6 +1188,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         let identity: TokenHubIdentity
         do { identity = try directQuota.discoverTarget() }
         catch {
+            hasCompletedInitialQuotaRead = true
             tokenHubDirectScanInFlight = false
             tokenHubQuotaSnapshot = nil; tokenHubQuotaIsDirect = false
             tokenHubDirectFailure = nil
@@ -1193,6 +1210,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             switch result {
             case .success(let snapshot):
                 guard source.identityIsCurrent(identity) else {
+                    self.hasCompletedInitialQuotaRead = true
                     self.tokenHubQuotaSnapshot = nil
                     self.tokenHubQuotaIsDirect = false
                     self.tokenHubDirectFailure = .identityChanged
@@ -1211,6 +1229,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     }
 
     private func tokenHubStatusConnected(interval: TimeInterval) {
+        hasCompletedInitialQuotaRead = true
         tokenHubQuotaStatus = .connected
         tokenHubQuotaFailure = nil
         tokenHubDirectFailure = nil
@@ -1220,6 +1239,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     }
 
     private func tokenHubStatusFailed(_ error: Error, interval: TimeInterval) {
+        hasCompletedInitialQuotaRead = true
         let failure = (error as? TokenHubDirectQuotaFailure) ?? .transportFailed
         tokenHubQuotaSnapshot = nil
         tokenHubQuotaIsDirect = false
@@ -1337,6 +1357,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     }
 
     func invalidateTokenHubQuota(status: TokenHubQuotaStatus) {
+        hasCompletedInitialQuotaRead = true
         tokenHubGeneration &+= 1
         cancelTokenHubSchedule()
         tokenHubQuotaSnapshot = nil; tokenHubQuotaFailure = nil; tokenHubDirectFailure = nil
@@ -1348,6 +1369,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         guard !isShuttingDown, tokenHubGeneration == resultGeneration, cachedTokenHubPermission,
               config.dataSource == "localCodex", mode == .localCodex,
               tokenHubAutomaticReadingEnabled else { return }
+        hasCompletedInitialQuotaRead = true
         if result.status == .connected, let snapshot = result.snapshot {
             if let previous = tokenHubQuotaSnapshot, previous.identity != snapshot.identity {
                 tokenHubQuotaSnapshot = nil

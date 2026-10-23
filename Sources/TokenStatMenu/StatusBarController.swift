@@ -121,6 +121,7 @@ struct StatusBarContentFactories {
             let sourceStatus: String
             let widgetSnapshotPublished: Bool
             let widgetChannelUnavailable: Bool
+            let resetVoucherPresent: Bool
             let backgroundServiceResources: BackgroundServiceResources
         }
         let fiveHourResetPresent = projection.fiveHourCurrent.map { !$0.resetDisplay.isEmpty && $0.resetDisplay != "未知" } ?? false
@@ -146,6 +147,7 @@ struct StatusBarContentFactories {
             sourceStatus: model.sourceStatus,
             widgetSnapshotPublished: model.widgetSnapshotPublished,
             widgetChannelUnavailable: model.widgetChannelUnavailable,
+            resetVoucherPresent: model.tokenHubQuotaSnapshot?.resetVoucherCount != nil,
             backgroundServiceResources: model.backgroundServiceResources)
         if let data = try? JSONEncoder().encode(report) {
             DispatchQueue.global(qos: .utility).async { try? data.write(to: url, options: .atomic) }

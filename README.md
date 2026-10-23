@@ -1,44 +1,70 @@
 # TokenStatMenu
 
-<img src="Resources/AppIcon.png" width="96" alt="TokenStatMenu 应用图标">
+[![CI](https://img.shields.io/github/actions/workflow/status/Tupig/TokenStatMenu/ci.yml?branch=main&label=CI)](https://github.com/Tupig/TokenStatMenu/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Tupig/TokenStatMenu)](https://github.com/Tupig/TokenStatMenu/releases)
+[![License](https://img.shields.io/github/license/Tupig/TokenStatMenu)](LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-13%2B-blue?logo=apple)](#安装)
+[![Swift](https://img.shields.io/badge/Swift-native-orange?logo=swift)](#编译)
 
-面向 **Seasun Token Hub** 用户的原生 macOS 菜单栏统计工具，使用 Swift、SwiftUI 和 AppKit，提供中文界面。在本机 Token Hub 已运行并登录的前提下，自动读取 5 小时、7 天与月度额度，并展示当前配置关联的本地 Codex 记录，无需填写接口、密钥、模型或字段。
+**简体中文** | [English](#tokenstatmenu-english)
 
-**从这里开始：[文档中心](docs/wiki/Home.md) · [安装与使用](docs/wiki/安装与使用.md) · [统计口径](docs/wiki/统计口径.md) · [常见问题](docs/wiki/常见问题.md)**
+<img src="Resources/AppIcon.png" width="96" alt="TokenStatMenu 图标">
 
-> [!IMPORTANT]
-> 菜单栏的“实时≈”是本地活动记录的 token/s 估算；“上轮均”包含工具、网络与等待时间。权威服务端瞬时吞吐尚未接通，见 [Issue #37](https://github.com/Tupig/TokenStatMenu/issues/37)。本地记录小计、企业额度金额和完整账户账单是不同数据，不能互相替代。
+在 macOS 菜单栏查看 **Seasun Token Hub** 的 5 小时、7 天额度和月度用量。用 Swift、SwiftUI、AppKit 和 WidgetKit 编写，没有 Electron，也不需要另填 API Key。
 
-## 功能与适用范围
+[文档中心](docs/wiki/Home.md) · [安装与使用](docs/wiki/安装与使用.md) · [常见问题](docs/wiki/常见问题.md) · [下载 Release](https://github.com/Tupig/TokenStatMenu/releases)
 
-| 能看到什么 | 来源与实际含义 |
+## 目录
+
+- [功能](#功能)
+- [安装](#安装)
+- [更新](#更新)
+- [小组件](#小组件)
+- [编译](#编译)
+- [测试](#测试)
+- [项目结构](#项目结构)
+- [隐私与限制](#隐私与限制)
+- [贡献](#贡献)
+
+## 功能
+
+| 位置 | 显示内容 |
 | --- | --- |
-| 菜单栏速度 | 有新鲜、连续的活动累计记录时显示输入／输出速率估算；没有依据时显示未知或上轮均速 |
-| 5 小时与 7 天额度 | Token Hub 后台只读响应中的金额额度、剩余比例和重置时间；缺失窗口保持未知 |
-| 月度用量 | 后台提供的月度金额，与本地 Token 量分开显示 |
-| 本地 Token 与对话分类 | 有界扫描内可核算的输入、输出、总量与线程分类；不代表本次启动消耗或侧栏全部对话 |
-| 缓存与线程轮次明细 | 展开概览中的明细区，查看缓存读取、未缓存输入、命中率及完整轮次用量；缺失和无效值分别说明 |
-| 可选界面兼容快照 | 已有辅助功能信任时的回退来源，明确标注“界面”；关闭它不会关闭后台直接读取 |
-| 中文菜单栏界面 | 无主窗口、适配深浅色，不使用 Electron，不引入第三方运行时框架 |
+| 菜单栏 | `38.10% \| 74.40% \| $3,488.22`：依次为 5 小时已用、7 天已用、月度用量 |
+| 概览面板 | 5 小时和 7 天的剩余比例、已用金额、额度与重置时间；月度用量和重置券 |
+| 小尺寸小组件 | 5 小时、7 天进度条；条下左侧为最大额度，右侧为重置时间；月度用量和重置券 |
+| 本地记录 | 当前配置关联的 Codex Token 小计、线程分类、缓存及完整轮次明细 |
 
-应用目前专用于 Seasun Token Hub。通用 API、Ollama、手填网关、价格和代理接入不属于正式界面；核心库保留的旧协议代码用于回归测试，不能据此推断正式 App 已支持这些接入方式。
+百分比显示两位小数，金额最多两位小数，月度金额固定两位。缺失、过期或已经重置的数据显示“未知”或 `—`，不会用零或另一个窗口填补。上面的数字只是格式示例。
 
-当前配置只能关联同名 provider 的本地记录，不能反向证明全部历史会话的实际网关路由。无法核算、超出覆盖范围或来源缺失的部分会标为未知，不当作零。完整解释见 [统计口径](docs/wiki/统计口径.md)。
+菜单栏只显示三个额度数字，不显示本地速度。活动区间估算和上轮均速仍可在面板与详情中查看；它们不是服务端瞬时吞吐。[统计口径](docs/wiki/统计口径.md)介绍各项数字的来源和计算方法。
 
-输入 Token 已包含缓存读取，不能将两者再次相加。明细仅保留当前扫描范围内最多 32 个线程、每线程 16 个完整轮次、合计 128 个轮次；重新扫描替换旧快照，不建立跨重启历史账本。整轮用时与均速包含工具、网络和等待，模型调用用时、平均 TTFT 与 decode TPS 在没有来源事件时保持未知。
+## 安装
 
-## 快速开始
+需要 macOS 13 或更新版本。先启动并登录 Seasun Token Hub，再打开 TokenStatMenu。后台额度读取不需要辅助功能权限。
 
-需要 macOS 13 或更新版本，Apple Silicon 或 Intel Mac。Homebrew 安装从正式版本源码在本机编译，需要完整 Xcode 15 或更新版本；Homebrew 对宿主系统的支持范围另以其要求为准。Apple Silicon 为优先验证平台，Intel 已有交叉构建；不能把交叉构建当作 Intel 硬件验收。
+### Homebrew
 
-先正常启动并登录 Seasun Token Hub，再通过项目的 [Homebrew tap](https://github.com/Tupig/homebrew-tokenstatmenu) 安装和打开：
+需要 Homebrew 和完整 Xcode 15+；只有 Command Line Tools 不够。
 
 ```bash
 brew install Tupig/tokenstatmenu/tokenstatmenu
 tokenstatmenu
 ```
 
-安装与升级只更新磁盘上的应用，不会自动启动、退出或重启已有实例。更新时先从 TokenStatMenu 菜单退出应用，再执行：
+Homebrew 从 Release 源码包编译本机架构，App 保存在 Homebrew 目录内，不覆盖手动安装的副本。[Tap 仓库](https://github.com/Tupig/homebrew-tokenstatmenu)负责配方更新。
+
+### DMG
+
+1. 在 [Releases](https://github.com/Tupig/TokenStatMenu/releases) 下载 `TokenStatMenu.dmg` 和同版 `SHA256SUMS`。
+2. 用 `shasum -a 256 <文件名>` 核对摘要。
+3. 打开 DMG，把 `TokenStatMenu.app` 拖到“应用程序”，再从安装位置打开。
+
+1.1.7 起只支持 Apple Silicon（M 系列），不支持 Intel。Release 也提供 App ZIP 和源码 ZIP。下载包采用 ad hoc 签名，尚未做 Developer ID 签名或 Apple 公证；系统或企业策略可能阻止运行，不建议关闭系统保护来绕过。
+
+## 更新
+
+Homebrew 用户先从面板退出旧实例，然后执行：
 
 ```bash
 brew update
@@ -46,132 +72,188 @@ brew upgrade Tupig/tokenstatmenu/tokenstatmenu
 tokenstatmenu
 ```
 
-Homebrew 从正式 Release 的校验源码包构建原生 App，使用本机 ad hoc 签名；正式 App 仅依赖系统框架。它不会替换个人“应用程序”目录中的手动安装副本，也没有应用内自动更新器。完整说明见 [安装与使用](docs/wiki/安装与使用.md)。
+DMG 用户下载新版，退出旧实例后替换 App。不要同时启动 Homebrew 版和手动副本。设置页会显示正在运行的版本与构建号。应用没有内置自动更新器，升级不会清除个人偏好。
 
-开发者也可直接构建源码：
+## 小组件
 
-1. 在本机正常启动并登录 Seasun Token Hub。
-2. 克隆仓库并构建应用：
+只提供 **small** 尺寸。支持的系统上，在小组件图库中搜索 TokenStatMenu 并添加；桌面小组件需要 macOS 14+。文字统一为 10pt，月度只显示已用金额，没有月度进度条。
 
-   ```bash
-   git clone https://github.com/Tupig/TokenStatMenu.git
-   cd TokenStatMenu
-   ./script/build_and_run.sh --build-only
-   ```
+> [!IMPORTANT]
+> 小组件读写依赖 App Group 授权。本机 Apple Development 签名候选已验证；公开 DMG 和 Homebrew 的 ad hoc 签名不能保证获得该权限。包内含扩展不等于小组件能够读取数据。菜单栏与面板不受这项限制影响；分发签名问题见 [#88](https://github.com/Tupig/TokenStatMenu/issues/88)。
 
-3. 先退出已运行的旧版 TokenStatMenu，再打开新产物：
-
-   ```bash
-   open dist/TokenStatMenu.app
-   ```
-
-正常启动只显示菜单栏条目，点击后展开面板；没有主窗口属于预期行为。不需要创建 plist，也不需要授予辅助功能权限来连接后台。设置里的辅助功能入口仅用于可选界面兼容读取。
-
-首次 SwiftPM 构建可能需要联网解析测试依赖。当前 1.1.4/build6 历史 Release 为 ZIP-only；1.1.5/build7 已在同一 Universal App ZIP 和源码 ZIP 之外增加 Finder 友好的 DMG 安装包装，并已按五资产正式发布。DMG 不是新运行时或更新器，必须与同一已审核 App、源码、manifest 和 SHA256SUMS 绑定。二进制发行使用 ad hoc 签名，尚未完成 Developer ID 签名或 Apple 公证；Homebrew 通过在本机编译源码安装。固定路径安装、升级、回退和首次打开说明见 [安装与使用](docs/wiki/安装与使用.md)。
-
-## 文档导航
-
-文档采用 README 入口、文档中心和专题页的结构。可以按下面的任务选择阅读路径，也可从 [文档目录](docs/README.md) 查找全部页面。
-
-| 你要做什么 | 建议阅读 |
-| --- | --- |
-| 第一次运行或更新应用 | [安装与使用](docs/wiki/安装与使用.md) → [可选偏好](docs/CONFIGURATION.md) |
-| 看懂速度、额度和会话数 | [统计口径](docs/wiki/统计口径.md) → [常见问题](docs/wiki/常见问题.md) |
-| 了解读取范围和会话复用 | [隐私说明](PRIVACY.md) → [设计说明](docs/DESIGN.md) |
-| 编译、测试或调试 | [编译指南](docs/wiki/编译指南.md) → [测试指南](docs/wiki/测试指南.md) → [命令行参数](docs/wiki/命令行参数.md) |
-| 查看自动检查与交付状态 | [CI/CD](docs/wiki/CI-CD.md) → [实现范围](docs/IMPLEMENTATION.md) → [验证状态](docs/VALIDATION.md) |
-| 报告问题或贡献代码 | [贡献指南](docs/wiki/贡献指南.md) → [Issues](https://github.com/Tupig/TokenStatMenu/issues) |
-
-## 整体架构
-
-```text
-AppKit NSStatusItem + NSPopover
-  └─ AppModel：专用启动、来源状态、可选偏好与后台调度
-      ├─ Token Hub 只读会话交换 → 5 小时／7 天／月度后台额度
-      ├─ 当前 provider 与 Hub origin 匹配 → 有界本地 Codex 记录扫描
-      │   └─ Token 小计、线程分类、活动速率估算、完整轮次均速
-      ├─ 已有系统信任下的可选 AX 兼容读取 → 独立界面快照
-      └─ 共享只读快照发布（App Group 容器）
-WidgetKit 扩展（内嵌于 App 的 Contents/PlugIns）
-  └─ 读取共享快照 → 小/中号渲染，缺失显示“未知”
-SwiftUI：概览、数据来源、偏好设置
-```
-
-后台额度、界面快照与本地记录各自保留来源语义。后台直接读取不受可选 AX 开关影响；目标退出或身份变化会失效旧结果，重新运行后再识别并读取。正式运行不启动旧代理、不改 Hub／Codex 连接配置，也不调用任意用户填写的企业 URL。
-
-来源流程、计量边界、刷新时效与安全失败条件见 [设计说明](docs/DESIGN.md)。
-
-## 文件与职责
-
-| 位置 | 职责 |
-| --- | --- |
-| `Sources/TokenStatMenu/` | AppKit 菜单栏与弹出面板、SwiftUI 界面、来源调度、偏好存储、共享快照发布与 AX 适配 |
-| `Sources/TokenStatCore/` | 本地记录核算、后台额度交换与解析、窗口模型及旧协议回归组件 |
-| `Sources/TokenStatWidgetShared/` | 菜单栏与小组件共用的只读快照模型、字节编解码与 App Group 读写 |
-| `Sources/TokenStatWidgetExtension/` | 内嵌的 WidgetKit 扩展：时间线提供器与小/中号渲染 |
-| `Resources/` | 应用元数据、图标、Widget 扩展配置与仅含可选偏好的示例 plist |
-| `Tests/` | 纯合成核心检查、共享协议检查、原生状态与界面快照测试 |
-| `script/` | 原生构建、隔离集成、离线渲染、文档校验与源码导出 |
-| `docs/wiki/` | 面向使用者、开发者和贡献者的专题指南 |
-| `docs/DESIGN.md`、`docs/IMPLEMENTATION.md` | 设计细节、当前支持范围与剩余工作 |
-| `docs/VALIDATION.md` | 当前验证范围、复验方法与未验收限制；历史通过不自动等于当前全部能力已验收 |
-
-## 构建与运行
-
-在仓库根目录执行。构建不会按进程名关闭其他应用，打开新实例前应先退出旧版，避免误看另一份构建。
-
-| 命令 | 结果 |
-| --- | --- |
-| `./script/build_and_run.sh --build-only` | 构建本机架构 Debug `.app`，不启动应用 |
-| `./script/build_and_run.sh --universal` | 构建 arm64 与 x86_64 Release 通用 `.app`，不启动应用 |
-| `./script/build_and_run.sh` | 构建并运行本机架构 Debug `.app` |
-| `./script/build_and_run.sh --release` | 构建后运行本机架构 Release `.app`，不是只编译模式 |
-| `swift build --force-resolved-versions -c release --product TokenStatMenu` | 按审核锁文件编译 SwiftPM 可执行目标；不会单独完成 `.app` 资源打包 |
-
-也可打开 `TokenStatMenu.xcodeproj`，选择 TokenStatMenu Scheme 和 My Mac 编译。若默认开发目录仍指向 Command Line Tools，可只为当前命令选择完整 Xcode：
+## 编译
 
 ```bash
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
-  -project TokenStatMenu.xcodeproj \
-  -scheme TokenStatMenu \
-  -configuration Release build
+git clone https://github.com/Tupig/TokenStatMenu.git
+cd TokenStatMenu
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  ./script/build_and_run.sh --build-only
+open dist/TokenStatMenu.app
 ```
 
-更多环境准备、图标资源、双架构、构建身份和常见错误见 [编译指南](docs/wiki/编译指南.md)；发布前检查与签名限制见 [CI/CD](docs/wiki/CI-CD.md)。
+上述 SwiftPM 构建只组装主 App。带小组件的本机开发版使用 `./script/build_and_run.sh --dev-widget`，需要 Apple Development 身份；它会安装到 `~/Applications` 并重启应用和小组件相关进程。
 
-SwiftPM 构建和测试使用 `--force-resolved-versions`，只接受已提交的 `Package.resolved`。测试依赖在不同 Swift 工具链下会选择不同的兼容清单，锁文件包含这两条依赖图的审核版本；缺少必要 pin 或版本冲突时应停止，不能通过自动解析、构建后恢复锁文件或跳过源码一致性检查来掩盖。正式 App 的运行时依赖不因此增加。
+本地构建自动递增 App 与扩展的 build 号。arm64 发布构建保留已提交的 build，并要求显式设置 App Group。完整命令见[编译指南](docs/wiki/编译指南.md)。Python 仅供构建、检查和打包，不进入 App。
 
-## 验证与维护
+## 测试
 
 ```bash
-# 纯合成核心检查
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 swift run --force-resolved-versions TokenStatCoreChecks
-
-# 原生 XCTest 与界面回归（需要完整 Xcode：Command Line Tools 不含 XCTest.framework）
 swift test --force-resolved-versions
-
-# 核心、只构建及隔离启动集成
-./script/test.sh
-
-# 按白名单生成源码 ZIP，不改写已跟踪文件
-python3 script/package_source.py
-
-# 检查文档链接与公开内容
-python3 script/check_docs.py
-python3 script/check_public_content.py
-
-# 发布资产合同（合成 Git/ZIP 与隔离的本机签名样本）
+TOKENSTAT_SKIP_BUILD_BUMP=1 ./script/test.sh
 python3 -B script/test_release_assets.py
+python3 -B script/check_docs.py --self-test
+python3 -B script/check_public_content.py
+git diff --check
 ```
 
-正式版本推送 `vMAJOR.MINOR.PATCH` 标签后，由 [macOS CI 与发布工作流](.github/workflows/ci.yml) 检查版本、源码提交和 `main` 归属，构建 arm64 + x86_64 Universal App。该单一工作流也在 `main` push 和 pull request 上运行只读检查；只有 canonical 仓库的版本标签会在构建成功后进入发布 job。当前 1.1.4 历史合同发布四项资产；从 1.1.5/build7 起，目标是五项资产：应用 ZIP、源码 ZIP、同一 App 的 Universal DMG、`release-manifest.json` 和 `SHA256SUMS`。构建检查与写入 Release 的 job 分开授权；相同内容可安全重跑，不会覆盖不同内容的既有资产。DMG 只提供将 App 拖入“应用程序”的 Finder 包装，不声明 Developer ID 或公证。维护者步骤和失败恢复见 [CI/CD](docs/wiki/CI-CD.md)。
+测试使用合成数据。像素快照受 macOS 和渲染环境影响；CI 排除部分图像测试，本机仍需运行完整测试。系统小组件、公开下载、DMG 安装和 Homebrew 升级分别验收，不能只看 CI 绿灯。[测试指南](docs/wiki/测试指南.md)列有检查方法。
 
-真实机器核验与合成测试分开记录；后者不能证明企业账号、完整账单或真实服务器吞吐正确。视觉参考图只使用合成数据，录制图像本身不算通过。详细方法见 [测试指南](docs/wiki/测试指南.md) 和 [UI 测试说明](docs/UI_TESTING.md)，最近的结果与限制见 [验证记录](docs/VALIDATION.md)。
+## 项目结构
 
-## 隐私与开源
+| 路径 | 内容 |
+| --- | --- |
+| `Sources/TokenStatMenu/` | 菜单栏、面板、偏好与生命周期 |
+| `Sources/TokenStatCore/` | 只读来源、解析、核算和刷新逻辑 |
+| `Sources/TokenStatWidgetShared/` | 小组件快照、编码与共享存储 |
+| `Sources/TokenStatWidgetExtension/` | WidgetKit 扩展 |
+| `Resources/` | 图标、Info.plist 和签名权限配置 |
+| `Tests/` | 核心检查、状态回归和合成 UI 基线 |
+| `script/` | 构建、检查、打包和发布工具 |
+| `docs/wiki/` | 中英双语使用及开发文档 |
 
-应用只读获取 Token Hub 必要的连接与现有登录材料，在内存中向其既有 HTTPS 来源交换短期会话并读取额度。它不会把令牌、账号、实际额度或响应正文写入正常日志、配置或源码仓库；本地会话文件在解析时可能短暂接触正文，但仅提取允许的计量和身份字段，不保存或上传正文。完整读取边界与开源检查方法见 [隐私说明](PRIVACY.md)。
+## 隐私与限制
 
-采用 [MIT 许可证](LICENSE)。报告问题时只提交版本、状态描述、操作步骤和合成示例，不提交凭据、企业地址、账户数据库、会话正文或原始运行截图。贡献流程见 [贡献指南](docs/wiki/贡献指南.md)。
+- 只读使用本机 Hub 的现有连接和登录会话访问对应后台，不修改 Hub 数据库、登录态或 Codex 路由。
+- 本地用量来自 Codex 记录，不读取 OpenCode 会话或数据库，不把本地 Token 小计当作企业账单。
+- 没有上传分析、远程遥测或第三方运行时。后台额度请求仍会访问 Hub 配置对应的服务。
+- 共享快照只保存小组件所需的显示字段，不包含凭据、会话正文或原始响应。
+- 当前没有权威服务端实时 token/s、请求级 TTFT 或延迟来源；Developer ID、公证及完整原生辅助功能验收尚未完成。Intel 不在支持范围。
 
-界面布局参考 codexU 的紧凑分组思路；文档组织参考 [TuPigGHD2Chinese](https://github.com/Tupig/TuPigGHD2Chinese) 的文档中心与专题导航，内容依据本项目的实际实现编写。
+## 贡献
+
+问题反馈请附版本、macOS、芯片、复现步骤和脱敏状态文字。不要上传数据库、令牌、真实响应、会话正文或未遮挡的截图。
+
+[贡献指南](docs/wiki/贡献指南.md) · [CI/CD](docs/wiki/CI-CD.md) · [MIT 许可证](LICENSE)
+
+---
+
+# TokenStatMenu (English)
+
+[简体中文](#tokenstatmenu) | **English**
+
+A native macOS menu bar app for **Seasun Token Hub** quotas: five-hour usage, seven-day usage, and monthly spend. Built with Swift, SwiftUI, AppKit, and WidgetKit. No Electron and no API Key to enter.
+
+[Documentation](docs/wiki/Home.md#documentation-hub-english) · [Installation](docs/wiki/安装与使用.md#installation-and-usage-english) · [FAQ](docs/wiki/常见问题.md#faq-english) · [Releases](https://github.com/Tupig/TokenStatMenu/releases)
+
+## Features
+
+| Surface | Contents |
+| --- | --- |
+| Menu bar | `38.10% \| 74.40% \| $3,488.22`: five-hour used, seven-day used, monthly spend |
+| Panel | Remaining percentages, used amounts, limits and reset times; monthly spend and reset vouchers |
+| Small widget | Five-hour and seven-day bars, limits on the left and reset times on the right; monthly spend and vouchers |
+| Local records | Codex Token subtotals associated with the current configuration, thread categories, cache and completed-turn details |
+
+Percentages use two decimal places. Amounts use up to two, with monthly spend fixed at two. Missing, expired or reset data stays unknown; another window or a zero never fills the gap. The numbers above are examples.
+
+The menu bar contains only the three quota figures. Local activity estimates and completed-turn averages remain in the panel and details, not as server-authoritative throughput. See [Metric definitions](docs/wiki/统计口径.md#metric-definitions-english).
+
+## Installation
+
+Requires macOS 13+. Start and sign in to Seasun Token Hub before opening TokenStatMenu. Direct quota reads do not need Accessibility permission.
+
+### Homebrew
+
+Requires Homebrew and full Xcode 15+; Command Line Tools alone are insufficient.
+
+```bash
+brew install Tupig/tokenstatmenu/tokenstatmenu
+tokenstatmenu
+```
+
+The formula builds the host architecture from the Release source archive and keeps the App under Homebrew. It does not replace manual copies. Formula updates live in the [Tap repository](https://github.com/Tupig/homebrew-tokenstatmenu).
+
+### DMG
+
+1. Download `TokenStatMenu.dmg` and the matching `SHA256SUMS` from [Releases](https://github.com/Tupig/TokenStatMenu/releases).
+2. Compare `shasum -a 256 <filename>` with the listed digest.
+3. Open the DMG, drag `TokenStatMenu.app` to Applications, then open the installed copy.
+
+Version 1.1.7 onward supports Apple Silicon (M-series) only, not Intel. App ZIP and source ZIP downloads are also available. Downloads are ad hoc signed, not Developer ID signed or notarized. macOS or company policy may block them; do not disable system protections to bypass that restriction.
+
+## Updating
+
+Quit the running App before upgrading:
+
+```bash
+brew update
+brew upgrade Tupig/tokenstatmenu/tokenstatmenu
+tokenstatmenu
+```
+
+For DMG installs, quit the old App and replace it with the new download. Do not run Homebrew and manual copies together. Settings shows the running version and build. There is no in-app updater; upgrades preserve preferences.
+
+## Widget
+
+Only **small** is supported. Add TokenStatMenu from the widget gallery on supported systems; desktop widgets require macOS 14+. Text uses 10pt throughout. Monthly spend is an amount, not a progress bar.
+
+> [!IMPORTANT]
+> Widget sharing needs App Group authorization. The local Apple Development-signed candidate has been tested; public DMG and Homebrew ad hoc signatures cannot guarantee that authorization. An embedded extension does not establish working data access. The menu bar and panel remain usable. See [#88](https://github.com/Tupig/TokenStatMenu/issues/88).
+
+## Building
+
+```bash
+git clone https://github.com/Tupig/TokenStatMenu.git
+cd TokenStatMenu
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  ./script/build_and_run.sh --build-only
+open dist/TokenStatMenu.app
+```
+
+This SwiftPM build assembles the main App only. Use `./script/build_and_run.sh --dev-widget` for a local widget build with an Apple Development identity. It installs into `~/Applications` and restarts the App and widget-related processes.
+
+Local builds increment both build numbers automatically. arm64 release builds preserve the committed build and require an explicit App Group. See the [Build guide](docs/wiki/编译指南.md#build-guide-english). Python is used by development tools, not shipped in the App.
+
+## Testing
+
+```bash
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+swift run --force-resolved-versions TokenStatCoreChecks
+swift test --force-resolved-versions
+TOKENSTAT_SKIP_BUILD_BUMP=1 ./script/test.sh
+python3 -B script/test_release_assets.py
+python3 -B script/check_docs.py --self-test
+python3 -B script/check_public_content.py
+git diff --check
+```
+
+Tests use synthetic data. Pixel snapshots depend on the rendering environment; CI skips some image tests, so run the full suite locally. System widgets, public downloads, DMG installation and Homebrew upgrades need separate checks. See the [Testing guide](docs/wiki/测试指南.md#testing-guide-english).
+
+## Project Layout
+
+| Path | Contents |
+| --- | --- |
+| `Sources/TokenStatMenu/` | Menu bar, panel, preferences and lifecycle |
+| `Sources/TokenStatCore/` | Read-only sources, parsing, accounting and refresh logic |
+| `Sources/TokenStatWidgetShared/` | Snapshot model, codec and shared storage |
+| `Sources/TokenStatWidgetExtension/` | WidgetKit extension |
+| `Resources/` | Icons, Info.plists and signing entitlements |
+| `Tests/` | Core checks, state regressions and synthetic UI references |
+| `script/` | Build, validation, packaging and release tools |
+| `docs/wiki/` | Chinese and English documentation |
+
+## Privacy and Limitations
+
+- Uses the existing local Hub connection and login session for read-only requests. It does not modify the Hub database, session or Codex routing.
+- Local usage comes from Codex records. It does not read OpenCode sessions or databases, or treat local Token subtotals as the enterprise bill.
+- No analytics upload, remote telemetry or third-party runtime. Quota requests still contact the service configured by Hub.
+- Shared snapshots contain display fields, not credentials, conversation text or raw responses.
+- Authoritative server token/s, request-level TTFT and latency are unavailable. Developer ID signing, notarization and full native Accessibility checks remain unverified. Intel is unsupported.
+
+## Contributing
+
+Include the App version, macOS version, architecture, reproduction steps and sanitized status text in bug reports. Do not upload databases, tokens, real responses, conversations or unredacted screenshots.
+
+[Contributing](docs/wiki/贡献指南.md#contributing-english) · [CI/CD](docs/wiki/CI-CD.md#cicd-english) · [MIT License](LICENSE)

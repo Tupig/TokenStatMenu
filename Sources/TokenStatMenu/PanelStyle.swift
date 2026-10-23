@@ -24,7 +24,7 @@ enum HeaderActionMetrics {
 }
 
 enum PanelMetrics {
-    static let size = CGSize(width: 320, height: 420)
+    static let size = CGSize(width: 300, height: 420)
 }
 
 /// 顶部操作不使用强调色，使设置和退出按钮在获取键盘焦点时仍保持中性、对称。
@@ -40,11 +40,11 @@ struct NeutralHeaderActionButtonStyle: ButtonStyle {
 
 struct PanelCardStyle: GroupBoxStyle {
     func makeBody(configuration: Configuration) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             configuration.label.font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
             configuration.content.frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(14)
+        .padding(12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(.primary.opacity(0.07)))
     }

@@ -4,8 +4,20 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 MODE="${1:-run}"
 APP="$ROOT/dist/TokenStatMenu.app"
-case "$MODE" in run|--build-only|--verify|--release|--universal|--logs|--telemetry|--debug) ;; *) echo "Usage: $0 [--build-only|--verify|--release|--universal|--logs|--telemetry|--debug]"; exit 2 ;; esac
+case "$MODE" in run|--build-only|--verify|--release|--arm64|--universal|--dev-widget|--logs|--telemetry|--debug) ;; *) echo "Usage: $0 [--build-only|--verify|--release|--arm64|--dev-widget|--logs|--telemetry|--debug]"; exit 2 ;; esac
+# Keep the old release entry point without producing an Intel slice.
+if [ "$MODE" = "--arm64" ]; then MODE=--universal; fi
+if [ "$(uname -m)" != arm64 ]; then
+    echo "error: TokenStatMenu requires Apple Silicon (M-series); run outside Rosetta" >&2
+    exit 2
+fi
 mkdir -p "$(dirname "$APP")"
+# Local installs advance CFBundleVersion so WidgetKit treats the bundle as a
+# new build and reloads the extension. --universal is a release artifact and
+# must keep the version committed for its tag.
+if [ "$MODE" != "--universal" ] && [ "${TOKENSTAT_SKIP_BUILD_BUMP:-0}" != "1" ]; then
+    python3 -B "$ROOT/script/bump_build.py"
+fi
 # Native SwiftPM also works with Command Line Tools; no global xcode-select changes.
 if [ "$MODE" = "--universal" ]; then
     # A universal distribution build must come from the Xcode project: only
@@ -26,7 +38,7 @@ if [ "$MODE" = "--universal" ]; then
     DERIVED="$ROOT/.build/xcode-universal"
     xcodebuild -project "$ROOT/TokenStatMenu.xcodeproj" -scheme TokenStatMenu \
         -configuration Release -derivedDataPath "$DERIVED" \
-        ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+        ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
         TOKENSTAT_WIDGET_GROUP="$GROUP" build
     BUILT_APP="$DERIVED/Build/Products/Release/TokenStatMenu.app"
@@ -62,6 +74,62 @@ if [ "$MODE" = "--universal" ]; then
             exit 1
         fi
     done
+elif [ "$MODE" = "--dev-widget" ]; then
+    # Signed local install for widget development. Ad hoc signing cannot grant
+    # the App Group, so this branch uses the Apple Development identity and
+    # installs over the existing ~/Applications copy.
+    TEAM="${TOKENSTAT_TEAM_ID:-}"
+    if [ -z "$TEAM" ]; then
+        # The name in find-identity is the Apple ID, not the team. The signing
+        # team is the certificate subject OU (the same value codesign reports
+        # as TeamIdentifier).
+        TEAM="$(security find-certificate -a -c 'Apple Development' -p 2>/dev/null \
+            | openssl x509 -noout -subject -nameopt sep_comma_plus 2>/dev/null \
+            | sed -n 's/.*OU=\([A-Z0-9][A-Z0-9]*\).*/\1/p' \
+            | head -n 1)"
+    fi
+    if [ -z "$TEAM" ]; then
+        echo "error: --dev-widget needs an Apple Development identity; set TOKENSTAT_TEAM_ID" >&2
+        exit 2
+    fi
+    GROUP="${TOKENSTAT_WIDGET_GROUP:-$TEAM.com.tupig.TokenStatMenu}"
+    if ! [[ "$GROUP" =~ ^(group|[A-Z0-9]{10})(\.[A-Za-z0-9]+([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+        echo "error: invalid TOKENSTAT_WIDGET_GROUP: $GROUP" >&2
+        exit 2
+    fi
+    if ! xcodebuild -version >/dev/null 2>&1 && [ -d /Applications/Xcode.app/Contents/Developer ]; then
+        export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+    fi
+    DERIVED="$ROOT/.build/xcode-dev"
+    xcodebuild -project "$ROOT/TokenStatMenu.xcodeproj" -scheme TokenStatMenu \
+        -configuration Release -derivedDataPath "$DERIVED" \
+        ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+        CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM="$TEAM" \
+        CODE_SIGN_IDENTITY="Apple Development" \
+        TOKENSTAT_WIDGET_GROUP="$GROUP" build
+    BUILT_APP="$DERIVED/Build/Products/Release/TokenStatMenu.app"
+    if [ ! -d "$BUILT_APP/Contents/PlugIns/TokenStatMenuWidget.appex" ]; then
+        echo "error: built app contains no TokenStatMenuWidget.appex" >&2
+        exit 1
+    fi
+    INSTALL_DIR="${TOKENSTAT_INSTALL_DIR:-$HOME/Applications}"
+    INSTALLED_APP="$INSTALL_DIR/TokenStatMenu.app"
+    mkdir -p "$INSTALL_DIR"
+    rm -rf "$INSTALLED_APP"
+    ditto "$BUILT_APP" "$INSTALLED_APP"
+    if ! codesign --verify --deep --strict "$INSTALLED_APP"; then
+        echo "error: signature verification failed" >&2
+        exit 1
+    fi
+    # Replace the cached extension and timeline with this build.
+    killall TokenStatMenu 2>/dev/null || true
+    killall TokenStatMenuWidget 2>/dev/null || true
+    killall chronod 2>/dev/null || true
+    open -n "$INSTALLED_APP"
+    VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INSTALLED_APP/Contents/Info.plist")"
+    BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INSTALLED_APP/Contents/Info.plist")"
+    echo "Installed: $INSTALLED_APP ($VERSION build $BUILD)"
+    exit 0
 else
     rm -rf "$APP"
     mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -105,7 +173,9 @@ if ! codesign --verify --deep --strict "$APP"; then
     echo "error: ad hoc signature verification failed" >&2
     exit 1
 fi
-if [ "$MODE" = "--build-only" ] || [ "$MODE" = "--universal" ]; then echo "Built: $APP"; exit 0; fi
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")"
+if [ "$MODE" = "--build-only" ] || [ "$MODE" = "--universal" ]; then echo "Built: $APP ($VERSION build $BUILD, arm64)"; exit 0; fi
 if [ "$MODE" = "--debug" ]; then exec lldb "$APP/Contents/MacOS/TokenStatMenu"; fi
 open -n "$APP"
 case "$MODE" in

@@ -4,8 +4,15 @@ import TokenStatCore
 #endif
 
 enum TokenHubDecimalFormatter {
+    /// 金额统一保留最多两位小数，整数不补零；千分位便于阅读。
     static func string(_ value: Decimal) -> String {
-        NSDecimalNumber(decimal: value).stringValue
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 2
+        return formatter.string(from: NSDecimalNumber(decimal: value))
+            ?? NSDecimalNumber(decimal: value).stringValue
     }
 }
 
@@ -69,44 +76,19 @@ enum TokenHubDecimalFormatter {
         } label: { Label(directSource ? "Token Hub 企业额度" : "Token Hub 界面额度快照", systemImage: "window.ceiling") }
     }
     private func monthlyRow(_ monthly: TokenHubMonthlyUsage, isCurrent: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack {
-                Text("月度").fontWeight(.medium)
-                Spacer(minLength: 0)
-                if presentation.futureObservation {
-                    Text("时间异常 · 当前用量未知").fontWeight(.semibold).foregroundStyle(.secondary)
-                } else if let usedPercent = monthly.usedPercent {
-                    Text("已用 \(TwoDecimalPercentFormatter.string(usedPercent))")
-                        .fontWeight(.semibold).monospacedDigit()
-                } else {
-                    Text("已用").fontWeight(.semibold)
-                }
-            }
-            if isCurrent, let limit = monthly.limitAmount, let usedPercent = monthly.usedPercent {
-                let usedFraction = min(1, max(0, NSDecimalNumber(decimal: usedPercent / 100).doubleValue))
-                GeometryReader { geometry in
-                    Capsule().fill(PanelPalette.blue.opacity(0.12))
-                    Capsule().fill(barColor(for: usedPercent))
-                        .frame(width: geometry.size.width * usedFraction)
-                }
-                .frame(height: 5)
-                HStack {
-                    Text("\(monthly.sourceSymbol)\(amount(monthly.usedAmount)) / \(monthly.sourceSymbol)\(amount(limit))")
-                        .monospacedDigit()
-                    Spacer(minLength: 0)
-                    if let remaining = monthly.remainingAmount {
-                        Text("剩余 \(monthly.sourceSymbol)\(amount(remaining))")
-                            .foregroundStyle(.secondary).monospacedDigit()
-                    }
-                }
-            } else if presentation.futureObservation {
-                Text("时间异常 · 月度数值未知").foregroundStyle(.secondary)
-            } else if !isCurrent {
-                Text("历史已用 \(monthly.sourceSymbol)\(amount(monthly.usedAmount)) · 当前进度未知")
-                    .foregroundStyle(.secondary)
+        HStack(spacing: 6) {
+            Text("月度用量").fontWeight(.medium)
+            Spacer(minLength: 0)
+            if presentation.futureObservation {
+                Text("时间异常 · 当前用量未知")
+                    .fontWeight(.semibold).foregroundStyle(.secondary)
+            } else if isCurrent {
+                Text("\(monthly.sourceSymbol)\(monthlyAmount(monthly.usedAmount))")
+                    .font(.system(size: 14, weight: .semibold))
+                    .monospacedDigit()
             } else {
-                Text("已用 \(monthly.sourceSymbol)\(amount(monthly.usedAmount)) · 后台未提供月度总额，剩余与进度未知")
-                    .foregroundStyle(.secondary)
+                Text("历史已用 \(monthly.sourceSymbol)\(monthlyAmount(monthly.usedAmount))")
+                    .fontWeight(.semibold).monospacedDigit().foregroundStyle(.secondary)
             }
         }
         .font(.system(size: 10))
@@ -135,9 +117,13 @@ enum TokenHubDecimalFormatter {
                     .frame(width: geometry.size.width * usedFraction)
             }
             .frame(height: 5)
-            HStack {
-                Text("\(directSource ? "后台已用" : "界面已用") \(TwoDecimalPercentFormatter.string(usedPercent)) · \(symbol)\(amount(used)) / \(symbol)\(amount(limit))")
-                    .monospacedDigit()
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(directSource ? "后台已用" : "界面已用") \(TwoDecimalPercentFormatter.string(usedPercent))")
+                        .monospacedDigit()
+                    Text("\(symbol)\(amount(used)) / \(symbol)\(amount(limit))")
+                        .monospacedDigit()
+                }
                 Spacer(minLength: 0)
                 Text(Self.resetLabel(reset)).foregroundStyle(.secondary)
             }
@@ -163,9 +149,13 @@ enum TokenHubDecimalFormatter {
                            : "周期已重置 · 历史已用 \(TwoDecimalPercentFormatter.string(window.usedPercent))")
                     .fontWeight(.semibold).monospacedDigit().foregroundStyle(.secondary)
             }
-            HStack {
-                Text("\(directSource ? "后台已用" : "界面已用") \(TwoDecimalPercentFormatter.string(window.usedPercent)) · \(window.sourceSymbol)\(amount(window.usedAmount)) / \(window.sourceSymbol)\(amount(window.limitAmount))")
-                    .monospacedDigit()
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(directSource ? "后台已用" : "界面已用") \(TwoDecimalPercentFormatter.string(window.usedPercent))")
+                        .monospacedDigit()
+                    Text("\(window.sourceSymbol)\(amount(window.usedAmount)) / \(window.sourceSymbol)\(amount(window.limitAmount))")
+                        .monospacedDigit()
+                }
                 Spacer(minLength: 0)
                 Text(Self.resetLabel(window.resetDisplay)).foregroundStyle(.secondary)
             }
@@ -178,4 +168,15 @@ enum TokenHubDecimalFormatter {
         return PanelPalette.blue
     }
     private func amount(_ value: Decimal) -> String { TokenHubDecimalFormatter.string(value) }
+
+    /// 月度用量只展示已花金额：千分位、两位小数，不显示进度或上限。
+    private func monthlyAmount(_ value: Decimal) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        return formatter.string(from: NSDecimalNumber(decimal: value))
+            ?? NSDecimalNumber(decimal: value).stringValue
+    }
 }

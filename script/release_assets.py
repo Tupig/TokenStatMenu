@@ -478,6 +478,11 @@ def validate_app(
         "application full tree differs",
     )
     group = _bundle_content(root, files, identity)
+    expected_archs = (
+        ("arm64",)
+        if tuple(map(int, identity.version.split("."))) >= (1, 1, 7)
+        else ("arm64", "x86_64")
+    )
     widget_info_name = "Contents/PlugIns/TokenStatMenuWidget.appex/Contents/Info.plist"
     widget_binary = (
         app
@@ -514,11 +519,11 @@ def validate_app(
             )
             _require(
                 widget_arch.returncode == 0
-                and set(widget_arch.stdout.split()) == {"arm64", "x86_64"}
-                and len(widget_arch.stdout.split()) == 2,
-                "widget extension must have exactly arm64 and x86_64",
+                and set(widget_arch.stdout.split()) == set(expected_archs)
+                and len(widget_arch.stdout.split()) == len(expected_archs),
+                "widget extension architectures differ from release contract",
             )
-            for widget_slice in ("arm64", "x86_64"):
+            for widget_slice in expected_archs:
                 widget_entitlements = _signed_entitlements(
                     app / "Contents/PlugIns/TokenStatMenuWidget.appex",
                     command_runner,
@@ -532,7 +537,7 @@ def validate_app(
                     == [group],
                     "widget extension entitlements differ",
                 )
-            for app_slice in ("arm64", "x86_64"):
+            for app_slice in expected_archs:
                 app_entitlements = _signed_entitlements(
                     app, command_runner, arch=app_slice
                 )
@@ -550,9 +555,9 @@ def validate_app(
         )
         _require(
             arch.returncode == 0
-            and set(arch.stdout.split()) == {"arm64", "x86_64"}
-            and len(arch.stdout.split()) == 2,
-            "application must have exactly arm64 and x86_64",
+            and set(arch.stdout.split()) == set(expected_archs)
+            and len(arch.stdout.split()) == len(expected_archs),
+            "application architectures differ from release contract",
         )
         signed = command_runner(
             ["codesign", "--verify", "--deep", "--strict", str(app)],
@@ -570,6 +575,12 @@ def validate_app(
 
 def _names(identity: ReleaseIdentity) -> dict[str, str]:
     _identity_fields(identity)
+    if tuple(map(int, identity.version.split("."))) >= (1, 1, 7):
+        return {
+            "universal": "TokenStatMenu.zip",
+            "source": "TokenStatMenu-source.zip",
+            "dmg": "TokenStatMenu.dmg",
+        }
     names = {
         kind: f"TokenStatMenu-{identity.version}-{kind}.zip"
         for kind in ["universal", "source"]
@@ -1110,10 +1121,40 @@ class GitHubClient:
         _require(identity == self.identity, "unexpected draft identity")
         notes = (
             f"TokenStatMenu {identity.version} (build {identity.build}).\n\n"
-            "macOS 13 or later; Universal arm64 and x86_64.\n"
-            "This archive is ad hoc signed for local development. It is not Developer ID signed or notarized.\n"
+            + (
+                "macOS 13+; Apple Silicon (M-series, arm64) only.\n"
+                if tuple(map(int, identity.version.split("."))) >= (1, 1, 7)
+                else "macOS 13 or later; Universal arm64 and x86_64.\n"
+            )
+            + "This archive is ad hoc signed for local development. It is not Developer ID signed or notarized.\n"
             f"Public source commit: {identity.commit}.\n"
         )
+        if tuple(map(int, identity.version.split("."))) >= (1, 1, 7):
+            notes = (
+                f"## TokenStatMenu {identity.version}（build {identity.build}）\n\n"
+                "仅支持 Apple Silicon（M 系列），macOS 13+。\n\n"
+                "- 菜单栏显示 5 小时已用、7 天已用、月度用量，百分比两位小数。\n"
+                "- 紧凑面板；small 小组件统一字号，显示额度、重置时间、月度用量和重置券。\n"
+                "- 修复重置券传递、首次发布竞态及过期数据投影。\n"
+                "- README 与 Wiki 全部中英双语。\n\n"
+                "### 安装与更新\n\n"
+                "下载 `TokenStatMenu.dmg`，将 App 拖到应用程序；或使用 Homebrew：\n\n"
+                "```bash\nbrew install Tupig/tokenstatmenu/tokenstatmenu\n"
+                "# 已安装用户\nbrew update\nbrew upgrade Tupig/tokenstatmenu/tokenstatmenu\n"
+                "tokenstatmenu\n```\n\n"
+                "升级前退出旧实例。Tap 需完成发布后的配方测试才会跟进。\n\n"
+                "**签名限制：** 当前为 ad hoc 签名，未做 Developer ID/公证。"
+                "公开 DMG 与 Homebrew 不保证获得 App Group 权限；系统小组件可能无法读数据，"
+                "菜单栏与面板不受此限制。详见 [#88](https://github.com/Tupig/TokenStatMenu/issues/88)。\n\n"
+                "## English\n\n"
+                "Apple Silicon (M-series) only; macOS 13+. Compact panel, small Widget, "
+                "two-decimal quota percentages, voucher transport and expiry fixes, and bilingual documentation.\n\n"
+                "Install from `TokenStatMenu.dmg` or the Homebrew commands above. Quit the old App before upgrading. "
+                "The Tap updates after its post-release checks. Downloads are ad hoc signed, not Developer ID "
+                "signed or notarized. App Group authorization for public Widget builds is not guaranteed; "
+                "the menu bar and panel remain available.\n\n"
+                f"Source commit: `{identity.commit}`. Verify downloads with `SHA256SUMS`.\n"
+            )
         with tempfile.TemporaryDirectory(
             prefix="tokenstat-release-notes-"
         ) as temporary:

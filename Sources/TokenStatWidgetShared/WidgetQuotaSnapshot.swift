@@ -11,10 +11,26 @@ public struct WidgetQuotaSnapshot: Equatable, Sendable {
         public let remainingPercent: Double
         /// 来源提供的窗口重置时间。
         public let resetsAt: Date?
+        /// 后台已用金额；旧快照或来源缺失时为 nil。
+        public let usedAmount: Double?
+        /// 后台窗口上限金额；旧快照或来源缺失时为 nil。
+        public let limitAmount: Double?
+        /// 来源货币符号，例如 `$`。
+        public let sourceSymbol: String?
 
-        public init(remainingPercent: Double, resetsAt: Date?) {
+        public init(remainingPercent: Double, resetsAt: Date?,
+                    usedAmount: Double? = nil, limitAmount: Double? = nil,
+                    sourceSymbol: String? = nil) {
             self.remainingPercent = remainingPercent
             self.resetsAt = resetsAt
+            self.usedAmount = usedAmount
+            self.limitAmount = limitAmount
+            self.sourceSymbol = sourceSymbol
+        }
+
+        /// 已用比例；由剩余比例反推，与面板进度条一致。
+        public var usedPercent: Double {
+            min(100, max(0, 100 - remainingPercent))
         }
     }
 
@@ -119,5 +135,17 @@ public struct WidgetQuotaSnapshot: Equatable, Sendable {
     /// 月度用量采用相同的有效期规则，过期或重置后不再显示旧百分比。
     public func currentMonthly(at now: Date) -> Monthly? {
         hubIsCurrent(at: now) ? monthly : nil
+    }
+
+    /// 券数与额度使用同一有效期，零是有效值，失效不能退回旧数量。
+    public func currentResetVoucherCount(at now: Date) -> Int? {
+        hubIsCurrent(at: now) ? resetVoucherCount : nil
+    }
+
+    /// 提前安排窗口重置及快照到期的条目，不依赖 App 持续运行。
+    public func timelineDates(after now: Date) -> [Date] {
+        let expiry = validUntil.map { $0.addingTimeInterval(0.001) }
+        return Array(Set([fiveHour?.resetsAt, sevenDay?.resetsAt, expiry]
+            .compactMap { $0 }.filter { $0 > now })).sorted()
     }
 }

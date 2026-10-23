@@ -20,9 +20,12 @@ struct WidgetProvider: TimelineProvider {
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<WidgetEntry>) -> Void) {
         let entry = currentEntry()
-        // 五分钟后刷新；应用发布新快照时也会向 WidgetKit 请求重载。
-        let next = Date().addingTimeInterval(300)
-        completion(Timeline(entries: [entry], policy: .after(next)))
+        // 到期条目只做失效投影；不把旧快照重新当成当前数据。
+        let boundaries = entry.snapshot?.timelineDates(after: entry.date) ?? []
+        let entries = [entry] + boundaries.map {
+            WidgetEntry(date: $0, snapshot: entry.snapshot, channelAvailable: entry.channelAvailable)
+        }
+        completion(Timeline(entries: entries, policy: .after(entry.date.addingTimeInterval(300))))
     }
 
     private func currentEntry() -> WidgetEntry {

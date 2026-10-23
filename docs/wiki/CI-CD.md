@@ -1,104 +1,123 @@
 # CI/CD
 
-[返回文档中心](Home.md)
+**简体中文** | [English](#cicd-english)
 
-## 当前自动化范围
+[文档中心](Home.md) · [编译指南](编译指南.md) · [测试指南](测试指南.md)
 
-仓库只有一个 [TokenStatMenu CI 与发布工作流](../../.github/workflows/ci.yml)，在 `main` 的 push、pull request 和 `v*` 标签 push 上运行，使用 `macos-15` runner。当前采用本地出包、验证后上传 Release；云端出包与发布默认关闭，避免推送标签时覆盖或抢先发布本地资产。只有显式设置仓库变量 `TOKENSTAT_CLOUD_RELEASE=enabled`，云端标签发布分支才启用。普通 CI 仅有读取仓库内容的权限，checkout 关闭凭据持久化。当前 checkout 固定为官方 `v7.0.1` 的完整提交 `3d3c42e5aac5ba805825da76410c181273ba90b1`，其运行时为 Node 24；升级时重新核对官方 release/tag 与完整 SHA，不只移动标签。官方要求 Actions Runner 至少为 `v2.327.1`，自托管 runner 需同步满足此版本；GitHub 托管 runner 由平台维护。来源见 [checkout v7.0.1](https://github.com/actions/checkout/tree/v7.0.1)。
+## CI 检查
 
-| 顺序 | 检查 | 当前实际覆盖 |
-| --- | --- | --- |
-| 1 | 文档链接与检查器自测 | `python3 script/check_docs.py --self-test` 检查本地链接/锚点，并用合成材料检查错误是否会被发现 |
-| 2 | 公开内容防线 | 检查 Git index 中白名单文件的精确内容 |
-| 3 | Release 校验器测试 | 虚构发布材料、路径/版本/摘要错误、无网络写入及私有原生包装 fixture |
-| 4 | 核心与发现检查 | 运行 `TokenStatCoreChecks` 的合成回归 |
-| 5 | 原生测试目标编译及不依赖 OS 像素的检查 | 三个指定过滤检查，以及排除受渲染环境约束项目后的完整测试步骤 |
-| 6 | Xcode Release 构建 | 使用明确绑定 App target 的共享 Scheme，禁用代码签名完成原生工程构建 |
-| 7 | 完整依赖锁未改动 | `git diff --exit-code -- Package.resolved`；任何隐式改写都会让 CI 失败 |
+[ci.yml](../../.github/workflows/ci.yml) 在 main push、PR 和 `v*` 标签上运行：文档链接、公开内容、发行契约、CoreChecks、状态/UI 测试、Xcode Release 构建和依赖锁未变检查。部分依赖 macOS 渲染的像素测试不在 CI 比较，本机仍运行完整套件。
 
-CI 不比较受特定 macOS 渲染环境约束的工具栏基线，也不调用真实 Seasun 网关、不读取企业账号或本地会话。当前工作流不是完整 `swift test --force-resolved-versions`、隔离 `script/test.sh`、Universal 构建或本机安装验收的替代。性能基准也不在 CI 中作为时间阈值运行，以免把共享 runner 的负载变化当作性能回归。
+普通 job 只有读权限。动作固定到完整提交，SwiftPM 使用 `--force-resolved-versions`。CI 不读用户 Hub/Codex 数据，不请求权限，不证明真实小组件或企业链路可用。
 
-## CI 通过应怎样解读
+## 1.1.7 发布约定
 
-CI 绿色说明该提交完成了工作流声明的检查，不能据此声称：
+只支持 Apple Silicon（M 系列）。App 和扩展均为 arm64，Bundle 版本/build 同步。文件名使用仓库名，不重复版本和架构：
 
-- 真实 Hub 登录、5 小时/7 天、重置时间或实时活动事件已在用户机器验证。
-- 所有浅色/深色布局、自然键盘焦点和可访问性行为均通过。
-- arm64 与 Intel 实机都运行成功。
-- 已生成可下载 Release、完成 Developer ID 签名或 Apple 公证。
-- 正在运行的 App 与该提交构建产物一致。
+| 资产 | 用途 |
+| --- | --- |
+| `TokenStatMenu.zip` | 原生 `TokenStatMenu.app`，含小组件扩展 |
+| `TokenStatMenu-source.zip` | 白名单源码、工程、资源、测试和文档 |
+| `TokenStatMenu.dmg` | 同一 App 与 Applications 别名 |
+| `release-manifest.json` | 标签、提交、版本/build、文件大小和 SHA-256 |
+| `SHA256SUMS` | App ZIP、源码 ZIP、DMG 与 manifest 的摘要 |
 
-每项交付报告都应把本地测试、CI、真实环境、安装和发布证据分别写清楚。
+版本在 Release 标签及 App 元数据中，不在资产名中。旧 Release 保留原文件名与校验规则，不回写历史资产。
 
-## SwiftPM 锁定与失败保留
+## 本地发布
 
-所有会解析依赖的 SwiftPM 构建、运行、测试及路径查询都显式使用 `--force-resolved-versions`。已审阅的锁同时保留 custom-dump 1.7.3 两种工具链 manifest 所需的精确 pin，SnapshotTesting 仍固定 1.19.6。缺少当前图的必要 pin 或约束冲突必须失败，不运行自动更新、不用事后恢复锁文件掩盖变化。PR/main 构建末尾另用 `git diff --exit-code -- Package.resolved` 强制检查完整锁未改动；发布阶段原有的全树 `git diff --exit-code` 也继续保留。
-
-这项修正来自 [v1.1.3 的实际失败 run](https://github.com/Tupig/TokenStatMenu/actions/runs/39093885964)：构建已完成，但 CI 工具链将 issue-reporting pin 改成 overlay pin，源归档后的干净检查失败，后续打包/上传与 publish 均跳过，没有生成正式 Release。失败标签保留，后续候选采用 1.1.4（build 6）。本机 Swift 6.4 实验通过不能证明该旧工具链图或新 Release 已成功，必须等待对应 PR/main/tag run 与真实资产验收。完整原因见 [编译指南](编译指南.md#固定测试依赖与跨工具链锁)。
-
-## 本地到推送的建议流程
-
-1. 用合成数据复现问题，为确认的问题建立或关联 Issue。
-2. 实现最小改动，执行与改动相符的核心、状态或视觉验证。
-3. 按 [测试指南](测试指南.md) 完成本地回归、原生构建及必要的真实本机验收。
-4. 更新文档、公开文件白名单与源码 ZIP 语义，并检查差异与隐私边界。
-5. 审阅暂存内容并执行 `check_public_content.py --git-index`，本地验证完成后再推送。
-6. 创建可审查的 PR，写明问题、最终行为、测试结果和未覆盖范围；等待该提交的 CI 结果。
-
-## 本地出包与正式 Release
-
-本地使用 Xcode 构建 App 与内嵌 Widget，签名后核验版本、构建号、架构与安装行为。公开分发的有效签名与 App Group 权限未解决前不得宣称完整小组件可用；Apple Development 本机候选不是 Developer ID 发行包。完成回归并固定源码提交后，使用现有发布工具打包、复验、上传并回读远端资产，不覆盖旧版本。
-
-发布工具只接受数字稳定版本 `vMAJOR.MINOR.PATCH`，核对 Info.plist 的版本/构建号、标签实际提交、干净工作区及 `origin/main` 祖先关系。分支名不能代替源码提交。以下命令要求版本标签已经按发布授权固定到验收通过的提交；`APP` 必须指向同一提交构建并带公开源码身份的已验证 Universal App，不可填开发探针。
+先完成回归、提交并推送 main，等待对应 CI 通过，再固定 `v1.1.7` 标签。发布构建不得带工作区改动：
 
 ```bash
-TAG=v1.1.6
+TAG=v1.1.7
 COMMIT=$(git rev-parse HEAD)
-APP=dist/TokenStatMenu.app
+TOKENSTAT_WIDGET_GROUP=<已配置的组名> ./script/build_and_run.sh --arm64
 python3 -B script/release_assets.py preflight --tag "$TAG" --commit "$COMMIT"
 python3 -B script/package_source.py
-python3 -B script/release_assets.py package --tag "$TAG" --commit "$COMMIT" --app "$APP" --source dist/TokenStatMenu-source.zip --directory dist/release
+python3 -B script/release_assets.py package --tag "$TAG" --commit "$COMMIT" --app dist/TokenStatMenu.app --source dist/TokenStatMenu-source.zip --directory dist/release
 python3 -B script/release_assets.py verify --tag "$TAG" --commit "$COMMIT" --directory dist/release
 python3 -B script/release_assets.py publish --tag "$TAG" --commit "$COMMIT" --directory dist/release
 ```
 
-`publish` 会核对已有草稿/正式资产，逐一下载回读后才公开；遇到冲突立即停止，不使用 `--clobber`。发布后还需 Tap 跟进及真实 `brew upgrade` 验证，不能把上传成功当作 Brew 已升级。
+`preflight` 核对标签、HEAD、origin/main 和干净源码；`package/verify` 检查精确文件树、两个可执行文件的 arm64、版本、组名和签名。DMG 用只读挂载检查，随后卸载。`publish` 上传后回读远端字节，匹配才公开；冲突不覆盖，不用 `--clobber`。
 
-### 保留的可选云端发布路径
+完成后确认 Releases 列表中非草稿可见，五项资产能下载且摘要一致。只有本地文件或草稿不算发布完成。
 
-仅在 `TOKENSTAT_CLOUD_RELEASE=enabled` 且推送版本标签时启用；本地出包期间保持关闭。该路径仍使用下列两阶段门禁。
+## 可选云端发布
 
-流水线分成 `build` 与 `publish` 两个 job：
+默认关闭。设置 `TOKENSTAT_CLOUD_RELEASE=enabled` 并配置 `TOKENSTAT_WIDGET_GROUP` 后，标签 push 才运行构建和 publish。不要同时本地、云端出同版包。只有 publish job 有 `contents: write`，回读验证后才公开。
 
-| 阶段 | 权限与实际动作 |
+公开构建采用 ad hoc 签名，未做 Developer ID/公证；App Group 字符串和签名检查不能代替 Apple 授权。小组件分发仍受 [#88](https://github.com/Tupig/TokenStatMenu/issues/88) 限制。
+
+## Homebrew 跟进
+
+[Tap](https://github.com/Tupig/homebrew-tokenstatmenu) 从正式 Release 获取源码 ZIP，先核验身份和摘要，再构建、`brew style/audit/test`，最后更新 Formula。1.1.7 起要求 arm64，并检查主 App 和内嵌扩展的版本、签名和文件树。旧版模板保留兼容，避免读不了现有配方。
+
+Tap 的自动检查、测试与写入分开。配方更新后用户仍需 `brew update` 和 `brew upgrade`；要实测已有安装升级，不能只看自动 check 的“无变化”。
+
+## 文档和 Wiki
+
+README 与 `docs/wiki/` 随源码发布。GitHub Wiki 是独立仓库，首次未初始化时需要先创建 Home；同步时处理 Wiki 页面与仓库源码链接的区别。未确认远端可读前，不在报告中写“Wiki 已同步”。
+
+---
+
+# CI/CD (English)
+
+[简体中文](#cicd) | **English**
+
+[Documentation](Home.md#documentation-hub-english) · [Build](编译指南.md#build-guide-english) · [Testing](测试指南.md#testing-guide-english)
+
+## CI Checks
+
+[ci.yml](../../.github/workflows/ci.yml) runs on main pushes, PRs and `v*` tags. It checks docs, public content, release contracts, CoreChecks, state/UI tests, Xcode Release assembly and an unchanged dependency lock. Some renderer-dependent image comparisons are local-only.
+
+Normal jobs are read-only. Actions use full commit pins; SwiftPM uses `--force-resolved-versions`. CI does not access user Hub/Codex data or establish real Widget/service acceptance.
+
+## Version 1.1.7 Contract
+
+Apple Silicon (M-series) only. App and widget are arm64 with matching version/build. Asset names follow the repository name:
+
+| Asset | Purpose |
 | --- | --- |
-| `build` | `macos-15`、仓库只读；运行公开内容/文档/核心及指定原生检查，构建 Xcode 工程，再构建并 ad hoc 签名 Universal App；使用显式白名单生成源码 ZIP，并要求跟踪文件无未提交差异；从 1.1.5/build7 起创建和核验五个资产（App ZIP、源码 ZIP、Universal DMG、manifest、SUMS）后上传 Actions artifact |
-| `publish` | `macos-15`、仅此 job 有 `contents: write`；下载同一 run 的 artifact，再次按源码、版本、结构、摘要和 DMG 镜像内容核验；只对固定主仓库的该标签处理 Release，支持继续匹配的草稿，远端逐个核验后才公开 |
+| `TokenStatMenu.zip` | Native App with embedded widget |
+| `TokenStatMenu-source.zip` | Allowlisted code, project, resources, tests and docs |
+| `TokenStatMenu.dmg` | The same App plus Applications alias |
+| `release-manifest.json` | Tag, commit, version/build, sizes and digests |
+| `SHA256SUMS` | Digests of the three archives/image and manifest |
 
-当前 1.1.4/build6 历史 Release 恰好包含以下四个手动上传资产；从 1.1.5/build7 起目标为五项，GitHub 自动提供的 Source code 归档不属于这些资产：
+The tag and bundle metadata carry the version, not the asset filename. Older Releases retain their original names and checks.
 
-| 文件 | 用途 |
-| --- | --- |
-| `TokenStatMenu-<版本>-universal.zip` | 包含 arm64 与 x86_64 的原生 App |
-| `TokenStatMenu-<版本>-source.zip` | 显式白名单导出的源码、原生工程和资源，统一 `TokenStatMenu/` 根目录 |
-| `TokenStatMenu-<版本>-universal.dmg` | 与同一 Universal App 绑定的 Finder 拖拽安装包装，根目录仅含 App 与 `Applications` 别名 |
-| `release-manifest.json` | 版本、构建、标签、40 位公开提交，以及当前四资产或下一版五资产的文件名、字节数和 SHA-256 |
-| `SHA256SUMS` | 当前四资产历史为三行；五资产版本为四行排序校验和，覆盖所有三个发布二进制/源码资产和 manifest，不包含自身摘要 |
+## Local Publication
 
-应用包检查版本/架构、图标、Info/二进制/图标/签名四个文件和严格签名；DMG 另外使用 `hdiutil imageinfo` 并以只读方式挂载，核对根目录 App、`Applications` 别名和同一 App 身份，再安全卸载。源归档检查白名单及路径/类型/摘要。校验器不会因资产已经存在就直接成功；已有资产内容冲突会失败，不覆盖未知发布材料。工具的入口和边界见 [release_assets.py](../../script/release_assets.py) 与 [对应合成测试](../../script/test_release_assets.py)。
+Test, commit and push main, wait for its CI, then fix the `v1.1.7` tag. Build from clean committed source:
 
-App 使用 **ad hoc 签名**，没有配置 Developer ID 证书或 Apple 公证。资产摘要和 Git 提交用于核对完整性与来源，不是 Apple 信任证明，也不能证明用户机器上的企业链路可用。工作流不安装 App 到用户目录，不自动启动应用、不操作企业服务或系统权限。
+```bash
+TAG=v1.1.7
+COMMIT=$(git rev-parse HEAD)
+TOKENSTAT_WIDGET_GROUP=<configured-group> ./script/build_and_run.sh --arm64
+python3 -B script/release_assets.py preflight --tag "$TAG" --commit "$COMMIT"
+python3 -B script/package_source.py
+python3 -B script/release_assets.py package --tag "$TAG" --commit "$COMMIT" --app dist/TokenStatMenu.app --source dist/TokenStatMenu-source.zip --directory dist/release
+python3 -B script/release_assets.py verify --tag "$TAG" --commit "$COMMIT" --directory dist/release
+python3 -B script/release_assets.py publish --tag "$TAG" --commit "$COMMIT" --directory dist/release
+```
 
-首次正式标签、Actions 实际完成、四资产历史或五资产下一版下载核验及安装验收需分别记录在 [验证记录](../VALIDATION.md)。工作流文件存在、合成检查通过或草稿已创建，都不能直接称为发布完成；当前页面不预写 1.1.5 CI/Release 成功。
+Preflight checks tag, HEAD, origin/main and clean source. Packaging checks the exact file tree, both arm64 executables, version, group and signatures. DMG checks use read-only mounts. Publish reads remote assets back before making the Release public; mismatches fail without clobbering.
 
-## Homebrew 源码安装和自动跟进
+Confirm a public, non-draft entry and five downloadable matching assets. A local package or draft alone is not a completed release.
 
-独立 [Homebrew tap](https://github.com/Tupig/homebrew-tokenstatmenu) 使用正式 Release 的**源码 ZIP**。Formula 以完整 Xcode 15+ 的原生工程构建主机架构，安装在 Homebrew 的 `libexec`，生成无参数的 `tokenstatmenu` 启动器；不通过 SwiftPM 下载测试依赖。它在最终安装位置 ad hoc 签名，并写入 Release 提交及 `release-source` 来源状态。
+## Optional Cloud Publication
 
-tap 的定时/手动更新有三个阶段：只读 `check` 核验公共 Release；只读 macOS `smoke` 重建同一候选，执行单元检查、`brew style`、`brew audit`、真实源码安装和 `brew test`；最后 Ubuntu `publish` 再核对全部候选字段和旧 Formula Git blob SHA，仅改写本 tap 的 Formula 文件。无版本、不变、降级、同版本冲突、测试失败或并发变更均不会强行更新。
+Disabled by default. Enable `TOKENSTAT_CLOUD_RELEASE=enabled` with `TOKENSTAT_WIDGET_GROUP` to run tag-triggered build/publish. Do not build the same release locally and in the cloud. Only the publish job gets write permission.
 
-公开下载不用企业凭据或跨仓库 PAT。仅最后的 job 使用 tap 自身的 `GITHUB_TOKEN`，写入前不执行下载的应用源码。GitHub token 产生的提交通常不会再次触发普通 push CI，因此同一工作流中的 macOS 测试必须先完成。相关平台规则见 [GitHub 工作流触发说明](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)。
+Public builds are ad hoc signed, not Developer ID signed or notarized. Entitlement checks do not grant App Group authorization; [#88](https://github.com/Tupig/TokenStatMenu/issues/88) remains relevant.
 
-该机制更新的是公开 Formula；用户仍需 `brew update` / `brew upgrade`，且先退出旧 App。安装命令、Xcode 前提和回退方式见 [安装与使用](安装与使用.md)。实际正式 Release 下载、两版本隔离升级和最终公开 tap 安装分别验收，不用合成下载或本地 URL 适配替代公开端点验证。
+## Homebrew Follow-up
 
-相关页面：[测试指南](测试指南.md) · [编译指南](编译指南.md) · [贡献指南](贡献指南.md) · [验证记录](../VALIDATION.md)
+The [Tap](https://github.com/Tupig/homebrew-tokenstatmenu) validates the official source archive, then builds and runs style/audit/test before publishing a formula change. Version 1.1.7 onward requires arm64 and validates the embedded extension too. Historical templates remain compatible with existing pins.
+
+Check, smoke testing and writes are separate. Users still run `brew update` and `brew upgrade`. Test an actual installed-version upgrade; a successful no-change check is insufficient.
+
+## Documentation and Wiki
+
+README and `docs/wiki/` ship with source. GitHub Wiki is a separate repository and may need an initial Home page. Convert links appropriately when syncing. Do not report synchronization before confirming public readability.

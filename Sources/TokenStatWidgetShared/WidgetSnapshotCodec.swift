@@ -21,7 +21,12 @@ public enum WidgetSnapshotCodec {
         "hubSource", "hubState", "fiveHour", "sevenDay", "monthly", "local",
         "resetVoucherCount"
     ]
-    private static let windowKeys: Set<String> = ["remainingPercent", "resetsAtMs"]
+    private static let windowKeys: Set<String> = [
+        "remainingPercent", "resetsAtMs", "usedAmount", "limitAmount", "sourceSymbol"
+    ]
+    private static let optionalWindowKeys: Set<String> = [
+        "usedAmount", "limitAmount", "sourceSymbol"
+    ]
     private static let monthlyKeys: Set<String> = ["usedAmount", "limitAmount", "sourceSymbol"]
     private static let localKeys: Set<String> = [
         "inputTokens", "outputTokens", "totalTokens",
@@ -61,6 +66,17 @@ public enum WidgetSnapshotCodec {
             else { throw CodecError.outOfRange("\(label).remainingPercent") }
             if let reset = window.resetsAt {
                 try validateTimestamp(reset, "\(label).resetsAtMs")
+            }
+            for (name, amount) in [("usedAmount", window.usedAmount),
+                                   ("limitAmount", window.limitAmount)] {
+                if let amount {
+                    guard amount.isFinite, amount >= 0 else {
+                        throw CodecError.outOfRange("\(label).\(name)")
+                    }
+                }
+            }
+            if let symbol = window.sourceSymbol, symbol.count > 4 {
+                throw CodecError.outOfRange("\(label).sourceSymbol")
             }
         }
         try validateTimestamp(snapshot.writtenAt, "writtenAtMs")
@@ -115,7 +131,10 @@ public enum WidgetSnapshotCodec {
 
     private static func encodeWindow(_ window: WidgetQuotaSnapshot.Window) -> [String: Any] {
         ["remainingPercent": window.remainingPercent,
-         "resetsAtMs": window.resetsAt.map(milliseconds) ?? NSNull()]
+         "resetsAtMs": window.resetsAt.map(milliseconds) ?? NSNull(),
+         "usedAmount": window.usedAmount ?? NSNull(),
+         "limitAmount": window.limitAmount ?? NSNull(),
+         "sourceSymbol": window.sourceSymbol ?? NSNull()]
     }
 
     private static func encodeMonthly(_ monthly: WidgetQuotaSnapshot.Monthly) -> [String: Any] {
@@ -191,13 +210,17 @@ public enum WidgetSnapshotCodec {
         guard let raw = root[key] else { throw CodecError.missingKey(key) }
         if raw is NSNull { return nil }
         guard let object = raw as? [String: Any] else { throw CodecError.wrongType(key) }
-        try requireClosed(object, keys: windowKeys)
+        try requireClosed(object, keys: windowKeys, optional: optionalWindowKeys)
         let percent = try number(object, "remainingPercent").doubleValue
         guard percent.isFinite, (0...100).contains(percent) else {
             throw CodecError.outOfRange("remainingPercent")
         }
         let resetsAt = try date(object, "resetsAtMs")
-        return WidgetQuotaSnapshot.Window(remainingPercent: percent, resetsAt: resetsAt)
+        let usedAmount = try optionalAmount(object, "usedAmount")
+        let limitAmount = try optionalAmount(object, "limitAmount")
+        let sourceSymbol = try optionalSymbol(object, "sourceSymbol")
+        return WidgetQuotaSnapshot.Window(remainingPercent: percent, resetsAt: resetsAt,
+            usedAmount: usedAmount, limitAmount: limitAmount, sourceSymbol: sourceSymbol)
     }
 
     private static func monthlyValue(_ root: [String: Any], _ key: String) throws
@@ -279,6 +302,22 @@ public enum WidgetSnapshotCodec {
         guard let raw = object[key], !(raw is NSNull) else { return nil }
         let value = try integer(object, key)
         guard value <= 1_000_000 else { throw CodecError.outOfRange(key) }
+        return value
+    }
+
+    /// JSON null 或字段缺失时返回 nil；负数、非有限值抛出错误。
+    private static func optionalAmount(_ object: [String: Any], _ key: String) throws -> Double? {
+        guard let raw = object[key], !(raw is NSNull) else { return nil }
+        let value = try number(object, key).doubleValue
+        guard value.isFinite, value >= 0 else { throw CodecError.outOfRange(key) }
+        return value
+    }
+
+    /// JSON null 或字段缺失时返回 nil；非字符串或过长符号抛出错误。
+    private static func optionalSymbol(_ object: [String: Any], _ key: String) throws -> String? {
+        guard let raw = object[key], !(raw is NSNull) else { return nil }
+        let value = try string(object, key)
+        guard value.count <= 4 else { throw CodecError.outOfRange(key) }
         return value
     }
 

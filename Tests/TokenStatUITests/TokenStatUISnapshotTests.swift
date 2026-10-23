@@ -24,7 +24,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
     func testCompactPanelSizeMatchesPopover() {
         let model = AppModel(preview: true)
         defer { model.shutdown() }
-        XCTAssertEqual(PanelMetrics.size, NSSize(width: 320, height: 420))
+        XCTAssertEqual(PanelMetrics.size, NSSize(width: 300, height: 420))
         for settings in [false, true] {
             let host = NSHostingView(rootView: DashboardView(model: model, settings: settings))
             host.frame = NSRect(origin: .zero, size: PanelMetrics.size)

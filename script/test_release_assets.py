@@ -557,6 +557,14 @@ class ReleaseChecks(unittest.TestCase):
             },
         )
         self.assertNotIn("dmg", release._names(legacy_identity))
+        self.assertEqual(
+            release._names(release.ReleaseIdentity("1.1.7", "21", "v1.1.7", f.commit)),
+            {
+                "universal": "TokenStatMenu.zip",
+                "source": "TokenStatMenu-source.zip",
+                "dmg": "TokenStatMenu.dmg",
+            },
+        )
 
     def test_verify_and_publish_request_native_dmg_validation(self):
         f = self.fixture
@@ -1262,8 +1270,14 @@ class NativeReleaseChecks(unittest.TestCase):
             release.validate_app(f.root, f.app, f.identity, subprocess.run)
 
     def test_116_requires_and_accepts_the_embedded_widget(self):
+        self.check_embedded_widget("1.1.6")
+
+    def test_117_requires_arm64_widget_and_rejects_universal(self):
+        self.check_embedded_widget("1.1.7")
+
+    def check_embedded_widget(self, version):
         f = self.fixture
-        identity = release.ReleaseIdentity("1.1.6", "9", "v1.1.6", f.commit)
+        identity = release.ReleaseIdentity(version, "9", "v" + version, f.commit)
         self.assertEqual(
             release._bundle_shape(identity),
             (release.WIDGET_APP_FILES, release.WIDGET_APP_DIRECTORIES),
@@ -1278,7 +1292,7 @@ class NativeReleaseChecks(unittest.TestCase):
 
         source_info = dict(
             f.source_info,
-            CFBundleShortVersionString="1.1.6",
+            CFBundleShortVersionString=version,
             CFBundleVersion="9",
         )
         (f.root / "Resources/Info.plist").write_bytes(plistlib.dumps(source_info))
@@ -1305,7 +1319,7 @@ class NativeReleaseChecks(unittest.TestCase):
                     "CFBundleExecutable": "TokenStatMenuWidget",
                     "CFBundlePackageType": "XPC!",
                     "CFBundleVersion": "9",
-                    "CFBundleShortVersionString": "1.1.6",
+                    "CFBundleShortVersionString": version,
                     "TokenStatWidgetGroup": "group.com.tupig.TokenStatMenu",
                     "NSExtension": {
                         "NSExtensionPointIdentifier": "com.apple.widgetkit-extension"
@@ -1355,6 +1369,35 @@ class NativeReleaseChecks(unittest.TestCase):
         )
         for name, mode in release.WIDGET_APP_FILES.items():
             (f.app / name).chmod(mode)
+        if version == "1.1.7":
+            with self.assertRaisesRegex(ValueError, "architectures differ"):
+                release.validate_app(f.root, f.app, identity, subprocess.run)
+            for binary in [
+                f.app / "Contents/MacOS/TokenStatMenu",
+                widget / "Contents/MacOS/TokenStatMenuWidget",
+            ]:
+                thin = binary.with_suffix(".thin")
+                run("lipo", str(binary), "-thin", "arm64", "-output", str(thin))
+                os.replace(thin, binary)
+                binary.chmod(0o755)
+            run(
+                "codesign",
+                "--force",
+                "--sign",
+                "-",
+                "--entitlements",
+                str(widget_entitlements),
+                str(widget),
+            )
+            run(
+                "codesign",
+                "--force",
+                "--sign",
+                "-",
+                "--entitlements",
+                str(app_entitlements),
+                str(f.app),
+            )
         release.validate_app(f.root, f.app, identity, subprocess.run)
 
         # A matching version and group are not enough: the extension bundle
@@ -1535,10 +1578,11 @@ class CleanupChecks(unittest.TestCase):
     def test_default_packaging_preserves_tracked_bytes_modes_and_git_state(self):
         root = self.synthetic_root()
         (root / ".gitignore").write_text("dist/\n")
-        (root / "docs/VALIDATION.md").write_text(
+        (root / "docs/wiki").mkdir()
+        (root / "docs/wiki/Home.md").write_text(
             "# Synthetic validation\nUnchanged sentinel.\n"
         )
-        names = ["README.md", ".gitignore", "docs/VALIDATION.md"]
+        names = ["README.md", ".gitignore", "docs/wiki/Home.md"]
         run("git", "init", "--quiet", "--initial-branch=main", cwd=root)
         run("git", "config", "user.name", "Synthetic Cleanup Fixture", cwd=root)
         run("git", "config", "user.email", "cleanup-fixture@example.invalid", cwd=root)
@@ -1636,14 +1680,20 @@ def workflow_contract(document: dict, raw: str) -> None:
     assert " ".join(uploads[0].get("if", "").split()) == TAG_ONLY_IF
     paths = uploads[0]["with"]["path"]
     assert "*" not in paths and len(paths.splitlines()) == 5
-    assert any(path.endswith("-universal.dmg") for path in paths.splitlines())
+    assert set(paths.splitlines()) == {
+        "dist/release/TokenStatMenu.zip",
+        "dist/release/TokenStatMenu-source.zip",
+        "dist/release/TokenStatMenu.dmg",
+        "dist/release/release-manifest.json",
+        "dist/release/SHA256SUMS",
+    }
     scripts = "\n".join(
         step.get("run", "") for job in [build, publish] for step in job["steps"]
     )
     assert "$" + "{{ github.ref_name }}" not in scripts
     assert "--clobber" not in scripts and "continue-on-error: true" not in raw
     assert "script/release_assets.py" in scripts
-    assert "--universal" in scripts
+    assert "--arm64" in scripts
     assert "script/test_release_assets.py" in scripts
     assert "GH_TOKEN" in json.dumps(publish)
     assert "GH_TOKEN" not in json.dumps(build)
@@ -1723,7 +1773,7 @@ def workflow_contract(document: dict, raw: str) -> None:
     )
     for prefix in [
         "python3 -B script/release_assets.py preflight",
-        "./script/build_and_run.sh --universal",
+        "./script/build_and_run.sh --arm64",
         "python3 -B script/package_source.py",
         "python3 -B script/release_assets.py package",
         "python3 -B script/release_assets.py verify",
@@ -1860,6 +1910,115 @@ class WorkflowChecks(unittest.TestCase):
                 workflow_contract(value, raw)
         with self.assertRaises(AssertionError):
             workflow_contract(baseline, raw + "\ncontinue-on-error: true\n")
+
+
+PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>CFBundleShortVersionString</key>
+\t<string>{version}</string>
+\t<key>CFBundleVersion</key>
+\t<string>{build}</string>
+</dict>
+</plist>
+"""
+
+
+class BumpBuildChecks(unittest.TestCase):
+    """Local builds advance both plists; release builds stay at tag identity."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="tokenstat-bump-"))
+        self.addCleanup(shutil.rmtree, self.root)
+        self.write_plists("1.2.3", "7", "1.2.3", "7")
+
+    def write_plists(self, app_version, app_build, widget_version, widget_build):
+        for name, version, build in (
+            ("Resources/Info.plist", app_version, app_build),
+            ("Resources/WidgetExtension-Info.plist", widget_version, widget_build),
+        ):
+            target = self.root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                PLIST_TEMPLATE.format(version=version, build=build),
+                encoding="utf-8",
+            )
+
+    def bump(self, *args):
+        return subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(PROJECT / "script/bump_build.py"),
+                "--root",
+                str(self.root),
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def contents(self):
+        return {
+            name: (self.root / name).read_text(encoding="utf-8")
+            for name in (
+                "Resources/Info.plist",
+                "Resources/WidgetExtension-Info.plist",
+            )
+        }
+
+    def test_increments_both_plists(self):
+        before = self.contents()
+        result = self.bump()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "build 7 -> 8 (1.2.3)")
+        after = self.contents()
+        for name, text in after.items():
+            self.assertEqual(text.count("<string>8</string>"), 1)
+            self.assertEqual(
+                text.replace("<string>8</string>", "<string>7</string>"),
+                before[name],
+            )
+        printed = self.bump("--print")
+        self.assertEqual(printed.returncode, 0, printed.stderr)
+        self.assertEqual(printed.stdout.strip(), "1.2.3 (build 8)")
+
+    def test_print_leaves_files_unchanged(self):
+        before = self.contents()
+        result = self.bump("--print")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1.2.3 (build 7)")
+        self.assertEqual(self.contents(), before)
+
+    def test_rejects_drifted_builds(self):
+        self.write_plists("1.2.3", "7", "1.2.3", "9")
+        before = self.contents()
+        result = self.bump()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CFBundleVersion differ", result.stderr)
+        self.assertEqual(self.contents(), before)
+
+    def test_rejects_drifted_versions(self):
+        self.write_plists("1.2.3", "7", "1.2.4", "7")
+        result = self.bump()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CFBundleShortVersionString differ", result.stderr)
+
+    def test_rejects_non_integer_build(self):
+        self.write_plists("1.2.3", "abc", "1.2.3", "abc")
+        before = self.contents()
+        result = self.bump()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CFBundleVersion", result.stderr)
+        self.assertEqual(self.contents(), before)
+
+    def test_rejects_missing_plist(self):
+        (self.root / "Resources/WidgetExtension-Info.plist").unlink()
+        result = self.bump()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing", result.stderr)
 
 
 if __name__ == "__main__":

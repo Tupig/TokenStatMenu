@@ -8,150 +8,159 @@ struct WidgetEntryView: View {
     private var snapshot: WidgetQuotaSnapshot? { entry.snapshot }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            header
+        Group {
             if !entry.channelAvailable {
                 unavailableNotice
             } else if let snapshot {
                 content(snapshot)
             } else {
-                Text("尚未获取数据")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("打开 TokenStatMenu 后自动更新")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                emptyState
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(2)
-    }
-
-    private var header: some View {
-        HStack(spacing: 4) {
-            Text("Token")
-                .font(.caption.bold())
-            Spacer(minLength: 0)
-            if let snapshot {
-                Text(snapshot.hubIsCurrent(at: .now) ? "实时" : "已过期")
-                    .font(.caption2)
-                    .foregroundStyle(snapshot.hubIsCurrent(at: .now) ? .secondary : .tertiary)
-            }
-        }
+        .padding(4)
     }
 
     private var unavailableNotice: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 4) {
             Text("共享通道不可用")
-                .font(.caption)
+                .font(.system(size: 10))
                 .foregroundStyle(.secondary)
             Text("需要签名与 App Group")
-                .font(.caption2)
+                .font(.system(size: 9))
                 .foregroundStyle(.tertiary)
         }
     }
 
-    @ViewBuilder
-    private func content(_ snapshot: WidgetQuotaSnapshot) -> some View {
-        // 渲染时判断有效期；`entry.date` 在时间线创建时固定，不能反映后续重置。
-        let five = snapshot.currentWindow(snapshot.fiveHour, at: .now)
-        let seven = snapshot.currentWindow(snapshot.sevenDay, at: .now)
-        let monthly = snapshot.currentMonthly(at: .now)
-        smallBody(five: five, seven: seven, monthly: monthly,
-                  vouchers: snapshot.resetVoucherCount)
-    }
-
-    private func smallBody(five: WidgetQuotaSnapshot.Window?,
-                           seven: WidgetQuotaSnapshot.Window?,
-                           monthly: WidgetQuotaSnapshot.Monthly?,
-                           vouchers: Int?) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
-            compactQuotaRow("5h", five)
-            compactQuotaRow("7d", seven)
-            HStack(spacing: 6) {
-                Text("月度")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 2)
-                if let monthly {
-                    Text("\(monthly.sourceSymbol)\(amountText(monthly.usedAmount))")
-                        .font(.caption.bold())
-                        .monospacedDigit()
-                } else {
-                    Text("未知")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            HStack(spacing: 6) {
-                Text("重置券")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 2)
-                if let vouchers {
-                    Text("\(vouchers) 张")
-                        .font(.caption.bold())
-                        .monospacedDigit()
-                } else {
-                    Text("未知")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            Spacer(minLength: 0)
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("尚未获取数据")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            Text("打开 TokenStatMenu 后自动更新")
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
         }
     }
 
-    private func compactQuotaRow(_ label: String,
-                                 _ window: WidgetQuotaSnapshot.Window?) -> some View {
-        HStack(spacing: 6) {
-            Text(label)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .frame(width: 22, alignment: .leading)
-            if let window {
-                quotaBar(usedPercent(window))
-                    .frame(width: 58)
+    /// 三组额度在方形小组件内均匀分布，避免全部挤在顶部。
+    private func content(_ snapshot: WidgetQuotaSnapshot) -> some View {
+        // 边界时间线负责推进；渲染若延迟，仍按实际时间拒绝过期数据。
+        let now = max(entry.date, Date.now)
+        let five = snapshot.currentWindow(snapshot.fiveHour, at: now)
+        let seven = snapshot.currentWindow(snapshot.sevenDay, at: now)
+        let monthly = snapshot.currentMonthly(at: now)
+        return VStack(alignment: .leading, spacing: 0) {
+            quotaLine("5 小时", five)
+            Spacer(minLength: 6)
+            quotaLine("7 天", seven)
+            Spacer(minLength: 6)
+            monthlyLine(monthly)
+            Spacer(minLength: 6)
+            voucherLine(snapshot.currentResetVoucherCount(at: now))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// 标题、剩余百分比、已用进度条；下方左侧为窗口最大额度，右侧为重置时间。
+    private func quotaLine(_ label: String,
+                           _ window: WidgetQuotaSnapshot.Window?) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 2) {
+                Text(label)
+                    .font(.system(size: 10, weight: .medium))
                 Spacer(minLength: 2)
-                Text(usedText(window))
-                    .font(.caption.bold())
+                if let window {
+                    Text("剩余 \(percentText(window.remainingPercent))%")
+                        .font(.system(size: 10, weight: .semibold))
+                        .monospacedDigit()
+                } else {
+                    Text("未知")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            quotaBar(window?.usedPercent)
+            HStack(spacing: 2) {
+                Text(windowLimit(window))
+                    .font(.system(size: 10, weight: .medium))
                     .monospacedDigit()
-            } else {
-                Capsule()
-                    .fill(Color.primary.opacity(0.08))
-                    .frame(width: 58, height: 6)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
                 Spacer(minLength: 2)
+                Text(resetText(window?.resetsAt))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+        }
+    }
+
+    /// 月度只显示已用金额，不显示进度条。
+    private func monthlyLine(_ monthly: WidgetQuotaSnapshot.Monthly?) -> some View {
+        HStack(spacing: 2) {
+            Text("月度用量")
+                .font(.system(size: 10, weight: .medium))
+            Spacer(minLength: 2)
+            if let monthly {
+                Text("\(monthly.sourceSymbol)\(monthlyAmountText(monthly.usedAmount))")
+                    .font(.system(size: 10, weight: .semibold))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            } else {
                 Text("未知")
-                    .font(.caption)
+                    .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
             }
         }
     }
 
-    private func quotaBar(_ used: Double) -> some View {
+    private func voucherLine(_ count: Int?) -> some View {
+        HStack(spacing: 2) {
+            Text("重置券")
+                .font(.system(size: 10, weight: .medium))
+            Spacer(minLength: 2)
+            Text(count.map { "\($0) 张" } ?? "未知")
+                .font(.system(size: 10, weight: .semibold))
+                .monospacedDigit()
+        }
+    }
+
+    /// 进度条下方只显示窗口最大额度；已用比例已在上方文字和进度条中表达。
+    private func windowLimit(_ window: WidgetQuotaSnapshot.Window?) -> String {
+        guard let limit = window?.limitAmount else { return "额度未知" }
+        if let symbol = window?.sourceSymbol {
+            return "\(symbol)\(amountText(limit))"
+        }
+        return amountText(limit)
+    }
+
+    private func resetText(_ date: Date?) -> String {
+        guard let date else { return "重置未知" }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MM-dd HH:mm"
+        return "重置 \(formatter.string(from: date))"
+    }
+
+    private func quotaBar(_ used: Double?) -> some View {
         GeometryReader { proxy in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.12))
-                Capsule()
-                    .fill(quotaTint(used))
-                    .frame(width: proxy.size.width * min(100, max(0, used)) / 100)
+                Capsule().fill(Color.blue.opacity(0.15))
+                if let used {
+                    Capsule()
+                        .fill(Color.blue)
+                        .frame(width: proxy.size.width * min(100, max(0, used)) / 100)
+                }
             }
         }
-        .frame(height: 6)
+        .frame(height: 4)
     }
 
-    private func quotaTint(_ used: Double) -> Color {
-        if used >= 90 { return .red }
-        if used >= 70 { return .orange }
-        return .green
-    }
-
-    private func usedPercent(_ window: WidgetQuotaSnapshot.Window) -> Double {
-        min(100, max(0, 100 - window.remainingPercent))
-    }
-
-    private func usedText(_ window: WidgetQuotaSnapshot.Window) -> String {
-        String(format: "%.1f%%", usedPercent(window))
+    private func percentText(_ value: Double) -> String {
+        String(format: "%.2f", value)
     }
 
     // MARK: - 格式化
@@ -161,7 +170,17 @@ struct WidgetEntryView: View {
         formatter.numberStyle = .decimal
         formatter.usesGroupingSeparator = true
         formatter.maximumFractionDigits = 2
+        formatter.minimumFractionDigits = 0
+        return formatter.string(from: NSNumber(value: value)) ?? String(format: "%.2f", value)
+    }
+
+    /// 月度金额与面板一致：千分位、两位小数。
+    private func monthlyAmountText(_ value: Double) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
         formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
         return formatter.string(from: NSNumber(value: value)) ?? String(format: "%.2f", value)
     }
 }

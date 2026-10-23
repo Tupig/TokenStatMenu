@@ -5,7 +5,13 @@ let package = Package(
     name: "TokenStatMenu",
     platforms: [.macOS(.v13)],
     products: [.executable(name: "TokenStatMenu", targets: ["TokenStatMenu"])],
-    dependencies: [.package(url: "https://github.com/pointfreeco/swift-snapshot-testing", exact: "1.19.6")],
+    dependencies: [
+        .package(url: "https://github.com/pointfreeco/swift-snapshot-testing", exact: "1.19.6"),
+        // Keep both manifest branches in the graph rather than orphan pins
+        // which newer SwiftPM versions prune from Package.resolved.
+        .package(url: "https://github.com/pointfreeco/swift-issue-reporting", exact: "2.1.2"),
+        .package(url: "https://github.com/pointfreeco/xctest-dynamic-overlay", exact: "1.13.1"),
+    ],
     targets: [
         .target(name: "TokenStatCore"),
         // Shared between the menu-bar app and its embedded widget extension.
