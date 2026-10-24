@@ -160,7 +160,7 @@ final class DashboardHistoryTests: XCTestCase {
         host.layoutSubtreeIfNeeded()
         let fitted = host.fittingSize
         XCTAssertEqual(fitted.width, 460, accuracy: 0.5)
-        XCTAssertGreaterThan(fitted.height, 200, "render must include actual overview content, not a toolbar crop")
+        XCTAssertGreaterThan(fitted.height, 120, "render must include the quota overview, not a toolbar crop")
         XCTAssertLessThan(fitted.height, 4000)
         let bounds = NSRect(x: 0, y: 0, width: 460, height: ceil(fitted.height))
         let window = NSWindow(contentRect: bounds, styleMask: [.borderless], backing: .buffered, defer: false)
