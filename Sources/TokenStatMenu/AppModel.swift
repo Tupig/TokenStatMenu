@@ -126,26 +126,12 @@ struct DirectQuotaTransportSnapshot: Sendable {
     }
 }
 
-/// 在主 actor 之外执行进程发现、设置与 SQLite 读取及认证请求，身份和凭据不离开此 actor。
+/// 正式路径不打开 Token Hub 数据库，也不执行 SQL。
+/// 没有独立的非数据库会话来源时保持未知。
 private actor TokenHubDirectQuotaWorker {
-    private let client = TokenHubDirectQuotaClient()
-
     func fetch(nowProvider: @Sendable () -> Date) async throws -> DirectQuotaTransportSnapshot {
-        let observedAt = nowProvider()
-        let applications = NSRunningApplication.runningApplications(withBundleIdentifier: TokenHubTarget.bundleID)
-            .filter { !$0.isTerminated }
-        guard !applications.isEmpty else { throw TokenHubQuotaFailure.noTarget }
-        guard applications.count == 1, let app = applications.first,
-              let executable = app.executableURL?.standardizedFileURL.path,
-              let bundle = app.bundleIdentifier else {
-            throw applications.count > 1 ? TokenHubQuotaFailure.multipleTargets : TokenHubQuotaFailure.identityChanged
-        }
-        let identity = TokenHubIdentity(pid: app.processIdentifier, bundleID: bundle, executablePath: executable)
-        let snapshot = try await client.fetch(identity: identity, nowProvider: nowProvider,
-                                              observationAt: observedAt)
-        try Task.checkCancellation()
-        // TokenHubDirectQuotaClient 在网络交换前后校验配置和数据库身份，不返回目标身份。
-        return DirectQuotaTransportSnapshot(snapshot: snapshot)
+        _ = nowProvider
+        throw TokenHubDirectQuotaFailure.connectionUnavailable
     }
 }
 

@@ -104,7 +104,8 @@ private enum TokenHubTimestamp {
     }
 }
 
-/// 仅读取 Token Hub 的连接和会话字段。SQLite 以只读方式打开，按固定键查询，不保留其他行。
+/// 现行规则不允许打开 Token Hub 数据库。
+/// 这些入口保留给历史测试注入，正式刷新不会调用。
 public enum TokenHubConnectionDiscovery {
     public static func defaultDatabaseURL(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
         home.appendingPathComponent(".seasun-token-hub", isDirectory: true).appendingPathComponent("tokenhub.db")
