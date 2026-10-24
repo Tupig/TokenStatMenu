@@ -8,7 +8,9 @@ import TokenStatWidgetShared
 @MainActor
 final class WidgetEntryViewTests: XCTestCase {
     func testActualWidgetRendersCurrentUnknownExpiredResetAndUnavailableStates() async throws {
-        let now = Date()
+        // 产品取 max(entry.date, Date.now)；提前一小时的条目时间让本组
+        // 慢速图像识别期间仍按同一逻辑时钟验证，不修改产品时钟策略。
+        let now = Date().addingTimeInterval(3600)
         func snapshot(observed: Date, reset: Date, sevenReset: Date? = nil,
                       state: WidgetQuotaSnapshot.HubState = .ready) -> WidgetQuotaSnapshot {
             WidgetQuotaSnapshot(writtenAt: observed, observedAt: observed,
@@ -116,10 +118,13 @@ final class WidgetEntryViewTests: XCTestCase {
         let observations = request.results ?? []
         let text = observations.compactMap { $0.topCandidates(1).first?.string }
             .joined(separator: "\n").replacingOccurrences(of: " ", with: "")
-        // 数值与旧值泄露仍核对整图 top-1；中文标签另核对未经词表纠正的
-        // 原始候选及真实行区域，避免把 Vision 的“度/慶”“券/劵”错字当产品缺陷。
+        // 数值与旧值泄露仍核对关闭纠正的整图 top-1。中文标签另核对
+        // 原始候选和启用系统纠正的真实行区域；不注入预期词，不能据此
+        // 宣称每个中文字形正确，也不代替原生辅助功能检查。
         var labels = observations.flatMap { $0.topCandidates(10) }.map(\.string)
         for observation in observations {
+            let recognized = observation.topCandidates(1).first?.string ?? ""
+            guard recognized.unicodeScalars.contains(where: { (0x3400...0x9FFF).contains($0.value) }) else { continue }
             let box = observation.boundingBox
             let region = CGRect(x: box.minX * CGFloat(image.width) - 12,
                 y: (1 - box.maxY) * CGFloat(image.height) - 12,
@@ -127,12 +132,25 @@ final class WidgetEntryViewTests: XCTestCase {
                 height: box.height * CGFloat(image.height) + 24)
                 .intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height)).integral
             guard let crop = image.cropping(to: region) else { continue }
-            let lineRequest = VNRecognizeTextRequest()
-            lineRequest.recognitionLevel = .accurate
-            lineRequest.recognitionLanguages = ["zh-Hans", "en-US"]
-            lineRequest.usesLanguageCorrection = false
-            try VNImageRequestHandler(cgImage: crop, options: [:]).perform([lineRequest])
-            labels += (lineRequest.results ?? []).flatMap { $0.topCandidates(10) }.map(\.string)
+            // 不同 macOS Vision 对 6× 小字的字形分割不同。用原始行和
+            // 降采样行各取系统识别结果，不注入预期词，也不替换错字。
+            for scale: CGFloat in [1, 0.5] {
+                let context = try XCTUnwrap(CGContext(data: nil,
+                    width: max(1, Int(CGFloat(crop.width) * scale)),
+                    height: max(1, Int(CGFloat(crop.height) * scale)),
+                    bitsPerComponent: 8, bytesPerRow: 0,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+                context.interpolationQuality = .high
+                context.draw(crop, in: CGRect(x: 0, y: 0, width: context.width, height: context.height))
+                let lineImage = try XCTUnwrap(context.makeImage())
+                let lineRequest = VNRecognizeTextRequest()
+                lineRequest.recognitionLevel = .accurate
+                lineRequest.recognitionLanguages = ["zh-Hans", "en-US"]
+                lineRequest.usesLanguageCorrection = true
+                try VNImageRequestHandler(cgImage: lineImage, options: [:]).perform([lineRequest])
+                labels += (lineRequest.results ?? []).flatMap { $0.topCandidates(10) }.map(\.string)
+            }
         }
         return RenderResult(text: text, labels: labels.joined(separator: "\n").replacingOccurrences(of: " ", with: ""))
     }
