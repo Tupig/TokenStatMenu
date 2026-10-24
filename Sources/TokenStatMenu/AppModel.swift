@@ -758,14 +758,18 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         return String(format: "%.2f%%", min(100, max(0, number)))
     }
 
-    private func menuAmount(_ value: Decimal) -> String {
+    private static let menuAmountFormatter: NumberFormatter = {
         let formatter = NumberFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.numberStyle = .decimal
         formatter.usesGroupingSeparator = true
         formatter.minimumFractionDigits = 2
         formatter.maximumFractionDigits = 2
-        return formatter.string(from: NSDecimalNumber(decimal: value)) ?? "—"
+        return formatter
+    }()
+
+    private func menuAmount(_ value: Decimal) -> String {
+        Self.menuAmountFormatter.string(from: NSDecimalNumber(decimal: value)) ?? "—"
     }
     var menuTooltip: String {
         let now = tokenHubNow()

@@ -313,7 +313,7 @@ private struct SpeedHistorySparkline: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let values = points.map(\.value)
+            let values = points.lazy.map(\.value)
             let maximum = max(values.max() ?? 1, 1)
             let minimum = values.min() ?? 0
             let span = max(maximum - minimum, 1)

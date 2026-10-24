@@ -864,12 +864,9 @@ public enum LocalCodexUsageReader {
         let headLines = wholeFileRead ? completeLines(Data(bytes), startsAtFileStart: true, endsAtFileEnd: size <= bytes.count) : completeLines(Data(head), startsAtFileStart: true, endsAtFileEnd: false)
         let tailLines = !wholeFileRead && tailLength > 0 ? completeLines(Data(tail), startsAtFileStart: false, endsAtFileEnd: true) : []
         let headSlots = headLines.enumerated().map { parseLine($0.element, fallbackOrdinal: $0.offset) }
-        let decodedHead = headSlots.compactMap { $0 }
         let physicalRecordCountHead = headLines.count
         let tailOrdinalBase = size > headLimit + tailLimit ? -1 : physicalRecordCountHead
         let tailSlots = tailLines.enumerated().map { parseLine($0.element, fallbackOrdinal: tailOrdinalBase < 0 ? -1 : tailOrdinalBase + $0.offset) }
-        let decodedTail = tailSlots.compactMap { $0 }
-        var decoded = tailLength > 0 ? decodedHead + decodedTail : decodedHead
         let continuousRead = wholeFileRead
         let finalLineWithoutLF: Data.SubSequence? = bytes.last == 10 ? nil :
             bytes[(bytes.lastIndex(of: 10).map { bytes.index(after: $0) } ?? bytes.startIndex)...]
@@ -899,7 +896,7 @@ public enum LocalCodexUsageReader {
         }
         let mappedHeadSlots = headSlots.map { $0.map(remap) }
         let mappedTailSlots = tailSlots.map { $0.map(remap) }
-        decoded = (wholeFileRead ? mappedHeadSlots : mappedHeadSlots + mappedTailSlots).compactMap { $0 }
+        let decoded = (wholeFileRead ? mappedHeadSlots : mappedHeadSlots + mappedTailSlots).compactMap { $0 }
         guard let firstMetaLine = firstPhysicalLine else { return FileSummary(identity: nil, lineage: .unknown, isFork: false, sourceKnownTop: false, contribution: nil, rate: nil, quotaDate: nil, turnEvidence: [], turn: nil, turnEvidenceTruncated: false, live: nil, latestEventAt: nil, tailLimited: tailLimited, headComplete: headComplete, hasFutureTurn: false, contentHash: bytes.fullContentHashIfComplete(fileSize: size), signature: signature) }
         let metadata = (try? JSONSerialization.jsonObject(with: Data(firstMetaLine))) as? [String: Any]
         let payload = metadata?["payload"] as? [String: Any] ?? [:]
@@ -1022,7 +1019,8 @@ public enum LocalCodexUsageReader {
         guard let object = try? JSONSerialization.jsonObject(with: Data(line)), let root = object as? [String: Any],
               let type = root["type"] as? String else { return nil }
         let payload = root["payload"] as? [String: Any] ?? [:]
-        let date = parseDate(root["timestamp"]) ?? .distantPast
+        let parsedDate = parseDate(root["timestamp"])
+        let date = parsedDate ?? .distantPast
         // 无效的事件封装与损坏 JSON 一样会中断连续性，避免遗漏生命周期边界。
         if type == "event_msg" {
             guard let kind = payload["type"] as? String, !kind.isEmpty else { return nil }
@@ -1046,7 +1044,7 @@ public enum LocalCodexUsageReader {
         } else { duration = nil }
         let ownID = normalizeUUID((payload["id"] as? String) ?? "")
         let eventThread = normalizeUUID((payload["thread_id"] as? String) ?? "")
-        let invalidLifecycleTimestamp = ["task_started", "task_complete", "turn_aborted", "token_count"].contains(eventType) && parseDate(root["timestamp"]) == nil
+        let invalidLifecycleTimestamp = ["task_started", "task_complete", "turn_aborted", "token_count"].contains(eventType) && parsedDate == nil
         return ParsedEvent(date: date, type: eventType, turnID: payload["turn_id"] as? String,
             duration: duration, totalTokens: usage?.total, outputTokens: usage?.output,
             hasCumulativePayload: cumulativePresent, usage: usage, rate: rate, quotaUpdate: quota,
