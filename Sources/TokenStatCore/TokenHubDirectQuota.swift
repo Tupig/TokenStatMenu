@@ -338,11 +338,10 @@ public struct TokenHubDirectQuotaClient: Sendable {
         }
         guard response.data.count <= 1_048_576 else { throw TokenHubDirectQuotaFailure.responseTooLarge }
         try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
-        // 额度与重置券并行读取；券读取失败时只把券数量留为未知，不影响额度。
-        let voucherAccess = access
-        async let vouchers = resetVoucherCount(baseURL: settings.aiManagerBaseURL, access: voucherAccess)
         let decoded = try TokenHubDirectQuotaDecoder.decode(response.data, identity: identity, now: observedAt)
-        let voucherCount = await vouchers
+        // 先确认额度有效，再用同一个可注入transport读取券；失败仅令券未知。
+        let voucherCount = await resetVoucherCount(baseURL: settings.aiManagerBaseURL, access: access)
+        try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
         return TokenHubQuotaSnapshot(identity: decoded.identity, fiveHour: decoded.fiveHour,
                                      sevenDay: decoded.sevenDay, monthly: decoded.monthly,
                                      resetVoucherCount: voucherCount, observedAt: decoded.observedAt)
@@ -352,7 +351,7 @@ public struct TokenHubDirectQuotaClient: Sendable {
     private func resetVoucherCount(baseURL: URL, access: String) async -> Int? {
         guard let url = Self.resetVoucherURL(baseURL: baseURL) else { return nil }
         do {
-            let response = try await Self.liveRequest(url: url, bearer: access)
+            let response = try await request(url, access)
             guard (200..<300).contains(response.statusCode),
                   response.data.count <= 1_048_576 else { return nil }
             return TokenHubResetVoucherDecoder.decode(response.data)

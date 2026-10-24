@@ -33,6 +33,54 @@ import TokenStatCore
         check(ollama.usage?.total == 30 && ollama.serverOutputTPS == 5, "Ollama final usage and server TPS")
         let responses = try UsageDecoder.decode(json("{\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}"), streaming: true)
         check(responses.terminal && responses.usage?.total == 16, "Responses final nested usage")
+        let usageBodies: (String, String) -> [(String, String)] = { input, output in [
+            ("Chat", "{\"usage\":{\"prompt_tokens\":\(input),\"completion_tokens\":\(output)}}"),
+            ("Responses", "{\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":\(input),\"output_tokens\":\(output)}}}"),
+            ("Ollama", "{\"done\":true,\"prompt_eval_count\":\(input),\"eval_count\":\(output),\"prompt_eval_duration\":1000000000,\"eval_duration\":1000000000}"),
+        ] }
+        for literal in ["1.5", "999999999999.00001", "true", "-1", "1000000000000", "null", "\"2\"", "5e-324", "1e308"] {
+            for (field, input, output) in [("input", literal, "2"), ("output", "2", literal)] {
+                for (protocolName, body) in usageBodies(input, output) {
+                    for streaming in [true, false] {
+                        let decoded = try UsageDecoder.decode(json(body), streaming: streaming)
+                        let label = "\(protocolName) \(field)=\(literal) streaming=\(streaming)"
+                        check(decoded.usage == nil, "\(label) cannot become exact")
+                        if protocolName == "Ollama" {
+                            check(decoded.terminal, "\(label) preserves completion")
+                            check(decoded.serverInputTPS == nil && decoded.serverOutputTPS == nil, "\(label) cannot produce either server speed")
+                        }
+                    }
+                }
+            }
+        }
+        for (literal, count) in [("0", 0), ("2.0", 2), ("2e0", 2), ("999999999999", 999_999_999_999)] {
+            for (protocolName, body) in usageBodies(literal, literal) {
+                for streaming in [true, false] {
+                    let decoded = try UsageDecoder.decode(json(body), streaming: streaming)
+                    check(decoded.usage == TokenUsage(input: count, output: count), "\(protocolName) exact integer \(literal) remains valid streaming=\(streaming)")
+                    if protocolName == "Ollama" {
+                        check(decoded.serverInputTPS == Double(count) && decoded.serverOutputTPS == Double(count), "Ollama exact integer \(literal) has both finite speeds")
+                    }
+                }
+            }
+        }
+        for field in ["prompt_eval_duration", "eval_duration"] {
+            for duration in ["0", "-1", "true", "null", "\"100\"", "5e-324", "1e-310", "1e308"] {
+                let inputDuration = field == "prompt_eval_duration" ? duration : "2000000000"
+                let outputDuration = field == "eval_duration" ? duration : "2000000000"
+                let value = try UsageDecoder.decode(json("{\"done\":true,\"prompt_eval_count\":20,\"eval_count\":10,\"prompt_eval_duration\":\(inputDuration),\"eval_duration\":\(outputDuration)}"), streaming: true)
+                check(value.terminal && value.usage == TokenUsage(input: 20, output: 10), "\(field)=\(duration) preserves completion and exact counts")
+                let speed = field == "prompt_eval_duration" ? value.serverInputTPS : value.serverOutputTPS
+                let unaffectedSpeed = field == "prompt_eval_duration" ? value.serverOutputTPS : value.serverInputTPS
+                check(unaffectedSpeed == (field == "prompt_eval_duration" ? 5 : 10), "\(field)=\(duration) does not discard the other valid speed")
+                if duration == "1e308" {
+                    let expected = Double(field == "prompt_eval_duration" ? 20 : 10) / (1e308 / 1e9)
+                    check(speed == expected && expected.isFinite && expected > 0, "\(field) large finite duration yields the expected positive speed")
+                } else {
+                    check(speed == nil, "\(field)=\(duration) invalid, seconds underflow or division overflow stays unknown")
+                }
+            }
+        }
         let tool = try UsageDecoder.decode(json("{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{}\"}}]}}]}"), streaming: true)
         check(tool.output == "{}", "tool call deltas counted")
         let nilError = try UsageDecoder.decode(json("{\"error\":null,\"choices\":[{\"message\":{\"content\":\"OK\"}}]}"), streaming: false)

@@ -91,8 +91,9 @@ public enum UsageDecoder {
             result.terminal = true; return result
         }
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw StatError.message("流返回非 JSON 对象") }
+        let counts = try JSONDecoder().decode(ExactCounts.self, from: data)
         if let error = obj["error"], !(error is NSNull) { result.failed = true; result.terminal = true }
-        if let usage = obj["usage"] as? [String: Any] { result.usage = tokens(usage) }
+        result.usage = counts.usage
         // OpenAI Chat：流式时只统计 delta，绝不将完整的最终消息重复统计两次。
         if let choices = obj["choices"] as? [[String: Any]] {
             for choice in choices {
@@ -113,7 +114,7 @@ public enum UsageDecoder {
             if ["response.completed", "response.failed", "response.incomplete"].contains(type) {
                 result.terminal = true
                 result.failed = type != "response.completed"
-                if let r = obj["response"] as? [String: Any], let u = r["usage"] as? [String: Any] { result.usage = tokens(u) }
+                if let r = obj["response"] as? [String: Any], r["usage"] is [String: Any] { result.usage = counts.responseUsage }
             }
         }
         if !streaming, let output = obj["output"] as? [[String: Any]] {
@@ -131,22 +132,61 @@ public enum UsageDecoder {
         result.output += obj["response"] as? String ?? ""
         if obj["done"] as? Bool == true {
             result.terminal = true
-            if let input = nonnegativeInt(obj["prompt_eval_count"]), let output = nonnegativeInt(obj["eval_count"]) {
-                result.usage = TokenUsage(input: input, output: output)
-                if let n = obj["prompt_eval_duration"] as? Double, n > 0 { result.serverInputTPS = Double(input) / (n / 1e9) }
-                if let n = obj["eval_duration"] as? Double, n > 0 { result.serverOutputTPS = Double(output) / (n / 1e9) }
+            if let usage = counts.ollamaUsage {
+                result.usage = usage
+                result.serverInputTPS = serverTPS(count: usage.input, nanoseconds: obj["prompt_eval_duration"])
+                result.serverOutputTPS = serverTPS(count: usage.output, nanoseconds: obj["eval_duration"])
             }
         }
         return result
     }
-    private static func tokens(_ o: [String: Any]) -> TokenUsage? {
-        guard let input = nonnegativeInt(o["prompt_tokens"] ?? o["input_tokens"]),
-              let output = nonnegativeInt(o["completion_tokens"] ?? o["output_tokens"]) else { return nil }
-        return TokenUsage(input: input, output: output)
+    // 必须直接从原始 JSON 读取 Decimal：JSONSerialization/NSNumber 已可能舍入小数计数。
+    private struct ExactCounts: Decodable {
+        private enum Key: String, CodingKey {
+            case usage, response
+            case promptTokens = "prompt_tokens", completionTokens = "completion_tokens"
+            case inputTokens = "input_tokens", outputTokens = "output_tokens"
+            case promptEvalCount = "prompt_eval_count", evalCount = "eval_count"
+        }
+        let usage: TokenUsage?
+        let responseUsage: TokenUsage?
+        let ollamaUsage: TokenUsage?
+
+        init(from decoder: Decoder) throws {
+            let root = try decoder.container(keyedBy: Key.self)
+            usage = (try? root.nestedContainer(keyedBy: Key.self, forKey: .usage)).flatMap(Self.tokens)
+            let response = try? root.nestedContainer(keyedBy: Key.self, forKey: .response)
+            responseUsage = (try? response?.nestedContainer(keyedBy: Key.self, forKey: .usage)).flatMap(Self.tokens)
+            ollamaUsage = Self.tokens(root, input: .promptEvalCount, output: .evalCount)
+        }
+
+        private static func tokens(_ container: KeyedDecodingContainer<Key>) -> TokenUsage? {
+            tokens(container, input: container.contains(.promptTokens) ? .promptTokens : .inputTokens,
+                   output: container.contains(.completionTokens) ? .completionTokens : .outputTokens)
+        }
+
+        private static func tokens(_ container: KeyedDecodingContainer<Key>, input: Key, output: Key) -> TokenUsage? {
+            guard let input = count(container, key: input), let output = count(container, key: output) else { return nil }
+            return TokenUsage(input: input, output: output)
+        }
+
+        private static func count(_ container: KeyedDecodingContainer<Key>, key: Key) -> Int? {
+            guard var value = try? container.decode(Decimal.self, forKey: key),
+                  !value.isNaN, value >= 0, value < Decimal(1_000_000_000_000) else { return nil }
+            var integer = Decimal()
+            NSDecimalRound(&integer, &value, 0, .down)
+            guard value == integer else { return nil }
+            return NSDecimalNumber(decimal: value).intValue
+        }
     }
-    private static func nonnegativeInt(_ value: Any?) -> Int? {
-        guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(),
-              n.doubleValue.isFinite, n.doubleValue >= 0, n.doubleValue < 1e12 else { return nil }
-        return n.intValue
+
+    private static func serverTPS(count: Int, nanoseconds: Any?) -> Double? {
+        guard let number = nanoseconds as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let duration = number.doubleValue
+        guard duration.isFinite, duration > 0 else { return nil }
+        let seconds = duration / 1e9
+        guard seconds.isFinite, seconds > 0 else { return nil }
+        let value = Double(count) / seconds
+        return value.isFinite && value >= 0 ? value : nil
     }
 }

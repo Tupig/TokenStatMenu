@@ -51,6 +51,7 @@ extension CoreChecks {
         try directCallbackLocationChecks()
         try directDatabaseReplacementChecks()
         try directAmountLexicalChecks()
+        try directVoucherTransportChecks()
         let identity = TokenHubIdentity(pid: 47816,
             bundleID: TokenHubTarget.bundleID,
             executablePath: "/Applications/Seasun Token Hub.app/Contents/MacOS/seasun-token-hub")
@@ -183,7 +184,6 @@ extension CoreChecks {
                                                   organizationURL: URL(string: "https://sso.example.test")!); check(false, "untrusted endpoint host rejects") }
         catch let error as TokenHubDirectQuotaFailure { check(error == .endpointRejected, "untrusted endpoint reports typed failure") }
 
-
         // All connection/session values are synthetic; tests never inspect the
         // current user's Hub database or make a network request.
         let temporaryHome = FileManager.default.temporaryDirectory.appendingPathComponent("tokenstat-direct-fixture-" + UUID().uuidString, isDirectory: true)
@@ -193,6 +193,7 @@ extension CoreChecks {
             try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-session")
             let counter = DirectQuotaCounter()
             let client = TokenHubDirectQuotaClient(request: { url, bearer in
+                if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
                 let call = counter.noteQuota(url.path == "/api/v1/auth/me/quota-usage" && bearer == "fixture-access")
                 if scenario == 2 && call == 1 {
                     try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-replaced-session")
@@ -228,6 +229,93 @@ extension CoreChecks {
         }
     }
 
+    private static func directVoucherTransportChecks() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let identity = TokenHubIdentity(pid: 47095, bundleID: TokenHubTarget.bundleID, executablePath: "/Synthetic/Hub")
+        let quota = json(#"{"data":{"currency":"USD","windows":[{"kind":"fixed_5h","quota_amount":100,"used_amount":20}]}}"#)
+        for scenario in ["valid", "zero", "http", "malformed", "throw", "quota-error", "quota-malformed", "callback-error", "identity-change", "retry"] {
+            let home = FileManager.default.temporaryDirectory.appendingPathComponent("voucher-transport-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: home) }
+            let database = TokenHubConnectionDiscovery.defaultDatabaseURL(home: home)
+            try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-session")
+            let calls = OSAllocatedUnfairLock(initialState: [String]())
+            let client = TokenHubDirectQuotaClient(request: { url, bearer in
+                let quotaCalls = calls.withLock {
+                    $0.append("\(url.path)|\(bearer)")
+                    return $0.filter { $0.hasPrefix("/api/v1/auth/me/quota-usage|") }.count
+                }
+                let expectedAccess = scenario == "retry" && (url.path == "/api/v1/me/reset-vouchers" || quotaCalls > 1)
+                    ? "fixture-refreshed-access" : "fixture-access"
+                guard url.host == "aihub.example.test", bearer == expectedAccess else {
+                    throw TokenHubDirectQuotaFailure.transportFailed
+                }
+                if url.path == "/api/v1/auth/me/quota-usage" {
+                    if scenario == "retry" && quotaCalls == 1 {
+                        return TokenHubDirectQuotaHTTPResponse(statusCode: 401, data: Data())
+                    }
+                    return TokenHubDirectQuotaHTTPResponse(statusCode: scenario == "quota-error" ? 403 : 200,
+                        data: scenario == "quota-malformed" ? Data("{}".utf8) : quota)
+                }
+                guard url.path == "/api/v1/me/reset-vouchers" else { throw TokenHubDirectQuotaFailure.endpointRejected }
+                if scenario == "throw" { throw URLError(.notConnectedToInternet) }
+                if scenario == "identity-change" {
+                    try writeDirectQuotaFixture(at: database, now: now, sessionToken: "changed-session")
+                }
+                return TokenHubDirectQuotaHTTPResponse(statusCode: scenario == "http" ? 503 : 200,
+                    data: scenario == "malformed" ? Data("{}".utf8) : json(scenario == "zero" ? #"{"data":{"total":0}}"# : #"{"data":{"total":3}}"#))
+            }, callbackRequest: { url in
+                let access = calls.withLock {
+                    let number = $0.filter { $0.hasPrefix("callback|") }.count + 1
+                    let access = scenario == "retry" && number == 2 ? "fixture-refreshed-access" : "fixture-access"
+                    $0.append("callback|\(access)")
+                    return access
+                }
+                guard url.host == "aihub.example.test", url.path == "/api/v1/auth/it-sso/callback" else {
+                    throw TokenHubDirectQuotaFailure.endpointRejected
+                }
+                if scenario == "callback-error" { throw TokenHubDirectQuotaFailure.exchangeRejected }
+                return access
+            })
+            var failure: TokenHubDirectQuotaFailure?
+            let result: TokenHubQuotaSnapshot?
+            do {
+                result = try awaitDirectQuota {
+                    do { return try await client.fetch(identity: identity, now: now, home: home) }
+                    catch let error as TokenHubDirectQuotaFailure { throw error }
+                    catch {
+                        check(false, "voucher transport \(scenario) never escapes an unknown failure before the result bridge")
+                        throw error
+                    }
+                }
+            } catch let error as TokenHubDirectQuotaFailure { failure = error; result = nil }
+            catch {
+                check(false, "voucher transport \(scenario) never escapes an unknown failure")
+                result = nil
+            }
+            let events = calls.withLock { $0 }
+            let noVoucher = ["quota-error", "quota-malformed", "callback-error"].contains(scenario)
+            var expectedEvents = ["callback|fixture-access"]
+            if scenario != "callback-error" { expectedEvents.append("/api/v1/auth/me/quota-usage|fixture-access") }
+            if scenario == "retry" {
+                expectedEvents += ["callback|fixture-refreshed-access", "/api/v1/auth/me/quota-usage|fixture-refreshed-access"]
+            }
+            if !noVoucher { expectedEvents.append("/api/v1/me/reset-vouchers|\(scenario == "retry" ? "fixture-refreshed-access" : "fixture-access")") }
+            check(events == expectedEvents,
+                  "voucher transport \(scenario) uses exact callback, quota and voucher order, counts and bearers")
+            if noVoucher || scenario == "identity-change" {
+                check(result == nil, "voucher transport \(scenario) cannot publish invalid or changed identity")
+                let expected: TokenHubDirectQuotaFailure = scenario == "identity-change" ? .identityChanged :
+                    scenario == "quota-error" ? .httpStatus(403) : scenario == "callback-error" ? .exchangeRejected : .malformedResponse
+                check(failure == expected, "voucher transport \(scenario) preserves exact typed failure")
+            } else {
+                check(failure == nil && result != nil, "voucher transport \(scenario) returns quota without a typed or unknown failure")
+                check(result?.fiveHour?.usedPercent == 20, "voucher failure does not discard valid quota \(scenario)")
+                check(result?.resetVoucherCount == (["valid", "retry"].contains(scenario) ? 3 : scenario == "zero" ? 0 : nil),
+                      "voucher \(scenario) preserves count or unknown without live transport")
+            }
+        }
+    }
+
 #if TOKENSTAT_BP38_C01
     /// Synthetic database, clock and HTTP callbacks verify that a worker's
     /// observation timestamp is fixed at transaction start while credential
@@ -242,7 +330,8 @@ extension CoreChecks {
 
         let counter = DirectQuotaCounter()
         let clock = DirectQuotaClock(startedAt)
-        let client = TokenHubDirectQuotaClient(request: { _, _ in
+        let client = TokenHubDirectQuotaClient(request: { url, _ in
+            if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
             counter.noteQuota(true)
             clock.set(startedAt.addingTimeInterval(2))
             return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
@@ -287,7 +376,8 @@ extension CoreChecks {
             let boundaryClock = DirectQuotaClock(startedAt)
             let exactBoundary = expiration.addingTimeInterval(-30)
             let checkpointCounts = DirectQuotaCounter()
-            let checkpointClient = TokenHubDirectQuotaClient(request: { _, _ in
+            let checkpointClient = TokenHubDirectQuotaClient(request: { url, _ in
+                if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
                 let number = checkpointCounts.noteQuota(true)
                 if checkpoint.transition == "quota-\(number)" { boundaryClock.set(exactBoundary) }
                 if (checkpoint.name == "before-retry" || checkpoint.name == "after-retry-callback") && number == 1 {
@@ -322,7 +412,8 @@ extension CoreChecks {
                 now: startedAt, sessionToken: "bp38-boundary-\(remaining)",
                 expiresAt: startedAt.addingTimeInterval(remaining))
             let calls = DirectQuotaCounter()
-            let boundedClient = TokenHubDirectQuotaClient(request: { _, _ in
+            let boundedClient = TokenHubDirectQuotaClient(request: { url, _ in
+                if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
                 calls.noteQuota(true)
                 return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
                 {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100}]}}
@@ -350,7 +441,8 @@ extension CoreChecks {
             now: startedAt, sessionToken: "bp38-current-exact-30", expiresAt: expiresAt)
         let exactCurrentClock = DirectQuotaClock(startedAt.addingTimeInterval(70))
         let exactCurrentCalls = DirectQuotaCounter()
-        let exactCurrentClient = TokenHubDirectQuotaClient(request: { _, _ in
+        let exactCurrentClient = TokenHubDirectQuotaClient(request: { url, _ in
+            if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
             _ = exactCurrentCalls.noteQuota(true)
             return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
             {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100}]}}
@@ -377,6 +469,7 @@ extension CoreChecks {
         let aboveBoundaryClock = DirectQuotaClock(startedAt.addingTimeInterval(69.999))
         let aboveBoundaryCalls = DirectQuotaCounter()
         let aboveBoundaryClient = TokenHubDirectQuotaClient(request: { url, bearer in
+            if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
             _ = aboveBoundaryCalls.noteQuota(url.path == "/api/v1/auth/me/quota-usage" && bearer == "synthetic-access")
             return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
             {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100}]}}
@@ -524,7 +617,6 @@ extension CoreChecks {
               "used-only monthly response keeps limit-derived fields unknown")
     }
 }
-
 
 extension CoreChecks {
     static func directCallbackLocationChecks() throws {
@@ -765,6 +857,7 @@ extension CoreChecks {
                                             now: now, sessionToken: "fixture-session")
                 let calls = DirectQuotaCounter()
                 let client = TokenHubDirectQuotaClient(request: { url, bearer in
+                    if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
                     let count = calls.noteQuota(url.absoluteString == "https://aihub.example.test/api/v1/auth/me/quota-usage"
                         && bearer == "fixture-access")
                     return TokenHubDirectQuotaHTTPResponse(statusCode: rejectedCallback == 2 && count == 1 ? 401 : 200, data: data)
@@ -793,7 +886,6 @@ extension CoreChecks {
         }
     }
 }
-
 
 private func writeDirectQuotaFixture(at database: URL, now: Date, sessionToken: String,
                                      expiresAt: Date? = nil) throws {
@@ -850,7 +942,6 @@ private func awaitDirectQuotaOutcome<Value: Sendable>(
     catch { return DirectQuotaAttempt(succeeded: false, failure: error as? TokenHubDirectQuotaFailure) }
 }
 
-
 extension CoreChecks {
     static func directDatabaseReplacementChecks() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
@@ -863,7 +954,8 @@ extension CoreChecks {
             let database = TokenHubConnectionDiscovery.defaultDatabaseURL(home: home)
             try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-session")
             let counter = DirectQuotaCounter()
-            let client = TokenHubDirectQuotaClient(request: { _, _ in
+            let client = TokenHubDirectQuotaClient(request: { url, _ in
+                if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
                 let call = counter.noteQuota(true)
                 if (scenario == 2 || scenario == 3) && call == 1 {
                     try replaceDirectQuotaFixture(at: database, now: now)
