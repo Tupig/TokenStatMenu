@@ -8,10 +8,6 @@ final class DevWidgetProbeTests: XCTestCase {
 
     func testDevelopmentRefreshPolicyIsBoundedAndSchedulesExpiry() throws {
         let now = Date(timeIntervalSince1970: Double(nowMs) / 1000)
-        XCTAssertTrue(DevWidgetRefreshPolicy.mayReload(last: nil, now: now))
-        XCTAssertFalse(DevWidgetRefreshPolicy.mayReload(last: now, now: now.addingTimeInterval(299.999)))
-        XCTAssertTrue(DevWidgetRefreshPolicy.mayReload(last: now, now: now.addingTimeInterval(300)))
-        XCTAssertFalse(DevWidgetRefreshPolicy.mayReload(last: now, now: now.addingTimeInterval(-1)))
         XCTAssertEqual(DevWidgetRefreshPolicy.nextRefresh(after: now), now.addingTimeInterval(300))
         let bytes = try XCTUnwrap(DevWidgetSnapshot.sample(1, atMs: nowMs))
         let snapshot = try XCTUnwrap(DevWidgetSnapshot.decode(bytes, nowMs: nowMs))
@@ -107,6 +103,76 @@ final class DevWidgetProbeTests: XCTestCase {
         XCTAssertTrue(result.io.values.allSatisfy { $0 == 0 })
         XCTAssertTrue(result.counts.values.allSatisfy { $0 == 0 })
         XCTAssertNotNil(result.terminalEvent)
+    }
+
+    func testReadyMonthlySevenDayAndLocalCacheRejectMissingAndExtraFields() throws {
+        let sample = try XCTUnwrap(DevWidgetSnapshot.sample(1, atMs: nowMs))
+        var root = try XCTUnwrap(JSONSerialization.jsonObject(with: sample) as? [String: Any])
+        var hub = try XCTUnwrap(root["hub"] as? [String: Any])
+        // JSONSerialization的Double往返可能把87.66改为87.659999999999997；
+        // 本矩阵验证对象结构，金额/百分比使用十进制字面量避免夹具漂移。
+        var five = try XCTUnwrap(hub["fiveHour"] as? [String: Any])
+        five["remainingPercent"] = NSDecimalNumber(string: "87.66")
+        hub["fiveHour"] = five
+        let partialReset: [String: Any] = ["kind": "partial", "month": 2, "day": 29, "hour": 12, "minute": 34]
+        let seven: [String: Any] = ["remainingPercent": NSDecimalNumber(string: "12.34"), "reset": partialReset]
+        let monthly: [String: Any] = ["usedAmount": NSDecimalNumber(string: "12.34"), "limitAmount": 100, "symbol": "dollar"]
+        let cache: [String: Any] = ["state": "complete", "baseRows": 1, "knownRows": 1,
+            "missingRows": 0, "invalidRows": 0, "matchedInputTokens": 10, "matchedCachedInputTokens": 4]
+        let local: [String: Any] = ["source": "synthetic", "state": "ready", "readAtMs": nowMs,
+            "latestEventAtMs": nowMs, "validUntilMs": nowMs + 120_000,
+            "inputTokens": 10, "outputTokens": 5, "totalTokens": 15,
+            "knownThreads": 1, "unknownThreads": 0, "unidentifiedFiles": 0, "topLevelThreads": 1,
+            "isLimited": false, "detailLimited": false, "cache": cache]
+        hub["sevenDay"] = seven
+        hub["monthly"] = monthly
+        root["hub"] = hub
+        root["local"] = local
+        func decode(_ payload: [String: Any]) throws -> DevWidgetSnapshot? {
+            let bytes = try JSONSerialization.data(withJSONObject: payload)
+            XCTAssertNoThrow(try JSONSerialization.jsonObject(with: bytes))
+            return DevWidgetSnapshot.decode(bytes, nowMs: nowMs)
+        }
+        XCTAssertNotNil(try decode(root), "完整ready分区必须先证明可接受")
+        for (section, object) in [("sevenDay", seven), ("monthly", monthly), ("local", local), ("cache", cache), ("partialReset", partialReset)] {
+            for field in Array(object.keys) + ["extra"] {
+                var changed = object
+                if field == "extra" { changed[field] = 1 } else { changed.removeValue(forKey: field) }
+                var payload = root
+                if section == "partialReset" {
+                    var changedSeven = seven; changedSeven["reset"] = changed
+                    var changedHub = hub; changedHub["sevenDay"] = changedSeven; payload["hub"] = changedHub
+                } else if section == "local" { payload["local"] = changed }
+                else if section == "cache" {
+                    var changedLocal = local; changedLocal["cache"] = changed; payload["local"] = changedLocal
+                } else {
+                    var changedHub = hub; changedHub[section] = changed; payload["hub"] = changedHub
+                }
+                XCTAssertNil(try decode(payload), "\(section).\(field)")
+            }
+        }
+        var expiredHub = hub
+        expiredHub["observedAtMs"] = nowMs - 1_001
+        expiredHub["validUntilMs"] = nowMs - 1
+        var payload = root; payload["hub"] = expiredHub
+        let hidden = try XCTUnwrap(decode(payload))
+        XCTAssertFalse(hidden.hubVisible, "Hub过期不拒绝形状合法的独立local分区")
+        XCTAssertNil(hidden.remainingPercent)
+        var expiredLocal = local
+        expiredLocal["readAtMs"] = nowMs - 1_001
+        expiredLocal["latestEventAtMs"] = nowMs - 1_001
+        expiredLocal["validUntilMs"] = nowMs - 1
+        payload = root; payload["local"] = expiredLocal
+        let visible = try XCTUnwrap(decode(payload))
+        XCTAssertTrue(visible.hubVisible, "local到期不能连带隐藏有效Hub")
+        XCTAssertEqual(visible.remainingPercent, Decimal(string: "87.66"))
+        for (field, value) in [("month", 0), ("month", 13), ("day", 30), ("hour", 24), ("minute", 60)] {
+            var invalidReset = partialReset; invalidReset[field] = value
+            var invalidSeven = seven; invalidSeven["reset"] = invalidReset
+            var invalidHub = hub; invalidHub["sevenDay"] = invalidSeven
+            payload = root; payload["hub"] = invalidHub
+            XCTAssertNil(try decode(payload), "partial reset \(field)=\(value)")
+        }
     }
 
     func testGroupShapeRejectsAnExtraMiddleSegment() {

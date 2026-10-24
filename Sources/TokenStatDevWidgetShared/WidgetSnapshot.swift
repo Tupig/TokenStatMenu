@@ -9,11 +9,6 @@ enum DevWidgetRefreshPolicy {
         now.addingTimeInterval(interval)
     }
 
-    static func mayReload(last: Date?, now: Date) -> Bool {
-        guard let last else { return true }
-        return now.timeIntervalSince(last) >= interval
-    }
-
     static func expiryDates(snapshot: DevWidgetSnapshot?, after now: Date) -> [Date] {
         guard let snapshot else { return [] }
         let valid = snapshot.validUntilMs.map { Date(timeIntervalSince1970: Double($0 + 1) / 1000) }
