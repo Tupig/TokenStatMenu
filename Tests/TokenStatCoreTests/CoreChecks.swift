@@ -64,6 +64,9 @@ import TokenStatCore
                 }
             }
         }
+        check(Double.leastNonzeroMagnitude > 0 && Double.leastNonzeroMagnitude / 1e9 == 0, "5e-324 nanoseconds exercises seconds underflow")
+        let tinySeconds = 1e-310 / 1e9
+        check(tinySeconds > 0 && !(10 / tinySeconds).isFinite, "1e-310 nanoseconds exercises final division overflow, not seconds underflow")
         for field in ["prompt_eval_duration", "eval_duration"] {
             for duration in ["0", "-1", "true", "null", "\"100\"", "5e-324", "1e-310", "1e308"] {
                 let inputDuration = field == "prompt_eval_duration" ? duration : "2000000000"
