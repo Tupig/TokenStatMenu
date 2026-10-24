@@ -32,8 +32,13 @@ public struct StreamParser {
         if line.starts(with: Data("data:".utf8)) {
             var data = Data(line.dropFirst(5))
             if data.first == 32 { data.removeFirst() }
-            eventSize += data.count
-            guard eventSize <= 2_097_152 else { throw StatError.message("SSE data 事件过大") }
+            let nextSize = eventSize + data.count
+            guard nextSize <= 2_097_152 else {
+                dataLines.removeAll(keepingCapacity: true)
+                eventSize = 0
+                throw StatError.message("SSE data 事件过大")
+            }
+            eventSize = nextSize
             dataLines.append(data)
         }
     }

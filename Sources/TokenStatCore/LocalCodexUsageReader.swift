@@ -492,8 +492,8 @@ public enum LocalCodexUsageReader {
             cache.entries.removeAll(); cache.clearOpaqueState(); cache.routeFingerprint = routeContext?.fingerprint
         }
         var st = stat()
-        guard lstat(directory.path, &st) == 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; cache?.clearOpaqueState(); return empty() }
-        guard (st.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; cache?.clearOpaqueState(); return empty() }
+        guard lstat(directory.path, &st) == 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; cache?.clearOpaqueState(); return empty(limited: true) }
+        guard (st.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; cache?.clearOpaqueState(); return empty(limited: true) }
         let rootFD = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
         // 目录存在但打不开表示读取不完整，不能按空目录处理。
         guard rootFD >= 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; cache?.clearOpaqueState(); return empty(limited: true) }
@@ -555,6 +555,7 @@ public enum LocalCodexUsageReader {
             if fst.st_size < 0 { unsafeCandidate = true; continue }
             // 时钟回拨后，旧结果可能落在未来，需重新解析而非复用缓存。
             if let cached = cache?.entries[signature], now >= cached.evaluatedAt {
+                if let threadID = cached.summary.identity, excludingThreads.contains(threadID) { continue }
                 cache?.hit()
                 let cachedSummary = cached.summary
                 let cachedLive: LocalLiveTurnSummary? = cachedSummary.live.flatMap { live in
