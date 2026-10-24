@@ -6,6 +6,21 @@ final class DevWidgetProbeTests: XCTestCase {
     private let team = "ABCDE12345.com.tupig.TokenStatMenu.DevWidgetTest"
     private let nowMs: Int64 = 1_800_000_000_000
 
+    func testDevelopmentRefreshPolicyIsBoundedAndSchedulesExpiry() throws {
+        let now = Date(timeIntervalSince1970: Double(nowMs) / 1000)
+        XCTAssertTrue(DevWidgetRefreshPolicy.mayReload(last: nil, now: now))
+        XCTAssertFalse(DevWidgetRefreshPolicy.mayReload(last: now, now: now.addingTimeInterval(299.999)))
+        XCTAssertTrue(DevWidgetRefreshPolicy.mayReload(last: now, now: now.addingTimeInterval(300)))
+        XCTAssertFalse(DevWidgetRefreshPolicy.mayReload(last: now, now: now.addingTimeInterval(-1)))
+        XCTAssertEqual(DevWidgetRefreshPolicy.nextRefresh(after: now), now.addingTimeInterval(300))
+        let bytes = try XCTUnwrap(DevWidgetSnapshot.sample(1, atMs: nowMs))
+        let snapshot = try XCTUnwrap(DevWidgetSnapshot.decode(bytes, nowMs: nowMs))
+        let dates = DevWidgetRefreshPolicy.expiryDates(snapshot: snapshot, after: now)
+        XCTAssertEqual(try XCTUnwrap(dates.first).timeIntervalSince(now), 120.001, accuracy: 0.000001)
+        XCTAssertEqual(dates.last, now.addingTimeInterval(3600))
+        XCTAssertTrue(DevWidgetRefreshPolicy.expiryDates(snapshot: nil, after: now).isEmpty)
+    }
+
     func testSignatureAuthorizationRejectsMissingAdhocAndWrongTeam() {
         XCTAssertTrue(DevGroupGuard.authorizationMatches(group: team, team: "ABCDE12345", flags: 0))
         XCTAssertFalse(DevGroupGuard.authorizationMatches(group: team, team: nil, flags: 0))

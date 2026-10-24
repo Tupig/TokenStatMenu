@@ -17,7 +17,10 @@ private struct DevProvider: TimelineProvider {
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<DevEntry>) -> Void) {
         let current = entry()
-        completion(Timeline(entries: [current], policy: .after(current.date.addingTimeInterval(300))))
+        let expired = DevWidgetRefreshPolicy.expiryDates(snapshot: current.snapshot, after: current.date)
+            .map { DevEntry(date: $0, snapshot: nil) }
+        completion(Timeline(entries: [current] + expired,
+                            policy: .after(DevWidgetRefreshPolicy.nextRefresh(after: current.date))))
     }
 
     private func entry() -> DevEntry {

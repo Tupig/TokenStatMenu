@@ -1,5 +1,28 @@
 import Foundation
 
+/// 开发候选独立使用的刷新规则，可用固定时钟验证，不能借正式 Publisher
+/// 的测试替代。失效条目只改变显示，不额外发出系统 reload 请求。
+enum DevWidgetRefreshPolicy {
+    static let interval: TimeInterval = 300
+
+    static func nextRefresh(after now: Date) -> Date {
+        now.addingTimeInterval(interval)
+    }
+
+    static func mayReload(last: Date?, now: Date) -> Bool {
+        guard let last else { return true }
+        return now.timeIntervalSince(last) >= interval
+    }
+
+    static func expiryDates(snapshot: DevWidgetSnapshot?, after now: Date) -> [Date] {
+        guard let snapshot else { return [] }
+        let valid = snapshot.validUntilMs.map { Date(timeIntervalSince1970: Double($0 + 1) / 1000) }
+        let reset = snapshot.resetAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000) }
+        let overall = Date(timeIntervalSince1970: Double(snapshot.writtenAtMs + 120_001) / 1000)
+        return Array(Set([valid, reset, overall].compactMap { $0 }.filter { $0 > now })).sorted()
+    }
+}
+
 // 仅编译到独立开发宿主和扩展，不依赖正式采集器或账号凭据。
 enum DevProbeArguments {
     enum Mode { case normal, sample(Int), reject }
