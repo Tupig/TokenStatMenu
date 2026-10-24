@@ -127,9 +127,12 @@ struct WidgetEntryView: View {
         }
     }
 
+    // 同一个 Text 同时供实际视图和精确文案契约使用，不提供独立测试文案。
+    var voucherTitle: Text { Text("重置券") }
+
     private func voucherLine(_ count: Int?) -> some View {
         HStack(spacing: 2) {
-            Text("重置券")
+            voucherTitle
                 .font(.system(size: 10, weight: .medium))
             Spacer(minLength: 2)
             Text(count.map { "\($0) 张" } ?? "未知")

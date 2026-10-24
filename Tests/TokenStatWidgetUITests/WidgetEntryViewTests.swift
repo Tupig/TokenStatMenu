@@ -24,9 +24,11 @@ final class WidgetEntryViewTests: XCTestCase {
         let expired = snapshot(observed: now.addingTimeInterval(-121), reset: now.addingTimeInterval(600))
         let reset = snapshot(observed: now, reset: now.addingTimeInterval(-1))
         func assertLabels(_ result: RenderResult) {
-            for label in ["5小时", "7天", "月度用量", "重置券"] {
+            for label in ["5小时", "7天", "月度用量"] {
                 XCTAssertTrue(result.labels.contains(label), "top-1: \(result.text)\n候选: \(result.labels)")
             }
+            XCTAssertTrue(result.hasExactVoucherLabel,
+                "券标签须有产品 Text 精确文案及图像证据；top-1: \(result.text)")
         }
         func assertNoOldValues(_ result: RenderResult) {
             let text = result.text
@@ -85,11 +87,27 @@ final class WidgetEntryViewTests: XCTestCase {
     private struct RenderResult {
         let text: String
         let labels: String
+        let voucherTitle: Text
+
+        var hasExactVoucherLabel: Bool {
+            // Vision 在部分 macOS 上把券稳定识别为劵。仅在同一实际视图
+            // 使用精确的“重置券”Text 时接受这一处图像歧义，不替换整图文本。
+            voucherTitle == Text("重置券") &&
+                (labels.contains("重置券") || labels.contains("重置劵"))
+        }
+    }
+
+    func testVoucherOracleRejectsWrongOrEmptyProductTextAndMissingOCR() {
+        XCTAssertTrue(RenderResult(text: "", labels: "重置劵", voucherTitle: Text("重置券")).hasExactVoucherLabel)
+        XCTAssertFalse(RenderResult(text: "", labels: "重置劵", voucherTitle: Text("重置劵")).hasExactVoucherLabel)
+        XCTAssertFalse(RenderResult(text: "", labels: "重置券", voucherTitle: Text("")).hasExactVoucherLabel)
+        XCTAssertFalse(RenderResult(text: "", labels: "", voucherTitle: Text("重置券")).hasExactVoucherLabel)
     }
 
     private func render(_ entry: WidgetEntry, dark: Bool) async throws -> RenderResult {
         let bounds = NSRect(x: 0, y: 0, width: 164, height: 164)
-        let view = WidgetEntryView(entry: entry)
+        let productView = WidgetEntryView(entry: entry)
+        let view = productView
             .environment(\.colorScheme, dark ? .dark : .light)
             .frame(width: bounds.width, height: bounds.height)
             .background(dark ? Color.black : Color.white)
@@ -152,6 +170,7 @@ final class WidgetEntryViewTests: XCTestCase {
                 labels += (lineRequest.results ?? []).flatMap { $0.topCandidates(10) }.map(\.string)
             }
         }
-        return RenderResult(text: text, labels: labels.joined(separator: "\n").replacingOccurrences(of: " ", with: ""))
+        return RenderResult(text: text, labels: labels.joined(separator: "\n").replacingOccurrences(of: " ", with: ""),
+                            voucherTitle: productView.voucherTitle)
     }
 }
