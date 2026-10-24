@@ -165,6 +165,19 @@ final class WidgetSnapshotStoreTests: XCTestCase {
         XCTAssertNil(WidgetSnapshotStore.acceptedGroup(String(repeating: "a", count: 129)))
     }
 
+    func testAcceptedGroupLengthBoundaryHasOtherwiseValidShape() {
+        for prefix in ["group.", "AB12CD34EF."] {
+            let accepted = prefix + String(repeating: "a", count: 128 - prefix.count)
+            XCTAssertEqual(accepted.count, 128)
+            XCTAssertEqual(WidgetSnapshotStore.acceptedGroup(accepted), accepted)
+            XCTAssertNil(WidgetSnapshotStore.acceptedGroup(accepted + "a"),
+                         "129字符仍有合法前缀和分段，必须仅因长度拒绝")
+        }
+        // UNRESOLVED 本身是10位大写字母，形状可通过Team前缀校验，
+        // 必须由明确的构建占位符门禁拒绝，不能用非法前缀冒充覆盖。
+        XCTAssertNil(WidgetSnapshotStore.acceptedGroup("UNRESOLVED.example"))
+    }
+
     func testDirectoryWriteCreatesThenReplacesOnlyOwnedBytes() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("tokenstat-widget-\(UUID().uuidString)", isDirectory: true)
