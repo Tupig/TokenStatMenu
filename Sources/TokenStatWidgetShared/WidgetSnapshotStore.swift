@@ -159,6 +159,12 @@ public enum WidgetSnapshotStore {
         return try write(data, replacing: expected, directory: dirfd)
     }
 
+    /// 删除当前进程拥有的快照。身份不符时保留原文件并失败。
+    static func removeOwned(_ expected: Ownership, directory dirfd: Int32) throws {
+        try requireOwned(dirfd, expected: expected)
+        guard unlinkat(dirfd, fileName, 0) == 0 else { throw StoreError.ioFailure }
+    }
+
     /// 向已打开的目录写入。测试使用临时目录检查归属、权限和替换规则。
     static func write(_ data: Data, replacing expected: Ownership?,
                       directory dirfd: Int32) throws -> Ownership {
@@ -207,6 +213,12 @@ public enum WidgetSnapshotStore {
     }
 
     // MARK: - 容器
+
+    public static func removeOwned(_ expected: Ownership, bundle: Bundle = .main) throws {
+        let dirfd = try openContainer(bundle: bundle)
+        defer { close(dirfd) }
+        try removeOwned(expected, directory: dirfd)
+    }
 
     private static func openContainer(bundle: Bundle) throws -> Int32 {
         guard let url = containerURL(bundle: bundle) else { throw StoreError.unavailable }

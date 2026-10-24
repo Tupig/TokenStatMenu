@@ -592,12 +592,15 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
                 sourceSymbol: quota.sourceSymbol.count <= 4 ? quota.sourceSymbol : nil)
         }
 
-        let monthly = presentation.monthlyCurrent.map { usage in
-            WidgetQuotaSnapshot.Monthly(
-                usedAmount: NSDecimalNumber(decimal: usage.usedAmount).doubleValue,
-                limitAmount: usage.limitAmount.map { NSDecimalNumber(decimal: $0).doubleValue },
-                sourceSymbol: usage.sourceSymbol)
+        let monthly = presentation.monthlyCurrent.flatMap { usage -> WidgetQuotaSnapshot.Monthly? in
+            let used = NSDecimalNumber(decimal: usage.usedAmount).doubleValue
+            let limit = usage.limitAmount.map { NSDecimalNumber(decimal: $0).doubleValue }
+            guard used.isFinite, used >= 0,
+                  limit.map({ $0.isFinite && $0 >= 0 }) ?? true else { return nil }
+            return WidgetQuotaSnapshot.Monthly(
+                usedAmount: used, limitAmount: limit, sourceSymbol: usage.sourceSymbol)
         }
+        guard presentation.monthlyCurrent == nil || monthly != nil else { return }
         let local: WidgetQuotaSnapshot.Local? = {
             let snapshot = localSnapshot
             guard snapshot.filesScanned > 0 || snapshot.total > 0 else { return nil }
@@ -1383,6 +1386,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             tokenHubQuotaStatus = snapshot.observedAt > now || now.timeIntervalSince(snapshot.observedAt) > max(120, config.refreshSeconds * 2)
                 ? .stale : .connected
             tokenHubQuotaFailure = nil
+            tokenHubDirectFailure = nil
         } else {
             tokenHubQuotaSnapshot = nil
             tokenHubQuotaStatus = result.status

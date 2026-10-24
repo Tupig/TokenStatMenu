@@ -230,6 +230,24 @@ final class WidgetPublisherFailureTests: XCTestCase {
         XCTAssertEqual(reloads, 0)
     }
 
+    func testUnencodableSnapshotRemovesPreviousSuccessfulSnapshot() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dirfd = open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(dirfd, 0)
+        defer { close(dirfd) }
+        let publisher = WidgetSnapshotPublisher(now: { self.start }, channelAvailable: { true },
+            claim: { WidgetSnapshotStore.claimExisting(directory: dirfd) },
+            write: { data, owned in try WidgetSnapshotStore.write(data, replacing: owned, directory: dirfd) },
+            removeOwned: { try WidgetSnapshotStore.removeOwned($0, directory: dirfd) },
+            reload: {})
+        XCTAssertTrue(publisher.publish(snapshot(50)))
+        XCTAssertNotNil(WidgetSnapshotStore.claimExisting(directory: dirfd))
+        XCTAssertFalse(publisher.publish(snapshot(.nan)))
+        XCTAssertNil(WidgetSnapshotStore.claimExisting(directory: dirfd))
+    }
+
     func testDiagnosticStateTracksFailuresRecoveryAndReset() {
         var available = true
         let owned = WidgetSnapshotStore.Ownership(device: 1, inode: 1, size: 1, digest: "synthetic")

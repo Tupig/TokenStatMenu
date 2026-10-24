@@ -25,6 +25,7 @@ public final class WidgetSnapshotPublisher {
     private let channelAvailable: @MainActor () -> Bool
     private let claim: @MainActor () -> WidgetSnapshotStore.Ownership?
     private let write: @MainActor (Data, WidgetSnapshotStore.Ownership?) throws -> WidgetSnapshotStore.Ownership
+    private let removeOwned: @MainActor (WidgetSnapshotStore.Ownership) throws -> Void
     private let reload: @MainActor () -> Void
 
     /// `reloadAllTimelines()` 的最短调用间隔，避免频繁请求耗尽 WidgetKit 重载预算。
@@ -35,6 +36,7 @@ public final class WidgetSnapshotPublisher {
         self.channelAvailable = { WidgetSnapshotStore.isAvailable() }
         self.claim = { WidgetSnapshotStore.claimExisting() }
         self.write = { try WidgetSnapshotStore.write($0, replacing: $1) }
+        self.removeOwned = { try WidgetSnapshotStore.removeOwned($0) }
         self.reload = { WidgetCenter.shared.reloadAllTimelines() }
     }
 
@@ -43,11 +45,13 @@ public final class WidgetSnapshotPublisher {
          channelAvailable: @escaping @MainActor () -> Bool,
          claim: @escaping @MainActor () -> WidgetSnapshotStore.Ownership?,
          write: @escaping @MainActor (Data, WidgetSnapshotStore.Ownership?) throws -> WidgetSnapshotStore.Ownership,
+         removeOwned: @escaping @MainActor (WidgetSnapshotStore.Ownership) throws -> Void = { _ in },
          reload: @escaping @MainActor () -> Void) {
         self.now = now
         self.channelAvailable = channelAvailable
         self.claim = claim
         self.write = write
+        self.removeOwned = removeOwned
         self.reload = reload
     }
 
@@ -76,6 +80,7 @@ public final class WidgetSnapshotPublisher {
             return false
         }
         guard let data = try? WidgetSnapshotCodec.encode(snapshot) else {
+            clearStaleSnapshot()
             lastPublishSucceeded = false
             return false
         }
@@ -160,6 +165,19 @@ public final class WidgetSnapshotPublisher {
         lastReloadAt = current
         pendingReload = false
         reload()
+    }
+
+    /// 当前快照无法安全编码时清除上次成功展示，避免 Widget 继续显示旧额度。
+    private func clearStaleSnapshot() {
+        if let ownership {
+            try? removeOwned(ownership)
+        }
+        self.ownership = nil
+        needsClaim = true
+        lastPayload = nil
+        lastWriteFailed = true
+        pendingReload = true
+        reloadTimelinesIfAllowed()
     }
 
     /// 清除内存中的文件身份，使下次发布重新读取容器。
