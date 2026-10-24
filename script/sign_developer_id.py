@@ -369,7 +369,28 @@ def verify_bundle(
     temporary: Path,
     index: int,
 ) -> None:
-    run_tool([CODESIGN, "--verify", "--strict", str(bundle)])
+    bundle_id = read_plist(bundle / "Contents/Info.plist", "signed Info").get("CFBundleIdentifier")
+    require(
+        isinstance(bundle_id, str)
+        and re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", bundle_id) is not None
+        and re.fullmatch(r"[A-Z0-9]{10}", team) is not None,
+        "Invalid signed bundle identifier or Team",
+    )
+    identifiers = [authorization.entitlements[key] for key in IDENTIFIER_KEYS
+                   if key in authorization.entitlements]
+    require(
+        bool(identifiers) and all(value == f"{team}.{bundle_id}" for value in identifiers),
+        "Signed bundle identifier differs from profile authorization",
+    )
+    # Authority display names and a profile's leaf bytes do not establish Apple trust.
+    requirement = (
+        'anchor apple generic and identifier "' + bundle_id + '"'
+        ' and certificate leaf[subject.OU] = "' + team + '"'
+        " and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+    )
+    run_tool([
+        CODESIGN, "--verify", "--strict", "--test-requirement", requirement, str(bundle),
+    ])
     displayed = run_tool([CODESIGN, "--display", "--verbose=4", str(bundle)])
     details = (displayed.stdout + displayed.stderr).decode("utf-8", errors="replace")
     require(

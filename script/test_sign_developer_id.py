@@ -89,6 +89,7 @@ class SigningTests(unittest.TestCase):
         self.certificate_end = "Jan  1 00:00:00 2027 GMT"
         self.extra_certificates = {}
         self.fail_sign = False
+        self.apple_anchored = True
         self.subprocess = mock.patch.object(
             signing.subprocess, "run", side_effect=self.fake_run
         ).start()
@@ -141,6 +142,19 @@ class SigningTests(unittest.TestCase):
                 self.signed_entitlements[bundle] = plistlib.loads(
                     Path(command[command.index("--entitlements") + 1]).read_bytes()
                 )
+            elif "--test-requirement" in command:
+                identifier = IDS[1] if bundle.endswith(".appex") else IDS[0]
+                expected = (
+                    'anchor apple generic and identifier "' + identifier + '"'
+                    ' and certificate leaf[subject.OU] = "' + TEAM + '"'
+                    " and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+                )
+                self.assertEqual(command, [signing.CODESIGN, "--verify", "--strict",
+                                          "--test-requirement", expected, bundle])
+                if not self.apple_anchored:
+                    raise subprocess.CalledProcessError(
+                        1, command, stderr=b"PRIVATE untrusted self-signed certificate",
+                    )
             elif "--verbose=4" in command:
                 stderr = (
                     self.details_override
@@ -486,6 +500,57 @@ class SigningTests(unittest.TestCase):
         for bundle in (app, app / "Contents/PlugIns/TokenStatMenuWidget.appex"):
             profile = bundle / "Contents/embedded.provisionprofile"
             self.assertEqual(profile.stat().st_mode & 0o777, 0o644)
+
+    def test_apple_requirement_checks_both_real_identifiers_before_metadata(self):
+        app = self.make_app()
+        self.execute()
+        commands = [call.args[0] for call in self.subprocess.call_args_list]
+        checks = [command for command in commands if "--test-requirement" in command]
+        self.assertEqual([command[-1] for command in checks], [
+            str(app / "Contents/PlugIns/TokenStatMenuWidget.appex"), str(app),
+        ])
+        for command in checks:
+            display = [signing.CODESIGN, "--display", "--verbose=4", command[-1]]
+            self.assertLess(commands.index(command), commands.index(display))
+
+    def test_self_signed_same_name_chain_and_matching_leaf_are_rejected(self):
+        self.make_app()
+        # These are identical to the successful fixture: metadata/SHA alone would pass.
+        self.details_override = (
+            f"Authority={NAME}\nAuthority=Developer ID Certification Authority\n"
+            f"Authority=Apple Root CA\nTeamIdentifier={TEAM}\n"
+            "CodeDirectory v=20500 size=123 flags=0x10000(runtime) hashes=1\n"
+            "Timestamp=Oct 24, 2026\n"
+        ).encode()
+        self.leaf = CERTIFICATE
+        self.apple_anchored = False
+        with self.assertRaises(signing.SigningError) as error:
+            self.execute()
+        self.assertNotIn("PRIVATE", str(error.exception))
+        commands = [call.args[0] for call in self.subprocess.call_args_list]
+        self.assertEqual(len([command for command in commands if "--sign" in command]), 1)
+        self.assertIn("--test-requirement", commands[-1])
+        self.assertFalse(any("--display" in command for command in commands))
+
+    def test_requirement_tool_error_fails_without_plain_verify_or_sign_fallback(self):
+        self.make_app()
+        original = self.subprocess.side_effect
+
+        def unavailable(command, **kwargs):
+            if "--test-requirement" in command:
+                raise OSError("PRIVATE requirement evaluation failure")
+            return original(command, **kwargs)
+
+        self.subprocess.side_effect = unavailable
+        with self.assertRaises(signing.SigningError) as error:
+            self.execute()
+        self.assertNotIn("PRIVATE", str(error.exception))
+        commands = [call.args[0] for call in self.subprocess.call_args_list]
+        self.assertEqual(len([command for command in commands if "--sign" in command]), 1)
+        verifies = [command for command in commands if "--verify" in command]
+        self.assertEqual(len(verifies), 1)
+        self.assertIn("--test-requirement", verifies[0])
+        self.assertEqual(commands[-1], verifies[0])
 
     def test_signing_failure_is_redacted_and_never_falls_back(self):
         self.make_app()
