@@ -1129,6 +1129,55 @@ final class TokenHubQuotaStateTests: XCTestCase {
         XCTFail("AppModel did not reach expected state \(status)")
     }
 
+    private enum DiagnosticWaitError: Error, Equatable {
+        case timedOut(String)
+    }
+
+    /// 诊断通过 utility queue 原子落盘；yield 次数不代表后台 I/O 已完成。
+    /// 只等待尚未创建的文件，其他读取错误立即抛出，超时不能当成成功。
+    private func waitForDiagnosticData(at url: URL, timeout: Duration = .seconds(5)) async throws -> Data {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while true {
+            try Task.checkCancellation()
+            do {
+                return try Data(contentsOf: url)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                guard clock.now < deadline else { throw DiagnosticWaitError.timedOut(url.lastPathComponent) }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+    }
+
+    func testDiagnosticWaitReadsDelayedAtomicWriteAndTimesOutWhenMissing() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("delayed.json")
+        let expected = Data("{\"fiveHourPresent\":false,\"sevenDayPresent\":true}".utf8)
+        let writer = Task {
+            try await Task.sleep(for: .milliseconds(100))
+            try expected.write(to: url, options: .atomic)
+        }
+        defer { writer.cancel() }
+        let actual = try await waitForDiagnosticData(at: url)
+        try await writer.value
+        XCTAssertEqual(actual, expected)
+        let missing = root.appendingPathComponent("never-written.json")
+        do {
+            _ = try await waitForDiagnosticData(at: missing, timeout: .milliseconds(20))
+            XCTFail("没有诊断文件必须失败，不能返回空值通过")
+        } catch let error as DiagnosticWaitError {
+            XCTAssertEqual(error, .timedOut("never-written.json"))
+        }
+        do {
+            _ = try await waitForDiagnosticData(at: root)
+            XCTFail("非文件的读取错误不能被当作等待成功")
+        } catch {
+            XCTAssertFalse(error is DiagnosticWaitError, "非缺失错误应立即传播")
+        }
+    }
+
     func testFixtureSuppressesOnlyNativeScannerAndSettingsMergeKeepsLiveToggle() {
         XCTAssertTrue(AppModel.shouldSuppressNativeTokenHubRead(isTestFixture: true, scannerIsNative: true))
         XCTAssertFalse(AppModel.shouldSuppressNativeTokenHubRead(isTestFixture: true, scannerIsNative: false),
@@ -1801,16 +1850,13 @@ extension TokenHubQuotaStateTests {
 
         let diagnosticsRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("TokenStatMenu-BP38-C02-\(UUID().uuidString)", isDirectory: true)
-        try? FileManager.default.createDirectory(at: diagnosticsRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: diagnosticsRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: diagnosticsRoot) }
         let diagnosticURL = diagnosticsRoot.appendingPathComponent("synthetic-diagnostics.json")
         _ = NSApplication.shared
         let controller = StatusBarController(model: model, diagnosticsURL: diagnosticURL)
         controller.refreshTitle()
-        for _ in 0..<100 where !FileManager.default.fileExists(atPath: diagnosticURL.path) {
-            try? await Task.sleep(for: .milliseconds(5))
-        }
-        let diagnosticData = try Data(contentsOf: diagnosticURL)
+        let diagnosticData = try await waitForDiagnosticData(at: diagnosticURL)
         let diagnostic = try XCTUnwrap(try JSONSerialization.jsonObject(with: diagnosticData) as? [String: Any])
         XCTAssertEqual(diagnostic["fiveHourPresent"] as? Bool, false)
         XCTAssertEqual(diagnostic["sevenDayPresent"] as? Bool, true)
@@ -1826,7 +1872,13 @@ extension TokenHubQuotaStateTests {
         source.set(betweenTick)
         wall.set(base.addingTimeInterval(11))
         model.refreshTokenHubQuota()
-        for _ in 0..<100 where model.tokenHubQuotaSnapshot != betweenTick { await Task.yield() }
+        let responseClock = ContinuousClock()
+        let responseDeadline = responseClock.now.advanced(by: .seconds(5))
+        while model.tokenHubQuotaSnapshot != betweenTick, responseClock.now < responseDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        _ = try XCTUnwrap(model.tokenHubQuotaSnapshot == betweenTick ? model.tokenHubQuotaSnapshot : nil,
+                          "C02 timed out waiting for the replacement snapshot, not merely connected status")
         XCTAssertEqual(model.tokenHubQuotaSnapshot, betweenTick)
         XCTAssertEqual(model.quotaPresentation.fiveHourCurrent, betweenTick.fiveHour)
         XCTAssertEqual(model.quotaPresentation.sevenDayCurrent, betweenTick.sevenDay)
@@ -1846,8 +1898,7 @@ extension TokenHubQuotaStateTests {
         XCTAssertTrue(model.title.contains("50.00%"))
         XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
         XCTAssertTrue(model.menuTooltip.contains("7 天额度"))
-        for _ in 0..<100 where !FileManager.default.fileExists(atPath: fiveHourOutput.path) { await Task.yield() }
-        let fiveHourData = try Data(contentsOf: fiveHourOutput)
+        let fiveHourData = try await waitForDiagnosticData(at: fiveHourOutput)
         let fiveHourDiagnostic = try XCTUnwrap(try JSONSerialization.jsonObject(with: fiveHourData) as? [String: Any])
         XCTAssertEqual(fiveHourDiagnostic["fiveHourPresent"] as? Bool, false)
         XCTAssertEqual(fiveHourDiagnostic["sevenDayPresent"] as? Bool, true)
@@ -1870,8 +1921,7 @@ extension TokenHubQuotaStateTests {
         XCTAssertTrue(model.title.hasPrefix("— | — |"))
         XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
         XCTAssertTrue(model.menuTooltip.contains("7 天未知"))
-        for _ in 0..<100 where !FileManager.default.fileExists(atPath: sevenDayOutput.path) { await Task.yield() }
-        let sevenDayData = try Data(contentsOf: sevenDayOutput)
+        let sevenDayData = try await waitForDiagnosticData(at: sevenDayOutput)
         let sevenDayDiagnostic = try XCTUnwrap(try JSONSerialization.jsonObject(with: sevenDayData) as? [String: Any])
         XCTAssertEqual(sevenDayDiagnostic["fiveHourPresent"] as? Bool, false)
         XCTAssertEqual(sevenDayDiagnostic["sevenDayPresent"] as? Bool, false)
