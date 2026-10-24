@@ -175,8 +175,9 @@ public enum UsageDecoder {
                   !value.isNaN, value >= 0, value < Decimal(1_000_000_000_000) else { return nil }
             var integer = Decimal()
             NSDecimalRound(&integer, &value, 0, .down)
-            guard value == integer else { return nil }
-            return NSDecimalNumber(decimal: value).intValue
+            guard value == integer, value <= Decimal(Int.max) else { return nil }
+            return (value as NSDecimalNumber).int64Value == Int64(truncating: value as NSDecimalNumber)
+                ? Int(truncating: value as NSDecimalNumber) : nil
         }
     }
 

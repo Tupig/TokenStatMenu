@@ -465,7 +465,8 @@ public enum LocalCodexUsageReader {
             readAt: primary.readAt ?? extra.readAt,
             details: details,
             cacheCoverage: aggregateCacheCoverage(details.map(\.usage)),
-            detailLimited: primary.detailLimited || extra.detailLimited)
+            detailLimited: primary.detailLimited || extra.detailLimited,
+            quotaDate: rateWinner.quotaDate)
     }
 
     /// 扫描一个目录并返回实际使用的文件身份。

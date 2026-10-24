@@ -199,15 +199,16 @@ public enum TokenHubConnectionDiscovery {
         }
         let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else { throw TokenHubDirectQuotaFailure.databaseUnsafe }
-        defer { close(descriptor) }
+        defer { _ = descriptor }
         var info = stat()
         guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
               info.st_uid == getuid(), (info.st_mode & 0o022) == 0 else {
             throw TokenHubDirectQuotaFailure.databaseUnsafe
         }
         var db: OpaquePointer?
-        guard sqlite3_open_v2(url.standardizedFileURL.path, &db,
-                              SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK,
+        let databaseURI = "file:///dev/fd/" + String(descriptor) + "?mode=ro"
+        guard sqlite3_open_v2(databaseURI, &db,
+                              SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_URI, nil) == SQLITE_OK,
               let db else {
             if let db { sqlite3_close(db) }
             throw TokenHubDirectQuotaFailure.connectionUnavailable
@@ -238,7 +239,8 @@ public enum TokenHubConnectionDiscovery {
             throw TokenHubDirectQuotaFailure.connectionUnavailable
         }
         defer { sqlite3_finalize(statement) }
-        let bindResult = key.withCString { sqlite3_bind_text(statement, 1, $0, -1, nil) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let bindResult = key.withCString { sqlite3_bind_text(statement, 1, $0, -1, transient) }
         guard bindResult == SQLITE_OK else {
             throw TokenHubDirectQuotaFailure.connectionUnavailable
         }
