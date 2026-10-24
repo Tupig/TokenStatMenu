@@ -21,63 +21,71 @@ final class WidgetEntryViewTests: XCTestCase {
         let current = snapshot(observed: now, reset: now.addingTimeInterval(600))
         let expired = snapshot(observed: now.addingTimeInterval(-121), reset: now.addingTimeInterval(600))
         let reset = snapshot(observed: now, reset: now.addingTimeInterval(-1))
-        func assertLabels(_ text: String) {
-            for label in ["5小时", "7天", "月度用量", "重置券"] { XCTAssertTrue(text.contains(label), text) }
+        func assertLabels(_ result: RenderResult) {
+            for label in ["5小时", "7天", "月度用量", "重置券"] {
+                XCTAssertTrue(result.labels.contains(label), "top-1: \(result.text)\n候选: \(result.labels)")
+            }
         }
-        func assertNoOldValues(_ text: String) {
+        func assertNoOldValues(_ result: RenderResult) {
+            let text = result.text
             for old in ["87.66", "43.22", "1,234.56", "3张"] { XCTAssertFalse(text.contains(old), text) }
         }
         for dark in [false, true] {
             let live = try await render(.init(date: now, snapshot: current, channelAvailable: true), dark: dark)
             assertLabels(live)
-            XCTAssertTrue(live.contains("87.66%"), live)
-            XCTAssertTrue(live.contains("43.22%"), live)
-            XCTAssertTrue(live.contains("1,234.56"), live)
-            XCTAssertTrue(live.contains("3张"), live)
+            XCTAssertTrue(live.text.contains("87.66%"), live.text)
+            XCTAssertTrue(live.text.contains("43.22%"), live.text)
+            XCTAssertTrue(live.text.contains("1,234.56"), live.text)
+            XCTAssertTrue(live.text.contains("3张"), live.text)
             let stale = try await render(.init(date: now, snapshot: expired, channelAvailable: true), dark: dark)
-            XCTAssertTrue(stale.contains("未知"), stale)
+            XCTAssertTrue(stale.labels.contains("未知"), stale.text)
             assertLabels(stale)
             assertNoOldValues(stale)
             let resetText = try await render(.init(date: now, snapshot: reset, channelAvailable: true), dark: dark)
-            XCTAssertFalse(resetText.contains("87.66"), resetText)
-            XCTAssertTrue(resetText.contains("43.22%"), resetText)
-            XCTAssertTrue(resetText.contains("未知"), resetText)
+            XCTAssertFalse(resetText.text.contains("87.66"), resetText.text)
+            XCTAssertTrue(resetText.text.contains("43.22%"), resetText.text)
+            XCTAssertTrue(resetText.labels.contains("未知"), resetText.text)
             assertLabels(resetText)
-            XCTAssertTrue(resetText.contains("1,234.56") && resetText.contains("3张"), resetText)
+            XCTAssertTrue(resetText.text.contains("1,234.56") && resetText.text.contains("3张"), resetText.text)
             let sevenExpired = snapshot(observed: now, reset: now.addingTimeInterval(600), sevenReset: now.addingTimeInterval(-1))
             let reverse = try await render(.init(date: now, snapshot: sevenExpired, channelAvailable: true), dark: dark)
             assertLabels(reverse)
-            XCTAssertTrue(reverse.contains("87.66%") && reverse.contains("未知"), reverse)
-            XCTAssertFalse(reverse.contains("43.22"), reverse)
-            XCTAssertTrue(reverse.contains("1,234.56") && reverse.contains("3张"), reverse)
+            XCTAssertTrue(reverse.text.contains("87.66%") && reverse.labels.contains("未知"), reverse.text)
+            XCTAssertFalse(reverse.text.contains("43.22"), reverse.text)
+            XCTAssertTrue(reverse.text.contains("1,234.56") && reverse.text.contains("3张"), reverse.text)
             for vouchers: Int? in [nil, 0] {
                 let partial = WidgetQuotaSnapshot(writtenAt: now, observedAt: now, validUntil: now.addingTimeInterval(120),
                     hubSource: .direct, hubState: .ready, fiveHour: nil, sevenDay: current.sevenDay,
                     monthly: nil, local: nil, resetVoucherCount: vouchers)
                 let text = try await render(.init(date: now, snapshot: partial, channelAvailable: true), dark: dark)
                 assertLabels(text)
-                XCTAssertTrue(text.contains("43.22%") && text.contains("未知"), text)
-                XCTAssertFalse(text.contains("87.66") || text.contains("1,234.56") || text.contains("3张"), text)
-                XCTAssertEqual(text.contains("0张"), vouchers == 0, text)
+                XCTAssertTrue(text.text.contains("43.22%") && text.labels.contains("未知"), text.text)
+                XCTAssertFalse(text.text.contains("87.66") || text.text.contains("1,234.56") || text.text.contains("3张"), text.text)
+                XCTAssertEqual(text.text.contains("0张"), vouchers == 0, text.text)
             }
             for invalid in [
                 snapshot(observed: now, reset: now.addingTimeInterval(600), state: .unavailable),
                 snapshot(observed: now.addingTimeInterval(60), reset: now.addingTimeInterval(600)),
             ] {
                 let text = try await render(.init(date: now, snapshot: invalid, channelAvailable: true), dark: dark)
-                XCTAssertTrue(text.contains("未知"), text)
+                XCTAssertTrue(text.labels.contains("未知"), text.text)
                 assertLabels(text)
                 assertNoOldValues(text)
             }
             let empty = try await render(.init(date: now, snapshot: nil, channelAvailable: true), dark: dark)
-            XCTAssertTrue(empty.contains("尚未获取数据"), empty)
+            XCTAssertTrue(empty.labels.contains("尚未获取数据"), empty.text)
             let unavailable = try await render(.init(date: now, snapshot: current, channelAvailable: false), dark: dark)
-            XCTAssertTrue(unavailable.contains("共享通道不可用"), unavailable)
+            XCTAssertTrue(unavailable.labels.contains("共享通道不可用"), unavailable.text)
             assertNoOldValues(unavailable)
         }
     }
 
-    private func render(_ entry: WidgetEntry, dark: Bool) async throws -> String {
+    private struct RenderResult {
+        let text: String
+        let labels: String
+    }
+
+    private func render(_ entry: WidgetEntry, dark: Bool) async throws -> RenderResult {
         let bounds = NSRect(x: 0, y: 0, width: 164, height: 164)
         let view = WidgetEntryView(entry: entry)
             .environment(\.colorScheme, dark ? .dark : .light)
@@ -103,8 +111,29 @@ final class WidgetEntryViewTests: XCTestCase {
         request.recognitionLevel = .accurate
         request.recognitionLanguages = ["zh-Hans", "en-US"]
         request.usesLanguageCorrection = false
-        try VNImageRequestHandler(cgImage: XCTUnwrap(bitmap.cgImage), options: [:]).perform([request])
-        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+        let image = try XCTUnwrap(bitmap.cgImage)
+        try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+        let observations = request.results ?? []
+        let text = observations.compactMap { $0.topCandidates(1).first?.string }
             .joined(separator: "\n").replacingOccurrences(of: " ", with: "")
+        // 数值与旧值泄露仍核对整图 top-1；中文标签另核对未经词表纠正的
+        // 原始候选及真实行区域，避免把 Vision 的“度/慶”“券/劵”错字当产品缺陷。
+        var labels = observations.flatMap { $0.topCandidates(10) }.map(\.string)
+        for observation in observations {
+            let box = observation.boundingBox
+            let region = CGRect(x: box.minX * CGFloat(image.width) - 12,
+                y: (1 - box.maxY) * CGFloat(image.height) - 12,
+                width: box.width * CGFloat(image.width) + 24,
+                height: box.height * CGFloat(image.height) + 24)
+                .intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height)).integral
+            guard let crop = image.cropping(to: region) else { continue }
+            let lineRequest = VNRecognizeTextRequest()
+            lineRequest.recognitionLevel = .accurate
+            lineRequest.recognitionLanguages = ["zh-Hans", "en-US"]
+            lineRequest.usesLanguageCorrection = false
+            try VNImageRequestHandler(cgImage: crop, options: [:]).perform([lineRequest])
+            labels += (lineRequest.results ?? []).flatMap { $0.topCandidates(10) }.map(\.string)
+        }
+        return RenderResult(text: text, labels: labels.joined(separator: "\n").replacingOccurrences(of: " ", with: ""))
     }
 }

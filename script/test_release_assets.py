@@ -1731,10 +1731,33 @@ def workflow_contract(document: dict, raw: str) -> None:
     for prefix in [
         "python3 -B script/test_release_assets.py",
         "swift run --force-resolved-versions TokenStatCoreChecks",
-        "xcodebuild -project TokenStatMenu.xcodeproj",
+        "xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu ",
+        "xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatDevWidgetLogicTests ",
+        "xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenuDevWidgetTest ",
         "git diff --exit-code -- Package.resolved",
     ]:
         assert_step("build", prefix, None)
+    native_test = next(
+        step["run"]
+        for step in build["steps"]
+        if "-scheme TokenStatDevWidgetLogicTests " in step.get("run", "")
+    )
+    assert shlex.split(native_test) == [
+        "xcodebuild",
+        "-project",
+        "TokenStatMenu.xcodeproj",
+        "-scheme",
+        "TokenStatDevWidgetLogicTests",
+        "-destination",
+        "platform=macOS,arch=arm64",
+        "-derivedDataPath",
+        "$RUNNER_TEMP/TokenStatDevWidgetLogicTests",
+        "-parallel-testing-enabled",
+        "NO",
+        "CODE_SIGNING_ALLOWED=NO",
+        "CODE_SIGNING_REQUIRED=NO",
+        "test",
+    ]
     # The full-suite step runs the same prefix, so count only filtered runs
     # here. The unfiltered `--skip` step is asserted separately below.
     assert_step(
@@ -1784,6 +1807,28 @@ def workflow_contract(document: dict, raw: str) -> None:
 
 
 class WorkflowChecks(unittest.TestCase):
+    def test_workflow_requires_unsigned_native_product_tests_without_skipping(self):
+        path = PROJECT / ".github/workflows/ci.yml"
+        raw = path.read_text()
+        baseline = load_workflow(path)
+        workflow_contract(baseline, raw)
+        for mutation in ["remove", "build-only", "skip"]:
+            value = copy.deepcopy(baseline)
+            steps = value["jobs"]["build"]["steps"]
+            target = next(
+                step
+                for step in steps
+                if "-scheme TokenStatDevWidgetLogicTests " in step.get("run", "")
+            )
+            if mutation == "remove":
+                steps.remove(target)
+            elif mutation == "build-only":
+                target["run"] = target["run"].removesuffix("test") + "build"
+            else:
+                target["run"] += " -skip-testing:TokenStatDevWidgetLogicTests"
+            with self.assertRaises(AssertionError, msg=mutation):
+                workflow_contract(value, raw)
+
     def test_repository_has_one_workflow_entrypoint(self):
         workflow_root = PROJECT / ".github/workflows"
         workflow_files = sorted(

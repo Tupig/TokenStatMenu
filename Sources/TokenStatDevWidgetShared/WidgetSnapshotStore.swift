@@ -22,12 +22,20 @@ enum DevWidgetSnapshotStore {
     static func read(io: DevProbeIOAudit = DevProbeIOAudit()) throws -> Data {
         let dirfd = try openContainerDirectory(io: io)
         defer { close(dirfd) }
+        return try read(directory: dirfd, io: io)
+    }
+
+    static func read(directory dirfd: Int32, io: DevProbeIOAudit = DevProbeIOAudit(),
+                     beforeNameValidation: () throws -> Void = {}) throws -> Data {
         try checkDirectory(dirfd)
         io.enteringSnapshotRead()
-        let fd = openat(dirfd, DevWidgetIdentity.file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let fd = openat(dirfd, DevWidgetIdentity.file, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw StoreError.ioFailure }
         defer { close(fd) }
         let read = try safeRead(fd)
+        // 测试可在持有完整旧 fd 后安排一次提交，验证末尾路径复核拒绝旧代。
+        // 产品默认不插入操作；只在当前名称仍匹配时才返回数据。
+        try beforeNameValidation()
         try requireName(DevWidgetIdentity.file, matches: read.ownership, directory: dirfd)
         return read.data
     }
@@ -90,7 +98,7 @@ enum DevWidgetSnapshotStore {
             throw StoreError.ioFailure
         }
         io.enteringSnapshotRead()
-        let fd = openat(dirfd, DevWidgetIdentity.file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let fd = openat(dirfd, DevWidgetIdentity.file, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw StoreError.ioFailure }
         defer { close(fd) }
         let read = try safeRead(fd)
@@ -153,7 +161,7 @@ enum DevWidgetSnapshotStore {
     private static func checkExisting(_ expected: Ownership, directory: Int32) throws {
         // 打开或读取已有文件前，清单提供的身份须匹配元数据；未知对象保持不变。
         try requireName(DevWidgetIdentity.file, matches: expected, directory: directory)
-        let fd = openat(directory, DevWidgetIdentity.file, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let fd = openat(directory, DevWidgetIdentity.file, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw StoreError.existingObject }
         defer { close(fd) }
         try requireFD(fd, matches: expected)

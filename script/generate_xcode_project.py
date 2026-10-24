@@ -333,6 +333,92 @@ dev_host_target = obj(
     name = TokenStatMenuDevWidgetTest; productName = TokenStatMenuDevWidgetTest; productReference = {dev_host_product}; productType = "com.apple.product-type.application";""",
 )
 
+# Hostless XCTest compiles the exact product runner, store and provider files.
+# It has no App/appex dependency, entitlements or test host process.
+logic_product = obj(
+    "product:dev-logic-tests",
+    "isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = TokenStatDevWidgetLogicTests.xctest; sourceTree = BUILT_PRODUCTS_DIR;",
+)
+logic_refs, logic_builds = [], []
+for path in sorted((root / "Tests/TokenStatDevWidgetLogicTests").glob("*.swift")):
+    key = path.relative_to(root).as_posix()
+    ref = obj(
+        "file:" + key,
+        f'isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "{path.name}"; sourceTree = "<group>";',
+    )
+    logic_refs.append(ref)
+    logic_builds.append(
+        obj("build:dev-logic-tests:" + key, f"isa = PBXBuildFile; fileRef = {ref};")
+    )
+groups.append(
+    obj(
+        "group:dev-logic-tests",
+        f'isa = PBXGroup; children = {refs(logic_refs)}; path = "Tests/TokenStatDevWidgetLogicTests"; sourceTree = "<group>";',
+    )
+)
+for key, ref in dev_files.items():
+    if key.startswith("Sources/TokenStatDevWidgetShared/") or key.endswith(
+        "/DevProvider.swift"
+    ):
+        logic_builds.append(
+            obj("build:dev-logic-tests:" + key, f"isa = PBXBuildFile; fileRef = {ref};")
+        )
+logic_sources = obj(
+    "sources:dev-logic-tests",
+    f"isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = {refs(logic_builds)}; runOnlyForDeploymentPostprocessing = 0;",
+)
+xctest = obj(
+    "framework:XCTest",
+    "isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = Platforms/MacOSX.platform/Developer/Library/Frameworks/XCTest.framework; sourceTree = DEVELOPER_DIR;",
+)
+xctest_build = obj("build:XCTest", f"isa = PBXBuildFile; fileRef = {xctest};")
+logic_frameworks = obj(
+    "frameworks:dev-logic-tests",
+    f"isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ({xctest_build},); runOnlyForDeploymentPostprocessing = 0;",
+)
+logic_configs = []
+for mode in ["Debug", "Release"]:
+    logic_configs.append(
+        obj(
+            "config:dev-logic-tests:" + mode,
+            f"""isa = XCBuildConfiguration; name = {mode}; buildSettings = {{
+        PRODUCT_NAME = TokenStatDevWidgetLogicTests;
+        PRODUCT_BUNDLE_IDENTIFIER = com.tupig.TokenStatMenu.DevWidgetLogicTests;
+        MACOSX_DEPLOYMENT_TARGET = 14.0;
+        GENERATE_INFOPLIST_FILE = YES;
+        SUPPORTED_PLATFORMS = macosx;
+        SKIP_INSTALL = YES;
+        CODE_SIGNING_ALLOWED = NO;
+        CODE_SIGNING_REQUIRED = NO;
+        CODE_SIGN_IDENTITY = "";
+        ENABLE_APP_SANDBOX = NO;
+        ENABLE_HARDENED_RUNTIME = NO;
+        TEST_HOST = "";
+        BUNDLE_LOADER = "";
+        ENABLE_TESTING_SEARCH_PATHS = YES;
+        SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+        FRAMEWORK_SEARCH_PATHS = ("$(inherited)", "$(PLATFORM_DIR)/Developer/Library/Frameworks",);
+        LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@loader_path/../Frameworks", "@executable_path/../Frameworks", "$(PLATFORM_DIR)/Developer/Library/Frameworks",);
+    }};""",
+        )
+    )
+logic_list = obj(
+    "config-list:dev-logic-tests",
+    f"isa = XCConfigurationList; buildConfigurations = {refs(logic_configs)}; defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug;",
+)
+logic_target = obj(
+    "target:dev-logic-tests",
+    f"""isa = PBXNativeTarget; buildConfigurationList = {logic_list};
+    buildPhases = ({logic_sources}, {logic_frameworks},); buildRules = (); dependencies = ();
+    name = TokenStatDevWidgetLogicTests; productName = TokenStatDevWidgetLogicTests; productReference = {logic_product}; productType = "com.apple.product-type.bundle.unit-test";""",
+)
+objects[products] = (
+    f'isa = PBXGroup; children = ({product}, {widget_extension_product}, {dev_host_product}, {dev_extension_product}, {logic_product},); name = Products; sourceTree = "<group>";'
+)
+objects[main] = (
+    f'isa = PBXGroup; children = {refs(groups + resource_files + [xctest, products])}; sourceTree = "<group>";'
+)
+
 
 # Production widget extension: built as an appex and embedded into the app's
 # Contents/PlugIns, so one install surface carries the menu bar and the widget.
@@ -423,7 +509,7 @@ project = obj(
     f"""isa = PBXProject; attributes = {{ LastUpgradeCheck = 1600; }};
     buildConfigurationList = {project_list}; compatibilityVersion = "Xcode 14.0"; developmentRegion = en;
     hasScannedForEncodings = 0; knownRegions = (en, Base, "zh-Hans",);
-    mainGroup = {main}; productRefGroup = {products}; projectDirPath = ""; projectRoot = ""; targets = ({target}, {widget_target}, {dev_host_target}, {dev_extension_target},);""",
+    mainGroup = {main}; productRefGroup = {products}; projectDirPath = ""; projectRoot = ""; targets = ({target}, {widget_target}, {dev_host_target}, {dev_extension_target}, {logic_target},);""",
 )
 directory = root / "TokenStatMenu.xcodeproj"
 directory.mkdir(exist_ok=True)
@@ -465,6 +551,25 @@ dev_scheme = (
     )
 )
 (scheme_directory / "TokenStatMenuDevWidgetTest.xcscheme").write_text(dev_scheme)
+logic_reference = f'<BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="{logic_target}" BuildableName="TokenStatDevWidgetLogicTests.xctest" BlueprintName="TokenStatDevWidgetLogicTests" ReferencedContainer="container:TokenStatMenu.xcodeproj"/>'
+logic_scheme = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion="1600" version="1.3">
+  <BuildAction parallelizeBuildables="NO" buildImplicitDependencies="YES">
+    <BuildActionEntries>
+      <BuildActionEntry buildForTesting="YES" buildForRunning="NO" buildForProfiling="NO" buildForArchiving="NO" buildForAnalyzing="YES">
+        {logic_reference}
+      </BuildActionEntry>
+    </BuildActionEntries>
+  </BuildAction>
+  <TestAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.IDEFoundation.Launcher.LLDB" shouldUseLaunchSchemeArgsEnv="NO">
+    <Testables>
+      <TestableReference skipped="NO">{logic_reference}</TestableReference>
+    </Testables>
+  </TestAction>
+  <AnalyzeAction buildConfiguration="Debug"/>
+</Scheme>
+"""
+(scheme_directory / "TokenStatDevWidgetLogicTests.xcscheme").write_text(logic_scheme)
 # The widget extension is run through its own scheme. It is still embedded in
 # the app bundle, so building the app is what actually ships it.
 widget_scheme = (
@@ -477,5 +582,5 @@ widget_scheme = (
 (scheme_directory / "TokenStatMenuWidget.xcscheme").write_text(widget_scheme)
 print(directory)
 print(
-    "targets: TokenStatMenu, TokenStatMenuWidget, TokenStatMenuDevWidgetTest, TokenStatDevWidgetTest"
+    "targets: TokenStatMenu, TokenStatMenuWidget, TokenStatMenuDevWidgetTest, TokenStatDevWidgetTest, TokenStatDevWidgetLogicTests"
 )

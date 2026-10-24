@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 import sys
 import unittest
+import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,39 @@ def load_diagnostic_module():
 
 
 class PhaseTwoDiagnosticTests(unittest.TestCase):
+    def test_native_development_tests_bind_real_product_sources_without_app_host(self):
+        scheme = ET.parse(
+            ROOT
+            / "TokenStatMenu.xcodeproj/xcshareddata/xcschemes/TokenStatDevWidgetLogicTests.xcscheme"
+        ).getroot()
+        testable = scheme.find("./TestAction/Testables/TestableReference")
+        self.assertIsNotNone(testable)
+        self.assertEqual(testable.get("skipped"), "NO")
+        reference = testable.find("BuildableReference")
+        self.assertEqual(reference.get("BlueprintName"), "TokenStatDevWidgetLogicTests")
+        self.assertIsNone(scheme.find(".//BuildableProductRunnable"))
+        project = (ROOT / "TokenStatMenu.xcodeproj/project.pbxproj").read_text()
+        target_id = reference.get("BlueprintIdentifier")
+        target = project.split(target_id + " = {", 1)[1].split("};", 1)[0]
+        self.assertIn('productType = "com.apple.product-type.bundle.unit-test"', target)
+        self.assertIn("dependencies = ()", target)
+        generator = (ROOT / "script/generate_xcode_project.py").read_text()
+        for marker in [
+            "Sources/TokenStatDevWidgetShared/",
+            "/DevProvider.swift",
+            'TEST_HOST = ""',
+            'BUNDLE_LOADER = ""',
+            "CODE_SIGNING_ALLOWED = NO",
+        ]:
+            self.assertIn(marker, generator)
+        host = (ROOT / "Sources/TokenStatDevWidgetHost/main.swift").read_text()
+        self.assertLess(
+            host.index("DevProbeHostRunner.run("), host.index("NSApplication.shared")
+        )
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn("-scheme TokenStatDevWidgetLogicTests", workflow)
+        self.assertIn("CODE_SIGNING_REQUIRED=NO test", workflow)
+
     def test_ax_summary_requires_one_real_pass_and_zero_failures(self):
         sys.path.insert(0, str(ROOT / "script"))
         from classify_settings_ax import classify

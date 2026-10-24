@@ -53,6 +53,10 @@ jobs:
             --skip TokenStatUISnapshotTests/testEnterpriseQuotaAlertsUseOnlyFreshIndependentWindows
       - name: Native Xcode build
         run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build
+      - name: Native development Widget product XCTest
+        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatDevWidgetLogicTests -destination 'platform=macOS,arch=arm64' -derivedDataPath "$RUNNER_TEMP/TokenStatDevWidgetLogicTests" -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO test
+      - name: Native development Widget host and extension build
+        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenuDevWidgetTest -configuration Debug -derivedDataPath "$RUNNER_TEMP/TokenStatDevWidgetBuild" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
       - name: Require unchanged committed dependency lock
         run: git diff --exit-code -- Package.resolved
       - name: Build and ad hoc sign Universal app without launching
