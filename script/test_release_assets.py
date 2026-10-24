@@ -1883,6 +1883,7 @@ def workflow_contract(document: dict, raw: str) -> None:
     # shell prelude, local signing entrypoint, or a new packaging/upload action.
     single_commands = [
         'python3 -B script/release_assets.py preflight --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"',
+        "xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build",
         "python3 -B script/check_docs.py --self-test",
         "python3 -B script/check_public_content.py --git-index",
         "python3 -B script/test_release_assets.py",
@@ -1890,7 +1891,6 @@ def workflow_contract(document: dict, raw: str) -> None:
         "python3 -B script/test_sign_developer_id.py",
         "python3 -B script/test_build_entrypoint.py",
         "swift run --force-resolved-versions TokenStatCoreChecks",
-        "xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build",
         native_test,
         dev_build,
         "git diff --exit-code -- Package.resolved",

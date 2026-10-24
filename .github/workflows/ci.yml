@@ -25,6 +25,9 @@ jobs:
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         run: |
           python3 -B script/release_assets.py preflight --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"
+      # One unsigned product: TokenStatMenu.app embeds TokenStatMenuWidget.appex. A failure here stops the job.
+      - name: Unsigned Release app and embedded widget
+        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build
       - name: Documentation links and synthetic checker fixtures
         run: python3 -B script/check_docs.py --self-test
       - name: Public content guardrail
@@ -56,11 +59,10 @@ jobs:
             --skip TokenStatUISnapshotTests/testC11QuotaCardRenderExportsLocalAndEnterpriseSyntheticExamples \
             --skip TokenStatUISnapshotTests/testHistoricalQuotaPresentationPreservesOriginalSourceValues \
             --skip TokenStatUISnapshotTests/testEnterpriseQuotaAlertsUseOnlyFreshIndependentWindows
-      - name: Native Xcode build
-        run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build
       - name: Native development Widget product XCTest
         run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatDevWidgetLogicTests -destination 'platform=macOS,arch=arm64' -derivedDataPath "$RUNNER_TEMP/TokenStatDevWidget-CI" -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO test
-      - name: Native development Widget host and extension build
+      # Development probe only. It is not the widget shipped inside TokenStatMenu.app.
+      - name: Development widget probe build
         run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenuDevWidgetTest -configuration Debug -derivedDataPath "$RUNNER_TEMP/TokenStatDevWidget-CI" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
       - name: Require unchanged committed dependency lock
         run: git diff --exit-code -- Package.resolved

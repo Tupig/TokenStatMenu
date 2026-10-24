@@ -17,8 +17,7 @@
 ## 目录
 
 - [功能](#功能)
-- [安装](#安装)
-- [更新](#更新)
+- [安装、更新、卸载](#安装更新卸载)
 - [小组件](#小组件)
 - [编译](#编译)
 - [测试](#测试)
@@ -33,46 +32,25 @@
 | 菜单栏 | `38.10% \| 74.40% \| $3,488.22`：依次为 5 小时已用、7 天已用、月度用量 |
 | 概览面板 | 5 小时和 7 天的剩余比例、已用金额、额度与重置时间；月度用量和重置券 |
 | 小尺寸小组件 | 5 小时、7 天进度条；条下左侧为最大额度，右侧为重置时间；月度用量和重置券 |
-| 本地记录 | 当前配置关联的 Codex Token 小计、线程分类、缓存及完整轮次明细 |
 
 百分比显示两位小数，金额最多两位小数，月度金额固定两位。缺失、过期或已经重置的数据显示“未知”或 `—`，不会用零或另一个窗口填补。上面的数字只是格式示例。
 
-菜单栏只显示三个额度数字，不显示本地速度。活动区间估算和上轮均速仍可在面板与详情中查看；它们不是服务端瞬时吞吐。[统计口径](docs/wiki/统计口径.md)介绍各项数字的来源和计算方法。
+菜单栏只显示三个额度数字。概览只显示 Seasun Token Hub 的 5 小时、7 天、月度用量和重置券。[统计口径](docs/wiki/统计口径.md)介绍各项数字的来源和计算方法。
 
-## 安装
+## 安装、更新、卸载
 
-需要 macOS 13 或更新版本。先启动并登录 Seasun Token Hub，再打开 TokenStatMenu。后台额度读取不需要辅助功能权限。
+需要 macOS 13 或更新版本，以及 Homebrew 和完整 Xcode 15+。先启动并登录 Seasun Token Hub。后台额度读取不需要辅助功能权限。
 
-### Homebrew
-
-需要 Homebrew 和完整 Xcode 15+；只有 Command Line Tools 不够。
+先推送 `main`，等 GitHub Actions 的无签名构建变绿；失败就在那里修。通过后再在本机签名，上传到 [GitHub Release](https://github.com/Tupig/TokenStatMenu/releases)。安装、更新和卸载只走 Homebrew，配方消费该 Release，不把 DMG 或 CI 产物拖进「应用程序」。
 
 ```bash
 brew install Tupig/tokenstatmenu/tokenstatmenu
+brew update && brew upgrade Tupig/tokenstatmenu/tokenstatmenu
+brew uninstall Tupig/tokenstatmenu/tokenstatmenu
 tokenstatmenu
 ```
 
-Homebrew 从 Release 源码包编译本机架构，App 保存在 Homebrew 目录内，不覆盖手动安装的副本。[Tap 仓库](https://github.com/Tupig/homebrew-tokenstatmenu)负责配方更新。
-
-### DMG
-
-1. 在 [Releases](https://github.com/Tupig/TokenStatMenu/releases) 下载 `TokenStatMenu.dmg` 和同版 `SHA256SUMS`。
-2. 用 `shasum -a 256 <文件名>` 核对摘要。
-3. 打开 DMG，把 `TokenStatMenu.app` 拖到“应用程序”，再从安装位置打开。
-
-1.1.8 起只支持 Apple Silicon（M 系列），不支持 Intel。Release 也提供 App ZIP 和源码 ZIP。下载包采用 ad hoc 签名，尚未做 Developer ID 签名或 Apple 公证；系统或企业策略可能阻止运行，不建议关闭系统保护来绕过。
-
-## 更新
-
-Homebrew 用户先从面板退出旧实例，然后执行：
-
-```bash
-brew update
-brew upgrade Tupig/tokenstatmenu/tokenstatmenu
-tokenstatmenu
-```
-
-DMG 用户下载新版，退出旧实例后替换 App。不要同时启动 Homebrew 版和手动副本。设置页会显示正在运行的版本与构建号。应用没有内置自动更新器，升级不会清除个人偏好。
+更新前先从面板退出旧实例。`brew upgrade` 不替换仍在运行的进程，也不清除个人偏好。1.1.8 起只支持 Apple Silicon。公开包是 ad hoc 签名，不是 Developer ID 或公证。
 
 ## 小组件
 
@@ -125,7 +103,7 @@ git diff --check
 
 ## 隐私与限制
 
-- 不打开 Hub 数据库，不执行 SQL，不读取或改写 Hub 登录态和 Codex 路由。没有非数据库会话来源时，企业额度显示未知。
+- 只读打开本机 Hub 数据库，读取连接地址和现有登录态，向 Hub 已配置的服务查询 5 小时、7 天、月度用量和重置券。不改写数据库、登录态或 Codex 路由。令牌只留在内存，不写入偏好、快照或日志。没有可用会话时，企业额度显示未知。
 - 本地用量来自 Codex 记录，不读取 OpenCode 会话或数据库，不把本地 Token 小计当作企业账单。
 - 没有上传分析、远程遥测或第三方运行时。后台额度请求仍会访问 Hub 配置对应的服务。
 - 共享快照只保存小组件所需的显示字段，不包含凭据、会话正文或原始响应。
@@ -154,46 +132,25 @@ A native macOS menu bar app for **Seasun Token Hub** quotas: five-hour usage, se
 | Menu bar | `38.10% \| 74.40% \| $3,488.22`: five-hour used, seven-day used, monthly spend |
 | Panel | Remaining percentages, used amounts, limits and reset times; monthly spend and reset vouchers |
 | Small widget | Five-hour and seven-day bars, limits on the left and reset times on the right; monthly spend and vouchers |
-| Local records | Codex Token subtotals associated with the current configuration, thread categories, cache and completed-turn details |
 
 Percentages use two decimal places. Amounts use up to two, with monthly spend fixed at two. Missing, expired or reset data stays unknown; another window or a zero never fills the gap. The numbers above are examples.
 
-The menu bar contains only the three quota figures. Local activity estimates and completed-turn averages remain in the panel and details, not as server-authoritative throughput. See [Metric definitions](docs/wiki/统计口径.md#metric-definitions-english).
+The menu bar contains only the three quota figures. The panel shows Seasun Token Hub five-hour, seven-day, monthly usage and reset vouchers. See [Metric definitions](docs/wiki/统计口径.md#metric-definitions-english).
 
-## Installation
+## Install, Update, Uninstall
 
-Requires macOS 13+. Start and sign in to Seasun Token Hub before opening TokenStatMenu. Direct quota reads do not need Accessibility permission.
+Requires macOS 13+, Homebrew and full Xcode 15+. Start and sign in to Seasun Token Hub first. Direct quota reads do not need Accessibility permission.
 
-### Homebrew
-
-Requires Homebrew and full Xcode 15+; Command Line Tools alone are insufficient.
+Push `main` and wait until the unsigned GitHub Actions build is green; fix failures there. Then sign locally and upload to the [GitHub Release](https://github.com/Tupig/TokenStatMenu/releases). Install, update and uninstall only through Homebrew. The formula consumes that Release; do not install a DMG or the CI product.
 
 ```bash
 brew install Tupig/tokenstatmenu/tokenstatmenu
+brew update && brew upgrade Tupig/tokenstatmenu/tokenstatmenu
+brew uninstall Tupig/tokenstatmenu/tokenstatmenu
 tokenstatmenu
 ```
 
-The formula builds the host architecture from the Release source archive and keeps the App under Homebrew. It does not replace manual copies. Formula updates live in the [Tap repository](https://github.com/Tupig/homebrew-tokenstatmenu).
-
-### DMG
-
-1. Download `TokenStatMenu.dmg` and the matching `SHA256SUMS` from [Releases](https://github.com/Tupig/TokenStatMenu/releases).
-2. Compare `shasum -a 256 <filename>` with the listed digest.
-3. Open the DMG, drag `TokenStatMenu.app` to Applications, then open the installed copy.
-
-Version 1.1.8 onward supports Apple Silicon (M-series) only, not Intel. App ZIP and source ZIP downloads are also available. Downloads are ad hoc signed, not Developer ID signed or notarized. macOS or company policy may block them; do not disable system protections to bypass that restriction.
-
-## Updating
-
-Quit the running App before upgrading:
-
-```bash
-brew update
-brew upgrade Tupig/tokenstatmenu/tokenstatmenu
-tokenstatmenu
-```
-
-For DMG installs, quit the old App and replace it with the new download. Do not run Homebrew and manual copies together. Settings shows the running version and build. There is no in-app updater; upgrades preserve preferences.
+Quit the running App before upgrading. `brew upgrade` does not replace a running process or clear preferences. Version 1.1.8 onward is Apple Silicon only. Public builds are ad hoc signed, not Developer ID signed or notarized.
 
 ## Widget
 
@@ -246,7 +203,7 @@ Tests use synthetic data. Pixel snapshots depend on the rendering environment; C
 
 ## Privacy and Limitations
 
-- Uses the existing local Hub connection and login session for read-only requests. It does not modify the Hub database, session or Codex routing.
+- Reads the local Hub database and existing login session to query five-hour, seven-day, monthly usage and reset vouchers from the service Hub already uses. It does not modify the database, session or Codex routing. Tokens stay in memory and are not written to preferences, snapshots or logs. Enterprise quotas stay unknown without a usable session.
 - Local usage comes from Codex records. It does not read OpenCode sessions or databases, or treat local Token subtotals as the enterprise bill.
 - No analytics upload, remote telemetry or third-party runtime. Quota requests still contact the service configured by Hub.
 - Shared snapshots contain display fields, not credentials, conversation text or raw responses.

@@ -3059,9 +3059,9 @@ extension TokenHubQuotaStateTests {
         return (directory, requested != nil)
     }
 
-    private func bp39UIRenderOverview(_ model: AppModel, expanded: Bool, dark: Bool,
+    private func bp39UIRenderOverview(_ model: AppModel, dark: Bool,
                                      output: URL) async throws -> (text: String, candidates: String, png: Data) {
-        let content = DashboardView(model: model, detailedMetricsExpanded: expanded).overviewContent
+        let content = DashboardView(model: model).overviewContent
             .environment(\.colorScheme, dark ? .dark : .light)
             .fixedSize(horizontal: false, vertical: true)
             .frame(width: 460)
@@ -3162,26 +3162,14 @@ extension TokenHubQuotaStateTests {
         defer { if !artifacts.retain { try? FileManager.default.removeItem(at: artifacts.url) } }
         for dark in [false, true] {
             let appearance = dark ? "dark" : "light"
-            let collapsed = try await bp39UIRenderOverview(model, expanded: false, dark: dark,
-                output: artifacts.url.appendingPathComponent("\(appearance)-collapsed.png"))
-            let expanded = try await bp39UIRenderOverview(model, expanded: true, dark: dark,
-                output: artifacts.url.appendingPathComponent("\(appearance)-expanded.png"))
-            let text = expanded.text.replacingOccurrences(of: " ", with: "")
-            let labels = expanded.candidates.replacingOccurrences(of: " ", with: "")
-            for marker in ["缓存", "未缓存", "命中率", "线程", "轮次", "整轮用时", "整轮均速"] {
-                XCTAssertTrue(labels.contains(marker), "\(appearance) actual bitmap must display \(marker); OCR: \(text)")
-            }
-            XCTAssertTrue(text.contains("43.75%"), "the actual summary renders source C=70 / I=160")
-            XCTAssertTrue(text.contains("线程1")); XCTAssertTrue(text.contains("轮次1"))
-            for marker in ["模型调用", "TTFT", "decode"] {
-                bp39UIAssertUnknown(text, marker: marker, reason: ["来源未提供"])
+            let overview = try await bp39UIRenderOverview(model, dark: dark,
+                output: artifacts.url.appendingPathComponent("\(appearance)-overview.png"))
+            let text = overview.text.replacingOccurrences(of: " ", with: "")
+            for title in ["本地记录用量", "缓存与线程轮次明细", "本次缓存与线程汇总"] {
+                XCTAssertFalse(text.contains(title), "\(appearance) overview must not show \(title); OCR: \(text)")
             }
             XCTAssertFalse(text.contains("b0390000"), "raw thread IDs cannot appear in the bitmap")
             XCTAssertFalse(text.contains("synthetic-bp39-turn"), "raw turn IDs cannot appear in the bitmap")
-            XCTAssertNotEqual(collapsed.png, expanded.png,
-                              "the expanded control must reveal actual content, not an inert fitting-size view")
-            XCTAssertFalse(collapsed.text.replacingOccurrences(of: " ", with: "").contains("轮次1"),
-                           "the default detail disclosure is collapsed")
         }
     }
 

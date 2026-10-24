@@ -1230,8 +1230,20 @@ extension CoreChecks {
                 rateLimits: rateLimits(fiveHour: 25, sevenDay: 35, reset: future.addingTimeInterval(3600)))], modified: now)
         let futureSnapshot = try LocalCodexUsageReader.scan(directory: futureRoot, now: now)
         check(futureSnapshot.latestEventAt == future
-            && futureSnapshot.fiveHour?.isFresh(at: now, refreshSeconds: 60) == false,
-            "future-dated local quota retains its timestamp but is not treated as current")
+            && futureSnapshot.fiveHour == nil && futureSnapshot.sevenDay == nil,
+            "future-dated quota updates are not published over the current windows")
+        let futureOverrideRoot = try fixtureDirectory("future-quota-override")
+        try writeSession(in: futureOverrideRoot, uuid: "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1", events: [
+            tokenEvent(at: now.addingTimeInterval(-30), input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 12, sevenDay: 22, reset: now.addingTimeInterval(3600))),
+            tokenEvent(at: future, input: 1, output: 1,
+                rateLimits: rateLimits(fiveHour: 99, sevenDay: 98, reset: future.addingTimeInterval(3600))),
+            tokenEvent(at: future, input: 1, output: 1, rateLimits: [:])
+        ], modified: now)
+        let futureOverride = try LocalCodexUsageReader.scan(directory: futureOverrideRoot, now: now)
+        check(futureOverride.fiveHour?.usedPercent == 12 && futureOverride.sevenDay?.usedPercent == 22,
+            "a later future replace or clear cannot replace the current quota windows")
+        try? FileManager.default.removeItem(at: futureOverrideRoot.deletingLastPathComponent())
         try? FileManager.default.removeItem(at: futureRoot.deletingLastPathComponent())
 
         let symlinkRoot = try fixtureDirectory("symlink-root")
@@ -1244,8 +1256,22 @@ extension CoreChecks {
         try FileManager.default.createSymbolicLink(at: symlinkRoot.appendingPathComponent("linked-directory"),
             withDestinationURL: outsideRoot)
         let symlink = try LocalCodexUsageReader.scan(directory: symlinkRoot, now: now)
-        check(symlink.input == 0 && symlink.output == 0 && symlink.sessionCount == 0,
+        check(symlink.input == 0 && symlink.output == 0 && symlink.sessionCount == 0 && !symlink.isLimited,
             "file and directory symlinks outside the sessions root are not followed")
+        let linkedParent = try fixtureDirectory("symlink-session-root")
+        let realSessions = linkedParent.appendingPathComponent("real", isDirectory: true)
+        try FileManager.default.createDirectory(at: realSessions, withIntermediateDirectories: true)
+        try writeSession(in: realSessions, uuid: "d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1",
+            events: [tokenEvent(at: now, input: 9, output: 8)], modified: now)
+        let sessionsLink = linkedParent.appendingPathComponent("sessions-link")
+        try FileManager.default.createSymbolicLink(at: sessionsLink, withDestinationURL: realSessions)
+        let symlinkCache = LocalCodexUsageReader.Cache()
+        let warmed = try LocalCodexUsageReader.scan(directory: realSessions, now: now, cache: symlinkCache)
+        let viaLink = try LocalCodexUsageReader.scan(directory: sessionsLink, now: now, cache: symlinkCache)
+        check(warmed.input == 9 && viaLink.input == 0 && viaLink.output == 0 && viaLink.sessionCount == 0
+            && viaLink.isLimited && !viaLink.hasCompleteAccounting && symlinkCache.entryCount > 0,
+            "a symlink sessions root is an incomplete scan and does not clear the existing cache")
+        try? FileManager.default.removeItem(at: linkedParent.deletingLastPathComponent())
         try? FileManager.default.removeItem(at: symlinkRoot.deletingLastPathComponent())
         try? FileManager.default.removeItem(at: outsideRoot.deletingLastPathComponent())
 
@@ -1424,6 +1450,15 @@ extension CoreChecks {
         check(copied.input == 29 && copied.output == 17 && copied.knownThreadCount == 5
             && copied.details.count == 5,
               "a rollout copied into the archive is one logical thread and is counted once")
+        let cachedCopyID = "56565656-5656-4566-8566-565656565656"
+        let archiveCache = LocalCodexUsageReader.Cache()
+        try writeSession(in: archived, uuid: cachedCopyID, events: [tokenEvent(at: now, input: 13, output: 2)], modified: now)
+        _ = try LocalCodexUsageReader.scan(directory: archived, now: now, cache: archiveCache)
+        try FileManager.default.copyItem(at: sessionURL(in: archived, uuid: cachedCopyID),
+                                         to: sessionURL(in: active, uuid: cachedCopyID))
+        let cachedCopy = try LocalCodexUsageReader.scanCodexHome(sessions: active, now: now, archiveCache: archiveCache)
+        check(cachedCopy.input == 42 && cachedCopy.output == 19 && cachedCopy.knownThreadCount == 6,
+              "an archive cache hit still excludes a copied thread already counted from the active directory")
         try? FileManager.default.removeItem(at: archiveRoot)
         let legacyPlist: [String: Any] = ["endpoint": "https://gateway.example/v1/chat/completions",
             "usageURL": "https://gateway.example/usage", "port": 18888]

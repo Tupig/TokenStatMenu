@@ -13,21 +13,29 @@ public struct StreamParser {
 
     public mutating func feed(_ bytes: Data, eof: Bool = false) throws -> [Data] {
         pending.append(bytes)
-        guard pending.count <= 2_097_152 else { throw StatError.message("单个流事件过大") }
         var result: [Data] = []
         while let i = pending.firstIndex(of: 10) {
             var line = Data(pending[..<i]); pending.removeSubrange(...i)
             if line.last == 13 { line.removeLast() }
-            try consume(line, into: &result)
+            consume(line, into: &result)
+        }
+        // 未完成的超限行不能卡住后续解析，也不能带走本批已经结束的事件。
+        if pending.count > 2_097_152 {
+            pending.removeAll(keepingCapacity: true)
+            dataLines.removeAll(keepingCapacity: true)
+            eventSize = 0
         }
         if eof {
-            if !pending.isEmpty { try consume(pending, into: &result); pending.removeAll() }
+            if !pending.isEmpty { consume(pending, into: &result); pending.removeAll() }
             flush(into: &result)
         }
         return result
     }
-    private mutating func consume(_ line: Data, into result: inout [Data]) throws {
-        if format == .ndjson { if !line.isEmpty { result.append(line) }; return }
+    private mutating func consume(_ line: Data, into result: inout [Data]) {
+        if format == .ndjson {
+            if !line.isEmpty, line.count <= 2_097_152 { result.append(line) }
+            return
+        }
         if line.isEmpty { flush(into: &result); return }
         if line.starts(with: Data("data:".utf8)) {
             var data = Data(line.dropFirst(5))
@@ -36,7 +44,7 @@ public struct StreamParser {
             guard nextSize <= 2_097_152 else {
                 dataLines.removeAll(keepingCapacity: true)
                 eventSize = 0
-                throw StatError.message("SSE data 事件过大")
+                return
             }
             eventSize = nextSize
             dataLines.append(data)

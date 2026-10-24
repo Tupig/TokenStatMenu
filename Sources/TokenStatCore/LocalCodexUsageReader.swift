@@ -493,6 +493,8 @@ public enum LocalCodexUsageReader {
         }
         var st = stat()
         guard lstat(directory.path, &st) == 0 else { cache?.entries.removeAll(); cache?.rootIdentity = nil; cache?.clearOpaqueState(); return empty(limited: true) }
+        // 根路径本身是符号链接时不跟随，也不把已有缓存清成一次成功的零用量。
+        if (st.st_mode & S_IFMT) == S_IFLNK { return empty(limited: true) }
         guard (st.st_mode & S_IFMT) == S_IFDIR else { cache?.entries.removeAll(); cache?.rootIdentity = nil; cache?.clearOpaqueState(); return empty(limited: true) }
         let rootFD = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
         // 目录存在但打不开表示读取不完整，不能按空目录处理。
@@ -1162,6 +1164,7 @@ public enum LocalCodexUsageReader {
         var state = QuotaState.absent
         var latestDate: Date?
         for (date, update) in updates.enumerated().sorted(by: { lhs, rhs in lhs.element.0 == rhs.element.0 ? lhs.offset < rhs.offset : lhs.element.0 < rhs.element.0 }).map(\.element) {
+            if date > now { continue }
             switch update {
             case .unchanged: break
             case .clear: state = .absent; latestDate = date

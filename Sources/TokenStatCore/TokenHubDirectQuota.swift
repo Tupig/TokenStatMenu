@@ -104,8 +104,8 @@ private enum TokenHubTimestamp {
     }
 }
 
-/// 现行规则不允许打开 Token Hub 数据库。
-/// 这些入口保留给历史测试注入，正式刷新不会调用。
+/// 只读打开本机 Token Hub 数据库。
+/// 额度刷新读取连接与登录态；路由关联只读取连接源站，不读取会话行。不写库。
 public enum TokenHubConnectionDiscovery {
     public static func defaultDatabaseURL(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
         home.appendingPathComponent(".seasun-token-hub", isDirectory: true).appendingPathComponent("tokenhub.db")
@@ -200,23 +200,25 @@ public enum TokenHubConnectionDiscovery {
         }
         let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else { throw TokenHubDirectQuotaFailure.databaseUnsafe }
-        defer { _ = descriptor }
+        defer { close(descriptor) }
         var info = stat()
         guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
               info.st_uid == getuid(), (info.st_mode & 0o022) == 0 else {
             throw TokenHubDirectQuotaFailure.databaseUnsafe
         }
         var db: OpaquePointer?
-        let databaseURI = "file:///dev/fd/" + String(descriptor) + "?mode=ro"
-        guard sqlite3_open_v2(databaseURI, &db,
-                              SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_URI, nil) == SQLITE_OK,
-              let db else {
+        // 按真实路径只读打开，WAL 的 -wal/-shm 才能落在数据库旁边。
+        // /dev/fd 会让 SQLite 去找不存在的侧车文件，从而漏掉尚未检查点的提交。
+        // 描述符只用于确认最终文件不是符号链接；打开后关闭，不交给 SQLite。
+        // 不用 SQLITE_OPEN_NOFOLLOW：它会拒绝路径中任意一级符号链接，临时目录和部分主目录因此无法打开。
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX
+        guard sqlite3_open_v2(url.path, &db, flags, nil) == SQLITE_OK, let db else {
             if let db { sqlite3_close(db) }
             throw TokenHubDirectQuotaFailure.connectionUnavailable
         }
         var pathInfo = stat()
-        guard stat(url.path, &pathInfo) == 0, pathInfo.st_dev == info.st_dev,
-              pathInfo.st_ino == info.st_ino else {
+        guard lstat(url.path, &pathInfo) == 0, (pathInfo.st_mode & S_IFMT) == S_IFREG,
+              pathInfo.st_dev == info.st_dev, pathInfo.st_ino == info.st_ino else {
             sqlite3_close(db)
             throw TokenHubDirectQuotaFailure.databaseUnsafe
         }

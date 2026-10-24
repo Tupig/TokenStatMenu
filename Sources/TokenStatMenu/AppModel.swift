@@ -126,12 +126,16 @@ struct DirectQuotaTransportSnapshot: Sendable {
     }
 }
 
-/// 正式路径不打开 Token Hub 数据库，也不执行 SQL。
-/// 没有独立的非数据库会话来源时保持未知。
+/// 正式刷新只读打开本机 Token Hub 数据库，复用现有登录态换取短期令牌。
+/// 令牌只留在本次请求内存中，不写入偏好、快照或日志。
 private actor TokenHubDirectQuotaWorker {
+    private let client = TokenHubDirectQuotaClient()
+
     func fetch(nowProvider: @Sendable () -> Date) async throws -> DirectQuotaTransportSnapshot {
-        _ = nowProvider
-        throw TokenHubDirectQuotaFailure.connectionUnavailable
+        let identity = TokenHubIdentity(pid: 0, bundleID: TokenHubTarget.bundleID,
+                                        executablePath: "sanitized")
+        let snapshot = try await client.fetch(identity: identity, nowProvider: nowProvider)
+        return DirectQuotaTransportSnapshot(snapshot: snapshot)
     }
 }
 
@@ -365,6 +369,8 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     @Published var localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0) {
         didSet { capturePresentationTimeBaseline() }
     }
+    /// 最近一次本地扫描失败时保留上一份结果，不用全 0 覆盖。
+    @Published private(set) var localScanFailed = false
     @Published var quota: QuotaSnapshot? {
         didSet { capturePresentationTimeBaseline() }
     }
@@ -866,7 +872,13 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         let source = tokenHubQuotaIsDirect ? "Token Hub 后台直接响应" : "Token Hub 界面快照"
         let timing = tokenHubQuotaIsDirect ? "后台响应已提供" : "后台更新时间未提供"
         let currency = tokenHubQuotaIsDirect ? "币种来自后台响应" : "币种来源待确认"
-        return "\(source)：\(five) · \(seven)；\(tokenHubQuotaStatusText)；\(timing)；\(currency)"
+        let vouchers: String
+        if presentation.snapshotFresh, let count = presentation.snapshot?.resetVoucherCount {
+            vouchers = "重置券 \(count) 张"
+        } else {
+            vouchers = "重置券未知"
+        }
+        return "\(source)：\(five) · \(seven)；\(vouchers)；\(tokenHubQuotaStatusText)；\(timing)；\(currency)"
     }
     private func percentText(_ value: Decimal) -> String {
         TwoDecimalPercentFormatter.string(value)
@@ -1039,6 +1051,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0,
             subagentCount: 0, forkCount: 0)
         fiveHourQuota = nil; sevenDayQuota = nil
+        localScanFailed = false
     }
     /// 切换来源时清空额度，不执行 I/O。
     func resetQuotaState() {
@@ -1082,16 +1095,22 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             self.localScanRunTicket = ticket
             let nowProvider = self.timing.wallNow
             let result: LocalCodexScanWorker.Result?
-            if let scanDefault = self.localScanning.scanDefault {
-                result = try? await scanDefault(nowProvider, version)
-            } else if let resolveInputs = self.localScanning.resolveInputs,
-                      let scan = self.localScanning.scan {
-                let inputs = resolveInputs()
-                result = try? await self.localInjectedWorker.scanInjected(
-                    directory: inputs.directory, nowProvider: nowProvider, generation: version,
-                    routeContext: inputs.routeContext, operation: scan)
-            } else {
+            var scanFailed = false
+            do {
+                if let scanDefault = self.localScanning.scanDefault {
+                    result = try await scanDefault(nowProvider, version)
+                } else if let resolveInputs = self.localScanning.resolveInputs,
+                          let scan = self.localScanning.scan {
+                    let inputs = resolveInputs()
+                    result = try await self.localInjectedWorker.scanInjected(
+                        directory: inputs.directory, nowProvider: nowProvider, generation: version,
+                        routeContext: inputs.routeContext, operation: scan)
+                } else {
+                    result = nil
+                }
+            } catch {
                 result = nil
+                scanFailed = true
             }
             if self.localScanRunTicket == ticket {
                 self.localScanRunning = false
@@ -1113,9 +1132,13 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             if self.config.dataSource == "localCodex" {
                 if let snapshot = result?.snapshot {
                     self.localSnapshot = snapshot; self.fiveHourQuota = snapshot.fiveHour; self.sevenDayQuota = snapshot.sevenDay
+                    self.localScanFailed = false
+                } else if scanFailed {
+                    self.localScanFailed = true
                 } else {
                     self.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil, knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0, subagentCount: 0, forkCount: 0)
                     self.fiveHourQuota = nil; self.sevenDayQuota = nil
+                    self.localScanFailed = false
                 }
             }
             if self.config.dataSource == "localCodex", self.backgroundServicesStarted { self.scheduleLocalScan() }
@@ -1135,7 +1158,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         }
         return .verified(provider: active.provider, origin: activeOrigin)
     }
-    /// 正式刷新优先只读 Hub 连接并在内存中交换 SSO 令牌。
+    /// 正式刷新只读 Hub 数据库中的连接和登录态，并在内存中交换短期令牌。
     /// 预览和模拟测试使用限量 AX 扫描，不接触真实凭据。
     func refreshTokenHubQuota(observationNow: Date? = nil) {
         guard !isShuttingDown else { return }
@@ -1389,7 +1412,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
               presentation.fiveHourCurrent != nil || presentation.sevenDayCurrent != nil || presentation.monthlyCurrent != nil else { return nil }
         return TokenHubQuotaSnapshot(identity: snapshot.identity, fiveHour: presentation.fiveHourCurrent,
             sevenDay: presentation.sevenDayCurrent, monthly: presentation.monthlyCurrent,
-            observedAt: snapshot.observedAt)
+            resetVoucherCount: snapshot.resetVoucherCount, observedAt: snapshot.observedAt)
     }
 
     private func checkTokenHubPermissionIfDue(scheduleIfGranted: Bool = true) {

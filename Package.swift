@@ -11,6 +11,8 @@ let package = Package(
         // duplicate IssueReporting targets on older SwiftPM. Use one graph.
         .package(url: "https://github.com/pointfreeco/swift-custom-dump", exact: "1.6.0"),
         .package(url: "https://github.com/pointfreeco/xctest-dynamic-overlay", exact: "1.11.0"),
+        // 稳定版最新是 604.0.0；用 from 而不是 exact，605 正式发布后可以再往前走。
+        .package(url: "https://github.com/swiftlang/swift-syntax", from: "604.0.0"),
     ],
     targets: [
         .target(name: "TokenStatCore"),

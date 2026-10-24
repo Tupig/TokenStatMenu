@@ -50,6 +50,7 @@ extension CoreChecks {
 #endif
         try directCallbackLocationChecks()
         try directDatabaseReplacementChecks()
+        try directDatabaseReadChecks()
         try directAmountLexicalChecks()
         try directVoucherTransportChecks()
         let identity = TokenHubIdentity(pid: 47816,
@@ -989,6 +990,48 @@ extension CoreChecks {
                       "database replacement at stage \(scenario) rejects before the next external request")
             }
         }
+    }
+}
+
+extension CoreChecks {
+    static func directDatabaseReadChecks() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tokenstat-db-read-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let database = TokenHubConnectionDiscovery.defaultDatabaseURL(home: home)
+        try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-session")
+        var writer: OpaquePointer?
+        guard sqlite3_open(database.path, &writer) == SQLITE_OK, let writer else {
+            if let writer { sqlite3_close(writer) }
+            throw NSError(domain: "SyntheticDirectQuotaFixture", code: 6)
+        }
+        defer { sqlite3_close(writer) }
+        let wal = "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;"
+            + "UPDATE client_settings SET value_json = "
+            + "'{\"aiManagerBaseUrl\":\"https://wal.example.test\",\"aitsBaseUrl\":\"https://wal-aits.example.test\"}' "
+            + "WHERE key = 'client.connection';"
+        guard sqlite3_exec(writer, wal, nil, nil, nil) == SQLITE_OK else {
+            throw NSError(domain: "SyntheticDirectQuotaFixture", code: 7)
+        }
+        let visible = try TokenHubConnectionDiscovery.readDefaultConnectionBaseURLs(home: home)
+        check(visible.compactMap(\.host) == ["wal.example.test", "wal-aits.example.test"],
+              "read-only open sees committed WAL pages beside the database")
+        let before = openDescriptorCount()
+        for _ in 0..<24 {
+            _ = try TokenHubConnectionDiscovery.readDefaultConnectionBaseURLs(home: home)
+        }
+        let after = openDescriptorCount()
+        check(after <= before, "repeated hub database reads release the probe descriptor")
+    }
+
+    private static func openDescriptorCount() -> Int {
+        var count = 0
+        for fd in 0..<256 {
+            var info = stat()
+            if fstat(Int32(fd), &info) == 0 { count += 1 }
+        }
+        return count
     }
 }
 

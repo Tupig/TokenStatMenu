@@ -23,6 +23,42 @@ enum HeaderActionMetrics {
     static let actionSize: CGFloat = 30
 }
 
+/// README 与 AppIcon 使用的同一枚标记：圆角渐变、一条波形、两端各一个圆点。
+struct TokenStatMark: View {
+    var body: some View {
+        Canvas { context, size in
+            let scale = min(size.width, size.height) / 832
+            context.scaleBy(x: scale, y: scale)
+            let tile = Path(roundedRect: CGRect(x: 0, y: 0, width: 832, height: 832), cornerRadius: 190)
+            context.clip(to: tile)
+            context.fill(tile, with: .linearGradient(
+                Gradient(colors: [
+                    Color(.sRGB, red: 0.20, green: 0.38, blue: 0.98),
+                    Color(.sRGB, red: 0.52, green: 0.27, blue: 0.95)
+                ]),
+                startPoint: .zero,
+                endPoint: CGPoint(x: 832, y: 832)))
+            // AppIcon 坐标系原点在左下；这里换成 SwiftUI 的左上原点。
+            func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+                CGPoint(x: x - 96, y: 928 - y)
+            }
+            var pulse = Path()
+            pulse.move(to: point(320, 512))
+            pulse.addCurve(to: point(450, 650), control1: point(388, 512), control2: point(396, 650))
+            pulse.addCurve(to: point(562, 374), control1: point(508, 650), control2: point(504, 374))
+            pulse.addCurve(to: point(704, 512), control1: point(620, 374), control2: point(632, 512))
+            context.stroke(pulse, with: .color(.white),
+                           style: StrokeStyle(lineWidth: 50, lineCap: .round, lineJoin: .round))
+            for centerX in [CGFloat(220), 804] {
+                let center = point(centerX, 481)
+                let dot = Path(ellipseIn: CGRect(x: center.x - 31, y: center.y - 31, width: 62, height: 62))
+                context.fill(dot, with: .color(.white))
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
 enum PanelMetrics {
     static let size = CGSize(width: 300, height: 420)
 }

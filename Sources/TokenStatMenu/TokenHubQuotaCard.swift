@@ -44,7 +44,7 @@ enum TokenHubDecimalFormatter {
                 || presentation.monthlyCurrent != nil else { return nil }
         return TokenHubQuotaSnapshot(identity: raw.identity, fiveHour: presentation.fiveHourCurrent,
             sevenDay: presentation.sevenDayCurrent, monthly: presentation.monthlyCurrent,
-            observedAt: raw.observedAt)
+            resetVoucherCount: raw.resetVoucherCount, observedAt: raw.observedAt)
     }
     var emptyStateText: String { enabled ? status : "自动读取已关闭" }
     static func resetLabel(_ value: String) -> String {
@@ -67,6 +67,8 @@ enum TokenHubDecimalFormatter {
                     if let window = snapshot.sevenDay { projectedRow("7 天", window, state: presentation.sevenDay) }
                     else { unknownWindowRow("7 天") }
                     if let monthly = snapshot.monthly { monthlyRow(monthly, isCurrent: presentation.monthlyCurrent != nil) }
+                    else { unknownWindowRow("月度用量") }
+                    voucherRow(presentation.snapshotFresh ? snapshot.resetVoucherCount : nil)
                     Text("\(directSource ? "后台读取" : "界面读取")于 \(snapshot.observedAt.formatted(.dateTime.hour().minute()))；快照有效期 \(Int(max(120, refreshSeconds * 2))) 秒")
                         .font(.system(size: 9)).foregroundStyle(.secondary)
                 } else {
@@ -90,6 +92,16 @@ enum TokenHubDecimalFormatter {
                 Text("历史已用 \(monthly.sourceSymbol)\(monthlyAmount(monthly.usedAmount))")
                     .fontWeight(.semibold).monospacedDigit().foregroundStyle(.secondary)
             }
+        }
+        .font(.system(size: 10))
+    }
+    private func voucherRow(_ count: Int?) -> some View {
+        HStack(spacing: 6) {
+            Text("重置券").fontWeight(.medium)
+            Spacer(minLength: 0)
+            Text(count.map { "\($0) 张" } ?? "未知")
+                .fontWeight(.semibold).monospacedDigit()
+                .foregroundStyle(count == nil ? Color.secondary : Color.primary)
         }
         .font(.system(size: 10))
     }

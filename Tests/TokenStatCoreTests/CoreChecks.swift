@@ -29,6 +29,27 @@ import TokenStatCore
         var ndjson = StreamParser(format: .ndjson)
         let native = try ndjson.feed(json("{\"message\":{\"content\":\"ok\"}}\n{\"done\":true,\"prompt_eval_count\":20,\"eval_count\":10,\"eval_duration\":2000000000}"), eof: true)
         check(native.count == 2, "NDJSON EOF flush")
+        var oversized = StreamParser(format: .sse)
+        let huge = Data(repeating: 0x61, count: 2_097_153)
+        let batch = Data("data: {\"a\":1}\n\n".utf8) + Data("data: ".utf8) + huge + Data("\n\ndata: {\"b\":2}\n\n".utf8)
+        let kept = try oversized.feed(batch)
+        check(kept.count == 2 && String(decoding: kept[0], as: UTF8.self) == "{\"a\":1}"
+            && String(decoding: kept[1], as: UTF8.self) == "{\"b\":2}",
+            "an oversized SSE line drops only that event")
+        let continued = try oversized.feed(Data("data: {\"c\":3}\n\n".utf8))
+        check(continued.count == 1 && String(decoding: continued[0], as: UTF8.self) == "{\"c\":3}",
+            "legal SSE input continues after an oversized line")
+        var stuck = StreamParser(format: .sse)
+        _ = try stuck.feed(Data(repeating: 0x62, count: 2_097_153))
+        let recovered = try stuck.feed(Data("data: {\"d\":4}\n\n".utf8))
+        check(recovered.count == 1 && String(decoding: recovered[0], as: UTF8.self) == "{\"d\":4}",
+            "an oversized unfinished buffer does not stick the parser")
+        var ndjsonOversized = StreamParser(format: .ndjson)
+        let ndjsonBatch = Data("{\"a\":1}\n".utf8) + huge + Data("\n{\"b\":2}\n".utf8)
+        let ndjsonKept = try ndjsonOversized.feed(ndjsonBatch)
+        check(ndjsonKept.count == 2 && String(decoding: ndjsonKept[0], as: UTF8.self) == "{\"a\":1}"
+            && String(decoding: ndjsonKept[1], as: UTF8.self) == "{\"b\":2}",
+            "an oversized NDJSON line drops only that line")
         let ollama = try UsageDecoder.decode(native[1], streaming: true)
         check(ollama.usage?.total == 30 && ollama.serverOutputTPS == 5, "Ollama final usage and server TPS")
         let responses = try UsageDecoder.decode(json("{\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}"), streaming: true)

@@ -342,6 +342,19 @@ class ProfileReleaseChecks(unittest.TestCase):
                 ):
                     self.validate()
             self.details[index] = baseline
+        chain_baseline = self.details[0]
+        for snippet, replacement in (
+            ("Authority=Developer ID Certification Authority\n", ""),
+            ("flags=0x10000(runtime)", "flags=0x0(none)"),
+            ("Timestamp=synthetic\n", ""),
+        ):
+            self.details[0] = chain_baseline.replace(snippet, replacement)
+            with (
+                self.subTest(snippet=snippet),
+                self.assertRaisesRegex(ValueError, "timestamped hardened Developer ID"),
+            ):
+                self.validate()
+        self.details[0] = chain_baseline
         self.failure = True
         with self.assertRaisesRegex(ValueError, "strict application signature"):
             self.validate()

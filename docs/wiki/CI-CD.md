@@ -6,7 +6,7 @@
 
 ## CI 检查
 
-[ci.yml](../../.github/workflows/ci.yml) 在 main push、PR 和 `v*` 标签上运行：文档链接、公开内容、发行契约、CoreChecks、状态/UI 测试、Xcode Release 构建和依赖锁未变检查。部分依赖 macOS 渲染的像素测试不在 CI 比较，本机仍运行完整套件。
+[ci.yml](../../.github/workflows/ci.yml) 在 main push、PR 和 `v*` 标签上运行。检出后先无签名构建 `TokenStatMenu` scheme；正式小组件 `TokenStatMenuWidget.appex` 由这个 scheme 嵌进主 App，不是另一次产品构建。这一步失败就停止。通过后才执行文档、发行契约、CoreChecks、状态/UI 测试和依赖锁未变检查。后面的 `TokenStatMenuDevWidgetTest` 只是开发探针，不进发布包。部分依赖 macOS 渲染的像素测试不在 CI 比较。Actions 不签名、不上传 Release。
 
 普通 job 只有读权限。动作固定到完整提交，SwiftPM 使用 `--force-resolved-versions`。CI 不读用户 Hub/Codex 数据，不请求权限，不证明真实小组件或企业链路可用。
 
@@ -39,9 +39,20 @@
 
 版本在 Release 标签及 App 元数据中，不在资产名中。旧 Release 保留原文件名与校验规则，不回写历史资产。
 
+## 发布顺序
+
+只按这一条路径发布。GitHub Actions 不签名、不打包、不上传 Release。
+
+1. 提交并推送 `main`。Actions 用 `CODE_SIGNING_ALLOWED=NO` 构建 `TokenStatMenu` scheme；正式小组件嵌在这个 App 里。失败就在这里修，修完再推，直到这条工作流变绿。
+2. CI 通过后，在本机对同一个已提交的干净源码做签名构建。证书和 profile 只留在本机。
+3. 把本机签名产物上传到 GitHub Release。只有本地文件或草稿不算发布完成。
+4. 更新 Homebrew 配方，使它消费这个 Release。本机安装、更新、卸载只走 `brew install`、`brew upgrade`、`brew uninstall`。不把 DMG 拖进「应用程序」，也不把 CI 的未签名产物当安装包。
+
+1.1.5 已淘汰，不再安装。
+
 ## 本地发布
 
-先完成回归、提交并推送 main，等待对应 CI 通过，再固定 `v1.1.8` 标签。发布构建不得带工作区改动：
+先完成上面的第 1 步，再固定版本标签。发布构建不得带工作区改动：
 
 ```bash
 TAG=v1.1.8
@@ -69,7 +80,7 @@ python3 -B script/verify_public_release.py --tag "$TAG" --commit "$COMMIT" \
   --directory <全新的本机验收目录>
 ```
 
-该操作不使用 GitHub 登录或代理凭据，只读核验公开 tag、正式 Release 与五件套；原生 DMG 校验及 ZIP/DMG App 内容一致通过后才提升 `assets/`。它不安装或启动 App，不能替代两渠道系统验收；[#60](https://github.com/Tupig/TokenStatMenu/issues/60) 仍需最终真实下载成功后关闭。
+该操作不使用 GitHub 登录或代理凭据，只读核验公开 tag、正式 Release 与五件套；原生 DMG 校验及 ZIP/DMG App 内容一致通过后才提升 `assets/`。它不安装或启动 App。安装和升级验收用 Homebrew，不用 CI 产物。
 
 ## 仅本机签名与发布
 
@@ -81,7 +92,7 @@ python3 -B script/verify_public_release.py --tag "$TAG" --commit "$COMMIT" \
 
 ## Homebrew 跟进
 
-[Tap](https://github.com/Tupig/homebrew-tokenstatmenu) 保留旧 Formula，不自动卸载或替换用户安装。正式二进制渠道应消费同一本机签名 DMG，验证固定摘要、身份和授权，不在云端重建重签。未有合格正式资产前不生成虚假的版本或 Cask SHA；CI 的静态 style/audit 不等于安装或系统 Widget 验收。
+[Tap](https://github.com/Tupig/homebrew-tokenstatmenu) 在 Release 公开后再改配方，指向该 Release 的源码包。不在云端签名或重签。未有合格正式资产前不生成虚假的版本或 SHA。CI 变绿只说明未签名构建和测试通过，不等于 Homebrew 已经装上新版本。
 
 Tap 的自动检查、测试与写入分开。配方更新后用户仍需 `brew update` 和 `brew upgrade`；要实测已有安装升级，不能只看自动 check 的“无变化”。
 
@@ -99,7 +110,7 @@ README 与 `docs/wiki/` 随源码发布。GitHub Wiki 是独立仓库，首次�
 
 ## CI Checks
 
-[ci.yml](../../.github/workflows/ci.yml) runs on main pushes, PRs and `v*` tags. It checks docs, public content, release contracts, CoreChecks, state/UI tests, Xcode Release assembly and an unchanged dependency lock. Some renderer-dependent image comparisons are local-only.
+[ci.yml](../../.github/workflows/ci.yml) runs on main pushes, PRs and `v*` tags. After checkout it first builds the unsigned `TokenStatMenu` scheme. The shipping widget, `TokenStatMenuWidget.appex`, is embedded by that scheme; it is not a second product build. A failure there stops the job. Later checks cover docs, release contracts, CoreChecks, state/UI tests and an unchanged dependency lock. The later `TokenStatMenuDevWidgetTest` scheme is a development probe and is not shipped. Some renderer-dependent image comparisons are local-only. Actions does not sign or upload a Release.
 
 Normal jobs are read-only. Actions use full commit pins; SwiftPM uses `--force-resolved-versions`. CI does not access user Hub/Codex data or establish real Widget/service acceptance.
 
@@ -132,9 +143,20 @@ Apple Silicon (M-series) only. App and widget are arm64 with matching version/bu
 
 The tag and bundle metadata carry the version, not the asset filename. Older Releases retain their original names and checks.
 
+## Release Order
+
+Use only this path. GitHub Actions does not sign, package or upload a Release.
+
+1. Commit and push `main`. Actions builds the `TokenStatMenu` scheme with `CODE_SIGNING_ALLOWED=NO`; the shipping widget is embedded in that App. Fix failures there and push again until the workflow is green.
+2. After CI passes, sign that same clean commit on the local machine. Certificates and profiles stay local.
+3. Upload the locally signed assets to the GitHub Release. A local directory or draft alone is not a completed release.
+4. Update the Homebrew formula to consume that Release. Install, upgrade and uninstall only with `brew install`, `brew upgrade` and `brew uninstall`. Do not drag a DMG into Applications, and do not install the unsigned CI product.
+
+Version 1.1.5 is retired and must not be installed.
+
 ## Local Publication
 
-Test, commit and push main, wait for its CI, then fix the `v1.1.8` tag. Build from clean committed source:
+Finish step 1 above, then fix the version tag. Build from clean committed source:
 
 ```bash
 TAG=v1.1.8
@@ -162,7 +184,7 @@ python3 -B script/verify_public_release.py --tag "$TAG" --commit "$COMMIT" \
   --directory <new-local-acceptance-directory>
 ```
 
-It uses no GitHub login or proxy credentials, checks the public tag, stable Release and all five assets read-only, and promotes `assets/` only after native DMG validation and identical ZIP/DMG App payloads. It does not install or launch the App and cannot replace dual-channel system acceptance. [#60](https://github.com/Tupig/TokenStatMenu/issues/60) remains open until the final real download succeeds.
+It uses no GitHub login or proxy credentials, checks the public tag, stable Release and all five assets read-only, and promotes `assets/` only after native DMG validation and identical ZIP/DMG App payloads. It does not install or launch the App. Install and upgrade checks use Homebrew, not the CI product.
 
 ## Local-only Signing and Publication
 
@@ -174,7 +196,7 @@ Synthetic release fixtures that perform real signing are local-only too. CI expl
 
 ## Homebrew Follow-up
 
-The [Tap](https://github.com/Tupig/homebrew-tokenstatmenu) preserves the old Formula without automatically removing or replacing installations. The distribution channel must consume the same locally signed DMG, checking its pinned digest, identity and authorization without cloud rebuilding or re-signing. No fabricated version or Cask SHA is generated before qualified public assets exist. Static CI style/audit checks do not establish installation or system Widget acceptance.
+Update the [Tap](https://github.com/Tupig/homebrew-tokenstatmenu) only after the Release is public, pointing the formula at that Release source archive. Do not sign or re-sign in the cloud. Do not invent a version or digest before qualified assets exist. A green CI run only means the unsigned build and tests passed; it does not mean Homebrew has installed the new version.
 
 Check, smoke testing and writes are separate. Users still run `brew update` and `brew upgrade`. Test an actual installed-version upgrade; a successful no-change check is insufficient.
 
