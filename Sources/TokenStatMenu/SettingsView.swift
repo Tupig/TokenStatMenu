@@ -65,9 +65,8 @@ import SwiftUI
                         .accessibilityIdentifier("refresh-seconds")
                         .accessibilityLabel("刷新秒数")
                 }
-                Text("当前刷新秒数 \(draft.refreshSeconds)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                Color.clear.frame(width: 0, height: 0)
+                    .accessibilityElement()
                     .accessibilityIdentifier("refresh-seconds-value")
                     .accessibilityLabel("当前刷新秒数 \(draft.refreshSeconds)")
                 Toggle("Token Hub 界面兼容读取（可选）", isOn: $draft.tokenHubCompatibilityReadEnabled)
