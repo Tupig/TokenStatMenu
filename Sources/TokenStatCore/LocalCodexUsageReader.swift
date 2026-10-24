@@ -892,7 +892,7 @@ public enum LocalCodexUsageReader {
             ParsedEvent(date: event.date, type: event.type, turnID: event.turnID, duration: event.duration,
                 totalTokens: event.totalTokens, outputTokens: event.outputTokens, hasCumulativePayload: event.hasCumulativePayload,
                 usage: event.usage, rate: event.rate, quotaUpdate: event.quotaUpdate, threadID: event.threadID,
-                rawOrdinal: event.rawOrdinal, ownSettingsMatch: event.type == "thread_settings_applied" && event.threadID == identity,
+                rawOrdinal: event.rawOrdinal, ownSettingsMatch: event.ownSettingsMatch && event.threadID == identity,
                 invalidLifecycleTimestamp: event.invalidLifecycleTimestamp)
         }
         let mappedHeadSlots = headSlots.map { $0.map(remap) }
@@ -1050,7 +1050,7 @@ public enum LocalCodexUsageReader {
             duration: duration, totalTokens: usage?.total, outputTokens: usage?.output,
             hasCumulativePayload: cumulativePresent, usage: usage, rate: rate, quotaUpdate: quota,
             threadID: eventThread, rawOrdinal: fallbackOrdinal,
-            ownSettingsMatch: eventType == "thread_settings_applied" && ownID != nil && eventThread == ownID,
+            ownSettingsMatch: eventType == "thread_settings_applied" && eventThread != nil && (ownID == nil || ownID == eventThread),
             invalidLifecycleTimestamp: invalidLifecycleTimestamp)
     }
 
