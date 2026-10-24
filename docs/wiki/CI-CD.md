@@ -25,7 +25,7 @@
 
 “重置券”仅允许原有的“券/劵”图像歧义，并同时核对产品的精确 `Text("重置券")`。这些候选不能证明每个中文字形正确，也不能替代原生辅助功能或真实系统 Widget、共享容器、权限与双渠道安装验收；测试不采集用户桌面或真实数据。性能应以包含该改动的已提交 CI 日志比较，不能把此前 CI 或本机耗时当作云端收益。
 
-## 1.1.7 发布约定
+## 1.1.8 发布约定
 
 只支持 Apple Silicon（M 系列）。App 和扩展均为 arm64，Bundle 版本/build 同步。文件名使用仓库名，不重复版本和架构：
 
@@ -41,10 +41,10 @@
 
 ## 本地发布
 
-先完成回归、提交并推送 main，等待对应 CI 通过，再固定 `v1.1.7` 标签。发布构建不得带工作区改动：
+先完成回归、提交并推送 main，等待对应 CI 通过，再固定 `v1.1.8` 标签。发布构建不得带工作区改动：
 
 ```bash
-TAG=v1.1.7
+TAG=v1.1.8
 COMMIT=$(git rev-parse HEAD)
 python3 -B script/release_assets.py preflight --tag "$TAG" --commit "$COMMIT"
 TOKENSTAT_TEAM_ID=<团队> TOKENSTAT_WIDGET_GROUP=<已授权组名> \
@@ -118,7 +118,7 @@ Chinese labels first use genuine whole-image top-10 candidates. Only while requi
 
 The voucher label retains only the existing “券/劵” image ambiguity allowance, coupled with the product's exact `Text("重置券")`. Candidates do not establish correctness of every glyph or replace native accessibility, real system Widget, shared-container, permission or dual-channel installation acceptance. Tests capture neither the user's desktop nor real data. Compare performance using committed CI logs that include this change; earlier CI runs and local timings are not evidence of cloud speedup.
 
-## Version 1.1.7 Contract
+## Version 1.1.8 Contract
 
 Apple Silicon (M-series) only. App and widget are arm64 with matching version/build. Asset names follow the repository name:
 
@@ -134,10 +134,10 @@ The tag and bundle metadata carry the version, not the asset filename. Older Rel
 
 ## Local Publication
 
-Test, commit and push main, wait for its CI, then fix the `v1.1.7` tag. Build from clean committed source:
+Test, commit and push main, wait for its CI, then fix the `v1.1.8` tag. Build from clean committed source:
 
 ```bash
-TAG=v1.1.7
+TAG=v1.1.8
 COMMIT=$(git rev-parse HEAD)
 python3 -B script/release_assets.py preflight --tag "$TAG" --commit "$COMMIT"
 TOKENSTAT_TEAM_ID=<team> TOKENSTAT_WIDGET_GROUP=<authorized-group> \

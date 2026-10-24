@@ -60,7 +60,7 @@ Homebrew 从 Release 源码包编译本机架构，App 保存在 Homebrew 目录
 2. 用 `shasum -a 256 <文件名>` 核对摘要。
 3. 打开 DMG，把 `TokenStatMenu.app` 拖到“应用程序”，再从安装位置打开。
 
-1.1.7 起只支持 Apple Silicon（M 系列），不支持 Intel。Release 也提供 App ZIP 和源码 ZIP。下载包采用 ad hoc 签名，尚未做 Developer ID 签名或 Apple 公证；系统或企业策略可能阻止运行，不建议关闭系统保护来绕过。
+1.1.8 起只支持 Apple Silicon（M 系列），不支持 Intel。Release 也提供 App ZIP 和源码 ZIP。下载包采用 ad hoc 签名，尚未做 Developer ID 签名或 Apple 公证；系统或企业策略可能阻止运行，不建议关闭系统保护来绕过。
 
 ## 更新
 
@@ -181,7 +181,7 @@ The formula builds the host architecture from the Release source archive and kee
 2. Compare `shasum -a 256 <filename>` with the listed digest.
 3. Open the DMG, drag `TokenStatMenu.app` to Applications, then open the installed copy.
 
-Version 1.1.7 onward supports Apple Silicon (M-series) only, not Intel. App ZIP and source ZIP downloads are also available. Downloads are ad hoc signed, not Developer ID signed or notarized. macOS or company policy may block them; do not disable system protections to bypass that restriction.
+Version 1.1.8 onward supports Apple Silicon (M-series) only, not Intel. App ZIP and source ZIP downloads are also available. Downloads are ad hoc signed, not Developer ID signed or notarized. macOS or company policy may block them; do not disable system protections to bypass that restriction.
 
 ## Updating
 
