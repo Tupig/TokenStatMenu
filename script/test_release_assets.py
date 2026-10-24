@@ -1341,6 +1341,8 @@ class NativeReleaseChecks(unittest.TestCase):
                     "CFBundleVersion": "9",
                     "CFBundleShortVersionString": version,
                     "TokenStatWidgetGroup": "group.com.tupig.TokenStatMenu",
+                    "TokenStatSourceRevision": f.commit,
+                    "TokenStatSourceState": "clean",
                     "NSExtension": {
                         "NSExtensionPointIdentifier": "com.apple.widgetkit-extension"
                     },
@@ -1445,6 +1447,17 @@ class NativeReleaseChecks(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "unexpected widget extension identity"):
             release.validate_app(f.root, f.app, identity, subprocess.run)
+        widget_info["CFBundleIdentifier"] = "com.tupig.TokenStatMenu.Widget"
+        widget_info["NSAppTransportSecurity"] = {"NSAllowsArbitraryLoads": True}
+        (widget / "Contents/Info.plist").write_bytes(plistlib.dumps(widget_info))
+        with self.assertRaisesRegex(ValueError, "widget plist key set"):
+            release.validate_app(f.root, f.app, identity, subprocess.run)
+        widget_info.pop("NSAppTransportSecurity")
+        widget_info["TokenStatSourceState"] = "dirty"
+        (widget / "Contents/Info.plist").write_bytes(plistlib.dumps(widget_info))
+        with self.assertRaisesRegex(ValueError, "widget plist key set"):
+            release.validate_app(f.root, f.app, identity, subprocess.run)
+        widget_info["TokenStatSourceState"] = "clean"
 
         # An extension without the sandbox entitlement is rejected as well.
         widget_info["CFBundleIdentifier"] = "com.tupig.TokenStatMenu.Widget"

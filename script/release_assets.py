@@ -581,13 +581,21 @@ def _profile_signature(
     )
     authorities = re.findall(r"^Authority=(.+)$", details, re.M)
     _require(
-        bool(authorities)
+        len(authorities) == 3
         and re.fullmatch(
             r"Developer ID Application: [^\r\n]+ \(" + team + r"\)", authorities[0]
         )
         is not None
-        and re.search(r"^Signature=adhoc$", details, re.M) is None,
-        "profile-bearing bundle requires a Developer ID Application signature",
+        and authorities[1:] == ["Developer ID Certification Authority", "Apple Root CA"]
+        and re.search(r"^Signature=adhoc$", details, re.M) is None
+        and re.search(
+            r"^CodeDirectory .*flags=0x[0-9a-f]+\([^\n)]*\bruntime\b[^\n)]*\)",
+            details,
+            re.M | re.I,
+        )
+        is not None
+        and re.search(r"^Timestamp=.+$", details, re.M) is not None,
+        "profile-bearing bundle requires a timestamped hardened Developer ID chain",
     )
     # Displayed names are not trust anchors. Ask codesign to evaluate the Apple
     # anchor and Developer ID Application OID against this architecture's code.
@@ -733,9 +741,27 @@ def validate_app(
             extension = widget_info.get("NSExtension")
             _require(
                 isinstance(extension, dict)
+                and set(extension) == {"NSExtensionPointIdentifier"}
                 and extension.get("NSExtensionPointIdentifier")
                 == "com.apple.widgetkit-extension",
                 "widget extension point differs",
+            )
+            expected_widget_keys = {
+                "CFBundleShortVersionString",
+                "CFBundleVersion",
+                "CFBundleIdentifier",
+                "CFBundlePackageType",
+                "CFBundleExecutable",
+                "TokenStatWidgetGroup",
+                "NSExtension",
+                "TokenStatSourceRevision",
+                "TokenStatSourceState",
+            }
+            _require(
+                set(widget_info) == expected_widget_keys
+                and widget_info.get("TokenStatSourceRevision") == identity.commit
+                and widget_info.get("TokenStatSourceState") == "clean",
+                "widget plist key set or source identity differs",
             )
             widget_arch = command_runner(
                 ["lipo", "-archs", str(widget_binary)],

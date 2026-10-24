@@ -58,6 +58,8 @@ class ProfileReleaseChecks(unittest.TestCase):
             "CFBundleShortVersionString": "1.1.7",
             "CFBundleVersion": "21",
             "TokenStatWidgetGroup": GROUP,
+            "TokenStatSourceRevision": self.identity.commit,
+            "TokenStatSourceState": "clean",
             "NSExtension": {
                 "NSExtensionPointIdentifier": "com.apple.widgetkit-extension"
             },
@@ -113,6 +115,8 @@ class ProfileReleaseChecks(unittest.TestCase):
                 f"Identifier={identifier}\nTeamIdentifier={TEAM}\n"
                 f"Authority=Developer ID Application: Synthetic Fixture ({TEAM})\n"
                 "Authority=Developer ID Certification Authority\nAuthority=Apple Root CA\n"
+                "CodeDirectory v=20500 size=1 flags=0x10000(runtime) hashes=1+2 location=embedded\n"
+                "Timestamp=synthetic\n"
             )
         self.calls = []
         self.failure = None
@@ -322,6 +326,11 @@ class ProfileReleaseChecks(unittest.TestCase):
                 ),
                 baseline.replace("Developer ID Application:", "Apple Development:"),
                 baseline.replace("(" + TEAM + ")", "(ZZ99YY88XX)"),
+                baseline.replace(
+                    "Authority=Developer ID Certification Authority\n", ""
+                ),
+                baseline.replace("flags=0x10000(runtime)", "flags=0x0(none)"),
+                baseline.replace("Timestamp=synthetic\n", ""),
                 baseline + "Signature=adhoc\n",
                 "Signature=adhoc\n",
             ]
@@ -411,11 +420,10 @@ class ProfileReleaseChecks(unittest.TestCase):
             self.trusted[index] = False
             baseline = self.details[index]
             self.details[index] = "\n".join(baseline.splitlines()[:3]) + "\n"
-            # Even convincing self-reported Authority lines must fail when the
-            # native Apple anchor / Developer ID OID requirement rejects them.
+            # A truncated self-reported chain fails before the Apple anchor check.
             with (
                 self.subTest(bundle=index),
-                self.assertRaisesRegex(ValueError, "Apple-anchored"),
+                self.assertRaisesRegex(ValueError, "timestamped hardened Developer ID"),
             ):
                 self.validate()
             self.trusted[index] = True
