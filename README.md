@@ -86,7 +86,7 @@ python3 -B script/check_public_content.py
 git diff --check
 ```
 
-测试使用合成数据。像素快照受 macOS 和渲染环境影响；CI 排除部分图像测试，本机仍需运行完整测试。系统小组件、公开下载、DMG 安装和 Homebrew 升级分别验收，不能只看 CI 绿灯。[测试指南](docs/wiki/测试指南.md)列有检查方法。
+测试使用合成数据。像素快照受 macOS 和渲染环境影响；CI 排除部分图像测试，本机仍需运行完整测试。CI 变绿只说明未签名构建通过。安装和升级用 Homebrew 验收，不能只看 CI。[测试指南](docs/wiki/测试指南.md)列有检查方法。
 
 ## 项目结构
 
@@ -186,7 +186,7 @@ python3 -B script/check_public_content.py
 git diff --check
 ```
 
-Tests use synthetic data. Pixel snapshots depend on the rendering environment; CI skips some image tests, so run the full suite locally. System widgets, public downloads, DMG installation and Homebrew upgrades need separate checks. See the [Testing guide](docs/wiki/测试指南.md#testing-guide-english).
+Tests use synthetic data. Pixel snapshots depend on the rendering environment; CI skips some image tests, so run the full suite locally. A green CI run only proves the unsigned build. Install and upgrade checks use Homebrew. See the [Testing guide](docs/wiki/测试指南.md#testing-guide-english).
 
 ## Project Layout
 
