@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -27,7 +28,6 @@ import time
 import zipfile
 
 from package_source import PUBLIC_FILES
-
 
 REPOSITORY = "Tupig/TokenStatMenu"
 APP_FILES = {
@@ -59,6 +59,12 @@ WIDGET_APP_DIRECTORIES = APP_DIRECTORIES | {
     "Contents/PlugIns/TokenStatMenuWidget.appex/Contents",
     "Contents/PlugIns/TokenStatMenuWidget.appex/Contents/MacOS",
     "Contents/PlugIns/TokenStatMenuWidget.appex/Contents/_CodeSignature",
+}
+# Only these two explicit paths may carry profiles, and only as a pair in
+# 1.1.7+. The historical profile-free development shape remains unchanged.
+PROFILE_FILES = {
+    "Contents/embedded.provisionprofile": 0o644,
+    "Contents/PlugIns/TokenStatMenuWidget.appex/Contents/embedded.provisionprofile": 0o644,
 }
 # Xcode adds build-environment facts while processing INFOPLIST_FILE. They are
 # not application identity and are never copied into the reviewed source plist.
@@ -339,8 +345,17 @@ def validate_source_archive(
     return archived
 
 
-def _bundle_shape(identity: ReleaseIdentity) -> tuple[dict[str, int], set[str]]:
+def _bundle_shape(
+    identity: ReleaseIdentity, names=None
+) -> tuple[dict[str, int], set[str]]:
     version = tuple(int(part) for part in identity.version.split("."))
+    profiles = set(PROFILE_FILES).intersection(names or ())
+    if profiles:
+        _require(
+            version >= (1, 1, 7) and profiles == set(PROFILE_FILES),
+            "embedded profiles require the complete 1.1.7+ pair",
+        )
+        return {**WIDGET_APP_FILES, **PROFILE_FILES}, WIDGET_APP_DIRECTORIES
     if version >= (1, 1, 6):
         return WIDGET_APP_FILES, WIDGET_APP_DIRECTORIES
     return APP_FILES, APP_DIRECTORIES
@@ -350,7 +365,7 @@ def _bundle_content(
     root: Path, content: dict[str, tuple[bytes, int]], identity: ReleaseIdentity
 ) -> str | None:
     _identity_fields(identity)
-    files, _ = _bundle_shape(identity)
+    files, _ = _bundle_shape(identity, content)
     _require(set(content) == set(files), "bundle file set differs")
     source_info = _plist((Path(root) / "Resources/Info.plist").read_bytes())
     info = _plist(content["Contents/Info.plist"][0])
@@ -436,8 +451,8 @@ def _signed_entitlements(bundle: Path, command_runner, arch: str | None = None) 
     return _plist(result.stdout.encode())
 
 
-# The entitlement surface is closed: anything beyond the sandbox and the App
-# Group is rejected, so a future extra permission cannot slip into a release.
+# The development entitlement surface is closed. Profile-bearing bundles add
+# only their exact application/team identifiers, never additional permissions.
 _APP_ENTITLEMENTS = frozenset({"com.apple.security.application-groups"})
 _EXTENSION_ENTITLEMENTS = frozenset(
     {
@@ -445,6 +460,188 @@ _EXTENSION_ENTITLEMENTS = frozenset(
         "com.apple.security.application-groups",
     }
 )
+_TEAM_KEY = "com.apple.developer.team-identifier"
+_IDENTIFIER_KEYS = ("com.apple.application-identifier", "application-identifier")
+_GROUP_KEY = "com.apple.security.application-groups"
+_SANDBOX_KEY = "com.apple.security.app-sandbox"
+
+
+def _profile_entitlements(
+    path: Path, raw: bytes, bundle_id: str, group: str, sandbox: bool, command_runner
+) -> tuple[dict, tuple[bytes, ...]]:
+    """Decode one explicit embedded path; do not discover profiles/credentials.
+
+    CMS decoding and profile-declared identity are consistency checks, not an
+    independent trust anchor or a claim of Apple/App Group authorization.
+    """
+    _require(0 < len(raw) <= 10 * 1024 * 1024, "invalid embedded profile size")
+    result = command_runner(
+        ["/usr/bin/security", "cms", "-D", "-i", str(path)],
+        capture_output=True,
+        check=False,
+    )
+    _require(result.returncode == 0, "embedded profile cannot be decoded")
+    profile = _plist(result.stdout)
+    _require(path.read_bytes() == raw, "embedded profile changed during validation")
+    teams = profile.get("TeamIdentifier")
+    _require(
+        isinstance(teams, list)
+        and len(teams) == 1
+        and isinstance(teams[0], str)
+        and re.fullmatch(r"[A-Z0-9]{10}", teams[0]) is not None,
+        "invalid embedded profile TeamIdentifier",
+    )
+    team = teams[0]
+    _require(
+        group.split(".", 1)[0] in ("group", team), "profile App Group Team differs"
+    )
+    now = datetime.now(timezone.utc)
+    for key, before in (("CreationDate", True), ("ExpirationDate", False)):
+        date = profile.get(key)
+        _require(isinstance(date, datetime), "profile validity dates are required")
+        date = date.replace(tzinfo=timezone.utc) if date.tzinfo is None else date
+        _require(
+            date <= now if before else date > now, "profile is not currently valid"
+        )
+    _require(
+        profile.get("Platform") == ["OSX"]
+        and profile.get("ProvisionsAllDevices") is True
+        and "ProvisionedDevices" not in profile,
+        "embedded profile is not for macOS Developer ID distribution",
+    )
+    if "ApplicationIdentifierPrefix" in profile:
+        _require(
+            profile["ApplicationIdentifierPrefix"] == [team],
+            "profile application identifier prefix differs",
+        )
+    entitlements = profile.get("Entitlements")
+    _require(isinstance(entitlements, dict), "profile entitlements are missing")
+    _require(entitlements.get(_TEAM_KEY) == team, "profile entitlement Team differs")
+    identifiers = {
+        key: entitlements[key] for key in _IDENTIFIER_KEYS if key in entitlements
+    }
+    _require(
+        bool(identifiers)
+        and all(value == team + "." + bundle_id for value in identifiers.values()),
+        "profile application identifier differs or is wildcarded",
+    )
+    groups = entitlements.get(_GROUP_KEY)
+    _require(
+        isinstance(groups, list)
+        and group in groups
+        and all(
+            isinstance(value, str) and GROUP_PATTERN.fullmatch(value) is not None
+            for value in groups
+        ),
+        "profile does not explicitly authorize the bundle App Group",
+    )
+    for key in ("get-task-allow", "com.apple.security.get-task-allow"):
+        _require(
+            key not in entitlements or entitlements[key] is False,
+            "development profile entitlements are forbidden",
+        )
+    _require(
+        _SANDBOX_KEY not in entitlements or entitlements[_SANDBOX_KEY] is sandbox,
+        "profile sandbox policy differs",
+    )
+    expected = {_GROUP_KEY: [group], _TEAM_KEY: team, **identifiers}
+    if sandbox:
+        expected[_SANDBOX_KEY] = True
+    certificates = profile.get("DeveloperCertificates")
+    _require(
+        isinstance(certificates, list)
+        and bool(certificates)
+        and all(isinstance(value, bytes) and value for value in certificates),
+        "profile signing certificates are missing or invalid",
+    )
+    return expected, tuple(certificates)
+
+
+def _profile_signature(
+    bundle: Path,
+    bundle_id: str,
+    entitlements: dict,
+    certificates: tuple[bytes, ...],
+    arch: str,
+    command_runner,
+) -> None:
+    result = command_runner(
+        ["codesign", "-d", "--verbose=4", "--arch", arch, str(bundle)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    _require(result.returncode == 0, "profile-bearing signature is unreadable")
+    details = result.stdout + result.stderr
+    team = entitlements[_TEAM_KEY]
+    _require(
+        re.findall(r"^TeamIdentifier=(.+)$", details, re.M) == [team]
+        and re.findall(r"^Identifier=(.+)$", details, re.M) == [bundle_id],
+        "signed bundle Team/identifier differs from embedded profile",
+    )
+    authorities = re.findall(r"^Authority=(.+)$", details, re.M)
+    _require(
+        bool(authorities)
+        and re.fullmatch(
+            r"Developer ID Application: [^\r\n]+ \(" + team + r"\)", authorities[0]
+        )
+        is not None
+        and re.search(r"^Signature=adhoc$", details, re.M) is None,
+        "profile-bearing bundle requires a Developer ID Application signature",
+    )
+    # Displayed names are not trust anchors. Ask codesign to evaluate the Apple
+    # anchor and Developer ID Application OID against this architecture's code.
+    requirement = (
+        'anchor apple generic and identifier "' + bundle_id + '"'
+        ' and certificate leaf[subject.OU] = "' + team + '"'
+        " and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+    )
+    verified = command_runner(
+        [
+            "codesign",
+            "--verify",
+            "--strict",
+            "--arch",
+            arch,
+            "--test-requirement",
+            requirement,
+            str(bundle),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    _require(verified.returncode == 0, "Apple-anchored Developer ID requirement failed")
+    # Extraction writes only into our private temporary directory. Compare the
+    # actual leaf DER bytes, not a self-reported name/fingerprint in metadata.
+    with tempfile.TemporaryDirectory(prefix="tokenstat-release-cert-") as temporary:
+        prefix = Path(temporary) / "certificate-"
+        extracted = command_runner(
+            [
+                "codesign",
+                "-d",
+                "--arch",
+                arch,
+                "--extract-certificates",
+                str(prefix),
+                str(bundle),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        leaf = Path(str(prefix) + "0")
+        _require(
+            extracted.returncode == 0
+            and not leaf.is_symlink()
+            and leaf.is_file()
+            and stat.S_ISREG(leaf.stat().st_mode),
+            "signed leaf certificate cannot be extracted",
+        )
+        _require(
+            leaf.read_bytes() in certificates,
+            "signed leaf certificate is not authorized by embedded profile",
+        )
 
 
 def validate_app(
@@ -456,6 +653,13 @@ def validate_app(
         "application is not a regular bundle directory",
     )
     files, directories = {}, set()
+    # Probe only the two allowed locations; no profile discovery is performed.
+    profile_names = {
+        name
+        for name in PROFILE_FILES
+        if (app / name).exists() or (app / name).is_symlink()
+    }
+    allowed, allowed_directories = _bundle_shape(identity, profile_names)
     for path in app.rglob("*"):
         _require(not path.is_symlink(), "application contains a symbolic link")
         name = path.relative_to(app).as_posix()
@@ -463,7 +667,6 @@ def validate_app(
         if stat.S_ISDIR(mode):
             directories.add(name)
         else:
-            allowed, _ = _bundle_shape(identity)
             _require(
                 stat.S_ISREG(mode) and name in allowed,
                 "application contains an unapproved file",
@@ -472,7 +675,7 @@ def validate_app(
                 stat.S_IMODE(mode) == allowed[name], "incorrect application file mode"
             )
             files[name] = (path.read_bytes(), stat.S_IMODE(mode))
-    allowed_files, allowed_directories = _bundle_shape(identity)
+    allowed_files = allowed
     _require(
         directories == allowed_directories and set(files) == set(allowed_files),
         "application full tree differs",
@@ -490,6 +693,29 @@ def validate_app(
     )
     try:
         if widget_info_name in files:
+            app_authorization = widget_authorization = None
+            if profile_names:
+                app_profile, widget_profile = PROFILE_FILES
+                app_authorization, app_certificates = _profile_entitlements(
+                    app / app_profile,
+                    files[app_profile][0],
+                    "com.tupig.TokenStatMenu",
+                    group,
+                    False,
+                    command_runner,
+                )
+                widget_authorization, widget_certificates = _profile_entitlements(
+                    app / widget_profile,
+                    files[widget_profile][0],
+                    "com.tupig.TokenStatMenu.Widget",
+                    group,
+                    True,
+                    command_runner,
+                )
+                _require(
+                    app_authorization[_TEAM_KEY] == widget_authorization[_TEAM_KEY],
+                    "embedded profile pair Teams differ",
+                )
             widget_info = _plist(files[widget_info_name][0])
             _require(
                 widget_info.get("CFBundleShortVersionString") == identity.version
@@ -530,23 +756,49 @@ def validate_app(
                     arch=widget_slice,
                 )
                 _require(
-                    set(widget_entitlements) == _EXTENSION_ENTITLEMENTS
+                    (
+                        widget_entitlements == widget_authorization
+                        if widget_authorization is not None
+                        else set(widget_entitlements) == _EXTENSION_ENTITLEMENTS
+                    )
                     and widget_entitlements.get("com.apple.security.app-sandbox")
                     is True
                     and widget_entitlements.get("com.apple.security.application-groups")
                     == [group],
                     "widget extension entitlements differ",
                 )
+                if widget_authorization is not None:
+                    _profile_signature(
+                        app / "Contents/PlugIns/TokenStatMenuWidget.appex",
+                        "com.tupig.TokenStatMenu.Widget",
+                        widget_authorization,
+                        widget_certificates,
+                        widget_slice,
+                        command_runner,
+                    )
             for app_slice in expected_archs:
                 app_entitlements = _signed_entitlements(
                     app, command_runner, arch=app_slice
                 )
                 _require(
-                    set(app_entitlements) == _APP_ENTITLEMENTS
+                    (
+                        app_entitlements == app_authorization
+                        if app_authorization is not None
+                        else set(app_entitlements) == _APP_ENTITLEMENTS
+                    )
                     and app_entitlements.get("com.apple.security.application-groups")
                     == [group],
                     "application entitlements differ",
                 )
+                if app_authorization is not None:
+                    _profile_signature(
+                        app,
+                        "com.tupig.TokenStatMenu",
+                        app_authorization,
+                        app_certificates,
+                        app_slice,
+                        command_runner,
+                    )
         arch = command_runner(
             ["lipo", "-archs", str(app / "Contents/MacOS/TokenStatMenu")],
             text=True,
@@ -657,7 +909,11 @@ def create_dmg(
 
 
 def validate_dmg(
-    root: Path, dmg_path: Path, identity: ReleaseIdentity, command_runner=subprocess.run
+    root: Path,
+    dmg_path: Path,
+    identity: ReleaseIdentity,
+    command_runner=subprocess.run,
+    expected_bundle: dict[str, tuple[bytes, int]] | None = None,
 ) -> dict:
     """Inspect a DMG through imageinfo and a read-only owned mount."""
     _identity_fields(identity)
@@ -667,6 +923,7 @@ def validate_dmg(
     )
     mount = Path(tempfile.mkdtemp(prefix="tokenstat-dmg-mount-"))
     device: str | None = None
+    attach_attempted = False
 
     def run_tool(arguments):
         try:
@@ -679,6 +936,9 @@ def validate_dmg(
     try:
         info = run_tool(["/usr/bin/hdiutil", "imageinfo", str(dmg_path)])
         _require(info.returncode == 0, "hdiutil imageinfo failed")
+        # Even a failed/raised attach can leave a partial mount. Its only safe
+        # fallback detach target is this exact, exclusively owned mountpoint.
+        attach_attempted = True
         attach = run_tool(
             [
                 "/usr/bin/hdiutil",
@@ -690,7 +950,6 @@ def validate_dmg(
                 str(dmg_path),
             ]
         )
-        _require(attach.returncode == 0, "read-only DMG attach failed")
         # `hdiutil attach` may print localized checksum diagnostics before
         # its tabular device rows. Select only the row that explicitly names
         # our disposable mountpoint; never detach an arbitrary first device.
@@ -706,6 +965,7 @@ def validate_dmg(
             ):
                 device = fields[0]
                 break
+        _require(attach.returncode == 0, "read-only DMG attach failed")
         _require(device is not None, "hdiutil attach returned no owned device")
         entries = list(mount.iterdir())
         _require(
@@ -721,7 +981,11 @@ def validate_dmg(
             applications.is_symlink() and os.readlink(applications) == "/Applications",
             "DMG Applications alias is unsafe",
         )
-        validate_app(root, app, identity, command_runner)
+        actual_bundle = validate_app(root, app, identity, command_runner)
+        if expected_bundle is not None:
+            _require(
+                actual_bundle == expected_bundle, "ZIP and DMG App payloads differ"
+            )
         data = dmg_path.read_bytes()
         return {
             "name": dmg_path.name,
@@ -730,17 +994,19 @@ def validate_dmg(
         }
     finally:
         detach_error: BaseException | None = None
-        if device is not None:
+        if attach_attempted:
             try:
-                detached = run_tool(["/usr/bin/hdiutil", "detach", device])
+                detached = run_tool(
+                    ["/usr/bin/hdiutil", "detach", device or str(mount)]
+                )
                 _require(detached.returncode == 0, "owned DMG detach failed")
             except BaseException as error:
                 detach_error = error
-        shutil.rmtree(mount, ignore_errors=True)
         if detach_error is not None:
             # A cleanup failure must remain visible even when inspection also
             # failed; silently swallowing it could leave an owned image mounted.
             raise RuntimeError("owned DMG detach failed") from detach_error
+        shutil.rmtree(mount, ignore_errors=True)
 
 
 def _canonical_zip(
@@ -882,13 +1148,26 @@ def validate_assets(
         "checksum file differs",
     )
     validate_source_archive(root, directory / names["source"], PUBLIC_FILES)
-    files, _ = _bundle_shape(identity)
+    try:
+        with zipfile.ZipFile(directory / names["universal"]) as archive:
+            members = [
+                name.removeprefix("TokenStatMenu.app/") for name in archive.namelist()
+            ]
+    except (zipfile.BadZipFile, OSError) as error:
+        raise ValueError("invalid release archive") from error
+    files, _ = _bundle_shape(identity, members)
     bundle = _zip_files(
         directory / names["universal"], "TokenStatMenu.app/", set(files), files
     )
     _bundle_content(root, bundle, identity)
     if "dmg" in names and validate_dmg_image:
-        validate_dmg(root, directory / names["dmg"], identity, command_runner)
+        validate_dmg(
+            root,
+            directory / names["dmg"],
+            identity,
+            command_runner,
+            expected_bundle=bundle,
+        )
     return manifest
 
 
@@ -1143,15 +1422,18 @@ class GitHubClient:
                 "# 已安装用户\nbrew update\nbrew upgrade Tupig/tokenstatmenu/tokenstatmenu\n"
                 "tokenstatmenu\n```\n\n"
                 "升级前退出旧实例。Tap 需完成发布后的配方测试才会跟进。\n\n"
-                "**签名限制：** 当前为 ad hoc 签名，未做 Developer ID/公证。"
+                "**签名说明：** 签名类型以本次资产验签为准；Developer ID 和公证须独立核验，"
+                "不能因存在 profile 推断。"
                 "公开 DMG 与 Homebrew 不保证获得 App Group 权限；系统小组件可能无法读数据，"
                 "菜单栏与面板不受此限制。详见 [#88](https://github.com/Tupig/TokenStatMenu/issues/88)。\n\n"
                 "## English\n\n"
                 "Apple Silicon (M-series) only; macOS 13+. Compact panel, small Widget, "
                 "two-decimal quota percentages, voucher transport and expiry fixes, and bilingual documentation.\n\n"
                 "Install from `TokenStatMenu.dmg` or the Homebrew commands above. Quit the old App before upgrading. "
-                "The Tap updates after its post-release checks. Downloads are ad hoc signed, not Developer ID "
-                "signed or notarized. App Group authorization for public Widget builds is not guaranteed; "
+                "The Tap updates after its post-release checks. The signature type must be determined by "
+                "verification of these release assets. Developer ID signing and notarization require "
+                "independent verification; neither may be inferred from the presence of a profile. "
+                "App Group authorization for public Widget builds is not guaranteed; "
                 "the menu bar and panel remain available.\n\n"
                 f"Source commit: `{identity.commit}`. Verify downloads with `SHA256SUMS`.\n"
             )

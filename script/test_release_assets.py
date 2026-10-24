@@ -34,13 +34,8 @@ PROJECT = Path(__file__).resolve().parents[1]
 TAG = "v1.1.3"
 VERSION = "1.1.3"
 BUILD = "5"
-PUBLISH_IF = (
-    "$"
-    + "{{ vars.TOKENSTAT_CLOUD_RELEASE == 'enabled' && github.repository == 'Tupig/TokenStatMenu' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
-)
 TAG_ONLY_IF = (
-    "$"
-    + "{{ vars.TOKENSTAT_CLOUD_RELEASE == 'enabled' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
+    "$" + "{{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}"
 )
 APP_FILES = {
     "Contents/Info.plist": 0o644,
@@ -1061,7 +1056,32 @@ class ReleaseChecks(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    sys.platform == "darwin", "real private macOS signing/Universal fixture"
+    sys.platform == "darwin"
+    and not any(
+        name in os.environ
+        for name in (
+            "CI",
+            "CONTINUOUS_INTEGRATION",
+            "GITHUB_ACTIONS",
+            "GITHUB_RUN_ID",
+            "BUILD_NUMBER",
+            "BUILD_ID",
+            "JENKINS_URL",
+            "GITLAB_CI",
+            "TF_BUILD",
+            "TEAMCITY_VERSION",
+            "CIRCLECI",
+            "TRAVIS",
+            "BUILDKITE",
+            "CODEBUILD_BUILD_ID",
+            "BITBUCKET_BUILD_NUMBER",
+            "DRONE",
+            "APPVEYOR",
+            "XCS",
+            "CI_WORKFLOW",
+        )
+    ),
+    "real signing fixtures are local-only; cloud CI uses unsigned/mock checks",
 )
 class NativeReleaseChecks(unittest.TestCase):
     @classmethod
@@ -1639,64 +1659,48 @@ def load_workflow(path: Path) -> dict:
 
 def workflow_contract(document: dict, raw: str) -> None:
     """A bounded assertion for this workflow, not a general workflow scanner."""
+    assert set(document) == {"name", "on", "permissions", "concurrency", "jobs"}
     assert document["on"] == {
         "push": {"branches": ["main"], "tags": ["v*"]},
         "pull_request": {},
     }
     assert document["permissions"] == {"contents": "read"}
-    assert set(document["jobs"]) == {"build", "publish"}
+    assert set(document["jobs"]) == {"build"}
     build = document["jobs"]["build"]
-    publish = document["jobs"]["publish"]
-    assert "if" not in build
-    assert all(job.get("continue-on-error", False) is False for job in [build, publish])
-    assert build.get("permissions", document["permissions"]) == {"contents": "read"}
-    assert publish["permissions"] == {"contents": "write"}
-    assert publish["needs"] in ["build", ["build"]]
-    assert " ".join(publish["if"].split()) == PUBLISH_IF
-    assert document["concurrency"]["cancel-in-progress"] is False
-    actions = [
-        step["uses"]
-        for job in [build, publish]
-        for step in job["steps"]
-        if "uses" in step
-    ]
-    allowed = {
-        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
-        "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+    assert set(build) == {"runs-on", "env", "steps"}
+    assert build["runs-on"] == "macos-15"
+    assert build["env"] == {
+        "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+        "RELEASE_TAG": "${{ github.ref_name }}",
+        "RELEASE_COMMIT": "${{ github.sha }}",
     }
-    assert set(actions) == allowed
-    for job in [build, publish]:
-        for step in job["steps"]:
-            if step.get("uses", "").startswith("actions/checkout@"):
-                assert step["with"]["persist-credentials"] is False
-    assert any(step.get("with", {}).get("fetch-depth") == 0 for step in build["steps"])
-    uploads = [
-        step
-        for step in build["steps"]
-        if step.get("uses", "").startswith("actions/upload-artifact@")
-    ]
-    assert len(uploads) == 1 and uploads[0]["with"]["if-no-files-found"] == "error"
-    assert " ".join(uploads[0].get("if", "").split()) == TAG_ONLY_IF
-    paths = uploads[0]["with"]["path"]
-    assert "*" not in paths and len(paths.splitlines()) == 5
-    assert set(paths.splitlines()) == {
-        "dist/release/TokenStatMenu.zip",
-        "dist/release/TokenStatMenu-source.zip",
-        "dist/release/TokenStatMenu.dmg",
-        "dist/release/release-manifest.json",
-        "dist/release/SHA256SUMS",
+    assert document["concurrency"] == {
+        "group": "ci-${{ github.ref }}",
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}",
     }
-    scripts = "\n".join(
-        step.get("run", "") for job in [build, publish] for step in job["steps"]
-    )
+    checkout = {
+        "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "with": {"persist-credentials": False, "fetch-depth": 0},
+    }
+    assert build["steps"][0] == checkout
+    assert [step for step in build["steps"] if "uses" in step] == [checkout]
+    for step in build["steps"][1:]:
+        assert {"name", "run"} <= set(step) <= {"name", "run", "if"}
+    scripts = "\n".join(step.get("run", "") for step in build["steps"])
     assert "$" + "{{ github.ref_name }}" not in scripts
     assert "--clobber" not in scripts and "continue-on-error: true" not in raw
-    assert "script/release_assets.py" in scripts
-    assert "--arm64" in scripts
-    assert "script/test_release_assets.py" in scripts
-    assert "GH_TOKEN" in json.dumps(publish)
-    assert "GH_TOKEN" not in json.dumps(build)
+    for forbidden in [
+        "TOKENSTAT_CLOUD_RELEASE",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "github.token",
+        "secrets.",
+        "build_and_run",
+        "script/package_source.py",
+        "script/release_assets.py package",
+        "script/release_assets.py publish",
+    ]:
+        assert forbidden not in raw and forbidden not in json.dumps(document)
 
     def assert_step(
         job_name: str, prefix: str, expected_if: str | None, expected_lines: int = 1
@@ -1711,6 +1715,7 @@ def workflow_contract(document: dict, raw: str) -> None:
         ]
         assert len(matching) == 1
         step = matching[0]
+        assert "shell" not in step
         if expected_if is None:
             assert "if" not in step
         else:
@@ -1729,7 +1734,12 @@ def workflow_contract(document: dict, raw: str) -> None:
             assert not line.endswith("&")
 
     for prefix in [
+        "python3 -B script/check_docs.py --self-test",
+        "python3 -B script/check_public_content.py --git-index",
         "python3 -B script/test_release_assets.py",
+        "PYTHONPATH=script python3 -B -m unittest test_verify_public_release test_release_dmg test_release_profiles",
+        "python3 -B script/test_sign_developer_id.py",
+        "python3 -B script/test_build_entrypoint.py",
         "swift run --force-resolved-versions TokenStatCoreChecks",
         "xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu ",
         "xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatDevWidgetLogicTests ",
@@ -1751,7 +1761,7 @@ def workflow_contract(document: dict, raw: str) -> None:
         "-destination",
         "platform=macOS,arch=arm64",
         "-derivedDataPath",
-        "$RUNNER_TEMP/TokenStatDevWidgetLogicTests",
+        "$RUNNER_TEMP/TokenStatDevWidget-CI",
         "-parallel-testing-enabled",
         "NO",
         "CODE_SIGNING_ALLOWED=NO",
@@ -1776,8 +1786,18 @@ def workflow_contract(document: dict, raw: str) -> None:
         if line.strip().startswith("swift test --force-resolved-versions --filter")
     ]
     assert actual_ui_commands == [
-        base_command + ["--filter", selector] for selector in expected_ui_selectors
+        base_command + ["--filter", selector] + ([] if index == 0 else ["--skip-build"])
+        for index, selector in enumerate(expected_ui_selectors)
     ]
+    filtered_step = next(
+        step
+        for step in build["steps"]
+        if expected_ui_selectors[0] in step.get("run", "")
+    )
+    assert [
+        shlex.split(line) for line in filtered_step["run"].splitlines() if line.strip()
+    ] == actual_ui_commands
+    assert "shell" not in filtered_step
     # The full-suite run must exclude the pixel-comparing image snapshots,
     # whose output depends on the runner's font and rendering stack.
     full_runs = [
@@ -1788,25 +1808,197 @@ def workflow_contract(document: dict, raw: str) -> None:
         and "--filter" not in line
     ]
     assert len(full_runs) == 1
+    expected_skips = [
+        "TokenStatUISnapshotTests/testDashboardLightAndDark",
+        "TokenStatUISnapshotTests/testSettingsLightAndDark",
+        "TokenStatUISnapshotTests/testLocalStatusTitleUsesCompletedTurnAndRecordedSessionTotal",
+        "TokenStatUISnapshotTests/testC12LocalAccountingUINeverLabelsPartialSubtotalAsComplete",
+        "TokenStatUISnapshotTests/testC12AccountingDashboardExportsSyntheticReviewRenders",
+        "TokenStatUISnapshotTests/testC11LocalQuotaSnapshotsNeverBecomeEnterpriseCurrentOrAlerts",
+        "TokenStatUISnapshotTests/testC11QuotaCardRenderExportsLocalAndEnterpriseSyntheticExamples",
+        "TokenStatUISnapshotTests/testHistoricalQuotaPresentationPreservesOriginalSourceValues",
+        "TokenStatUISnapshotTests/testEnterpriseQuotaAlertsUseOnlyFreshIndependentWindows",
+    ]
+    full_step = next(
+        step
+        for step in build["steps"]
+        if "swift test --force-resolved-versions --skip-build" in step.get("run", "")
+    )
+    assert (
+        "if" not in full_step
+        and "shell" not in full_step
+        and not full_step.get("continue-on-error", False)
+    )
+    assert shlex.split(full_step["run"].replace("\\\n", " ")) == (
+        base_command
+        + ["--skip-build"]
+        + [token for name in expected_skips for token in ("--skip", name)]
+    )
+    first_test_step = next(
+        step
+        for step in build["steps"]
+        if expected_ui_selectors[0] in step.get("run", "")
+    )
+    assert build["steps"].index(first_test_step) < build["steps"].index(full_step)
+    dev_build = next(
+        step["run"]
+        for step in build["steps"]
+        if "-scheme TokenStatMenuDevWidgetTest " in step.get("run", "")
+    )
+    assert shlex.split(dev_build) == [
+        "xcodebuild",
+        "-project",
+        "TokenStatMenu.xcodeproj",
+        "-scheme",
+        "TokenStatMenuDevWidgetTest",
+        "-configuration",
+        "Debug",
+        "-derivedDataPath",
+        "$RUNNER_TEMP/TokenStatDevWidget-CI",
+        "CODE_SIGNING_ALLOWED=NO",
+        "CODE_SIGNING_REQUIRED=NO",
+        "build",
+    ]
     assert "--skip" in "\n".join(
         step.get("run", "")
         for step in build["steps"]
         if "swift test --force-resolved-versions" in step.get("run", "")
         and "--filter" not in step.get("run", "")
     )
-    for prefix in [
-        "python3 -B script/release_assets.py preflight",
-        "./script/build_and_run.sh --arm64",
-        "python3 -B script/package_source.py",
-        "python3 -B script/release_assets.py package",
-        "python3 -B script/release_assets.py verify",
-    ]:
-        assert_step("build", prefix, TAG_ONLY_IF)
-    assert_step("publish", "python3 -B script/release_assets.py verify", None)
-    assert_step("publish", "python3 -B script/release_assets.py publish", None)
+    assert_step("build", "python3 -B script/release_assets.py preflight", TAG_ONLY_IF)
+    # Close the command set: required gates cannot coexist with a hidden writer,
+    # shell prelude, local signing entrypoint, or a new packaging/upload action.
+    single_commands = [
+        'python3 -B script/release_assets.py preflight --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"',
+        "python3 -B script/check_docs.py --self-test",
+        "python3 -B script/check_public_content.py --git-index",
+        "python3 -B script/test_release_assets.py",
+        "PYTHONPATH=script python3 -B -m unittest test_verify_public_release test_release_dmg test_release_profiles",
+        "python3 -B script/test_sign_developer_id.py",
+        "python3 -B script/test_build_entrypoint.py",
+        "swift run --force-resolved-versions TokenStatCoreChecks",
+        "xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatMenu -configuration Release -derivedDataPath /tmp/TokenStatMenu-CI CODE_SIGNING_ALLOWED=NO build",
+        native_test,
+        dev_build,
+        "git diff --exit-code -- Package.resolved",
+    ]
+    actual_single = [
+        shlex.split(step["run"])
+        for step in build["steps"][1:]
+        if step is not filtered_step and step is not full_step
+    ]
+    assert actual_single == [shlex.split(command) for command in single_commands]
+    assert len(build["steps"]) == 15
 
 
 class WorkflowChecks(unittest.TestCase):
+    def test_real_signing_fixtures_never_execute_in_ci(self):
+        for marker in ("CI", "GITHUB_ACTIONS", "BUILD_NUMBER"):
+            for value in ("true", "false", ""):
+                with self.subTest(marker=marker, value=value):
+                    environment = dict(os.environ)
+                    environment[marker] = value
+                    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-B",
+                            "-m",
+                            "unittest",
+                            "test_release_assets.NativeReleaseChecks",
+                        ],
+                        cwd=PROJECT / "script",
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=15,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    count = len(
+                        unittest.defaultTestLoader.getTestCaseNames(NativeReleaseChecks)
+                    )
+                    self.assertIn(f"skipped={count}", result.stderr)
+
+    def test_acceleration_preserves_build_order_coverage_and_tag_runs(self):
+        path = PROJECT / ".github/workflows/ci.yml"
+        raw = path.read_text()
+        baseline = load_workflow(path)
+        workflow_contract(baseline, raw)
+        for mutation in [
+            "cancel-all",
+            "cancel-none",
+            "sha-group",
+            "skip-first-build",
+            "rebuild-later",
+            "skip-bp39",
+            "skip-full-step",
+            "full-before-build",
+            "early-exit",
+            "filtered-shell",
+            "full-shell",
+            "remove-skip",
+            "dev-dd",
+        ]:
+            value = copy.deepcopy(baseline)
+            steps = value["jobs"]["build"]["steps"]
+            first = next(
+                step
+                for step in steps
+                if "testCredentialAccountNames" in step.get("run", "")
+            )
+            full = next(
+                step
+                for step in steps
+                if "swift test --force-resolved-versions --skip-build"
+                in step.get("run", "")
+            )
+            if mutation == "cancel-all":
+                value["concurrency"]["cancel-in-progress"] = True
+            elif mutation == "cancel-none":
+                value["concurrency"]["cancel-in-progress"] = False
+            elif mutation == "sha-group":
+                value["concurrency"]["group"] = "ci-${{ github.sha }}"
+            elif mutation == "skip-first-build":
+                first["run"] = first["run"].replace(
+                    "--filter TokenStatUISnapshotTests.testCredential",
+                    "--skip-build --filter TokenStatUISnapshotTests.testCredential",
+                )
+            elif mutation == "rebuild-later":
+                first["run"] = first["run"].replace(" --skip-build", "")
+            elif mutation == "skip-bp39":
+                full["run"] += " --skip TokenHubQuotaStateTests/testBP39"
+            elif mutation == "skip-full-step":
+                full["if"] = "false"
+            elif mutation == "early-exit":
+                first["run"] = "exit 0\n" + first["run"]
+            elif mutation == "filtered-shell":
+                first["shell"] = "bash {0}"
+            elif mutation == "full-shell":
+                full["shell"] = 'bash -c "bash {0}; exit 0"'
+            elif mutation == "remove-skip":
+                full["run"] = full["run"].replace(
+                    "--skip TokenStatUISnapshotTests/testDashboardLightAndDark", ""
+                )
+            elif mutation == "dev-dd":
+                dev = next(
+                    step
+                    for step in steps
+                    if "-scheme TokenStatMenuDevWidgetTest " in step.get("run", "")
+                )
+                dev["run"] = dev["run"].replace(
+                    "TokenStatDevWidget-CI", "DifferentDirectory"
+                )
+            else:
+                steps.remove(full)
+                steps.insert(steps.index(first), full)
+            assert value != baseline, mutation
+            with (
+                self.subTest(mutation=mutation),
+                self.assertRaises((AssertionError, StopIteration)),
+            ):
+                workflow_contract(value, raw)
+
     def test_workflow_requires_unsigned_native_product_tests_without_skipping(self):
         path = PROJECT / ".github/workflows/ci.yml"
         raw = path.read_text()
@@ -1838,7 +2030,7 @@ class WorkflowChecks(unittest.TestCase):
         )
         self.assertEqual(workflow_files, ["ci.yml"])
 
-    def test_release_workflow_has_bounded_tag_only_write_permissions(self):
+    def test_workflow_is_read_only_without_cloud_release_entrypoints(self):
         path = PROJECT / ".github/workflows/ci.yml"
         workflow_contract(load_workflow(path), path.read_text())
 
@@ -1862,51 +2054,146 @@ class WorkflowChecks(unittest.TestCase):
             with self.subTest(alteration=alteration), self.assertRaises(AssertionError):
                 workflow_contract(value, raw)
 
-    def test_workflow_assertions_reject_gate_permission_and_asset_mutations(self):
+    def test_workflow_rejects_hidden_writers_credentials_and_release_entrypoints(self):
         path = PROJECT / ".github/workflows/ci.yml"
         raw = path.read_text()
         baseline = load_workflow(path)
-        variants = []
-        value = copy.deepcopy(baseline)
-        value["on"]["pull_request_target"] = {}
-        variants.append(value)
-        value = copy.deepcopy(baseline)
-        value["permissions"] = {"contents": "write"}
-        variants.append(value)
-        value = copy.deepcopy(baseline)
-        value["jobs"]["publish"]["needs"] = []
-        variants.append(value)
-        value = copy.deepcopy(baseline)
-        value["jobs"]["publish"]["if"] = "always()"
-        variants.append(value)
-        value = copy.deepcopy(baseline)
-        value["jobs"]["build"]["steps"].append(
-            {"run": "echo " + "$" + "{{ github.ref_name }}"}
-        )
-        variants.append(value)
-        value = copy.deepcopy(baseline)
-        for step in value["jobs"]["build"]["steps"]:
-            if step.get("uses", "").startswith("actions/upload-artifact@"):
-                step["with"]["path"] = "dist/*"
-        variants.append(value)
-        value = copy.deepcopy(baseline)
-        value["jobs"]["publish"]["steps"].append({"run": "gh release upload --clobber"})
-        variants.append(value)
-        value = copy.deepcopy(baseline)
-        value["jobs"]["unexpected-writer"] = {
-            "permissions": {"contents": "write"},
-            "runs-on": "ubuntu-latest",
-            "steps": [{"run": "false"}],
-        }
-        variants.append(value)
-        for job_name in ["build", "publish"]:
+        workflow_contract(baseline, raw)
+        for mutation in [
+            "pull-request-target",
+            "global-write",
+            "job-write",
+            "id-token-write",
+            "hidden-writer",
+            "release-job",
+            "reusable-release-job",
+            "cloud-env",
+            "cloud-if",
+            "gh-token",
+            "github-token",
+            "secret",
+            "checkout-token",
+            "persist-credentials",
+            "shallow-checkout",
+            "upload",
+            "download",
+            "build-and-run",
+            "developer-id",
+            "package-source",
+            "package",
+            "verify",
+            "publish",
+            "codesign",
+            "gh-release",
+            "direct-ref",
+            "preflight-write",
+            "preflight-always",
+            "job-disabled",
+            "ignore-errors",
+            "global-shell",
+            "job-shell",
+            "extra-command",
+        ]:
             value = copy.deepcopy(baseline)
-            value["jobs"][job_name]["continue-on-error"] = True
-            variants.append(value)
-            if job_name == "build":
-                value = copy.deepcopy(baseline)
-                value["jobs"][job_name]["if"] = False
-                variants.append(value)
+            build = value["jobs"]["build"]
+            steps = build["steps"]
+            commands = {
+                "build-and-run": "./script/build_and_run.sh --arm64",
+                "developer-id": "./script/build_and_run.sh --developer-id",
+                "package-source": "python3 -B script/package_source.py",
+                "package": "python3 -B script/release_assets.py package",
+                "verify": "python3 -B script/release_assets.py verify",
+                "publish": "python3 -B script/release_assets.py publish",
+                "codesign": "codesign --force --sign - dist/TokenStatMenu.app",
+                "gh-release": "gh release upload --clobber",
+                "direct-ref": "echo ${{ github.ref_name }}",
+            }
+            if mutation in commands:
+                steps.append(
+                    {"name": "Forbidden release entrypoint", "run": commands[mutation]}
+                )
+            elif mutation == "pull-request-target":
+                value["on"]["pull_request_target"] = {}
+            elif mutation == "global-write":
+                value["permissions"] = {"contents": "write"}
+            elif mutation in {"job-write", "id-token-write"}:
+                build["permissions"] = (
+                    {"contents": "write"}
+                    if mutation == "job-write"
+                    else {"id-token": "write"}
+                )
+            elif mutation in {"hidden-writer", "release-job"}:
+                value["jobs"][
+                    "unexpected-writer" if mutation == "hidden-writer" else "release"
+                ] = {
+                    "permissions": {"contents": "write"},
+                    "runs-on": "ubuntu-latest",
+                    "if": "false",
+                    "steps": [{"run": "gh release create"}],
+                }
+            elif mutation == "reusable-release-job":
+                value["jobs"]["release"] = {"uses": "./.github/workflows/release.yml"}
+            elif mutation == "cloud-env":
+                build["env"]["TOKENSTAT_CLOUD_RELEASE"] = "enabled"
+            elif mutation == "cloud-if":
+                steps[1]["if"] = "${{ vars.TOKENSTAT_CLOUD_RELEASE == 'enabled' }}"
+            elif mutation in {"gh-token", "github-token", "secret"}:
+                key = (
+                    "GH_TOKEN"
+                    if mutation == "gh-token"
+                    else "GITHUB_TOKEN"
+                    if mutation == "github-token"
+                    else "SIGNING_IDENTITY"
+                )
+                steps[1]["env"] = {
+                    key: "${{ secrets.SIGNING_IDENTITY }}"
+                    if mutation == "secret"
+                    else "${{ github.token }}"
+                }
+            elif mutation == "checkout-token":
+                steps[0]["with"]["token"] = "${{ github.token }}"
+            elif mutation == "persist-credentials":
+                steps[0]["with"]["persist-credentials"] = True
+            elif mutation == "shallow-checkout":
+                steps[0]["with"]["fetch-depth"] = 1
+            elif mutation in {"upload", "download"}:
+                steps.append(
+                    {
+                        "uses": "actions/" + mutation + "-artifact@" + "a" * 40,
+                        "with": {"path": "dist/*"},
+                    }
+                )
+            elif mutation == "preflight-write":
+                steps[1]["run"] += '\necho "RELEASE_VERSION=1.2.3" >> "$GITHUB_ENV"'
+            elif mutation == "preflight-always":
+                steps[1]["if"] = "always()"
+            elif mutation == "job-disabled":
+                build["if"] = False
+            elif mutation == "ignore-errors":
+                build["continue-on-error"] = True
+            elif mutation in {"global-shell", "job-shell"}:
+                target = value if mutation == "global-shell" else build
+                target["defaults"] = {"run": {"shell": 'bash -c "bash {0}; exit 0"'}}
+            else:
+                steps[2]["run"] += "\ngh release create"
+            assert value != baseline, mutation
+            with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
+                workflow_contract(value, raw)
+        for forbidden in [
+            "TOKENSTAT_CLOUD_RELEASE",
+            "GH_TOKEN",
+            "github.token",
+            "build_and_run",
+        ]:
+            with self.subTest(raw=forbidden), self.assertRaises(AssertionError):
+                workflow_contract(baseline, raw + "\n# " + forbidden + "\n")
+
+    def test_workflow_assertions_reject_disabled_removed_or_bypassed_gates(self):
+        path = PROJECT / ".github/workflows/ci.yml"
+        raw = path.read_text()
+        baseline = load_workflow(path)
+        workflow_contract(baseline, raw)
+        for index in range(1, len(baseline["jobs"]["build"]["steps"])):
             for alteration in [
                 "disabled",
                 "removed",
@@ -1914,19 +2201,11 @@ class WorkflowChecks(unittest.TestCase):
                 "shell-or",
                 "shell-true",
                 "background",
+                "ignore-errors",
+                "shell",
             ]:
                 value = copy.deepcopy(baseline)
-                steps = value["jobs"][job_name]["steps"]
-                index = next(
-                    i
-                    for i, step in enumerate(steps)
-                    if any(
-                        line.strip().startswith(
-                            "python3 -B script/release_assets.py verify"
-                        )
-                        for line in step.get("run", "").splitlines()
-                    )
-                )
+                steps = value["jobs"]["build"]["steps"]
                 if alteration == "disabled":
                     steps[index]["if"] = False
                 elif alteration == "removed":
@@ -1935,24 +2214,23 @@ class WorkflowChecks(unittest.TestCase):
                     steps[index]["run"] = "\n".join(
                         "# " + line for line in steps[index]["run"].splitlines()
                     )
+                elif alteration == "ignore-errors":
+                    steps[index]["continue-on-error"] = True
+                elif alteration == "shell":
+                    steps[index]["shell"] = 'bash -c "bash {0}; exit 0"'
                 else:
                     suffix = {
                         "shell-or": " || true",
                         "shell-true": "; true",
                         "background": " &",
                     }[alteration]
-                    steps[index]["run"] = "\n".join(
-                        line + suffix
-                        if line.strip().startswith(
-                            "python3 -B script/release_assets.py verify"
-                        )
-                        else line
-                        for line in steps[index]["run"].splitlines()
-                    )
-                variants.append(value)
-        for index, value in enumerate(variants):
-            with self.subTest(index=index), self.assertRaises(AssertionError):
-                workflow_contract(value, raw)
+                    steps[index]["run"] += suffix
+                assert value != baseline, (index, alteration)
+                with (
+                    self.subTest(index=index, alteration=alteration),
+                    self.assertRaises(AssertionError),
+                ):
+                    workflow_contract(value, raw)
         with self.assertRaises(AssertionError):
             workflow_contract(baseline, raw + "\ncontinue-on-error: true\n")
 

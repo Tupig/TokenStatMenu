@@ -4,9 +4,51 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 MODE="${1:-run}"
 APP="$ROOT/dist/TokenStatMenu.app"
-case "$MODE" in run|--build-only|--verify|--release|--arm64|--universal|--dev-widget|--logs|--telemetry|--debug) ;; *) echo "Usage: $0 [--build-only|--verify|--release|--arm64|--dev-widget|--logs|--telemetry|--debug]"; exit 2 ;; esac
+if [ "$#" -gt 1 ]; then
+    echo "error: exactly one build mode is allowed; extra arguments are not supported" >&2
+    exit 2
+fi
+case "$MODE" in run|--build-only|--verify|--release|--arm64|--universal|--developer-id|--dev-widget|--logs|--telemetry|--debug) ;; *) echo "Usage: $0 [--build-only|--verify|--release|--arm64|--developer-id|--dev-widget|--logs|--telemetry|--debug]"; exit 2 ;; esac
+# Every mode below signs a product. CI must use the explicit unsigned Xcode
+# build/test commands, never this local build/install entry point.
+for CI_FLAG in CI CONTINUOUS_INTEGRATION GITHUB_ACTIONS GITHUB_RUN_ID GITLAB_CI TF_BUILD \
+    JENKINS_URL BUILD_NUMBER BUILD_ID TEAMCITY_VERSION CIRCLECI TRAVIS BUILDKITE \
+    CODEBUILD_BUILD_ID BITBUCKET_BUILD_NUMBER DRONE APPVEYOR XCS CI_WORKFLOW; do
+    if [ "${!CI_FLAG+x}" = x ]; then
+        echo "error: signing builds are local-only; CI must run unsigned build/test commands" >&2
+        exit 2
+    fi
+done
 # Keep the old release entry point without producing an Intel slice.
 if [ "$MODE" = "--arm64" ]; then MODE=--universal; fi
+# Refuse parent links before copying/removing output. In particular, a local
+# signing candidate must never resolve into an existing Applications install.
+for OUTPUT_DIR in "$ROOT/dist" "$ROOT/.build"; do
+    if [ -L "$OUTPUT_DIR" ]; then
+        echo "error: symbolic output directories are forbidden" >&2
+        exit 2
+    fi
+done
+if [ "$MODE" = "--developer-id" ]; then
+    for OUTPUT_DIR in "$ROOT/dist/developer-id" "$ROOT/.build/xcode-developer-id"; do
+        if [ -L "$OUTPUT_DIR" ]; then
+            echo "error: symbolic output directories are forbidden" >&2
+            exit 2
+        fi
+    done
+fi
+if [ "$MODE" = "--developer-id" ]; then
+    # Validate only explicit inputs before any version bump or output writes.
+    TEAM="${TOKENSTAT_TEAM_ID:-}"
+    GROUP="${TOKENSTAT_WIDGET_GROUP:-}"
+    IDENTITY="${TOKENSTAT_SIGN_IDENTITY:-}"
+    APP_PROFILE="${TOKENSTAT_APP_PROFILE:-}"
+    WIDGET_PROFILE="${TOKENSTAT_WIDGET_PROFILE:-}"
+    APP="$ROOT/dist/developer-id/TokenStatMenu.app"
+    python3 -B "$ROOT/script/sign_developer_id.py" --validate-only \
+        --app "$APP" --team "$TEAM" --group "$GROUP" --identity "$IDENTITY" \
+        --app-profile "$APP_PROFILE" --widget-profile "$WIDGET_PROFILE"
+fi
 if [ "$(uname -m)" != arm64 ]; then
     echo "error: TokenStatMenu requires Apple Silicon (M-series); run outside Rosetta" >&2
     exit 2
@@ -15,11 +57,11 @@ mkdir -p "$(dirname "$APP")"
 # Local installs advance CFBundleVersion so WidgetKit treats the bundle as a
 # new build and reloads the extension. --universal is a release artifact and
 # must keep the version committed for its tag.
-if [ "$MODE" != "--universal" ] && [ "${TOKENSTAT_SKIP_BUILD_BUMP:-0}" != "1" ]; then
+if [ "$MODE" != "--universal" ] && [ "$MODE" != "--developer-id" ] && [ "${TOKENSTAT_SKIP_BUILD_BUMP:-0}" != "1" ]; then
     python3 -B "$ROOT/script/bump_build.py"
 fi
 # Native SwiftPM also works with Command Line Tools; no global xcode-select changes.
-if [ "$MODE" = "--universal" ]; then
+if [ "$MODE" = "--universal" ] || [ "$MODE" = "--developer-id" ]; then
     # A universal distribution build must come from the Xcode project: only
     # that target graph embeds the widget extension and substitutes the App
     # Group placeholder in both Info.plists and entitlements.
@@ -36,6 +78,7 @@ if [ "$MODE" = "--universal" ]; then
         export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
     fi
     DERIVED="$ROOT/.build/xcode-universal"
+    if [ "$MODE" = "--developer-id" ]; then DERIVED="$ROOT/.build/xcode-developer-id"; fi
     xcodebuild -project "$ROOT/TokenStatMenu.xcodeproj" -scheme TokenStatMenu \
         -configuration Release -derivedDataPath "$DERIVED" \
         ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
@@ -59,9 +102,9 @@ if [ "$MODE" = "--universal" ]; then
     fi
     rm -rf "$APP"
     cp -R "$BUILT_APP" "$APP"
-    # The local machine has no signing identity, so Xcode cannot sign the
-    # product. Sign it ad hoc after embedding the resolved group in the
-    # entitlement plists; a signed build never reaches this branch.
+    # Resolve development entitlements without modifying the source templates.
+    # The Developer ID branch validates its profiles and signs separately below;
+    # the historical local candidate uses these ad hoc entitlements.
     SIGN_DIR="$DERIVED/signing"
     mkdir -p "$SIGN_DIR"
     sed "s|\$(TOKENSTAT_WIDGET_GROUP)|$GROUP|g" Resources/WidgetExtension.entitlements \
@@ -158,11 +201,23 @@ if [ -n "$SOURCE_GIT_ROOT" ] && [ "$(cd "$SOURCE_GIT_ROOT" && pwd -P)" = "$(pwd 
 fi
 /usr/libexec/PlistBuddy -c "Add :TokenStatSourceRevision string $SOURCE_REVISION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :TokenStatSourceState string $SOURCE_STATE" "$APP/Contents/Info.plist"
+if [ "$MODE" = "--developer-id" ]; then
+    # Both distribution channels validate the same source revision on the host
+    # and extension. Complete these edits before either bundle is signed.
+    /usr/libexec/PlistBuddy -c "Add :TokenStatSourceRevision string $SOURCE_REVISION" \
+        "$APP/Contents/PlugIns/TokenStatMenuWidget.appex/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :TokenStatSourceState string $SOURCE_STATE" \
+        "$APP/Contents/PlugIns/TokenStatMenuWidget.appex/Contents/Info.plist"
+fi
 chmod 755 "$APP/Contents/MacOS/TokenStatMenu"
 # Ad hoc signing is for a local development build, not a Developer ID / notarization claim.
 # The universal product is signed last, after the source identity is added:
 # signing before that edit would leave the Info.plist and signature mismatched.
-if [ "$MODE" = "--universal" ]; then
+if [ "$MODE" = "--developer-id" ]; then
+    python3 -B "$ROOT/script/sign_developer_id.py" \
+        --app "$APP" --team "$TEAM" --group "$GROUP" --identity "$IDENTITY" \
+        --app-profile "$APP_PROFILE" --widget-profile "$WIDGET_PROFILE"
+elif [ "$MODE" = "--universal" ]; then
     codesign --force --sign - --entitlements "$SIGN_DIR/WidgetExtension.entitlements" \
         "$APP/Contents/PlugIns/TokenStatMenuWidget.appex"
     codesign --force --sign - --entitlements "$SIGN_DIR/TokenStatMenu.entitlements" "$APP"
@@ -170,12 +225,12 @@ else
     codesign --force --sign - "$APP"
 fi
 if ! codesign --verify --deep --strict "$APP"; then
-    echo "error: ad hoc signature verification failed" >&2
+    echo "error: signature verification failed" >&2
     exit 1
 fi
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
 BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")"
-if [ "$MODE" = "--build-only" ] || [ "$MODE" = "--universal" ]; then echo "Built: $APP ($VERSION build $BUILD, arm64)"; exit 0; fi
+if [ "$MODE" = "--build-only" ] || [ "$MODE" = "--universal" ] || [ "$MODE" = "--developer-id" ]; then echo "Built: $APP ($VERSION build $BUILD, arm64)"; exit 0; fi
 if [ "$MODE" = "--debug" ]; then exec lldb "$APP/Contents/MacOS/TokenStatMenu"; fi
 open -n "$APP"
 case "$MODE" in
