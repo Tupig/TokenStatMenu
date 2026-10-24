@@ -41,18 +41,18 @@ final class WidgetEntryViewTests: XCTestCase {
             XCTAssertTrue(live.text.contains("43.22%"), live.text)
             XCTAssertTrue(live.text.contains("1,234.56"), live.text)
             XCTAssertTrue(live.text.contains("3张"), live.text)
-            let stale = try await render(.init(date: now, snapshot: expired, channelAvailable: true), dark: dark)
+            let stale = try await render(.init(date: now, snapshot: expired, channelAvailable: true), dark: dark, needsUnknown: true)
             XCTAssertTrue(stale.labels.contains("未知"), stale.text)
             assertLabels(stale)
             assertNoOldValues(stale)
-            let resetText = try await render(.init(date: now, snapshot: reset, channelAvailable: true), dark: dark)
+            let resetText = try await render(.init(date: now, snapshot: reset, channelAvailable: true), dark: dark, needsUnknown: true)
             XCTAssertFalse(resetText.text.contains("87.66"), resetText.text)
             XCTAssertTrue(resetText.text.contains("43.22%"), resetText.text)
             XCTAssertTrue(resetText.labels.contains("未知"), resetText.text)
             assertLabels(resetText)
             XCTAssertTrue(resetText.text.contains("1,234.56") && resetText.text.contains("3张"), resetText.text)
             let sevenExpired = snapshot(observed: now, reset: now.addingTimeInterval(600), sevenReset: now.addingTimeInterval(-1))
-            let reverse = try await render(.init(date: now, snapshot: sevenExpired, channelAvailable: true), dark: dark)
+            let reverse = try await render(.init(date: now, snapshot: sevenExpired, channelAvailable: true), dark: dark, needsUnknown: true)
             assertLabels(reverse)
             XCTAssertTrue(reverse.text.contains("87.66%") && reverse.labels.contains("未知"), reverse.text)
             XCTAssertFalse(reverse.text.contains("43.22"), reverse.text)
@@ -61,7 +61,7 @@ final class WidgetEntryViewTests: XCTestCase {
                 let partial = WidgetQuotaSnapshot(writtenAt: now, observedAt: now, validUntil: now.addingTimeInterval(120),
                     hubSource: .direct, hubState: .ready, fiveHour: nil, sevenDay: current.sevenDay,
                     monthly: nil, local: nil, resetVoucherCount: vouchers)
-                let text = try await render(.init(date: now, snapshot: partial, channelAvailable: true), dark: dark)
+                let text = try await render(.init(date: now, snapshot: partial, channelAvailable: true), dark: dark, needsUnknown: true)
                 assertLabels(text)
                 XCTAssertTrue(text.text.contains("43.22%") && text.labels.contains("未知"), text.text)
                 XCTAssertFalse(text.text.contains("87.66") || text.text.contains("1,234.56") || text.text.contains("3张"), text.text)
@@ -71,7 +71,7 @@ final class WidgetEntryViewTests: XCTestCase {
                 snapshot(observed: now, reset: now.addingTimeInterval(600), state: .unavailable),
                 snapshot(observed: now.addingTimeInterval(60), reset: now.addingTimeInterval(600)),
             ] {
-                let text = try await render(.init(date: now, snapshot: invalid, channelAvailable: true), dark: dark)
+                let text = try await render(.init(date: now, snapshot: invalid, channelAvailable: true), dark: dark, needsUnknown: true)
                 XCTAssertTrue(text.labels.contains("未知"), text.text)
                 assertLabels(text)
                 assertNoOldValues(text)
@@ -104,7 +104,50 @@ final class WidgetEntryViewTests: XCTestCase {
         XCTAssertFalse(RenderResult(text: "", labels: "", voucherTitle: Text("重置券")).hasExactVoucherLabel)
     }
 
-    private func render(_ entry: WidgetEntry, dark: Bool) async throws -> RenderResult {
+    /// 补救只处理真实 OCR 结果；满足全部标签后不再重复识别。
+    private func enrichLabels(_ initial: [String], required: [[String]],
+                              attempts: [() throws -> [String]]) throws -> [String] {
+        var result = initial
+        func complete() -> Bool {
+            let text = result.joined(separator: "\n").replacingOccurrences(of: " ", with: "")
+            return required.allSatisfy { variants in variants.contains { text.contains($0) } }
+        }
+        for attempt in attempts {
+            if complete() { break }
+            result += try attempt()
+        }
+        return result
+    }
+
+    func testLabelRescueIsLazyStopsWhenCompleteAndNeverInventsMissingEvidence() throws {
+        var calls = 0
+        let required = [["月度用量"], ["重置券", "重置劵"]]
+        let alreadyComplete = try enrichLabels(["月度用量", "重置劵"], required: required,
+            attempts: [{ calls += 1; return ["不应执行"] }])
+        XCTAssertEqual(calls, 0)
+        XCTAssertEqual(alreadyComplete, ["月度用量", "重置劵"])
+        let rescued = try enrichLabels(["月慶用量"], required: required, attempts: [
+            { calls += 1; return ["月度用量"] },
+            { calls += 1; return ["重置券"] },
+            { calls += 100; return [] },
+        ])
+        XCTAssertEqual(calls, 2, "全部补齐后不能执行剩余补救")
+        XCTAssertTrue(rescued.contains("月度用量") && rescued.contains("重置券"))
+        calls = 0
+        let missing = try enrichLabels([], required: required, attempts: [
+            { calls += 1; return [] }, { calls += 1; return ["月慶用量"] },
+        ])
+        XCTAssertEqual(calls, 2, "缺失时必须跑完现有补救链")
+        XCTAssertFalse(missing.contains("月度用量") || missing.contains("重置券"))
+        enum RescueError: Error, Equatable { case failed }
+        calls = 0
+        XCTAssertThrowsError(try enrichLabels([], required: required, attempts: [
+            { throw RescueError.failed }, { calls += 1; return ["不应执行"] },
+        ])) { XCTAssertEqual($0 as? RescueError, .failed) }
+        XCTAssertEqual(calls, 0, "失败必须立即传播，不能继续补救或假通过")
+    }
+
+    private func render(_ entry: WidgetEntry, dark: Bool, needsUnknown: Bool = false) async throws -> RenderResult {
         let bounds = NSRect(x: 0, y: 0, width: 164, height: 164)
         let productView = WidgetEntryView(entry: entry)
         let view = productView
@@ -139,7 +182,14 @@ final class WidgetEntryViewTests: XCTestCase {
         // 数值与旧值泄露仍核对关闭纠正的整图 top-1。中文标签另核对
         // 原始候选和启用系统纠正的真实行区域；不注入预期词，不能据此
         // 宣称每个中文字形正确，也不代替原生辅助功能检查。
-        var labels = observations.flatMap { $0.topCandidates(10) }.map(\.string)
+        let initialLabels = observations.flatMap { $0.topCandidates(10) }.map(\.string)
+        // required 仅控制补救何时停止，不传入 Vision，也不补写识别结果。
+        var required: [[String]]
+        if !entry.channelAvailable { required = [["共享通道不可用"]] }
+        else if entry.snapshot == nil { required = [["尚未获取数据"]] }
+        else { required = [["5小时"], ["7天"], ["月度用量"], ["重置券", "重置劵"]] }
+        if needsUnknown { required.append(["未知"]) }
+        var attempts: [() throws -> [String]] = []
         for observation in observations {
             let recognized = observation.topCandidates(1).first?.string ?? ""
             guard recognized.unicodeScalars.contains(where: { (0x3400...0x9FFF).contains($0.value) }) else { continue }
@@ -153,23 +203,26 @@ final class WidgetEntryViewTests: XCTestCase {
             // 不同 macOS Vision 对 6× 小字的字形分割不同。用原始行和
             // 降采样行各取系统识别结果，不注入预期词，也不替换错字。
             for scale: CGFloat in [1, 0.5] {
-                let context = try XCTUnwrap(CGContext(data: nil,
-                    width: max(1, Int(CGFloat(crop.width) * scale)),
-                    height: max(1, Int(CGFloat(crop.height) * scale)),
-                    bitsPerComponent: 8, bytesPerRow: 0,
-                    space: CGColorSpaceCreateDeviceRGB(),
-                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
-                context.interpolationQuality = .high
-                context.draw(crop, in: CGRect(x: 0, y: 0, width: context.width, height: context.height))
-                let lineImage = try XCTUnwrap(context.makeImage())
-                let lineRequest = VNRecognizeTextRequest()
-                lineRequest.recognitionLevel = .accurate
-                lineRequest.recognitionLanguages = ["zh-Hans", "en-US"]
-                lineRequest.usesLanguageCorrection = true
-                try VNImageRequestHandler(cgImage: lineImage, options: [:]).perform([lineRequest])
-                labels += (lineRequest.results ?? []).flatMap { $0.topCandidates(10) }.map(\.string)
+                attempts.append {
+                    let context = try XCTUnwrap(CGContext(data: nil,
+                        width: max(1, Int(CGFloat(crop.width) * scale)),
+                        height: max(1, Int(CGFloat(crop.height) * scale)),
+                        bitsPerComponent: 8, bytesPerRow: 0,
+                        space: CGColorSpaceCreateDeviceRGB(),
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+                    context.interpolationQuality = .high
+                    context.draw(crop, in: CGRect(x: 0, y: 0, width: context.width, height: context.height))
+                    let lineImage = try XCTUnwrap(context.makeImage())
+                    let lineRequest = VNRecognizeTextRequest()
+                    lineRequest.recognitionLevel = .accurate
+                    lineRequest.recognitionLanguages = ["zh-Hans", "en-US"]
+                    lineRequest.usesLanguageCorrection = true
+                    try VNImageRequestHandler(cgImage: lineImage, options: [:]).perform([lineRequest])
+                    return (lineRequest.results ?? []).flatMap { $0.topCandidates(10) }.map(\.string)
+                }
             }
         }
+        let labels = try enrichLabels(initialLabels, required: required, attempts: attempts)
         return RenderResult(text: text, labels: labels.joined(separator: "\n").replacingOccurrences(of: " ", with: ""),
                             voucherTitle: productView.voucherTitle)
     }

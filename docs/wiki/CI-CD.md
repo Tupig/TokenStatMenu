@@ -17,6 +17,14 @@
 - 两个开发 Debug 原生检查串行共享专用 DerivedData；正式 Release 使用独立目录，不用 Debug 代替 Release，不复用外部缓存的发布二进制。
 - 首轮不引入跨运行缓存或多 job 拆分。记录各步骤和总耗时，与成功运行基线比较，不把排队减少或一次快跑当作稳定收益。跟踪 [#93](https://github.com/Tupig/TokenStatMenu/issues/93)。
 
+### Widget 按需 OCR 测试边界
+
+`WidgetEntryViewTests` 保留浅/深色共 20 次实际 `WidgetEntryView` 的合成 `NSHostingView` 离屏位图渲染。每次仍执行关闭语言纠正的整图 OCR；全部数值、券数量和旧值泄露断言只使用该次整图 top-1，不使用补救候选替代。
+
+中文标签先使用整图真实 top-10 候选，只有所需标签尚缺时，才依次对实际中文行区域执行原尺寸和半尺寸、开启系统语言纠正的 OCR；标签齐全即停止后续识别。状态对应的所需标签（包括适用状态下的“未知”）仅控制停止条件，不传给 Vision，不注入预期词、不替换错字、不捏造结果；补救错误立即传播，缺失证据仍使断言失败。专门测试验证无需补救、补齐后停止、耗尽仍缺失及错误传播。
+
+“重置券”仅允许原有的“券/劵”图像歧义，并同时核对产品的精确 `Text("重置券")`。这些候选不能证明每个中文字形正确，也不能替代原生辅助功能或真实系统 Widget、共享容器、权限与双渠道安装验收；测试不采集用户桌面或真实数据。性能应以包含该改动的已提交 CI 日志比较，不能把此前 CI 或本机耗时当作云端收益。
+
 ## 1.1.7 发布约定
 
 只支持 Apple Silicon（M 系列）。App 和扩展均为 arm64，Bundle 版本/build 同步。文件名使用仓库名，不重复版本和架构：
@@ -101,6 +109,14 @@ Normal jobs are read-only. Actions use full commit pins; SwiftPM uses `--force-r
 - The first Swift test builds the suite. Later tests use `--skip-build` in the same workspace; all three preliminary selections and the full suite still execute, with lock verification retained.
 - The two development Debug native checks share one dedicated DerivedData directory sequentially. The production Release uses an independent directory; Debug does not replace Release, and cached external release binaries are not reused.
 - This first phase adds neither cross-run caches nor multiple jobs. Compare step and total durations against successful baselines; reduced queueing or one fast run is not stable performance evidence. Track [#93](https://github.com/Tupig/TokenStatMenu/issues/93).
+
+### On-demand Widget OCR Test Boundaries
+
+`WidgetEntryViewTests` retains 20 actual synthetic offscreen `NSHostingView` bitmap renders of `WidgetEntryView` across light and dark appearances. Every render still runs whole-image OCR with language correction disabled. All numeric values, voucher counts and stale-value leakage assertions use only that whole-image top-1, never rescue candidates.
+
+Chinese labels first use genuine whole-image top-10 candidates. Only while required labels remain missing does the test run language-corrected OCR on actual Chinese line regions at original and half sizes, stopping once all labels are present. State-specific required labels (including “未知” where applicable) are stop conditions only: they are not passed to Vision, injected as expected words, used to replace typos or fabricated as results. Rescue errors propagate immediately; missing evidence still fails assertions. A dedicated test covers no rescue needed, stopping after completion, exhaustion with missing evidence and error propagation.
+
+The voucher label retains only the existing “券/劵” image ambiguity allowance, coupled with the product's exact `Text("重置券")`. Candidates do not establish correctness of every glyph or replace native accessibility, real system Widget, shared-container, permission or dual-channel installation acceptance. Tests capture neither the user's desktop nor real data. Compare performance using committed CI logs that include this change; earlier CI runs and local timings are not evidence of cloud speedup.
 
 ## Version 1.1.7 Contract
 
