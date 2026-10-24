@@ -89,6 +89,8 @@ PUBLIC_FILES = [
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png",
     "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png",
     "script/build_and_run.sh",
+    "script/verify_public_release.py",
+    "script/test_verify_public_release.py",
     "script/bump_build.py",
     "script/test.sh",
     "script/integration.py",
