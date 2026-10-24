@@ -41,7 +41,9 @@ import SwiftUI
                     .foregroundStyle(.secondary)
                 Text(sourceStatusText)
                     .font(.caption)
+                    .accessibilityElement(children: .ignore)
                     .accessibilityIdentifier("seasun-source-status")
+                    .accessibilityLabel(sourceStatusText)
                     }
                 }
                 .accessibilityLabel("Seasun Token Hub")
@@ -60,10 +62,12 @@ import SwiftUI
                         .frame(width: 88)
                         .multilineTextAlignment(.trailing)
                         .labelsHidden()
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityIdentifier("refresh-seconds")
                         .accessibilityLabel("刷新秒数")
                 }
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("刷新秒数（15–3600）")
+                .accessibilityLabel("刷新秒数（15–3600），当前 \(draft.refreshSeconds) 秒")
                 Toggle("Token Hub 界面兼容读取（可选）", isOn: $draft.tokenHubCompatibilityReadEnabled)
                     .accessibilityIdentifier("token-hub-compatibility-toggle")
                     .accessibilityLabel("Token Hub 界面兼容读取（可选）")
@@ -91,6 +95,9 @@ import SwiftUI
                     VStack(alignment: .leading, spacing: 8) {
                 Text(model.tokenHubQuotaStatusText)
                     .font(.caption)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityIdentifier("token-hub-quota-status")
+                    .accessibilityLabel(model.tokenHubQuotaStatusText)
                 Button("请求辅助功能访问…") {
                     model.requestTokenHubAccessibilityAccess()
                 }
@@ -102,7 +109,6 @@ import SwiftUI
                 }
             }
             .padding(14)
-            .accessibilityElement(children: .contain)
         }
         .textFieldStyle(.roundedBorder)
     }
