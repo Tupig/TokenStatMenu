@@ -372,6 +372,12 @@ public struct TokenHubDirectQuotaClient: Sendable {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
         let prefix = baseURL.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         components?.path = prefix.isEmpty ? "/api/v1/me/reset-vouchers" : "/\(prefix)/api/v1/me/reset-vouchers"
+        components?.queryItems = [
+            URLQueryItem(name: "status", value: "available"),
+            URLQueryItem(name: "default_context", value: "true"),
+            URLQueryItem(name: "page", value: "1"),
+            URLQueryItem(name: "page_size", value: "100"),
+        ]
         return components?.url
     }
 
@@ -673,7 +679,7 @@ public enum TokenHubDirectQuotaDecoder {
 
 /// 解码 `/api/v1/me/reset-vouchers` 的可用券总数。
 ///
-/// 只接受非负整数 `data.total`；字段缺失、类型异常或超出上限时返回 nil。
+/// 只接受可用券筛选响应中的非负整数 `data.total`；字段缺失、类型异常或超出上限时返回 nil。
 public enum TokenHubResetVoucherDecoder {
     public static func decode(_ data: Data) -> Int? {
         guard data.count <= 1_048_576,

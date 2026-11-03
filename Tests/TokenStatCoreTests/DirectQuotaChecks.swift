@@ -258,12 +258,19 @@ extension CoreChecks {
                         data: scenario == "quota-malformed" ? Data("{}".utf8) : quota)
                 }
                 guard url.path == "/api/v1/me/reset-vouchers" else { throw TokenHubDirectQuotaFailure.endpointRejected }
+                let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+                let filtersMatch = query == [
+                    URLQueryItem(name: "status", value: "available"),
+                    URLQueryItem(name: "default_context", value: "true"),
+                    URLQueryItem(name: "page", value: "1"),
+                    URLQueryItem(name: "page_size", value: "100"),
+                ]
                 if scenario == "throw" { throw URLError(.notConnectedToInternet) }
                 if scenario == "identity-change" {
                     try writeDirectQuotaFixture(at: database, now: now, sessionToken: "changed-session")
                 }
                 return TokenHubDirectQuotaHTTPResponse(statusCode: scenario == "http" ? 503 : 200,
-                    data: scenario == "malformed" ? Data("{}".utf8) : json(scenario == "zero" ? #"{"data":{"total":0}}"# : #"{"data":{"total":3}}"#))
+                    data: scenario == "malformed" ? Data("{}".utf8) : json(!filtersMatch ? #"{"data":{"total":9}}"# : scenario == "zero" ? #"{"data":{"total":0}}"# : #"{"data":{"total":3}}"#))
             }, callbackRequest: { url in
                 let access = calls.withLock {
                     let number = $0.filter { $0.hasPrefix("callback|") }.count + 1
