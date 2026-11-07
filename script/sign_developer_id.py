@@ -431,7 +431,7 @@ def verify_bundle(
     )
     prefix = temporary / f"signed-{index}-"
     run_tool(
-        [CODESIGN, "--display", "--extract-certificates", str(prefix), str(bundle)]
+        [CODESIGN, "--display", "--extract-certificates=" + str(prefix), str(bundle)]
     )
     try:
         leaf = Path(str(prefix) + "0").read_bytes()

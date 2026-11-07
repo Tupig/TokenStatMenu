@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # fmt: off
-"""Offline signing-policy tests: every external process is intercepted."""
+"""Offline signing-policy tests; one macOS test invokes the real codesign CLI."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -90,6 +91,7 @@ class SigningTests(unittest.TestCase):
         self.extra_certificates = {}
         self.fail_sign = False
         self.apple_anchored = True
+        self.real_run = subprocess.run
         self.subprocess = mock.patch.object(
             signing.subprocess, "run", side_effect=self.fake_run
         ).start()
@@ -170,8 +172,9 @@ class SigningTests(unittest.TestCase):
                 stdout = plistlib.dumps(
                     self.signed_entitlements[bundle] if value is None else value
                 )
-            elif "--extract-certificates" in command:
-                prefix = command[command.index("--extract-certificates") + 1]
+            elif any(arg.startswith("--extract-certificates=") for arg in command):
+                prefix = next(arg.split("=", 1)[1] for arg in command
+                              if arg.startswith("--extract-certificates="))
                 Path(prefix + "0").write_bytes(self.leaf)
             else:
                 self.assertIn("--verify", command)
@@ -598,6 +601,35 @@ class SigningTests(unittest.TestCase):
         self.leaf = b"different certificate"
         with self.assertRaisesRegex(signing.SigningError, "certificate differs"):
             self.execute()
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS codesign")
+    def test_post_sign_certificate_extraction_uses_real_codesign(self):
+        # Use Apple's signed system executable; the other signing operations remain
+        # synthetic, and no keychain or private certificate is accessed.
+        app = self.make_app()
+        reference_prefix = str(self.root / "reference-")
+        self.real_run(
+            [signing.CODESIGN, "--display", "--extract-certificates=" + reference_prefix,
+             signing.CODESIGN],
+            capture_output=True, check=True, timeout=120,
+        )
+        leaf = Path(reference_prefix + "0").read_bytes()
+        entitlements = {signing.TEAM_KEY: TEAM,
+                        signing.IDENTIFIER_KEYS[0]: TEAM + "." + IDS[0],
+                        signing.GROUP_KEY: [GROUP]}
+        authorization = signing.Authorization(
+            b"synthetic profile", entitlements, {FINGERPRINT: NAME},
+            {FINGERPRINT: leaf},
+        )
+        self.signed_entitlements[str(app)] = entitlements
+
+        def extract_with_real_codesign(command, **kwargs):
+            if any(arg.startswith("--extract-certificates") for arg in command):
+                return self.real_run([*command[:-1], signing.CODESIGN], **kwargs)
+            return self.fake_run(command, **kwargs)
+
+        self.subprocess.side_effect = extract_with_real_codesign
+        signing.verify_bundle(app, authorization, TEAM, FINGERPRINT, NAME, self.root, 0)
 
     def test_post_sign_distinct_leaf_rejected_even_if_fingerprints_collide(self):
         self.make_app()
