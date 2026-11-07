@@ -10,6 +10,10 @@
 
 凭据不应写入偏好、共享快照或日志；共享快照不应包含会话正文或原始服务响应。App Group 是否可用取决于实际签名和系统授权；文件所有权检查不能单独证明文件由哪个进程创建。开发签名包的跨设备运行与 Widget 授权不等于已验证的正式分发。
 
+### 受支持版本
+
+我们会尽力处理当前 `main` 分支和最新公开版本的安全问题。旧版本可能不会获得修复，建议升级至最新公开版本。
+
 ### 报告漏洞
 
 请使用 [GitHub 私密漏洞报告](https://github.com/Tupig/TokenStatMenu/security/advisories/new)，不要在公开 Issue 中披露未修复的安全问题。请提供版本、系统环境、影响范围、最小复现步骤，以及可用的合成或脱敏证据。
@@ -25,6 +29,10 @@ This policy covers the macOS app, Widget, shared snapshots, and build and releas
 The app reads connection details and an existing session from the local Seasun Token Hub and queries the service configured by that Hub. The Widget reads a shared snapshot through an App Group. Treat service responses, local files, and their paths as untrusted inputs. Security review should consider credential disclosure, unauthorized data access or modification, unsafe network requests, and unauthorized snapshot reads, replacement, or parsing.
 
 Credentials must not be written to preferences, shared snapshots, or logs; shared snapshots must not contain conversation text or raw service responses. App Group availability depends on actual signing and system authorization. File ownership checks alone do not establish which process created a file. Cross-device execution and Widget authorization for development-signed builds are not evidence of verified production distribution.
+
+### Supported versions
+
+We make a best effort to address security issues in the current `main` branch and the latest public release. Older versions may not receive fixes; update to the latest public release where possible.
 
 ### Reporting a vulnerability
 
