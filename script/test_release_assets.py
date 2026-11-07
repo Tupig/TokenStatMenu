@@ -317,6 +317,19 @@ class FakeClient:
 
 
 class ReleaseChecks(unittest.TestCase):
+    def test_widget_group_rejects_many_ambiguous_segments_promptly(self):
+        # Run out of process so a backtracking regression cannot hang the suite.
+        source = (
+            "import release_assets as r; "
+            "s='group'+'.00'*30+'!'; "
+            "assert r.GROUP_PATTERN.fullmatch(s) is None; "
+            "import sign_developer_id as d, types; "
+            "args=types.SimpleNamespace(team='ABCDE12345', group=s, identity='A'*40); "
+            "exec(\"try:\\n d.validate_arguments(args, {})\\nexcept d.SigningError:\\n pass\\nelse:\\n raise AssertionError('invalid group accepted')\")"
+        )
+        subprocess.run([sys.executable, "-c", source], cwd=PROJECT / "script",
+                       check=True, timeout=5)
+
     def test_widget_group_validation_matches_runtime_and_build(self):
         valid = [
             "group.tokenstat.menu",

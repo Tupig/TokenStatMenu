@@ -13,6 +13,7 @@ PUBLIC_FILES = [
     "Package.swift",
     "Package.resolved",
     "README.md",
+    "SECURITY.md",
     "LICENSE",
     "Sources/TokenStatCore/Configuration.swift",
     "Sources/TokenStatCore/GatewayDiscovery.swift",

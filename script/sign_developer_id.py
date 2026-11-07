@@ -126,7 +126,7 @@ def validate_arguments(args: argparse.Namespace, environment: dict[str, str]) ->
     require(
         len(args.group) <= 128
         and re.fullmatch(
-            r"(?:group|[A-Z0-9]{10})(?:\.[A-Za-z0-9]+(?:[A-Za-z0-9-]*[A-Za-z0-9])?)+",
+            r"(?:group|[A-Z0-9]{10})(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+",
             args.group,
         )
         is not None,
@@ -307,6 +307,10 @@ def authorize_profile(
         if identity and (
             args.identity.upper() == identity[0] or args.identity == identity[1]
         ):
+            require(
+                identity[0] not in matching_data or matching_data[identity[0]] == certificate,
+                "Distinct certificates share the same identity fingerprint",
+            )
             matching[identity[0]] = identity[1]
             matching_data[identity[0]] = certificate
     require(
@@ -434,7 +438,7 @@ def verify_bundle(
     except OSError:
         raise SigningError("Cannot verify signed certificate") from None
     require(
-        hashlib.sha1(leaf).hexdigest().upper() == fingerprint,
+        leaf == authorization.certificate_data[fingerprint],
         "Signed certificate differs from authorized identity",
     )
 

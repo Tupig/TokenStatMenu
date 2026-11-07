@@ -88,7 +88,7 @@ SHA_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 # Same shape the runtime accepts in WidgetSnapshotStore.configuredGroup.
 GROUP_PATTERN = re.compile(
     r"(?=.{1,128}\Z)(?!FICTEAM)(?:group|[A-Z0-9]{10})"
-    r"(?:\.[A-Za-z0-9]+(?:[A-Za-z0-9-]*[A-Za-z0-9])?)+\Z"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+\Z"
 )
 
 

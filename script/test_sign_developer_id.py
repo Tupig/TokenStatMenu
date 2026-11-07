@@ -410,6 +410,13 @@ class SigningTests(unittest.TestCase):
         self.execute()
         self.assertEqual(self.validity_inputs(), [CERTIFICATE])
 
+    def test_distinct_certificates_with_colliding_fingerprints_are_rejected(self):
+        retired = self.add_rotation_certificate(NAME)
+        self.profiles[self.args.app_profile]["DeveloperCertificates"] = [CERTIFICATE, retired]
+        with mock.patch.object(signing, "certificate_identity", return_value=(FINGERPRINT, NAME)):
+            with self.assertRaisesRegex(signing.SigningError, "share the same identity fingerprint"):
+                self.execute()
+
     def test_rotation_name_resolves_common_candidate_before_validity(self):
         retired = self.add_rotation_certificate(NAME)
         self.profiles[self.args.app_profile]["DeveloperCertificates"] = [retired, CERTIFICATE]
@@ -591,6 +598,15 @@ class SigningTests(unittest.TestCase):
         self.leaf = b"different certificate"
         with self.assertRaisesRegex(signing.SigningError, "certificate differs"):
             self.execute()
+
+    def test_post_sign_distinct_leaf_rejected_even_if_fingerprints_collide(self):
+        self.make_app()
+        self.leaf = b"synthetic different certificate"
+        collision = mock.Mock()
+        collision.hexdigest.return_value = FINGERPRINT.lower()
+        with mock.patch.object(signing.hashlib, "sha1", return_value=collision):
+            with self.assertRaisesRegex(signing.SigningError, "certificate differs"):
+                self.execute()
 
     def test_wrong_bundle_or_group_does_not_modify_app(self):
         app = self.make_app()
