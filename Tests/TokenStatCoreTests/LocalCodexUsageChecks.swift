@@ -1,4 +1,5 @@
 import CoreFoundation
+import Darwin
 import Foundation
 @testable import TokenStatCore
 
@@ -132,6 +133,28 @@ extension CoreChecks {
             && exactZero.total == 0,
             "a metadata-backed known zero is distinguishable from absence of any known thread")
         try? FileManager.default.removeItem(at: exactZeroRoot.deletingLastPathComponent())
+
+        // A discovered directory that cannot be opened may hide other session
+        // files. The readable subtotal must never be described as complete.
+        let unreadableRoot = try fixtureDirectory("unreadable-session-directory")
+        defer { try? FileManager.default.removeItem(at: unreadableRoot.deletingLastPathComponent()) }
+        let unreadableChild = unreadableRoot.appendingPathComponent("blocked", isDirectory: true)
+        try FileManager.default.createDirectory(at: unreadableChild, withIntermediateDirectories: false)
+        try writeSession(in: unreadableRoot, uuid: "12121212-1212-4212-8212-121212121214",
+            events: [tokenEvent(at: now, input: 7, output: 5)], modified: now)
+        try writeSession(in: unreadableChild, uuid: "12121212-1212-4212-8212-121212121215",
+            events: [tokenEvent(at: now, input: 70, output: 50)], modified: now)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: unreadableChild.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: unreadableChild.path) }
+        let deniedFD = open(unreadableChild.path, O_RDONLY | O_DIRECTORY)
+        check(deniedFD < 0, "unreadable directory fixture must actually deny enumeration")
+        if deniedFD >= 0 { close(deniedFD) }
+        let unreadableCache = LocalCodexUsageReader.Cache()
+        for _ in 0..<2 {
+            let partial = try LocalCodexUsageReader.scan(directory: unreadableRoot, now: now, cache: unreadableCache)
+            check(partial.total == 12 && partial.isLimited && !partial.hasCompleteAccounting,
+                "inaccessible session directory marks cold and cached subtotals incomplete")
+        }
 
         let noFinalLFRoot = try fixtureDirectory("complete-no-final-lf")
         let noFinalLFID = "13131313-1313-4313-8313-131313131313"

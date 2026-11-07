@@ -210,6 +210,36 @@ final class WidgetPublisherFailureTests: XCTestCase {
         XCTAssertEqual(reloads, 2, "the queued reload is delivered when the gate opens")
     }
 
+    func testClockRollbackDoesNotPreventAQueuedReloadForHours() {
+        var now = start
+        var reloads = 0
+        let owned = WidgetSnapshotStore.Ownership(device: 1, inode: 1, size: 1, digest: "synthetic")
+        let publisher = WidgetSnapshotPublisher(now: { now }, channelAvailable: { true },
+            claim: { nil }, write: { _, _ in owned }, reload: { reloads += 1 })
+
+        XCTAssertTrue(publisher.publish(snapshot(50)))
+        XCTAssertEqual(reloads, 1)
+        now = start.addingTimeInterval(-3600)
+        XCTAssertTrue(publisher.publish(snapshot(40)))
+        XCTAssertEqual(reloads, 1, "a backward clock must not bypass the reload interval")
+        now = now.addingTimeInterval(60)
+        _ = publisher.publish(snapshot(40))
+        XCTAssertEqual(reloads, 2, "a queued reload must recover after one interval, not one hour")
+    }
+
+    func testClockRollbackRewritesAnUnchangedPayload() {
+        var now = start
+        var writes = 0
+        let owned = WidgetSnapshotStore.Ownership(device: 1, inode: 1, size: 1, digest: "synthetic")
+        let publisher = WidgetSnapshotPublisher(now: { now }, channelAvailable: { true }, claim: { nil },
+            write: { _, _ in writes += 1; return owned }, reload: {})
+
+        XCTAssertTrue(publisher.publish(snapshot(50)))
+        now = start.addingTimeInterval(-3600)
+        XCTAssertTrue(publisher.publish(snapshot(50)))
+        XCTAssertEqual(writes, 2, "a backward clock must not suppress an unchanged heartbeat")
+    }
+
     func testUnavailableChannelNeverCallsWriteOrReload() {
         var attempts = 0
         var reloads = 0
@@ -246,6 +276,45 @@ final class WidgetPublisherFailureTests: XCTestCase {
         XCTAssertNotNil(WidgetSnapshotStore.claimExisting(directory: dirfd))
         XCTAssertFalse(publisher.publish(snapshot(.nan)))
         XCTAssertNil(WidgetSnapshotStore.claimExisting(directory: dirfd))
+    }
+
+    func testFirstUnencodableSnapshotClearsSafeFileFromPreviousRun() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dirfd = open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(dirfd, 0)
+        defer { close(dirfd) }
+        _ = try WidgetSnapshotStore.write(WidgetSnapshotCodec.encode(snapshot(50)), replacing: nil, directory: dirfd)
+        let publisher = WidgetSnapshotPublisher(now: { self.start }, channelAvailable: { true },
+            claim: { WidgetSnapshotStore.claimExisting(directory: dirfd) },
+            write: { data, owned in try WidgetSnapshotStore.write(data, replacing: owned, directory: dirfd) },
+            removeOwned: { try WidgetSnapshotStore.removeOwned($0, directory: dirfd) }, reload: {})
+
+        XCTAssertFalse(publisher.publish(snapshot(.nan)))
+        XCTAssertNil(try WidgetSnapshotStore.read(directory: dirfd),
+                     "the first failed publish must clear a safely claimed prior snapshot")
+    }
+
+    func testFirstUnencodableSnapshotPreservesUnsafeExistingObject() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let victim = root.appendingPathComponent("victim")
+        try Data("unchanged".utf8).write(to: victim)
+        let link = root.appendingPathComponent(WidgetSnapshotStore.fileName)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: victim)
+        let dirfd = open(root.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(dirfd, 0)
+        defer { close(dirfd) }
+        let publisher = WidgetSnapshotPublisher(now: { self.start }, channelAvailable: { true },
+            claim: { WidgetSnapshotStore.claimExisting(directory: dirfd) },
+            write: { data, owned in try WidgetSnapshotStore.write(data, replacing: owned, directory: dirfd) },
+            removeOwned: { try WidgetSnapshotStore.removeOwned($0, directory: dirfd) }, reload: {})
+
+        XCTAssertFalse(publisher.publish(snapshot(.nan)))
+        XCTAssertEqual(try Data(contentsOf: victim), Data("unchanged".utf8))
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link.path), victim.path)
     }
 
     func testDiagnosticStateTracksFailuresRecoveryAndReset() {

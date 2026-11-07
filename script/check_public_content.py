@@ -30,10 +30,10 @@ LOCAL_ONLY_PREFIXES = (
 )
 
 SYNTHETIC_PNG_SHA256 = {
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "4f0730e13672d2bfe3eb83839a8ddd8963b2a1b62da2b5f5da59998f44e1f6b4",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "87dbcd12bb9e8c4389f05937f338230f5e95f88e75f6acda470f763ee56d4a43",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "8c08eb7e09e42e28d7ed4097eb1f1fa9cc190126e0f24facd12e0c5c4dfe08ac",
-    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "4a0a1af5a93f2cc6e65ab12dcf85654e50be9cc59983cc6eb78446b986376155",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-light.png": "0c8606581daf3bb9668fea3f18a0356079f15367bb3b05c25dd899a8ee95e5f4",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testDashboardLightAndDark.dashboard-dark.png": "ff6251299c12d526ba46763501a88b45d8a8f85193262f15ea8d2652a6bbab93",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-light.png": "667ecd479925eeed8f91e88359b7ceaa8b1baadc3ceb66fd00da6b80d90d42e3",
+    "Tests/TokenStatUITests/__Snapshots__/TokenStatUISnapshotTests/testSettingsLightAndDark.settings-dark.png": "0796f962469a68f9f0d2921dbe9fd2117a7a01aabde4868105b8e98fb071d92f",
 }
 
 # Original code-native assets, independently reviewed at 1024/64/32px.

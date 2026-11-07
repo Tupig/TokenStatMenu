@@ -511,13 +511,26 @@ public enum LocalCodexUsageReader {
         while let relative = directories.first, entries < maxEntries {
             directories.removeFirst()
             let dfd = relative.isEmpty ? dup(rootFD) : openDirectoryRelative(rootFD, relative)
-            guard dfd >= 0, let listing = fdopendir(dfd) else { if dfd >= 0 { close(dfd) }; continue }
-            while entries < maxEntries, let item = readdir(listing) {
+            guard dfd >= 0, let listing = fdopendir(dfd) else {
+                if dfd >= 0 { close(dfd) }
+                limited = true; discoveryLimited = true
+                continue
+            }
+            while entries < maxEntries {
+                errno = 0
+                guard let item = readdir(listing) else {
+                    if errno != 0 { limited = true; discoveryLimited = true }
+                    break
+                }
                 let leaf = withUnsafePointer(to: &item.pointee.d_name) { ptr in ptr.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) } }
                 if leaf == "." || leaf == ".." { continue }
                 entries += 1
                 let name = relative.isEmpty ? leaf : relative + "/" + leaf
-                var fst = stat(); guard fstatat(dfd, leaf, &fst, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
+                var fst = stat()
+                guard fstatat(dfd, leaf, &fst, AT_SYMLINK_NOFOLLOW) == 0 else {
+                    limited = true; discoveryLimited = true
+                    continue
+                }
                 if (fst.st_mode & S_IFMT) == S_IFDIR { directories.append(name); continue }
                 guard (fst.st_mode & S_IFMT) == S_IFREG, name.lowercased().hasSuffix(".jsonl") else { continue }
                 let identity = FileIdentity(fst)

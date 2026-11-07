@@ -777,7 +777,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         let live = freshLocalLiveTurn(at: now).map { String(format: "实时估算：输入 %.1f · 输出 %.1f tok/s（观测于 %@）", $0.inputTPS, $0.outputTPS, $0.observedAt.formatted()) } ?? "实时估算：未知（无新鲜活动 token_count）"
         let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
         let range = localSnapshot.latestEventAt.map { "最新记录：\($0.formatted())" } ?? "记录时间：未知"
-        let coverage = "扫描范围最多32个物理文件；不是全部对话；每文件头64KiB与尾256KiB，总计10MiB；" + (localSnapshot.isLimited ? "本次达到扫描上限" : "本次安全检查 \(localSnapshot.filesScanned) 个物理文件")
+        let coverage = "扫描范围最多32个物理文件；不是全部对话；每文件头64KiB与尾256KiB，总计10MiB；" + (localSnapshot.isLimited ? "本次扫描不完整（可能达到上限或读取失败）" : "本次安全检查 \(localSnapshot.filesScanned) 个物理文件")
         let input = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.input) : "未知"
         let output = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.output) : "未知"
         let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "本次记录合计"

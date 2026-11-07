@@ -277,7 +277,8 @@ final class DashboardHistoryTests: XCTestCase {
         XCTAssertTrue(f.model.menuTooltip.contains("实时估算：未知"))
         XCTAssertTrue(f.model.menuTooltip.contains("当前配置关联的本机 Codex 记录"))
         XCTAssertTrue(f.model.menuTooltip.contains("本次记录合计"))
-        XCTAssertTrue(f.model.menuTooltip.contains("本次达到扫描上限"))
+        XCTAssertTrue(f.model.menuTooltip.contains("本次扫描不完整"))
+        XCTAssertTrue(f.model.menuTooltip.contains("可能达到上限或读取失败"))
         XCTAssertTrue(f.model.menuTooltip.contains("其他线程 2"))
         for dark in [false, true] {
             let image = try render(DashboardView(model: f.model).overviewContent, dark: dark)

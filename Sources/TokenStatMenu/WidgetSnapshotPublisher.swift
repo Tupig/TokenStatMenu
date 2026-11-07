@@ -31,7 +31,11 @@ public final class WidgetSnapshotPublisher {
     /// `reloadAllTimelines()` 的最短调用间隔，避免频繁请求耗尽 WidgetKit 重载预算。
     nonisolated static let minimumReloadInterval: TimeInterval = 60
 
-    public init(now: @escaping @MainActor () -> Date = { Date() }) {
+    /// 节流使用单调运行时间，不受系统日期、时间或时区调整影响。
+    /// `now` 仅表示节流时钟；快照内的绝对时间仍由调用方提供。
+    public init(now: @escaping @MainActor () -> Date = {
+        Date(timeIntervalSinceReferenceDate: ProcessInfo.processInfo.systemUptime)
+    }) {
         self.now = now
         self.channelAvailable = { WidgetSnapshotStore.isAvailable() }
         self.claim = { WidgetSnapshotStore.claimExisting() }
@@ -139,7 +143,10 @@ public final class WidgetSnapshotPublisher {
                                           now: Date,
                                           recoveringFromFailure: Bool = false,
                                           minimumInterval: TimeInterval = minimumReloadInterval) -> PublishDecision {
-        let writeDue = lastWriteAt.map { now.timeIntervalSince($0) >= minimumInterval } ?? true
+        let writeDue = lastWriteAt.map {
+            let elapsed = now.timeIntervalSince($0)
+            return elapsed < 0 || elapsed >= minimumInterval
+        } ?? true
         let reloadDue = lastReloadAt.map { now.timeIntervalSince($0) >= minimumInterval } ?? true
         let shouldWrite = !sameValues || writeDue
         let needsReload = !sameValues || recoveringFromFailure
@@ -159,8 +166,14 @@ public final class WidgetSnapshotPublisher {
     /// 每个 `minimumReloadInterval` 内最多请求一次重载，扩展另有五分钟时间线刷新。
     private func reloadTimelinesIfAllowed() {
         let current = now()
-        if let lastReloadAt, current.timeIntervalSince(lastReloadAt) < Self.minimumReloadInterval {
-            return
+        if let lastReloadAt {
+            let elapsed = current.timeIntervalSince(lastReloadAt)
+            if elapsed < 0 {
+                // 注入时钟异常回退时，重新开始等待；不能因此绕过重载间隔。
+                self.lastReloadAt = current
+                return
+            }
+            if elapsed < Self.minimumReloadInterval { return }
         }
         lastReloadAt = current
         pendingReload = false
@@ -169,6 +182,9 @@ public final class WidgetSnapshotPublisher {
 
     /// 当前快照无法安全编码时清除上次成功展示，避免 Widget 继续显示旧额度。
     private func clearStaleSnapshot() {
+        // 新进程可能尚未写入，但容器里仍有上次运行留下的有效快照。
+        // 先通过正常的文件身份检查接管；不可信对象依旧不能移除。
+        if ownership == nil, needsClaim { ownership = claim() }
         if let ownership {
             try? removeOwned(ownership)
         }
