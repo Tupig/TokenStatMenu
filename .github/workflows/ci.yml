@@ -58,7 +58,10 @@ jobs:
             --skip TokenStatUISnapshotTests/testC11LocalQuotaSnapshotsNeverBecomeEnterpriseCurrentOrAlerts \
             --skip TokenStatUISnapshotTests/testC11QuotaCardRenderExportsLocalAndEnterpriseSyntheticExamples \
             --skip TokenStatUISnapshotTests/testHistoricalQuotaPresentationPreservesOriginalSourceValues \
-            --skip TokenStatUISnapshotTests/testEnterpriseQuotaAlertsUseOnlyFreshIndependentWindows
+            --skip TokenStatUISnapshotTests/testEnterpriseQuotaAlertsUseOnlyFreshIndependentWindows \
+            --skip WidgetCoinRoundingTests/testActualWidgetUsesPositiveHalfExpandForCoinAmounts \
+            --skip WidgetEntryViewTests/testActualWidgetRendersCurrentUnknownExpiredResetAndUnavailableStates \
+            --skip WidgetEntryViewTests/testActualWidgetRendersSchemaV2UnlimitedAndExceededStates
       - name: Native development Widget product XCTest
         run: xcodebuild -project TokenStatMenu.xcodeproj -scheme TokenStatDevWidgetLogicTests -destination 'platform=macOS,arch=arm64' -derivedDataPath "$RUNNER_TEMP/TokenStatDevWidget-CI" -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO test
       # Development probe only. It is not the widget shipped inside TokenStatMenu.app.

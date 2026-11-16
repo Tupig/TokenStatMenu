@@ -6,7 +6,7 @@
 
 ## CI 检查
 
-[ci.yml](../../.github/workflows/ci.yml) 在 main push、PR 和 `v*` 标签上运行。检出后先无签名构建 `TokenStatMenu` scheme；正式小组件 `TokenStatMenuWidget.appex` 由这个 scheme 嵌进主 App，不是另一次产品构建。这一步失败就停止。通过后才执行文档、发行契约、CoreChecks、状态/UI 测试和依赖锁未变检查。后面的 `TokenStatMenuDevWidgetTest` 只是开发探针，不进发布包。部分依赖 macOS 渲染的像素测试不在 CI 比较。Actions 不签名、不上传 Release。
+[ci.yml](../../.github/workflows/ci.yml) 在 main push、PR 和 `v*` 标签上运行。检出后先无签名构建 `TokenStatMenu` scheme；正式小组件 `TokenStatMenuWidget.appex` 由这个 scheme 嵌进主 App，不是另一次产品构建。这一步失败就停止。通过后才执行文档、发行契约、CoreChecks、状态/UI 测试和依赖锁未变检查。后面的 `TokenStatMenuDevWidgetTest` 只是开发探针，不进发布包。三个使用合成数据、经本机 `NSWindow` 渲染 `WidgetEntryView` 的方法只在本机完整 `./script/test.sh` 中运行：`WidgetCoinRoundingTests/testActualWidgetUsesPositiveHalfExpandForCoinAmounts`、`WidgetEntryViewTests/testActualWidgetRendersCurrentUnknownExpiredResetAndUnavailableStates`、`WidgetEntryViewTests/testActualWidgetRendersSchemaV2UnlimitedAndExceededStates`。CI 保留原有 9 项图像过滤，并新增这三项精确过滤；预计 172 项只是预测，实际数量、跳过项和结果以新 workflow 日志为准。历史 CI 的 3 个渲染方法、5 个断言失败记录保持原样，运行环境原因尚未证实；云端渲染未验收，本机通过也不外推到其他 Mac。部分依赖 macOS 渲染的像素测试不在 CI 比较。Actions 不签名、不上传 Release。
 
 普通 job 只有读权限。动作固定到完整提交，SwiftPM 使用 `--force-resolved-versions`。CI 不读用户 Hub/Codex 数据，不请求权限，不证明真实小组件或企业链路可用。
 
@@ -110,7 +110,7 @@ README 与 `docs/wiki/` 随源码发布。GitHub Wiki 是独立仓库，首次�
 
 ## CI Checks
 
-[ci.yml](../../.github/workflows/ci.yml) runs on main pushes, PRs and `v*` tags. After checkout it first builds the unsigned `TokenStatMenu` scheme. The shipping widget, `TokenStatMenuWidget.appex`, is embedded by that scheme; it is not a second product build. A failure there stops the job. Later checks cover docs, release contracts, CoreChecks, state/UI tests and an unchanged dependency lock. The later `TokenStatMenuDevWidgetTest` scheme is a development probe and is not shipped. Some renderer-dependent image comparisons are local-only. Actions does not sign or upload a Release.
+[ci.yml](../../.github/workflows/ci.yml) runs on main pushes, PRs and `v*` tags. After checkout it first builds the unsigned `TokenStatMenu` scheme. The shipping widget, `TokenStatMenuWidget.appex`, is embedded by that scheme; it is not a second product build. A failure there stops the job. Later checks cover docs, release contracts, CoreChecks, state/UI tests and an unchanged dependency lock. The later `TokenStatMenuDevWidgetTest` scheme is a development probe and is not shipped. Three methods that render the product `WidgetEntryView` with synthetic data in a local `NSWindow` must run in the full local `./script/test.sh`: `WidgetCoinRoundingTests/testActualWidgetUsesPositiveHalfExpandForCoinAmounts`, `WidgetEntryViewTests/testActualWidgetRendersCurrentUnknownExpiredResetAndUnavailableStates`, and `WidgetEntryViewTests/testActualWidgetRendersSchemaV2UnlimitedAndExceededStates`. CI retains the existing nine image filters and adds filters for these three exact methods; 172 is a prediction, and the actual count, skips and results must be read from the new workflow log. Historical CI records of three render methods and five assertion failures remain unchanged; an environment cause has not been established. Cloud rendering is not accepted, and local success does not generalize to other Macs. Some renderer-dependent image comparisons are local-only. Actions does not sign or upload a Release.
 
 Normal jobs are read-only. Actions use full commit pins; SwiftPM uses `--force-resolved-versions`. CI does not access user Hub/Codex data or establish real Widget/service acceptance.
 
