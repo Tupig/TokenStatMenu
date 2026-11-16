@@ -79,6 +79,130 @@ final class WidgetSnapshotCodecTests: XCTestCase {
         XCTAssertEqual(decoded.resetVoucherCount, 3)
     }
 
+    func testB5NormalMonthlyResetRoundTripsAndExpiresBeforeWholeSnapshotTTL() throws {
+        let monthlyReset = now.addingTimeInterval(60)
+        let siblingReset = now.addingTimeInterval(300)
+        let snapshot = WidgetQuotaSnapshot(writtenAt: now, observedAt: now,
+            validUntil: now.addingTimeInterval(120), hubSource: .direct, hubState: .ready,
+            fiveHour: .init(remainingPercent: 50, resetsAt: siblingReset,
+                usedAmount: 10, limitAmount: 20, sourceSymbol: "🪙"),
+            sevenDay: nil,
+            monthly: .init(usedAmount: 25.5, limitAmount: 100, sourceSymbol: "🪙",
+                resetsAt: monthlyReset),
+            local: nil, resetVoucherCount: nil)
+        let encoded = try WidgetSnapshotCodec.encode(snapshot)
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let monthlyObject = try XCTUnwrap(root["monthly"] as? [String: Any])
+        XCTAssertEqual((monthlyObject["resetsAtMs"] as? NSNumber)?.int64Value, 1_800_000_060_000)
+        let decoded = try WidgetSnapshotCodec.decode(encoded, now: now)
+        XCTAssertEqual(decoded.monthly?.resetsAt, monthlyReset)
+        XCTAssertTrue(decoded.hubIsCurrent(at: monthlyReset))
+        XCTAssertEqual(decoded.currentMonthly(at: monthlyReset.addingTimeInterval(-0.001)), decoded.monthly)
+        XCTAssertNil(decoded.currentMonthly(at: monthlyReset), "monthly numeric expires at reset equality")
+        XCTAssertNil(decoded.currentMonthly(at: monthlyReset.addingTimeInterval(0.001)))
+        XCTAssertNotNil(decoded.currentWindow(decoded.fiveHour, at: monthlyReset),
+                         "monthly reset does not invalidate the unreset sibling")
+        XCTAssertTrue(decoded.timelineDates(after: now).contains(monthlyReset))
+        XCTAssertFalse(decoded.timelineDates(after: monthlyReset).contains(monthlyReset))
+
+        var missingResetRoot = root
+        var monthlyWithoutReset = monthlyObject
+        monthlyWithoutReset.removeValue(forKey: "resetsAtMs")
+        missingResetRoot["monthly"] = monthlyWithoutReset
+        let missingResetData = try JSONSerialization.data(withJSONObject: missingResetRoot)
+        let missingReset = try WidgetSnapshotCodec.decode(missingResetData, now: now)
+        XCTAssertNil(missingReset.monthly?.resetsAt,
+                     "v2 monthly without the optional reset remains compatible and unknown")
+
+        let oldV1 = validPayload(replacing: "\"monthly\":null",
+            with: "\"monthly\":{\"usedAmount\":25.5,\"limitAmount\":100,\"sourceSymbol\":\"🪙\"}")
+        XCTAssertNil(try WidgetSnapshotCodec.decode(Data(oldV1.utf8), now: now).monthly?.resetsAt,
+                     "legacy v1 monthly shape has no reset and remains readable")
+    }
+
+    func testLegacyV1AcceptsFractionalOptionalDatesWhileV2RejectsTheSameTimestamps() throws {
+        let v1 = """
+        {"schemaVersion":1,"writtenAtMs":1800000000000,
+         "observedAtMs":1800000000000.25,"validUntilMs":1800000120000.5,
+         "hubSource":"direct","hubState":"ready",
+         "fiveHour":{"remainingPercent":50,"resetsAtMs":1800003600000.75,
+                     "usedAmount":50,"limitAmount":100,"sourceSymbol":"🪙"},
+         "sevenDay":null,"monthly":null,"local":null}
+        """
+        let decodedV1 = try WidgetSnapshotCodec.decode(Data(v1.utf8), now: now)
+        XCTAssertEqual(decodedV1.observedAt?.timeIntervalSince1970 ?? -1,
+                       1_800_000_000.00025, accuracy: 0.000001)
+        XCTAssertEqual(decodedV1.validUntil?.timeIntervalSince1970 ?? -1,
+                       1_800_000_120.0005, accuracy: 0.000001)
+        XCTAssertEqual(decodedV1.fiveHour?.resetsAt?.timeIntervalSince1970 ?? -1,
+                       1_800_003_600.00075, accuracy: 0.000001)
+
+        let v2 = v1
+            .replacingOccurrences(of: "\"schemaVersion\":1", with: "\"schemaVersion\":2")
+            .replacingOccurrences(of: "\"local\":null}",
+                with: "\"local\":null,\"resetVoucherCount\":null,\"states\":{\"fiveHour\":null,\"sevenDay\":null,\"monthly\":null}}")
+        XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(v2.utf8), now: now),
+            "v2 rejects the same fractional observed, validity, and numeric reset timestamps")
+    }
+
+    /// R6 wire-level coverage can compile before the shared model exposes typed
+    /// states: the contract is observed at JSON decode/re-encode boundaries.
+    func testSchemaV2StateWireRoundTripAndV1UpgradeCompatibility() throws {
+        let states = #"{"fiveHour":{"kind":"unlimited","resetsAtMs":1800003600000},"sevenDay":{"kind":"exceeded","resetsAtMs":1800007200000},"monthly":{"kind":"exceeded","resetsAtMs":null}}"#
+        let seven = #"{"remainingPercent":0,"resetsAtMs":1800007200000,"usedAmount":120,"limitAmount":100,"sourceSymbol":"🪙"}"#
+        let payload = schemaV2Payload(states: states, fiveHour: "null", sevenDay: seven,
+                                      monthly: "null", resetVoucherCount: "0")
+        XCTAssertNoThrow(try JSONSerialization.jsonObject(with: Data(payload.utf8)))
+        let decoded = try WidgetSnapshotCodec.decode(Data(payload.utf8), now: now)
+        XCTAssertEqual(decoded.resetVoucherCount, 0, "valid zero stays distinct from unknown")
+        XCTAssertEqual(decoded.sevenDay?.usedAmount, 120)
+        XCTAssertEqual(decoded.sevenDay?.limitAmount, 100)
+        XCTAssertEqual(decoded.sevenDay?.resetsAt, now.addingTimeInterval(7_200))
+        let encoded = try WidgetSnapshotCodec.encode(decoded)
+        let sourceRoot = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+        let encodedRoot = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let sourceStates = try XCTUnwrap(sourceRoot["states"] as? [String: Any])
+        let encodedStates = try XCTUnwrap(encodedRoot["states"] as? [String: Any])
+        XCTAssertEqual(try JSONSerialization.data(withJSONObject: sourceStates, options: [.sortedKeys]),
+                       try JSONSerialization.data(withJSONObject: encodedStates, options: [.sortedKeys]),
+                       "v2 reconstruction and encode retain all three states and their resets")
+        XCTAssertEqual(encodedRoot["resetVoucherCount"] as? Int, 0)
+
+        let v1 = try WidgetSnapshotCodec.decode(Data(validPayload(replacing: "", with: "").utf8), now: now)
+        let upgraded = try WidgetSnapshotCodec.encode(v1)
+        let upgradedRoot = try XCTUnwrap(JSONSerialization.jsonObject(with: upgraded) as? [String: Any])
+        let upgradedStates = try XCTUnwrap(upgradedRoot["states"] as? [String: Any])
+        XCTAssertEqual(Set(upgradedStates.keys), Set(["fiveHour", "sevenDay", "monthly"]))
+        XCTAssertTrue(upgradedStates.values.allSatisfy { $0 is NSNull },
+                      "v1 remains readable and upgrades with an empty state map")
+
+        let unknownVoucher = payload.replacingOccurrences(of: "\"resetVoucherCount\":0",
+                                                           with: "\"resetVoucherCount\":null")
+        XCTAssertNil(try WidgetSnapshotCodec.decode(Data(unknownVoucher.utf8), now: now).resetVoucherCount)
+    }
+
+    func testSchemaV2RejectsMalformedOrConflictingStateWireObjects() {
+        let validStates = #"{"fiveHour":{"kind":"unlimited","resetsAtMs":null},"sevenDay":null,"monthly":null}"#
+        let numeric = #"{"remainingPercent":50,"resetsAtMs":null}"#
+        let cases: [(String, String, String, String, String)] = [
+            ("missing state key", #"{"fiveHour":null,"sevenDay":null}"#, "null", "null", "null"),
+            ("unknown state key", #"{"fiveHour":null,"sevenDay":null,"monthly":null,"extra":null}"#, "null", "null", "null"),
+            ("unknown kind", #"{"fiveHour":{"kind":"other","resetsAtMs":null},"sevenDay":null,"monthly":null}"#, "null", "null", "null"),
+            ("wrong reset type", #"{"fiveHour":{"kind":"exceeded","resetsAtMs":"later"},"sevenDay":null,"monthly":null}"#, "null", "null", "null"),
+            ("unlimited with numeric value", validStates, numeric, "null", "null"),
+            ("mismatched state and numeric reset", #"{"fiveHour":null,"sevenDay":{"kind":"exceeded","resetsAtMs":1800003600000},"monthly":null}"#, "null", #"{"remainingPercent":50,"resetsAtMs":1800007200000}"#, "null")
+        ]
+        for (label, states, five, seven, monthly) in cases {
+            let payload = schemaV2Payload(states: states, fiveHour: five, sevenDay: seven,
+                                          monthly: monthly, resetVoucherCount: "null")
+            XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(payload.utf8), now: now),
+                                 "malformed v2 state case must fail: \(label)")
+        }
+        let missingStates = validPayload(replacing: "\"schemaVersion\":1", with: "\"schemaVersion\":2")
+        XCTAssertThrowsError(try WidgetSnapshotCodec.decode(Data(missingStates.utf8), now: now),
+                             "schema v2 requires the complete states object")
+    }
+
     /// 1.1.5 及更早的快照没有券字段；升级瞬间必须解码为未知，而不是整份快照失败。
     func testDecodeAcceptsPayloadWithoutResetVoucherCount() throws {
         let decoded = try WidgetSnapshotCodec.decode(Data(validPayload(replacing: "\"local\":null",
@@ -458,4 +582,14 @@ private func validPayload(replacing original: String, with replacement: String) 
      "fiveHour":null,"sevenDay":null,"monthly":null,"local":null}
     """
     return base.replacingOccurrences(of: original, with: replacement)
+}
+
+private func schemaV2Payload(states: String, fiveHour: String, sevenDay: String,
+                             monthly: String, resetVoucherCount: String) -> String {
+    """
+    {"schemaVersion":2,"writtenAtMs":1800000000000,"observedAtMs":null,
+     "validUntilMs":null,"hubSource":"direct","hubState":"ready",
+     "fiveHour":\(fiveHour),"sevenDay":\(sevenDay),"monthly":\(monthly),"local":null,
+     "resetVoucherCount":\(resetVoucherCount),"states":\(states)}
+    """
 }

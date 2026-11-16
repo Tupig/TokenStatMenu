@@ -14,6 +14,7 @@ struct WidgetEntry: TimelineEntry {
 /// 小组件视图：数据缺失时显示“未知”，不借用其他窗口的值或将过期数据当作当前值。
 struct WidgetEntryView: View {
     let entry: WidgetEntry
+    @Environment(\.displayScale) private var displayScale
 
     private var snapshot: WidgetQuotaSnapshot? { entry.snapshot }
 
@@ -57,15 +58,20 @@ struct WidgetEntryView: View {
     private func content(_ snapshot: WidgetQuotaSnapshot) -> some View {
         // 边界时间线负责推进；渲染若延迟，仍按实际时间拒绝过期数据。
         let now = max(entry.date, Date.now)
-        let five = snapshot.currentWindow(snapshot.fiveHour, at: now)
-        let seven = snapshot.currentWindow(snapshot.sevenDay, at: now)
-        let monthly = snapshot.currentMonthly(at: now)
+        let fiveState = snapshot.currentState(.fiveHour, at: now)
+        let sevenState = snapshot.currentState(.sevenDay, at: now)
+        let monthlyState = snapshot.currentState(.monthly, at: now)
+        let five = snapshot.currentWindow(snapshot.fiveHour, field: .fiveHour, at: now)
+        let seven = snapshot.currentWindow(snapshot.sevenDay, field: .sevenDay, at: now)
+        let monthly = snapshot.currentMonthly(at: now, field: .monthly)
         return VStack(alignment: .leading, spacing: 0) {
-            quotaLine("5 小时", five)
+            if five != nil || fiveState != nil {
+                quotaLine("5 小时", five, state: fiveState)
+                Spacer(minLength: 6)
+            }
+            quotaLine("7 天", seven, state: sevenState)
             Spacer(minLength: 6)
-            quotaLine("7 天", seven)
-            Spacer(minLength: 6)
-            monthlyLine(monthly)
+            monthlyLine(monthly, state: monthlyState)
             Spacer(minLength: 6)
             voucherLine(snapshot.currentResetVoucherCount(at: now))
         }
@@ -74,13 +80,28 @@ struct WidgetEntryView: View {
 
     /// 标题、剩余百分比、已用进度条；下方左侧为窗口最大额度，右侧为重置时间。
     private func quotaLine(_ label: String,
-                           _ window: WidgetQuotaSnapshot.Window?) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+                           _ window: WidgetQuotaSnapshot.Window?,
+                           state: WidgetQuotaValueState?) -> some View {
+        let barValue: Double?
+        if case .unlimited? = state {
+            barValue = nil
+        } else {
+            barValue = window?.usedPercent
+        }
+        return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 2) {
                 Text(label)
                     .font(.system(size: 10, weight: .medium))
                 Spacer(minLength: 2)
-                if let window {
+                if case .unlimited? = state {
+                    Text("不限额")
+                        .font(.system(size: 10, weight: .semibold))
+                } else if case .exceeded? = state {
+                    let actualPercent = window?.displayedUsedPercent
+                    Text(actualPercent.map { "已超限 \(percentText($0))%" } ?? "已超限")
+                        .font(.system(size: 10, weight: .semibold))
+                        .monospacedDigit()
+                } else if let window {
                     Text("剩余 \(percentText(window.remainingPercent))%")
                         .font(.system(size: 10, weight: .semibold))
                         .monospacedDigit()
@@ -90,35 +111,55 @@ struct WidgetEntryView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            quotaBar(window?.usedPercent)
+            quotaBar(barValue)
             HStack(spacing: 2) {
-                Text(windowLimit(window))
+            Text(windowLimit(window, state: state))
                     .font(.system(size: 10, weight: .medium))
                     .monospacedDigit()
                     .lineLimit(1)
                     .minimumScaleFactor(0.85)
                 Spacer(minLength: 2)
-                Text(resetText(window?.resetsAt))
+                Text(resetText(state?.resetAt ?? window?.resetsAt))
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.85)
             }
+            .padding(.top, 2 / displayScale)
         }
     }
 
     /// 月度只显示已用金额，不显示进度条。
-    private func monthlyLine(_ monthly: WidgetQuotaSnapshot.Monthly?) -> some View {
+    private func monthlyLine(_ monthly: WidgetQuotaSnapshot.Monthly?,
+                             state: WidgetQuotaValueState?) -> some View {
         HStack(spacing: 2) {
             Text("月度用量")
                 .font(.system(size: 10, weight: .medium))
             Spacer(minLength: 2)
             if let monthly {
-                Text("\(monthly.sourceSymbol)\(monthlyAmountText(monthly.usedAmount))")
+                let amount = formattedAmount(monthly.sourceSymbol, monthly.usedAmount, fixed: true)
+                if case .exceeded? = state {
+                    Text("已超限 \(amount)")
+                        .font(.system(size: 10, weight: .semibold))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                } else if case .unlimited? = state {
+                    Text("不限额")
+                        .font(.system(size: 10, weight: .semibold))
+                } else {
+                    Text(amount)
+                        .font(.system(size: 10, weight: .semibold))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                }
+            } else if case .unlimited? = state {
+                Text("不限额")
                     .font(.system(size: 10, weight: .semibold))
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.85)
+            } else if case .exceeded? = state {
+                Text("已超限")
+                    .font(.system(size: 10, weight: .semibold))
             } else {
                 Text("未知")
                     .font(.system(size: 10))
@@ -142,12 +183,21 @@ struct WidgetEntryView: View {
     }
 
     /// 进度条下方只显示窗口最大额度；已用比例已在上方文字和进度条中表达。
-    private func windowLimit(_ window: WidgetQuotaSnapshot.Window?) -> String {
+    private func windowLimit(_ window: WidgetQuotaSnapshot.Window?,
+                             state: WidgetQuotaValueState?) -> String {
+        if case .unlimited? = state { return "不设上限" }
         guard let limit = window?.limitAmount else { return "额度未知" }
         if let symbol = window?.sourceSymbol {
-            return "\(symbol)\(amountText(limit))"
+            return formattedAmount(symbol, limit, fixed: symbol == "🪙")
         }
         return amountText(limit)
+    }
+
+    /// 新版积分使用固定符号、空格和两位小数；旧 AX 美元格式保持原样。
+    private func formattedAmount(_ symbol: String, _ value: Double, fixed: Bool) -> String {
+        if symbol == "🪙" { return "🪙 \(coinAmountText(value))" }
+        let amount = fixed ? monthlyAmountText(value) : amountText(value)
+        return "\(symbol)\(amount)"
     }
 
     private func resetText(_ date: Date?) -> String {
@@ -196,6 +246,18 @@ struct WidgetEntryView: View {
         formatter.usesGroupingSeparator = true
         formatter.minimumFractionDigits = 2
         formatter.maximumFractionDigits = 2
+        return formatter.string(from: NSNumber(value: value)) ?? String(format: "%.2f", value)
+    }
+
+    /// 与 Token Hub `Intl.NumberFormat(en-US, {min/maxFractionDigits: 2})` 对齐，正数 halfExpand。
+    private func coinAmountText(_ value: Double) -> String {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        formatter.roundingMode = .halfUp
         return formatter.string(from: NSNumber(value: value)) ?? String(format: "%.2f", value)
     }
 }

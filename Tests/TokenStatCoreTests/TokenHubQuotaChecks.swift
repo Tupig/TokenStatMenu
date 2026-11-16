@@ -81,6 +81,26 @@ extension CoreChecks {
         check(valid.snapshot?.fiveHour?.resetDisplay == "02-29 23:59",
               "leap-day reset text preserved without year inference")
 
+        let coinPair = hubWindow(percentText: "已使用 12.34%", amount: "🪙 12.34 / 100.00",
+                                 progress: Decimal(string: "12.34"))
+        let coinPairPass = hubPass(five: coinPair, fiveMarker: true)
+        let coinPairResult = hubParse(hubObservation(first: coinPairPass, second: coinPairPass))
+        check(coinPairResult.snapshot?.fiveHour?.usedAmount == Decimal(string: "12.34")
+            && coinPairResult.snapshot?.fiveHour?.limitAmount == Decimal(100)
+            && coinPairResult.snapshot?.fiveHour?.usedPercent == Decimal(string: "12.34")
+            && coinPairResult.snapshot?.fiveHour?.sourceSymbol == "🪙",
+              "AX compatibility parser accepts a coin pair and retains its observed unit")
+        let coinSingle = TokenHubMonthlyObservation(amountText: "🪙 12.34")
+        let coinSinglePass = hubPass(monthlyCount: 1, monthly: coinSingle)
+        let coinSingleResult = hubParse(hubObservation(first: coinSinglePass, second: coinSinglePass))
+        check(coinSingleResult.snapshot?.monthly?.usedAmount == Decimal(string: "12.34")
+            && coinSingleResult.snapshot?.monthly?.sourceSymbol == "🪙",
+              "AX compatibility parser accepts a single coin amount and retains its observed unit")
+        let brokenCoin = hubWindow(amount: "🪙 12,34 / 100.00")
+        let brokenCoinPass = hubPass(five: brokenCoin, fiveMarker: true)
+        check(hubParse(hubObservation(first: brokenCoinPass, second: brokenCoinPass)).snapshot == nil,
+              "AX coin pair still rejects malformed grouping")
+
         let seven = hubWindow(.sevenDay, percentText: "已使用 37.5%", amount: "$3.75 / $10.00")
         let both = hubParse(hubObservation(first: hubPass(five: hubWindow(), fiveMarker: true,
                                                            seven: seven, sevenMarker: true),

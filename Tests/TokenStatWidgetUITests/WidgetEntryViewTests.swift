@@ -7,6 +7,31 @@ import TokenStatWidgetShared
 
 @MainActor
 final class WidgetEntryViewTests: XCTestCase {
+    func testActualWidgetRendersSchemaV2UnlimitedAndExceededStates() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let payload = #"""
+        {"schemaVersion":2,"writtenAtMs":1800000000000,"observedAtMs":1800000000000,
+         "validUntilMs":1800000120000,"hubSource":"direct","hubState":"ready",
+         "fiveHour":null,
+         "sevenDay":{"remainingPercent":0,"resetsAtMs":1800007200000,
+                      "usedAmount":120,"limitAmount":100,"sourceSymbol":"🪙"},
+         "monthly":null,"local":null,"resetVoucherCount":0,
+         "states":{"fiveHour":{"kind":"unlimited","resetsAtMs":1800003600000},
+                   "sevenDay":{"kind":"exceeded","resetsAtMs":1800007200000},
+                   "monthly":{"kind":"exceeded","resetsAtMs":null}}}
+        """#
+        let snapshot = try WidgetSnapshotCodec.decode(Data(payload.utf8), now: now)
+        for dark in [false, true] {
+            let rendered = try await render(
+                WidgetEntry(date: now, snapshot: snapshot, channelAvailable: true), dark: dark)
+            XCTAssertTrue(rendered.labels.contains("不限额"), rendered.labels)
+            XCTAssertTrue(rendered.labels.contains("5小时"), rendered.text)
+            XCTAssertTrue(rendered.labels.contains("已超限"), rendered.labels)
+            XCTAssertTrue(rendered.text.contains("120"), rendered.text)
+            XCTAssertTrue(rendered.text.contains("0张"), rendered.text)
+        }
+    }
+
     func testActualWidgetRendersCurrentUnknownExpiredResetAndUnavailableStates() async throws {
         // 产品取 max(entry.date, Date.now)；提前一小时的条目时间让本组
         // 慢速图像识别期间仍按同一逻辑时钟验证，不修改产品时钟策略。
@@ -24,7 +49,7 @@ final class WidgetEntryViewTests: XCTestCase {
         let expired = snapshot(observed: now.addingTimeInterval(-121), reset: now.addingTimeInterval(600))
         let reset = snapshot(observed: now, reset: now.addingTimeInterval(-1))
         func assertLabels(_ result: RenderResult) {
-            for label in ["5小时", "7天", "月度用量"] {
+            for label in ["7天", "月度用量"] {
                 XCTAssertTrue(result.labels.contains(label), "top-1: \(result.text)\n候选: \(result.labels)")
             }
             XCTAssertTrue(result.hasExactVoucherLabel,
@@ -37,6 +62,7 @@ final class WidgetEntryViewTests: XCTestCase {
         for dark in [false, true] {
             let live = try await render(.init(date: now, snapshot: current, channelAvailable: true), dark: dark)
             assertLabels(live)
+            XCTAssertTrue(live.labels.contains("5小时"), live.text)
             XCTAssertTrue(live.text.contains("87.66%"), live.text)
             XCTAssertTrue(live.text.contains("43.22%"), live.text)
             XCTAssertTrue(live.text.contains("1,234.56"), live.text)
@@ -44,16 +70,18 @@ final class WidgetEntryViewTests: XCTestCase {
             let stale = try await render(.init(date: now, snapshot: expired, channelAvailable: true), dark: dark, needsUnknown: true)
             XCTAssertTrue(stale.labels.contains("未知"), stale.text)
             assertLabels(stale)
+            XCTAssertFalse(stale.labels.contains("5小时"), stale.text)
             assertNoOldValues(stale)
-            let resetText = try await render(.init(date: now, snapshot: reset, channelAvailable: true), dark: dark, needsUnknown: true)
+            let resetText = try await render(.init(date: now, snapshot: reset, channelAvailable: true), dark: dark)
             XCTAssertFalse(resetText.text.contains("87.66"), resetText.text)
             XCTAssertTrue(resetText.text.contains("43.22%"), resetText.text)
-            XCTAssertTrue(resetText.labels.contains("未知"), resetText.text)
             assertLabels(resetText)
+            XCTAssertFalse(resetText.labels.contains("5小时"), resetText.text)
             XCTAssertTrue(resetText.text.contains("1,234.56") && resetText.text.contains("3张"), resetText.text)
             let sevenExpired = snapshot(observed: now, reset: now.addingTimeInterval(600), sevenReset: now.addingTimeInterval(-1))
             let reverse = try await render(.init(date: now, snapshot: sevenExpired, channelAvailable: true), dark: dark, needsUnknown: true)
             assertLabels(reverse)
+            XCTAssertTrue(reverse.labels.contains("5小时"), reverse.text)
             XCTAssertTrue(reverse.text.contains("87.66%") && reverse.labels.contains("未知"), reverse.text)
             XCTAssertFalse(reverse.text.contains("43.22"), reverse.text)
             XCTAssertTrue(reverse.text.contains("1,234.56") && reverse.text.contains("3张"), reverse.text)
@@ -63,6 +91,7 @@ final class WidgetEntryViewTests: XCTestCase {
                     monthly: nil, local: nil, resetVoucherCount: vouchers)
                 let text = try await render(.init(date: now, snapshot: partial, channelAvailable: true), dark: dark, needsUnknown: true)
                 assertLabels(text)
+                XCTAssertFalse(text.labels.contains("5小时"), text.text)
                 XCTAssertTrue(text.text.contains("43.22%") && text.labels.contains("未知"), text.text)
                 XCTAssertFalse(text.text.contains("87.66") || text.text.contains("1,234.56") || text.text.contains("3张"), text.text)
                 XCTAssertEqual(text.text.contains("0张"), vouchers == 0, text.text)
@@ -187,7 +216,7 @@ final class WidgetEntryViewTests: XCTestCase {
         var required: [[String]]
         if !entry.channelAvailable { required = [["共享通道不可用"]] }
         else if entry.snapshot == nil { required = [["尚未获取数据"]] }
-        else { required = [["5小时"], ["7天"], ["月度用量"], ["重置券", "重置劵"]] }
+        else { required = [["7天"], ["月度用量"], ["重置券", "重置劵"]] }
         if needsUnknown { required.append(["未知"]) }
         var attempts: [() throws -> [String]] = []
         for observation in observations {

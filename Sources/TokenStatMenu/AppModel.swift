@@ -107,6 +107,7 @@ struct DirectQuotaTransportSnapshot: Sendable {
     let monthly: TokenHubMonthlyUsage?
     /// 重置券数量；接口失败时为 nil，不能当作 0。
     let resetVoucherCount: Int?
+    let states: [TokenHubQuotaField: TokenHubQuotaValueState]
     let observedAt: Date
 
     func materializedSnapshot() -> TokenHubQuotaSnapshot {
@@ -116,12 +117,13 @@ struct DirectQuotaTransportSnapshot: Sendable {
         return TokenHubQuotaSnapshot(identity: sanitizedIdentity, fiveHour: fiveHour,
                                      sevenDay: sevenDay, monthly: monthly,
                                      resetVoucherCount: resetVoucherCount,
-                                     observedAt: observedAt)
+                                     observedAt: observedAt, states: states)
     }
 
     init(snapshot: TokenHubQuotaSnapshot) {
         fiveHour = snapshot.fiveHour; sevenDay = snapshot.sevenDay
         monthly = snapshot.monthly; resetVoucherCount = snapshot.resetVoucherCount
+        states = snapshot.states
         observedAt = snapshot.observedAt
     }
 }
@@ -288,6 +290,8 @@ struct PresentationTimeState: Equatable {
     let monthlyFresh: Bool
     let fiveHour: Window?
     let sevenDay: Window?
+    let hubStates: [TokenHubQuotaField: Window]
+    let monthlyQuota: Window?
 }
 
 /// 按同一时刻计算 Token Hub 的显示状态，使菜单、诊断和卡片一致，避免重复格式化日期和 Decimal。
@@ -307,6 +311,8 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     let fiveHourCurrent: TokenHubWindowQuota?
     let sevenDayCurrent: TokenHubWindowQuota?
     let monthlyCurrent: TokenHubMonthlyUsage?
+    /// 当前 freshness/reset 有效的异常状态；保留字段映射以供各展示端一致投影。
+    let states: [TokenHubQuotaField: TokenHubQuotaValueState]
     let fiveHour: WindowProjection?
     let sevenDay: WindowProjection?
     let menuAlertLevel: AlertLevel
@@ -316,7 +322,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         guard let snapshot else {
             return TokenHubQuotaPresentation(snapshot: nil, futureObservation: false, snapshotFresh: false,
                 fiveHourCurrent: nil, sevenDayCurrent: nil, monthlyCurrent: nil,
-                fiveHour: nil, sevenDay: nil, menuAlertLevel: .none)
+                states: [:], fiveHour: nil, sevenDay: nil, menuAlertLevel: .none)
         }
         let future = snapshot.observedAt > now
         let fresh = !future && now.timeIntervalSince(snapshot.observedAt) <= max(120, refreshSeconds * 2)
@@ -326,11 +332,60 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
                     resetPassed: raw.resetAt.map { $0 <= now } ?? false, resetAt: raw.resetAt)
             }
         }
+        func stateIsCurrent(_ field: TokenHubQuotaField, _ state: TokenHubQuotaValueState) -> Bool {
+            guard fresh else { return false }
+            let numericReset: Date?
+            let hasNumeric: Bool
+            switch field {
+            case .fiveHour:
+                numericReset = snapshot.fiveHour?.resetAt
+                hasNumeric = snapshot.fiveHour != nil
+            case .sevenDay:
+                numericReset = snapshot.sevenDay?.resetAt
+                hasNumeric = snapshot.sevenDay != nil
+            case .monthly:
+                numericReset = snapshot.monthly?.resetAt
+                hasNumeric = snapshot.monthly != nil
+            }
+            if case .unlimited = state, hasNumeric { return false }
+            if let stateReset = state.resetAt, let numericReset, stateReset != numericReset { return false }
+            if let reset = state.resetAt ?? numericReset, reset <= now { return false }
+            return true
+        }
+        let currentStates = Dictionary(uniqueKeysWithValues: snapshot.states.compactMap { field, state in
+            stateIsCurrent(field, state) ? (field, state) : nil
+        })
+
+        func currentWindow(_ field: TokenHubQuotaField, _ value: TokenHubWindowQuota?) -> TokenHubWindowQuota? {
+            guard fresh, let value else { return nil }
+            if let state = snapshot.states[field] {
+                if case .unlimited = state { return nil }
+                if let stateReset = state.resetAt, let numericReset = value.resetAt,
+                   stateReset != numericReset { return nil }
+                if let reset = state.resetAt ?? value.resetAt, reset <= now { return nil }
+            } else if value.resetAt.map({ $0 <= now }) == true {
+                return nil
+            }
+            return value
+        }
         let fiveProjection = window(snapshot.fiveHour)
         let sevenProjection = window(snapshot.sevenDay)
-        let fiveCurrent = fresh && fiveProjection?.resetPassed != true ? snapshot.fiveHour : nil
-        let sevenCurrent = fresh && sevenProjection?.resetPassed != true ? snapshot.sevenDay : nil
-        let monthly = fresh ? snapshot.monthly : nil
+        let fiveCurrent = currentWindow(.fiveHour, snapshot.fiveHour)
+        let sevenCurrent = currentWindow(.sevenDay, snapshot.sevenDay)
+        let monthly: TokenHubMonthlyUsage?
+        if fresh, let value = snapshot.monthly {
+            if let state = snapshot.states[.monthly] {
+                if case .unlimited = state { monthly = nil }
+                else if let stateReset = state.resetAt, let numericReset = value.resetAt,
+                        stateReset != numericReset { monthly = nil }
+                else if let reset = state.resetAt ?? value.resetAt, reset <= now { monthly = nil }
+                else { monthly = value }
+            } else {
+                monthly = value.resetAt.map { $0 <= now } == true ? nil : value
+            }
+        } else {
+            monthly = nil
+        }
         let highest = [fiveCurrent?.usedPercent, sevenCurrent?.usedPercent].compactMap { $0 }.max()
         let alert: AlertLevel
         if let highest, highest >= Decimal(95) { alert = .critical }
@@ -338,7 +393,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         else { alert = .none }
         return TokenHubQuotaPresentation(snapshot: snapshot, futureObservation: future, snapshotFresh: fresh,
             fiveHourCurrent: fiveCurrent, sevenDayCurrent: sevenCurrent, monthlyCurrent: monthly,
-            fiveHour: fiveProjection, sevenDay: sevenProjection, menuAlertLevel: alert)
+            states: currentStates, fiveHour: fiveProjection, sevenDay: sevenProjection, menuAlertLevel: alert)
     }
 }
 
@@ -454,7 +509,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     var tokenHubQuotaReadingEnabled: Bool { usesDirectQuotaSource || tokenHubAutomaticReadingEnabled }
     var userFacingStatus: String {
         if tokenHubQuotaIsDirect, tokenHubQuotaStatus == .connected {
-            return "Seasun Token Hub 企业额度已自动读取；5 小时和 7 天重置时间来自后台响应。"
+            return "Seasun Token Hub 企业额度已自动读取；重置时间来自后台响应。"
         }
         if let failure = tokenHubDirectFailure {
             return "Seasun Token Hub 企业后台直接来源：\(directFailureText(failure))。"
@@ -550,10 +605,15 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
     private func publishWidgetSnapshot(at now: Date) {
         // 预览和测试不发布快照，避免模拟数值出现在真实系统界面。
         guard !isPreview, !isTestFixture else { return }
-        let presentation = quotaPresentation(at: now)
         guard shouldPublishWidgetState else { return }
+        widgetPublisher.publish(makeWidgetQuotaSnapshot(at: now))
+    }
+
+    /// 纯投影入口供契约检查观察真实 App → Widget 映射，不触碰 App Group。
+    func makeWidgetQuotaSnapshot(at now: Date) -> WidgetQuotaSnapshot {
+        let presentation = quotaPresentation(at: now)
         let source: WidgetQuotaSnapshot.HubSource
-        if tokenHubQuotaIsDirect, tokenHubQuotaStatus == .connected || tokenHubQuotaStatus == .stale {
+        if tokenHubQuotaIsDirect && (tokenHubQuotaStatus == .connected || tokenHubQuotaStatus == .stale) {
             source = .direct
         } else if tokenHubQuotaSnapshot != nil {
             source = .compatibility
@@ -574,7 +634,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         func window(_ quota: TokenHubWindowQuota?) -> WidgetQuotaSnapshot.Window? {
             guard let quota else { return nil }
             let percent = NSDecimalNumber(decimal: quota.remainingPercent).doubleValue
-            guard percent.isFinite, (0...100).contains(percent) else { return nil }
+            guard percent.isFinite, percent >= 0 else { return nil }
             let used = NSDecimalNumber(decimal: quota.usedAmount).doubleValue
             let limit = NSDecimalNumber(decimal: quota.limitAmount).doubleValue
             return WidgetQuotaSnapshot.Window(
@@ -590,9 +650,9 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             guard used.isFinite, used >= 0,
                   limit.map({ $0.isFinite && $0 >= 0 }) ?? true else { return nil }
             return WidgetQuotaSnapshot.Monthly(
-                usedAmount: used, limitAmount: limit, sourceSymbol: usage.sourceSymbol)
+                usedAmount: used, limitAmount: limit, sourceSymbol: usage.sourceSymbol,
+                resetsAt: usage.resetAt)
         }
-        guard presentation.monthlyCurrent == nil || monthly != nil else { return }
         let local: WidgetQuotaSnapshot.Local? = {
             let snapshot = localSnapshot
             guard snapshot.filesScanned > 0 || snapshot.total > 0 else { return nil }
@@ -602,15 +662,29 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
                 unknownThreads: snapshot.unknownThreadCount, isLimited: snapshot.isLimited)
         }()
         let observedAt = tokenHubQuotaSnapshot?.observedAt
-        let published = WidgetQuotaSnapshot(
+        let states = Dictionary(uniqueKeysWithValues: presentation.states.map { field, state in
+            let widgetField: WidgetQuotaField
+            switch field {
+            case .fiveHour: widgetField = .fiveHour
+            case .sevenDay: widgetField = .sevenDay
+            case .monthly: widgetField = .monthly
+            }
+            let widgetState: WidgetQuotaValueState
+            switch state {
+            case .unlimited(let resetAt): widgetState = .unlimited(resetAt: resetAt)
+            case .exceeded(let resetAt): widgetState = .exceeded(resetAt: resetAt)
+            }
+            return (widgetField, widgetState)
+        })
+        return WidgetQuotaSnapshot(
             writtenAt: now, observedAt: observedAt,
             validUntil: observedAt.map { $0.addingTimeInterval(max(120, config.refreshSeconds * 2)) },
             hubSource: source, hubState: state,
             fiveHour: window(presentation.fiveHourCurrent),
             sevenDay: window(presentation.sevenDayCurrent),
             monthly: monthly, local: local,
-            resetVoucherCount: presentation.snapshotFresh ? presentation.snapshot?.resetVoucherCount : nil)
-        widgetPublisher.publish(published)
+            resetVoucherCount: presentation.snapshotFresh ? presentation.snapshot?.resetVoucherCount : nil,
+            states: states)
     }
 
     /// 每次刷新只保留最近十分钟闭区间内的样本，界面隐藏或无法采样时也清理。
@@ -686,10 +760,26 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
             PresentationTimeState.Window(futureObservation: $0.futureObservation, fresh: $0.fresh,
                 resetPassed: $0.resetPassed, resetAt: $0.resetAt)
         }
+        let hubStates = Dictionary(uniqueKeysWithValues: (tokenHubQuotaSnapshot?.states ?? [:]).map { field, state in
+            let resetAt = state.resetAt
+            return (field, PresentationTimeState.Window(
+                futureObservation: tokenHubQuotaSnapshot.map { $0.observedAt > now } ?? false,
+                fresh: quotaPresentation.snapshotFresh,
+                resetPassed: resetAt.map { $0 <= now } ?? false,
+                resetAt: resetAt))
+        })
+        let monthlyQuotaTime = tokenHubQuotaSnapshot?.monthly.map { monthly in
+            PresentationTimeState.Window(
+                futureObservation: tokenHubQuotaSnapshot.map { $0.observedAt > now } ?? false,
+                fresh: quotaPresentation.snapshotFresh,
+                resetPassed: monthly.resetAt.map { $0 <= now } ?? false,
+                resetAt: monthly.resetAt)
+        }
         return PresentationTimeState(localLive: freshLocalLiveTurn(at: now) != nil,
             tokenHubFresh: quotaPresentation.snapshotFresh, monthlyFresh: freshQuota(at: now) != nil,
             fiveHour: tokenHubQuotaIsDirect ? fiveHourState : window(fiveHourQuota),
-            sevenDay: tokenHubQuotaIsDirect ? sevenDayState : window(sevenDayQuota))
+            sevenDay: tokenHubQuotaIsDirect ? sevenDayState : window(sevenDayQuota),
+            hubStates: hubStates, monthlyQuota: monthlyQuotaTime)
     }
     var quotaPresentation: TokenHubQuotaPresentation { quotaPresentation(at: tokenHubNow()) }
     func quotaPresentation(at now: Date) -> TokenHubQuotaPresentation {
@@ -705,6 +795,7 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         return TokenHubQuotaPresentation(snapshot: projected.snapshot,
             futureObservation: projected.futureObservation, snapshotFresh: false,
             fiveHourCurrent: nil, sevenDayCurrent: nil, monthlyCurrent: nil,
+            states: [:],
             fiveHour: historical(projected.fiveHour), sevenDay: historical(projected.sevenDay),
             menuAlertLevel: .none)
     }
@@ -737,20 +828,52 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         let now = tokenHubNow()
         return title(at: now, quotaPresentation: quotaPresentation(at: now))
     }
-    /// 菜单栏只显示三个额度数字：5 小时已用、7 天已用、月度用量。
+    /// 菜单栏显示当前可用的额度数字。
     func title(at now: Date, quotaPresentation: TokenHubQuotaPresentation) -> String {
-        let five = quotaPresentation.fiveHourCurrent.map { menuPercent($0.usedPercent) } ?? "—"
-        let seven = quotaPresentation.sevenDayCurrent.map { menuPercent($0.usedPercent) } ?? "—"
-        let monthly = quotaPresentation.monthlyCurrent.map {
-            "\($0.sourceSymbol)\(menuAmount($0.usedAmount))"
-        } ?? "—"
-        return (isTestFixture ? "测试 " : "") + "\(five) | \(seven) | \(monthly)"
+        let five = quotaPresentation.fiveHourCurrent.map {
+            menuWindowText($0, state: quotaPresentation.states[.fiveHour])
+        } ?? (quotaPresentation.states[.fiveHour].map { menuWindowText(nil, state: $0) })
+        let seven = menuWindowText(quotaPresentation.sevenDayCurrent,
+                                   state: quotaPresentation.states[.sevenDay])
+        let monthly = menuMonthlyText(quotaPresentation.monthlyCurrent,
+                                      state: quotaPresentation.states[.monthly])
+        return (isTestFixture ? "测试 " : "") + [five, Optional(seven), Optional(monthly)]
+            .compactMap { $0 }.joined(separator: " | ")
+    }
+
+    private func menuWindowText(_ quota: TokenHubWindowQuota?, state: TokenHubQuotaValueState?) -> String {
+        switch state {
+        case .unlimited?: return "不限额"
+        case .exceeded?:
+            return quota.map { "已超限 \(menuPercent($0.usedPercent))" } ?? "已超限"
+        case nil:
+            return quota.map { menuPercent($0.usedPercent) } ?? "—"
+        }
+    }
+
+    private func menuMonthlyText(_ usage: TokenHubMonthlyUsage?, state: TokenHubQuotaValueState?) -> String {
+        switch state {
+        case .unlimited?: return "不限额"
+        case .exceeded?:
+            guard let usage else { return "已超限" }
+            return "已超限 \(menuFormattedAmount(usage.usedAmount, symbol: usage.sourceSymbol))"
+        case nil:
+            guard let usage else { return "—" }
+            return menuFormattedAmount(usage.usedAmount, symbol: usage.sourceSymbol)
+        }
+    }
+
+    private func menuFormattedAmount(_ value: Decimal, symbol: String) -> String {
+        if symbol == "🪙" {
+            return "🪙 \(Self.menuCoinAmountFormatter.string(from: NSDecimalNumber(decimal: value)) ?? "—")"
+        }
+        return "\(symbol)\(menuAmount(value))"
     }
 
     private func menuPercent(_ value: Decimal) -> String {
         let number = NSDecimalNumber(decimal: value).doubleValue
         guard number.isFinite else { return "—" }
-        return String(format: "%.2f%%", min(100, max(0, number)))
+        return String(format: "%.2f%%", number)
     }
 
     private static let menuAmountFormatter: NumberFormatter = {
@@ -763,6 +886,17 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         return formatter
     }()
 
+    private static let menuCoinAmountFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        formatter.roundingMode = .halfUp
+        return formatter
+    }()
+
     private func menuAmount(_ value: Decimal) -> String {
         Self.menuAmountFormatter.string(from: NSDecimalNumber(decimal: value)) ?? "—"
     }
@@ -771,8 +905,12 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         return menuTooltip(at: now, quotaPresentation: quotaPresentation(at: now))
     }
     func menuTooltip(at now: Date, quotaPresentation: TokenHubQuotaPresentation) -> String {
+        let hasCurrentFiveHour = quotaPresentation.fiveHourCurrent != nil
+            || quotaPresentation.states[.fiveHour] != nil
         if isPreview && config.dataSource != "localCodex" {
-            return "\(dataNotice) · \(sourceReadinessText)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .enterprise))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .enterprise))"
+            let five = hasCurrentFiveHour
+                ? "5 小时额度：\(quotaDescription(fiveHourQuota, source: .enterprise))\n" : ""
+            return "\(dataNotice) · \(sourceReadinessText)\n\(five)7 天额度：\(quotaDescription(sevenDayQuota, source: .enterprise))"
         }
         let live = freshLocalLiveTurn(at: now).map { String(format: "实时估算：输入 %.1f · 输出 %.1f tok/s（观测于 %@）", $0.inputTPS, $0.outputTPS, $0.observedAt.formatted()) } ?? "实时估算：未知（无新鲜活动 token_count）"
         let turn = localSnapshot.lastTurn.map { String(format: "上轮记录均速：%.1f tok/s（完成于 %@）", $0.outputTPS, $0.completedAt.formatted()) } ?? "上轮记录均速：未知"
@@ -783,7 +921,9 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         let amountLabel = localSnapshot.hasCompleteAccounting ? "本次扫描记录量" : "本次记录合计"
         let total = localSnapshot.knownThreadCount > 0 ? formatCount(localSnapshot.total) : "未知"
         let hub = tokenHubTooltipDetail(quotaPresentation)
-        return "\(userFacingStatus)\n当前配置关联的本机 Codex 记录；当前扫描范围：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(localDetailedMetricsTooltip)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
+        let localFive = hasCurrentFiveHour
+            ? "\n5 小时额度：\(quotaDescription(fiveHourQuota, source: .localCodex))" : ""
+        return "\(userFacingStatus)\n当前配置关联的本机 Codex 记录；当前扫描范围：输入 \(input) · 输出 \(output) · 总计 \(total) tokens（\(amountLabel) \(total) tokens）\n\(accountingDetail)\n\(coverage)；\(range)\n\(localDetailedMetricsTooltip)\n\(live)；\(turn)；实时值是最近活动 token_count 的短窗口估算；上轮均速含工具、网络和等待，不是模型瞬时生成速度\n\(hub)\(localFive)\n7 天额度：\(quotaDescription(sevenDayQuota, source: .localCodex))"
     }
     var localCacheReadout: String {
         guard localSnapshot.cacheCoverage.state == .complete,
@@ -859,26 +999,64 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         return lines.joined(separator: "\n")
     }
     private func tokenHubMenuSuffix(_ presentation: TokenHubQuotaPresentation) -> String {
-        let windows = [presentation.fiveHourCurrent.map { "5h剩 \(percentText($0.remainingPercent))" },
-                       presentation.sevenDayCurrent.map { "7d剩 \(percentText($0.remainingPercent))" }].compactMap { $0 }
+        let windows = [menuSuffixWindow("5h", presentation.fiveHourCurrent,
+                                        state: presentation.states[.fiveHour]),
+                       menuSuffixWindow("7d", presentation.sevenDayCurrent,
+                                        state: presentation.states[.sevenDay])].compactMap { $0 }
         return windows.isEmpty ? "" : " · Hub \(windows.joined(separator: " / "))"
+    }
+    private func menuSuffixWindow(_ label: String, _ quota: TokenHubWindowQuota?,
+                                  state: TokenHubQuotaValueState?) -> String? {
+        switch state {
+        case .unlimited?: return "\(label)不限额"
+        case .exceeded?: return quota.map { "\(label)已超限 \(percentText($0.usedPercent))" } ?? "\(label)已超限"
+        case nil: return quota.map { "\(label)剩 \(percentText($0.remainingPercent))" }
+        }
     }
     private var tokenHubMenuSuffix: String { tokenHubMenuSuffix(quotaPresentation) }
     var menuTitleContainsTokenHubSuffix: Bool { !tokenHubMenuSuffix.isEmpty }
     var tokenHubPermissionGrantedForDiagnostics: Bool { cachedTokenHubPermission }
     private func tokenHubTooltipDetail(_ presentation: TokenHubQuotaPresentation) -> String {
-        let five = presentation.fiveHourCurrent.map { "界面显示剩余 \(percentText($0.remainingPercent))（5 小时）" } ?? "5 小时未知"
-        let seven = presentation.sevenDayCurrent.map { "界面显示剩余 \(percentText($0.remainingPercent))（7 天）" } ?? "7 天未知"
+        let five = (presentation.fiveHourCurrent != nil || presentation.states[.fiveHour] != nil)
+            ? tooltipWindow("5 小时", presentation.fiveHourCurrent,
+                            state: presentation.states[.fiveHour]) : nil
+        let seven = tooltipWindow("7 天", presentation.sevenDayCurrent,
+                                  state: presentation.states[.sevenDay])
+        let monthly: String
+        switch presentation.states[.monthly] {
+        case .unlimited?: monthly = "月度不限额"
+        case .exceeded?:
+            monthly = presentation.monthlyCurrent.map {
+                "月度已超限 \(menuFormattedAmount($0.usedAmount, symbol: $0.sourceSymbol))"
+            } ?? "月度已超限"
+        case nil:
+            monthly = presentation.monthlyCurrent.map {
+                "月度用量 \(menuFormattedAmount($0.usedAmount, symbol: $0.sourceSymbol))"
+            } ?? "月度用量未知"
+        }
         let source = tokenHubQuotaIsDirect ? "Token Hub 后台直接响应" : "Token Hub 界面快照"
         let timing = tokenHubQuotaIsDirect ? "后台响应已提供" : "后台更新时间未提供"
-        let currency = tokenHubQuotaIsDirect ? "币种来自后台响应" : "币种来源待确认"
+        let currency = tokenHubQuotaIsDirect
+            ? "积分按 Token Hub 当前显示约定呈现；不作货币换算"
+            : "界面快照保留来源符号；币种来源待确认"
         let vouchers: String
         if presentation.snapshotFresh, let count = presentation.snapshot?.resetVoucherCount {
             vouchers = "重置券 \(count) 张"
         } else {
             vouchers = "重置券未知"
         }
-        return "\(source)：\(five) · \(seven)；\(vouchers)；\(tokenHubQuotaStatusText)；\(timing)；\(currency)"
+        let fields = ([five, Optional(seven), Optional(monthly)].compactMap { $0 }).joined(separator: " · ")
+        return "\(source)：\(fields)；\(vouchers)；\(tokenHubQuotaStatusText)；\(timing)；\(currency)"
+    }
+    private func tooltipWindow(_ label: String, _ quota: TokenHubWindowQuota?,
+                               state: TokenHubQuotaValueState?) -> String {
+        switch state {
+        case .unlimited?: return "\(label)不限额"
+        case .exceeded?:
+            return quota.map { "\(label)已超限 \(percentText($0.usedPercent))" } ?? "\(label)已超限"
+        case nil:
+            return quota.map { "界面显示剩余 \(percentText($0.remainingPercent))（\(label)）" } ?? "\(label)未知"
+        }
     }
     private func percentText(_ value: Decimal) -> String {
         TwoDecimalPercentFormatter.string(value)
@@ -1409,10 +1587,12 @@ struct TokenHubQuotaPresentation: Equatable, Sendable {
         let presentation = TokenHubQuotaPresentation.project(snapshot: snapshot, now: now,
             refreshSeconds: config.refreshSeconds)
         guard presentation.snapshotFresh,
-              presentation.fiveHourCurrent != nil || presentation.sevenDayCurrent != nil || presentation.monthlyCurrent != nil else { return nil }
+              presentation.fiveHourCurrent != nil || presentation.sevenDayCurrent != nil
+                || presentation.monthlyCurrent != nil || !presentation.states.isEmpty else { return nil }
         return TokenHubQuotaSnapshot(identity: snapshot.identity, fiveHour: presentation.fiveHourCurrent,
             sevenDay: presentation.sevenDayCurrent, monthly: presentation.monthlyCurrent,
-            resetVoucherCount: snapshot.resetVoucherCount, observedAt: snapshot.observedAt)
+            resetVoucherCount: snapshot.resetVoucherCount, observedAt: snapshot.observedAt,
+            states: presentation.states)
     }
 
     private func checkTokenHubPermissionIfDue(scheduleIfGranted: Bool = true) {

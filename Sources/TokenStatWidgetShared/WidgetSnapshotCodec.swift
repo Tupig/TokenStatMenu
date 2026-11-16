@@ -16,18 +16,21 @@ public enum WidgetSnapshotCodec {
         case invalidTimestamp(String)
     }
 
-    private static let rootKeys: Set<String> = [
+    private static let rootKeysV1: Set<String> = [
         "schemaVersion", "writtenAtMs", "observedAtMs", "validUntilMs",
         "hubSource", "hubState", "fiveHour", "sevenDay", "monthly", "local",
         "resetVoucherCount"
     ]
+    private static let rootKeysV2 = rootKeysV1.union(["states"])
+    private static let stateKeys: Set<String> = ["kind", "resetsAtMs"]
     private static let windowKeys: Set<String> = [
         "remainingPercent", "resetsAtMs", "usedAmount", "limitAmount", "sourceSymbol"
     ]
     private static let optionalWindowKeys: Set<String> = [
         "usedAmount", "limitAmount", "sourceSymbol"
     ]
-    private static let monthlyKeys: Set<String> = ["usedAmount", "limitAmount", "sourceSymbol"]
+    private static let monthlyKeysV1: Set<String> = ["usedAmount", "limitAmount", "sourceSymbol"]
+    private static let monthlyKeysV2 = monthlyKeysV1.union(["resetsAtMs"])
     private static let localKeys: Set<String> = [
         "inputTokens", "outputTokens", "totalTokens",
         "knownThreads", "unknownThreads", "isLimited"
@@ -44,7 +47,8 @@ public enum WidgetSnapshotCodec {
             "observedAtMs": snapshot.observedAt.map(milliseconds) ?? NSNull(),
             "validUntilMs": snapshot.validUntil.map(milliseconds) ?? NSNull(),
             "hubSource": snapshot.hubSource.rawValue,
-            "hubState": snapshot.hubState.rawValue
+            "hubState": snapshot.hubState.rawValue,
+            "states": encodeStates(snapshot.states)
         ]
         root["fiveHour"] = snapshot.fiveHour.map(encodeWindow) ?? NSNull()
         root["sevenDay"] = snapshot.sevenDay.map(encodeWindow) ?? NSNull()
@@ -88,6 +92,7 @@ public enum WidgetSnapshotCodec {
         }
         try validateWindow(snapshot.fiveHour, "fiveHour")
         try validateWindow(snapshot.sevenDay, "sevenDay")
+        try validateStates(snapshot)
         if let vouchers = snapshot.resetVoucherCount {
             guard (0...1_000_000).contains(vouchers) else {
                 throw CodecError.outOfRange("resetVoucherCount")
@@ -105,6 +110,9 @@ public enum WidgetSnapshotCodec {
             // 限制货币符号长度，避免异常字符串挤占小组件空间。
             guard monthly.sourceSymbol.count <= 4 else {
                 throw CodecError.outOfRange("monthly.sourceSymbol")
+            }
+            if let reset = monthly.resetsAt {
+                try validateTimestamp(reset, "monthly.resetsAtMs")
             }
         }
         if let local = snapshot.local {
@@ -140,7 +148,8 @@ public enum WidgetSnapshotCodec {
     private static func encodeMonthly(_ monthly: WidgetQuotaSnapshot.Monthly) -> [String: Any] {
         ["usedAmount": monthly.usedAmount,
          "limitAmount": monthly.limitAmount ?? NSNull(),
-         "sourceSymbol": monthly.sourceSymbol]
+         "sourceSymbol": monthly.sourceSymbol,
+         "resetsAtMs": monthly.resetsAt.map(milliseconds) ?? NSNull()]
     }
 
     private static func encodeLocal(_ local: WidgetQuotaSnapshot.Local) -> [String: Any] {
@@ -150,6 +159,51 @@ public enum WidgetSnapshotCodec {
          "knownThreads": local.knownThreads,
          "unknownThreads": local.unknownThreads,
          "isLimited": local.isLimited]
+    }
+
+    private static func encodeStates(
+        _ states: [WidgetQuotaField: WidgetQuotaValueState]
+    ) -> [String: Any] {
+        Dictionary(uniqueKeysWithValues: WidgetQuotaField.allCases.map { field in
+            let raw: Any
+            if let state = states[field] {
+                raw = ["kind": state.kind,
+                       "resetsAtMs": state.resetAt.map(milliseconds) ?? NSNull()] as [String: Any]
+            } else {
+                raw = NSNull()
+            }
+            return (field.rawValue, raw)
+        })
+    }
+
+    private static func validateStates(_ snapshot: WidgetQuotaSnapshot) throws {
+        for (field, state) in snapshot.states {
+            if let resetAt = state.resetAt {
+                try validateTimestamp(resetAt, "states.\(field.rawValue).resetsAtMs")
+            }
+            let window: WidgetQuotaSnapshot.Window?
+            switch field {
+            case .fiveHour: window = snapshot.fiveHour
+            case .sevenDay: window = snapshot.sevenDay
+            case .monthly: window = nil
+            }
+            if case .unlimited = state {
+                let hasNumeric: Bool
+                if field == .monthly {
+                    hasNumeric = snapshot.monthly != nil
+                } else {
+                    hasNumeric = window != nil
+                }
+                guard !hasNumeric else {
+                    throw CodecError.outOfRange("states.\(field.rawValue).unlimitedWithNumeric")
+                }
+            }
+            let numericReset = field == .monthly ? snapshot.monthly?.resetsAt : window?.resetsAt
+            if let stateReset = state.resetAt, let numericReset,
+               stateReset != numericReset {
+                throw CodecError.outOfRange("states.\(field.rawValue).resetMismatch")
+            }
+        }
     }
 
     // MARK: - 解码
@@ -162,13 +216,16 @@ public enum WidgetSnapshotCodec {
         guard let object = try? JSONSerialization.jsonObject(with: data),
               let root = object as? [String: Any] else { throw CodecError.notAnObject }
 
-        try requireClosed(root, keys: rootKeys, optional: ["resetVoucherCount"])
         // 比较精确值，不能用 `intValue` 把 1.5 截断为版本 1。
         guard let version = root["schemaVersion"] as? NSNumber,
               CFGetTypeID(version) != CFBooleanGetTypeID(),
-              version.doubleValue == Double(WidgetQuotaSnapshot.schemaVersion) else {
+              version.doubleValue == version.doubleValue.rounded(),
+              [1.0, Double(WidgetQuotaSnapshot.schemaVersion)].contains(version.doubleValue) else {
             throw CodecError.wrongSchemaVersion
         }
+        let isV2 = version.doubleValue == Double(WidgetQuotaSnapshot.schemaVersion)
+        try requireClosed(root, keys: isV2 ? rootKeysV2 : rootKeysV1,
+                          optional: ["resetVoucherCount"])
         // `writtenAtMs` 是小组件的绝对时间基准，必须为整数毫秒，不做舍入。
         guard let written = root["writtenAtMs"] else {
             throw CodecError.missingKey("writtenAtMs")
@@ -178,25 +235,27 @@ public enum WidgetSnapshotCodec {
             throw CodecError.wrongType("writtenAtMs")
         }
         guard writtenNumber.doubleValue == writtenNumber.doubleValue.rounded(),
-              let writtenAt = try date(root, "writtenAtMs") else {
+              let writtenAt = try date(root, "writtenAtMs", requireIntegerMilliseconds: true) else {
             throw CodecError.wrongType("writtenAtMs")
         }
-        let observedAt = try date(root, "observedAtMs")
-        let validUntil = try date(root, "validUntilMs")
+        let observedAt = try date(root, "observedAtMs", requireIntegerMilliseconds: isV2)
+        let validUntil = try date(root, "validUntilMs", requireIntegerMilliseconds: isV2)
         guard let hubSource = WidgetQuotaSnapshot.HubSource(rawValue: try string(root, "hubSource")),
               let hubState = WidgetQuotaSnapshot.HubState(rawValue: try string(root, "hubState")) else {
             throw CodecError.wrongType("hubSource/hubState")
         }
-        let fiveHour = try window(root, "fiveHour")
-        let sevenDay = try window(root, "sevenDay")
-        let monthly = try monthlyValue(root, "monthly")
+        let fiveHour = try window(root, "fiveHour", requireIntegerMilliseconds: isV2)
+        let sevenDay = try window(root, "sevenDay", requireIntegerMilliseconds: isV2)
+        let monthly = try monthlyValue(root, "monthly", isV2: isV2)
         let local = try localValue(root, "local")
         let resetVoucherCount = try optionalInteger(root, "resetVoucherCount")
+        let states = isV2 ? try statesValue(root, "states") : [:]
         let snapshot = WidgetQuotaSnapshot(
             writtenAt: writtenAt, observedAt: observedAt, validUntil: validUntil,
             hubSource: hubSource, hubState: hubState,
             fiveHour: fiveHour, sevenDay: sevenDay, monthly: monthly, local: local,
-            resetVoucherCount: resetVoucherCount)
+            resetVoucherCount: resetVoucherCount, states: states)
+        try validateStates(snapshot)
         // 这里只拒绝不可能的时间区间。未来的 `writtenAt` 由 `hubIsCurrent`
         // 按时钟回拨处理，不丢弃与绝对时间无关的 `local` 用量。
         if let validUntil, let observedAt, validUntil < observedAt {
@@ -205,7 +264,34 @@ public enum WidgetSnapshotCodec {
         return snapshot
     }
 
-    private static func window(_ root: [String: Any], _ key: String) throws
+    private static func statesValue(_ root: [String: Any], _ key: String) throws
+        -> [WidgetQuotaField: WidgetQuotaValueState] {
+        guard let raw = root[key] else { throw CodecError.missingKey(key) }
+        guard let object = raw as? [String: Any] else { throw CodecError.wrongType(key) }
+        try requireClosed(object, keys: Set(WidgetQuotaField.allCases.map(\.rawValue)))
+        var result: [WidgetQuotaField: WidgetQuotaValueState] = [:]
+        for field in WidgetQuotaField.allCases {
+            guard let value = object[field.rawValue] else { throw CodecError.missingKey(field.rawValue) }
+            if value is NSNull { continue }
+            guard let stateObject = value as? [String: Any] else {
+                throw CodecError.wrongType("states.\(field.rawValue)")
+            }
+            try requireClosed(stateObject, keys: stateKeys)
+            guard let kind = stateObject["kind"] as? String else {
+                throw CodecError.wrongType("states.\(field.rawValue).kind")
+            }
+            let resetAt = try date(stateObject, "resetsAtMs", requireIntegerMilliseconds: true)
+            switch kind {
+            case "unlimited": result[field] = .unlimited(resetAt: resetAt)
+            case "exceeded": result[field] = .exceeded(resetAt: resetAt)
+            default: throw CodecError.wrongType("states.\(field.rawValue).kind")
+            }
+        }
+        return result
+    }
+
+    private static func window(_ root: [String: Any], _ key: String,
+                               requireIntegerMilliseconds: Bool) throws
         -> WidgetQuotaSnapshot.Window? {
         guard let raw = root[key] else { throw CodecError.missingKey(key) }
         if raw is NSNull { return nil }
@@ -215,7 +301,8 @@ public enum WidgetSnapshotCodec {
         guard percent.isFinite, (0...100).contains(percent) else {
             throw CodecError.outOfRange("remainingPercent")
         }
-        let resetsAt = try date(object, "resetsAtMs")
+        let resetsAt = try date(object, "resetsAtMs",
+                                requireIntegerMilliseconds: requireIntegerMilliseconds)
         let usedAmount = try optionalAmount(object, "usedAmount")
         let limitAmount = try optionalAmount(object, "limitAmount")
         let sourceSymbol = try optionalSymbol(object, "sourceSymbol")
@@ -223,12 +310,13 @@ public enum WidgetSnapshotCodec {
             usedAmount: usedAmount, limitAmount: limitAmount, sourceSymbol: sourceSymbol)
     }
 
-    private static func monthlyValue(_ root: [String: Any], _ key: String) throws
+    private static func monthlyValue(_ root: [String: Any], _ key: String, isV2: Bool) throws
         -> WidgetQuotaSnapshot.Monthly? {
         guard let raw = root[key] else { throw CodecError.missingKey(key) }
         if raw is NSNull { return nil }
         guard let object = raw as? [String: Any] else { throw CodecError.wrongType(key) }
-        try requireClosed(object, keys: monthlyKeys)
+        try requireClosed(object, keys: isV2 ? monthlyKeysV2 : monthlyKeysV1,
+                          optional: isV2 ? ["resetsAtMs"] : [])
         let used = try number(object, "usedAmount").doubleValue
         guard used.isFinite, used >= 0 else { throw CodecError.outOfRange("usedAmount") }
         var limit: Double?
@@ -242,7 +330,11 @@ public enum WidgetSnapshotCodec {
         }
         let symbol = try string(object, "sourceSymbol")
         guard symbol.count <= 4 else { throw CodecError.outOfRange("sourceSymbol") }
-        return WidgetQuotaSnapshot.Monthly(usedAmount: used, limitAmount: limit, sourceSymbol: symbol)
+        let resetsAt = isV2
+            ? try date(object, "resetsAtMs", requireIntegerMilliseconds: true)
+            : nil
+        return WidgetQuotaSnapshot.Monthly(usedAmount: used, limitAmount: limit,
+            sourceSymbol: symbol, resetsAt: resetsAt)
     }
 
     private static func localValue(_ root: [String: Any], _ key: String) throws
@@ -321,12 +413,14 @@ public enum WidgetSnapshotCodec {
         return value
     }
 
-    /// JSON null 或字段缺失时返回 nil，其他非整数值抛出错误。
-    private static func date(_ object: [String: Any], _ key: String) throws -> Date? {
+    /// JSON null 或字段缺失时返回 nil；是否要求整数毫秒由协议版本决定。
+    private static func date(_ object: [String: Any], _ key: String,
+                             requireIntegerMilliseconds: Bool) throws -> Date? {
         guard let raw = object[key], !(raw is NSNull) else { return nil }
         let value = try number(object, key)
         let ms = value.doubleValue
-        guard ms.isFinite, ms >= 0, ms <= 253_402_300_799_999 else {
+        guard ms.isFinite, (!requireIntegerMilliseconds || ms == ms.rounded()),
+              ms >= 0, ms <= 253_402_300_799_999 else {
             throw CodecError.invalidTimestamp(key)
         }
         return Date(timeIntervalSince1970: ms / 1000)

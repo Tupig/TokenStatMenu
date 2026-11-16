@@ -56,7 +56,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
             filesScanned: 0, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
             knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 0,
             subagentCount: 0, forkCount: 0)
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
         model.localSnapshot = LocalCodexSnapshot(input: 125, output: 300, total: 425,
             sessionCount: 2, filesScanned: 2, isLimited: false,
             latestEventAt: Date(timeIntervalSince1970: 1_797_000_000), fiveHour: nil, sevenDay: nil,
@@ -64,12 +64,12 @@ final class TokenStatUISnapshotTests: XCTestCase {
             subagentCount: 0, forkCount: 0,
             lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
                 completedAt: Date(timeIntervalSince1970: 1_797_000_000)))
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
         XCTAssertTrue(model.dataNotice.contains("当前扫描范围记录合计"))
         XCTAssertTrue(model.menuTooltip.contains("425"))
         XCTAssertTrue(model.menuTooltip.contains("顶层对话 2"))
         XCTAssertTrue(model.menuTooltip.contains("含工具、网络和等待"))
-        XCTAssertTrue(model.menuTooltip.contains("5 小时"))
+        XCTAssertFalse(model.menuTooltip.contains("5 小时额度：本地"), "missing five-hour quota must stay hidden")
         XCTAssertTrue(model.menuTooltip.contains("7 天"))
         XCTAssertTrue(model.menuTooltip.contains("32"), "tooltip should describe the bounded session/file coverage")
         model.localSnapshot = LocalCodexSnapshot(input: 1_234_200, output: 367, total: 1_234_567,
@@ -80,7 +80,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
             lastTurn: LocalTurnSummary(outputTokens: 75, durationSeconds: 5,
                 completedAt: Date(timeIntervalSince1970: 1_797_000_000)))
         let fullTotal = 1_234_567.formatted(.number)
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
         XCTAssertFalse(model.title.contains("Σ"))
         XCTAssertTrue(model.menuTooltip.contains(fullTotal), "tooltip should retain the full cumulative total")
         let futureQuotaData = try JSONSerialization.data(withJSONObject: ["result": ["rateLimits": [
@@ -89,7 +89,8 @@ final class TokenStatUISnapshotTests: XCTestCase {
         ]]])
         model.fiveHourQuota = try QuotaReport.parse(futureQuotaData, config: AppConfiguration(),
             now: Date().addingTimeInterval(3600)).fiveHour
-        XCTAssertTrue(model.menuTooltip.contains("异常时间戳"), "tooltip should label future quota data anomalous")
+        XCTAssertFalse(model.menuTooltip.contains("5 小时额度：本地"), "future five-hour quota stays hidden")
+        XCTAssertFalse(model.menuTooltip.contains("88.00%"), "future five-hour quota must stay hidden from the tooltip")
     }
 
     func testC12LocalAccountingUINeverLabelsPartialSubtotalAsComplete() {
@@ -102,7 +103,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
             subagentCount: 0, forkCount: 0)
         XCTAssertFalse(known.hasCompleteAccounting)
         model.localSnapshot = known
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
         XCTAssertTrue(model.menuTooltip.contains("输入 30"))
         XCTAssertTrue(model.menuTooltip.contains("输出 20"))
         XCTAssertTrue(model.menuTooltip.contains("总计 50"))
@@ -115,13 +116,13 @@ final class TokenStatUISnapshotTests: XCTestCase {
             knownThreadCount: 1, unknownThreadCount: 0, unidentifiedFileCount: 0,
             subagentCount: 0, forkCount: 0)
         XCTAssertFalse(model.localSnapshot.hasCompleteAccounting, "a scan limit prevents complete accounting")
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
 
         model.localSnapshot = LocalCodexSnapshot(input: 0, output: 0, total: 0, sessionCount: 0,
             filesScanned: 2, isLimited: false, latestEventAt: nil, fiveHour: nil, sevenDay: nil,
             knownThreadCount: 0, unknownThreadCount: 0, unidentifiedFileCount: 2,
             subagentCount: 0, forkCount: 0)
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
         XCTAssertTrue(model.menuTooltip.contains("总计 未知"))
 
         model.localSnapshot = LocalCodexSnapshot(input: 30, output: 20, total: 50, sessionCount: 1,
@@ -129,7 +130,7 @@ final class TokenStatUISnapshotTests: XCTestCase {
             knownThreadCount: 1, unknownThreadCount: 0, unidentifiedFileCount: 0,
             subagentCount: 0, forkCount: 0)
         XCTAssertTrue(model.localSnapshot.hasCompleteAccounting)
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
         XCTAssertTrue(model.menuTooltip.contains("本次扫描记录量 50"))
 
         for snapshot in [known, model.localSnapshot,
@@ -276,10 +277,11 @@ final class TokenStatUISnapshotTests: XCTestCase {
             XCTAssertEqual(card.recordedAt, value.fetchedAt)
         }
         XCTAssertEqual(local.alertColor, .labelColor, "local rolling snapshots and a high monthly quota never drive enterprise alerts")
-        XCTAssertTrue(local.menuTooltip.contains("5 小时额度：本地"))
+        XCTAssertFalse(local.menuTooltip.contains("5 小时额度：本地"), "local five-hour quota is hidden from the tooltip")
         XCTAssertTrue(local.menuTooltip.contains("7 天额度：本地"))
         XCTAssertFalse(local.menuTooltip.contains("当前企业"))
-        XCTAssertTrue(local.menuTooltip.contains("99.00%"), "local tooltip renders two decimal places")
+        XCTAssertFalse(local.menuTooltip.contains("99.00%"), "hidden local five-hour value is absent from the tooltip")
+        XCTAssertTrue(local.menuTooltip.contains("98.00%"), "visible local seven-day quota renders two decimal places")
         XCTAssertTrue(local.menuTooltip.contains("重置"), "local tooltip includes the reset time when present")
 
         for (window, percent) in [(300, 77.0), (10080, 78.0)] {
@@ -336,7 +338,8 @@ final class TokenStatUISnapshotTests: XCTestCase {
         enterprise.fiveHourQuota = currentEnterprise.fiveHour
         enterprise.sevenDayQuota = currentEnterprise.sevenDay
         XCTAssertTrue(enterprise.menuTooltip.contains("企业"), "proxy tooltip identifies its quota source")
-        XCTAssertTrue(enterprise.menuTooltip.contains("96.00%"), "proxy tooltip renders two decimal places")
+        XCTAssertFalse(enterprise.menuTooltip.contains("96.00%"), "hidden enterprise five-hour quota is absent from the tooltip")
+        XCTAssertTrue(enterprise.menuTooltip.contains("20.00%"), "visible enterprise seven-day quota renders two decimal places")
         XCTAssertTrue(enterprise.menuTooltip.contains("重置"), "proxy tooltip includes the reset time")
         XCTAssertEqual(enterprise.quotaSource, .enterprise)
         let enterpriseCard = WindowQuotaCard.presentation(for: try XCTUnwrap(currentEnterprise.fiveHour), at: now,

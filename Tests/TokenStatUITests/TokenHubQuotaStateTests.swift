@@ -3,6 +3,7 @@ import Combine
 import SwiftUI
 import XCTest
 import TokenStatCore
+import TokenStatWidgetShared
 @testable import TokenStatMenu
 import os
 import Vision
@@ -16,6 +17,557 @@ private final class BP38LockedWallClock: Sendable {
     init(_ initial: Date) { storage = OSAllocatedUnfairLock(initialState: initial) }
     var now: Date { storage.withLock { $0 } }
     func set(_ value: Date) { storage.withLock { $0 = value } }
+}
+
+/// Keep the test expectation typed to the Widget protocol's independent enum.
+/// This is a structural field/kind/reset comparison, not a shared Core enum.
+private func widgetStates(_ states: [TokenHubQuotaField: TokenHubQuotaValueState])
+    -> [WidgetQuotaField: WidgetQuotaValueState] {
+    Dictionary(uniqueKeysWithValues: states.map { field, state in
+        let widgetField: WidgetQuotaField
+        switch field {
+        case .fiveHour: widgetField = .fiveHour
+        case .sevenDay: widgetField = .sevenDay
+        case .monthly: widgetField = .monthly
+        }
+        let widgetState: WidgetQuotaValueState
+        switch state {
+        case .unlimited(let resetAt): widgetState = .unlimited(resetAt: resetAt)
+        case .exceeded(let resetAt): widgetState = .exceeded(resetAt: resetAt)
+        }
+        return (widgetField, widgetState)
+    })
+}
+
+extension TokenHubQuotaStateTests {
+    /// R6 production path: synthetic raw response -> Core snapshot -> sanitized
+    /// background DTO -> AppModel's real workerFetch branch -> fresh/menu/card.
+    /// No network, database, native AX read, or Widget App Group write is used.
+    func testTHCR6RawStatesRoundTripThroughDTOAndProductionWorkerFetch() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let fiveReset = now.addingTimeInterval(30)
+        let sevenReset = now.addingTimeInterval(60)
+        let monthlyReset = now.addingTimeInterval(90)
+        let fullExpected: [TokenHubQuotaField: TokenHubQuotaValueState] = [
+            .fiveHour: .unlimited(resetAt: fiveReset),
+            .sevenDay: .exceeded(resetAt: sevenReset),
+            .monthly: .exceeded(resetAt: monthlyReset),
+        ]
+        let wall = BP38LockedWallClock(now)
+        let workerCalls = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let legacyCalls = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let identity = TokenHubIdentity(pid: 92_601, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic R6 Hub.app/Contents/MacOS/Hub")
+        let fullFixture = #"""
+        {"data":{"currency":"USD","windows":[
+          {"kind":"fixed_5h","enabled":false,"reset_at":"2027-01-15T08:00:30Z"},
+          {"kind":"fixed_7d","quota_amount":100,"used_amount":120,
+           "violated":true,"reset_at":"2027-01-15T08:01:00Z"},
+          {"kind":"user_month","violated":true,"reset_at":"2027-01-15T08:01:30Z"}]}}
+        """#
+        let decoded = try TokenHubDirectQuotaDecoder.decode(Data(fullFixture.utf8), identity: identity,
+            now: now, timeZone: TimeZone(secondsFromGMT: 0)!)
+        XCTAssertEqual(decoded.states, fullExpected, "each field maps to its own state kind and reset")
+        XCTAssertEqual(decoded.fiveHour, nil, "unlimited must not manufacture a numeric five-hour value")
+        XCTAssertEqual(decoded.sevenDay?.usedAmount, Decimal(120))
+        XCTAssertEqual(decoded.sevenDay?.limitAmount, Decimal(100))
+        XCTAssertEqual(decoded.sevenDay?.usedPercent, Decimal(120))
+        XCTAssertEqual(decoded.sevenDay?.remainingPercent, Decimal(0))
+        XCTAssertEqual(decoded.sevenDay?.resetAt, sevenReset)
+        XCTAssertNil(decoded.monthly, "state-only monthly exceeded has no fabricated numeric usage")
+
+        let transport = DirectQuotaTransportSnapshot(snapshot: decoded)
+        let materialized = transport.materializedSnapshot()
+        XCTAssertEqual(transport.states, fullExpected, "DTO extraction preserves status-to-field mapping and resets")
+        XCTAssertEqual(materialized.states, fullExpected, "DTO materialization preserves status-to-field mapping and resets")
+        XCTAssertEqual(Set(Mirror(reflecting: transport).children.compactMap(\.label)),
+                       Set(["fiveHour", "sevenDay", "monthly", "resetVoucherCount", "observedAt", "states"]),
+                       "display DTO has a closed field surface with no identity, URL, path, or credential")
+        let sanitizedIdentity = TokenHubIdentity(pid: 0, bundleID: TokenHubTarget.bundleID,
+                                                 executablePath: "sanitized")
+        XCTAssertEqual(materialized.identity, sanitizedIdentity,
+                        "materialization applies the normalized sanitized identity sentinel")
+        XCTAssertNotEqual(materialized.identity.executablePath, identity.executablePath)
+        XCTAssertNil(materialized.resetVoucherCount)
+        XCTAssertEqual(materialized.observedAt, now)
+
+        let transportBox = OSAllocatedUnfairLock<DirectQuotaTransportSnapshot>(initialState: transport)
+        let direct = TokenHubDirectQuotaDependencies(discoverTarget: { identity },
+            identityIsCurrent: { $0 == identity },
+            fetch: { _, _ in legacyCalls.withLock { $0 += 1 }; throw TokenHubDirectQuotaFailure.transportFailed },
+            workerFetch: { _ in
+                workerCalls.withLock { $0 += 1 }
+                return transportBox.withLock { $0 }
+            })
+        let permission = HubTestPermission()
+        permission.trusted = false
+        let scanner = HubTestScanner(result: TokenHubQuotaResult(status: .targetNotRunning,
+            snapshot: nil, failure: nil))
+        let timing = AppModelTimingDependencies(wallNow: { wall.now }, monotonicNow: { 0 },
+            schedule: { _, _ in { } })
+        let model = AppModel(preview: true, timing: timing, directQuota: direct,
+            tokenHubPermissionProvider: permission, tokenHubAXSource: scanner.source)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        model.config.refreshSeconds = 60
+        model.tokenHubAutomaticReadingEnabled = false
+        model.refreshTokenHubQuota(observationNow: now)
+        await settle(model, status: .connected)
+        XCTAssertEqual(workerCalls.withLock { $0 }, 1, "real workerFetch branch is used")
+        XCTAssertEqual(legacyCalls.withLock { $0 }, 0, "legacy fetch branch is not used")
+        XCTAssertTrue(model.tokenHubQuotaIsDirect)
+        XCTAssertEqual(model.tokenHubQuotaSnapshot?.states, fullExpected)
+        let initialPresentation = model.quotaPresentation(at: now)
+        XCTAssertTrue(initialPresentation.snapshotFresh)
+        XCTAssertEqual(initialPresentation.states, fullExpected)
+        let initialFresh = try XCTUnwrap(model.freshTokenHubQuota(at: now))
+        XCTAssertEqual(initialFresh.states, fullExpected)
+        XCTAssertEqual(initialFresh.resetVoucherCount, nil)
+        XCTAssertTrue(model.title(at: now, quotaPresentation: initialPresentation).contains("不限额"))
+        XCTAssertTrue(model.title(at: now, quotaPresentation: initialPresentation).contains("已超限"))
+        let initialCard = TokenHubQuotaCard(presentation: initialPresentation, status: "ready", enabled: true,
+                                            refreshSeconds: 60, directSource: true)
+        XCTAssertEqual(initialCard.snapshot?.states, fullExpected)
+        let initialWidget = model.makeWidgetQuotaSnapshot(at: now)
+        XCTAssertEqual(initialWidget.hubSource, .direct)
+        XCTAssertEqual(initialWidget.hubState, .ready)
+        XCTAssertEqual(initialWidget.writtenAt, now)
+        XCTAssertEqual(initialWidget.observedAt, now)
+        XCTAssertEqual(initialWidget.validUntil, now.addingTimeInterval(120))
+        XCTAssertEqual(initialWidget.states, widgetStates(fullExpected))
+        XCTAssertNil(initialWidget.fiveHour, "unlimited is not serialized as a numeric zero window")
+        XCTAssertEqual(initialWidget.sevenDay?.usedAmount, 120)
+        XCTAssertEqual(initialWidget.sevenDay?.remainingPercent, 0)
+        XCTAssertEqual(initialWidget.sevenDay?.resetsAt, sevenReset)
+        XCTAssertEqual(initialWidget.sevenDay?.sourceSymbol, "🪙")
+        XCTAssertNil(initialWidget.resetVoucherCount)
+
+        func copy(_ snapshot: TokenHubQuotaSnapshot, voucherCount: Int?, observedAt: Date) -> TokenHubQuotaSnapshot {
+            TokenHubQuotaSnapshot(identity: snapshot.identity, fiveHour: snapshot.fiveHour,
+                sevenDay: snapshot.sevenDay, monthly: snapshot.monthly,
+                resetVoucherCount: voucherCount, observedAt: observedAt, states: snapshot.states)
+        }
+        let zeroObservedAt = now.addingTimeInterval(1)
+        let zeroCore = copy(decoded, voucherCount: 0, observedAt: zeroObservedAt)
+        let zeroTransport = DirectQuotaTransportSnapshot(snapshot: zeroCore)
+        XCTAssertEqual(zeroTransport.states, fullExpected)
+        XCTAssertEqual(zeroTransport.materializedSnapshot().resetVoucherCount, 0)
+        XCTAssertEqual(zeroTransport.materializedSnapshot().states, fullExpected)
+        transportBox.withLock { $0 = zeroTransport }
+        wall.set(zeroObservedAt)
+        model.refreshTokenHubQuota(observationNow: zeroObservedAt)
+        for _ in 0..<100 where model.tokenHubQuotaSnapshot?.observedAt != zeroObservedAt {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(model.tokenHubQuotaSnapshot?.observedAt, zeroObservedAt)
+        XCTAssertEqual(model.freshTokenHubQuota(at: zeroObservedAt)?.resetVoucherCount, 0)
+        XCTAssertEqual(model.freshTokenHubQuota(at: zeroObservedAt)?.states, fullExpected)
+
+        // State-only and numeric siblings both take part in the dashboard's
+        // time projection. Drive the existing tick path with the fake clock;
+        // no timer, window, Widget publication, or real App Group is used.
+        model.tick()
+        var resetPublications = 0
+        let resetObserver = model.objectWillChange.sink { resetPublications += 1 }
+        wall.set(fiveReset)
+        model.tick()
+        XCTAssertEqual(resetPublications, 1, "state reset at equality notifies the open panel")
+        let fivePresentation = model.quotaPresentation(at: fiveReset)
+        XCTAssertFalse(model.title(at: fiveReset, quotaPresentation: fivePresentation).contains("不限额"))
+        let afterFiveReset = try XCTUnwrap(model.freshTokenHubQuota(at: fiveReset))
+        XCTAssertNil(afterFiveReset.states[.fiveHour])
+        XCTAssertEqual(afterFiveReset.states[.sevenDay], fullExpected[.sevenDay])
+        XCTAssertEqual(afterFiveReset.states[.monthly], fullExpected[.monthly],
+                       "state-only monthly remains current while its own reset is future")
+        XCTAssertNil(model.makeWidgetQuotaSnapshot(at: fiveReset).states[.fiveHour])
+        XCTAssertEqual(model.makeWidgetQuotaSnapshot(at: fiveReset).states,
+                       widgetStates([.monthly: .exceeded(resetAt: monthlyReset),
+                                     .sevenDay: .exceeded(resetAt: sevenReset)]))
+        wall.set(fiveReset.addingTimeInterval(0.001))
+        model.tick()
+        XCTAssertEqual(resetPublications, 1, "the post-reset tick does not publish the same transition twice")
+
+        wall.set(sevenReset)
+        model.tick()
+        XCTAssertEqual(resetPublications, 2, "the numeric exceeded sibling notifies at its reset boundary")
+        let afterSevenReset = try XCTUnwrap(model.freshTokenHubQuota(at: sevenReset))
+        XCTAssertNil(afterSevenReset.sevenDay, "expired exceeded numeric does not resurrect at reset")
+        XCTAssertEqual(afterSevenReset.states, [.monthly: fullExpected[.monthly]!])
+        let widgetAfterSevenReset = model.makeWidgetQuotaSnapshot(at: sevenReset)
+        XCTAssertNil(widgetAfterSevenReset.sevenDay)
+        XCTAssertEqual(widgetAfterSevenReset.states,
+                       widgetStates([.monthly: .exceeded(resetAt: monthlyReset)]))
+        XCTAssertTrue(model.title(at: sevenReset, quotaPresentation: model.quotaPresentation(at: sevenReset))
+            .contains("已超限"), "state-only monthly remains visible after the numeric sibling resets")
+        wall.set(sevenReset.addingTimeInterval(0.001))
+        model.tick()
+        XCTAssertEqual(resetPublications, 2, "the post-seven-day-reset tick does not publish the transition twice")
+
+        wall.set(monthlyReset)
+        model.tick()
+        XCTAssertEqual(resetPublications, 3, "monthly state-only reset notifies at equality")
+        XCTAssertNil(model.freshTokenHubQuota(at: monthlyReset), "all fields are unknown after their own reset")
+        let monthlyPresentation = model.quotaPresentation(at: monthlyReset)
+        XCTAssertFalse(model.title(at: monthlyReset, quotaPresentation: monthlyPresentation).contains("已超限"))
+        let widgetAfterMonthlyReset = model.makeWidgetQuotaSnapshot(at: monthlyReset)
+        XCTAssertTrue(widgetAfterMonthlyReset.states.isEmpty)
+        XCTAssertNil(widgetAfterMonthlyReset.monthly)
+        wall.set(monthlyReset.addingTimeInterval(0.001))
+        model.tick()
+        XCTAssertEqual(resetPublications, 3, "the post-monthly-reset tick does not publish the transition twice")
+        withExtendedLifetime(resetObserver) {}
+
+        let zeroWidget = model.makeWidgetQuotaSnapshot(at: zeroObservedAt)
+        XCTAssertEqual(zeroWidget.resetVoucherCount, 0)
+        XCTAssertEqual(zeroWidget.states, widgetStates(fullExpected))
+
+        let fiveExpired: [TokenHubQuotaField: TokenHubQuotaValueState] = [
+            .sevenDay: .exceeded(resetAt: sevenReset), .monthly: .exceeded(resetAt: monthlyReset)
+        ]
+        let sevenExpired: [TokenHubQuotaField: TokenHubQuotaValueState] = [
+            .monthly: .exceeded(resetAt: monthlyReset)
+        ]
+        let boundaryCases: [(Date, [TokenHubQuotaField: TokenHubQuotaValueState], String)] = [
+            (now.addingTimeInterval(29.999), fullExpected, "five-hour immediately before reset"),
+            (fiveReset, fiveExpired, "five-hour at reset"),
+            (now.addingTimeInterval(30.001), fiveExpired, "five-hour immediately after reset"),
+            (now.addingTimeInterval(59.999), fiveExpired, "seven-day immediately before reset"),
+            (sevenReset, sevenExpired, "seven-day at reset"),
+            (now.addingTimeInterval(60.001), sevenExpired, "seven-day immediately after reset"),
+            (now.addingTimeInterval(89.999), sevenExpired, "monthly immediately before reset"),
+            (monthlyReset, [:], "monthly at reset"),
+            (now.addingTimeInterval(90.001), [:], "monthly immediately after reset"),
+        ]
+        for (instant, expected, label) in boundaryCases {
+            let projection = model.quotaPresentation(at: instant)
+            XCTAssertTrue(projection.snapshotFresh, "reset boundary remains inside snapshot freshness: \(label)")
+            XCTAssertEqual(projection.states, expected, "projected state map at \(label)")
+            let fresh = model.freshTokenHubQuota(at: instant)
+            if expected.isEmpty { XCTAssertNil(fresh, "no expired state/numeric value resurrects at \(label)") }
+            else {
+                XCTAssertEqual(fresh?.states, expected, "fresh helper preserves only current states at \(label)")
+                XCTAssertEqual(fresh?.resetVoucherCount, 0, "zero voucher remains distinct and current at \(label)")
+            }
+            let card = TokenHubQuotaCard(presentation: projection, status: "ready", enabled: true,
+                                         refreshSeconds: 60, directSource: true)
+            if expected.isEmpty { XCTAssertNil(card.snapshot, "Card has no current status at \(label)") }
+            else { XCTAssertEqual(card.snapshot?.states, expected, "Card uses only current per-field states at \(label)") }
+            let title = model.title(at: instant, quotaPresentation: projection)
+            XCTAssertEqual(title.contains("不限额"), expected[.fiveHour] != nil, "menu assigns unlimited only to 5h at \(label)")
+            XCTAssertEqual(title.contains("已超限"), expected[.sevenDay] != nil || expected[.monthly] != nil,
+                           "menu keeps exceeded text only while an exceeded field is current at \(label)")
+            let widget = model.makeWidgetQuotaSnapshot(at: instant)
+            XCTAssertEqual(widget.resetVoucherCount, 0, "Widget keeps an explicit zero voucher at \(label)")
+            XCTAssertEqual(widget.states, widgetStates(expected), "Widget per-field state map at \(label)")
+            if instant >= fiveReset { XCTAssertNil(widget.fiveHour, "unlimited state reset cannot revive numeric 5h at \(label)") }
+            if instant >= sevenReset { XCTAssertNil(widget.sevenDay, "reset state cannot revive its numeric 7d value at \(label)") }
+        }
+        let staleTime = zeroObservedAt.addingTimeInterval(121)
+        XCTAssertFalse(model.quotaPresentation(at: staleTime).snapshotFresh)
+        XCTAssertNil(model.freshTokenHubQuota(at: staleTime), "stale snapshot has no current states")
+        let staleWidget = model.makeWidgetQuotaSnapshot(at: staleTime)
+        XCTAssertTrue(staleWidget.states.isEmpty, "stale state is not published to Widget")
+        XCTAssertNil(staleWidget.fiveHour)
+        XCTAssertNil(staleWidget.sevenDay)
+        XCTAssertNil(staleWidget.monthly)
+        XCTAssertNil(staleWidget.resetVoucherCount)
+
+        // Replace with a fully state-only current snapshot. It must remain
+        // usable by fresh()/Card even though every numeric value is absent.
+        let stateOnlyFixture = #"""
+        {"data":{"currency":"USD","windows":[
+          {"kind":"fixed_5h","enabled":false,"reset_at":"2027-01-15T08:00:30Z"},
+          {"kind":"user_month","violated":true,"reset_at":null}]}}
+        """#
+        let stateOnlyNow = now.addingTimeInterval(2)
+        let stateOnlyCore = try TokenHubDirectQuotaDecoder.decode(Data(stateOnlyFixture.utf8),
+            identity: identity, now: stateOnlyNow, timeZone: TimeZone(secondsFromGMT: 0)!)
+        let stateOnlyTransport = DirectQuotaTransportSnapshot(snapshot: stateOnlyCore)
+        let stateOnlyExpected: [TokenHubQuotaField: TokenHubQuotaValueState] = [
+            .fiveHour: .unlimited(resetAt: fiveReset), .monthly: .exceeded(resetAt: nil)
+        ]
+        XCTAssertEqual(stateOnlyCore.states, stateOnlyExpected)
+        XCTAssertEqual(stateOnlyTransport.states, stateOnlyExpected)
+        transportBox.withLock { $0 = stateOnlyTransport }
+        wall.set(stateOnlyNow)
+        model.refreshTokenHubQuota(observationNow: stateOnlyNow)
+        for _ in 0..<100 where model.tokenHubQuotaSnapshot?.observedAt != stateOnlyNow {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(model.tokenHubQuotaSnapshot?.observedAt, stateOnlyNow)
+        XCTAssertNil(model.tokenHubQuotaSnapshot?.fiveHour)
+        XCTAssertNil(model.tokenHubQuotaSnapshot?.sevenDay)
+        XCTAssertNil(model.tokenHubQuotaSnapshot?.monthly)
+        XCTAssertEqual(model.tokenHubQuotaSnapshot?.states, stateOnlyExpected)
+        let stateOnlyFresh = try XCTUnwrap(model.freshTokenHubQuota(at: stateOnlyNow),
+            "a current state-only snapshot remains available to dashboard/settings callers")
+        XCTAssertEqual(stateOnlyFresh.states, stateOnlyExpected)
+        let presentation = model.quotaPresentation(at: stateOnlyNow)
+        XCTAssertEqual(presentation.states, stateOnlyExpected)
+        let card = TokenHubQuotaCard(presentation: presentation, status: "ready", enabled: true,
+                                     refreshSeconds: 60, directSource: true)
+        XCTAssertNotNil(card.snapshot, "Card currentSnapshot accepts current state-only data")
+        XCTAssertEqual(card.snapshot?.states, stateOnlyExpected)
+        XCTAssertTrue(model.title(at: stateOnlyNow, quotaPresentation: presentation).contains("不限额"))
+        XCTAssertTrue(model.title(at: stateOnlyNow, quotaPresentation: presentation).contains("已超限"))
+        let stateOnlyWidget = model.makeWidgetQuotaSnapshot(at: stateOnlyNow)
+        XCTAssertEqual(stateOnlyWidget.hubSource, .direct)
+        XCTAssertEqual(stateOnlyWidget.hubState, .ready)
+        XCTAssertEqual(stateOnlyWidget.states, widgetStates(stateOnlyExpected))
+        XCTAssertNil(stateOnlyWidget.fiveHour)
+        XCTAssertNil(stateOnlyWidget.monthly)
+        XCTAssertNil(model.freshTokenHubQuota(at: now),
+                     "a future-observed state-only snapshot is not current")
+        XCTAssertNil(model.freshTokenHubQuota(at: stateOnlyNow.addingTimeInterval(121)),
+                     "an expired state-only snapshot is not current")
+        XCTAssertTrue(model.makeWidgetQuotaSnapshot(at: stateOnlyNow.addingTimeInterval(121)).states.isEmpty,
+                      "expired state-only input does not remain in the Widget projection")
+    }
+
+    func testB5NormalMonthlyNumericResetExpiresAcrossWorkerUIAndWidgetWhileSnapshotStaysFresh() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let monthlyReset = now.addingTimeInterval(60)
+        let fiveHourReset = now.addingTimeInterval(300)
+        let identity = TokenHubIdentity(pid: 92_610, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic Monthly Reset Hub.app/Contents/MacOS/Hub")
+        let monthly = TokenHubMonthlyUsage(usedAmount: Decimal(string: "25.5")!,
+            sourceSymbol: "🪙", limitAmount: Decimal(100), resetAt: monthlyReset)
+        let core = TokenHubQuotaSnapshot(identity: identity,
+            fiveHour: TokenHubWindowQuota(kind: .fiveHour, usedAmount: 10, limitAmount: 20,
+                sourceSymbol: "🪙", usedPercent: 50, resetDisplay: "synthetic later 5h",
+                resetAt: fiveHourReset),
+            sevenDay: nil, monthly: monthly, resetVoucherCount: 0, observedAt: now)
+        let conflicting = TokenHubQuotaSnapshot(identity: identity,
+            fiveHour: core.fiveHour, sevenDay: nil,
+            monthly: monthly,
+            observedAt: now,
+            states: [.monthly: .exceeded(resetAt: monthlyReset.addingTimeInterval(1))])
+        let conflictProjection = TokenHubQuotaPresentation.project(snapshot: conflicting,
+            now: now, refreshSeconds: 60)
+        XCTAssertNil(conflictProjection.monthlyCurrent,
+                     "mismatched monthly numeric/state clocks fail closed")
+        XCTAssertNil(conflictProjection.states[.monthly])
+        XCTAssertNotNil(conflictProjection.fiveHourCurrent,
+                        "a monthly reset conflict does not invalidate an independent sibling")
+        let dto = DirectQuotaTransportSnapshot(snapshot: core)
+        XCTAssertEqual(dto.monthly?.resetAt, monthlyReset, "DTO retains numeric monthly reset")
+        XCTAssertEqual(dto.materializedSnapshot().monthly?.resetAt, monthlyReset,
+                       "DTO materialization restores numeric monthly reset")
+
+        let wall = BP38LockedWallClock(now)
+        let workerCalls = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let legacyCalls = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let direct = TokenHubDirectQuotaDependencies(discoverTarget: { identity },
+            identityIsCurrent: { $0 == identity },
+            fetch: { _, _ in legacyCalls.withLock { $0 += 1 }; throw TokenHubDirectQuotaFailure.transportFailed },
+            workerFetch: { _ in workerCalls.withLock { $0 += 1 }; return dto })
+        let permission = HubTestPermission()
+        let timing = AppModelTimingDependencies(wallNow: { wall.now }, monotonicNow: { 0 },
+            schedule: { _, _ in { } })
+        let model = AppModel(preview: true, timing: timing, directQuota: direct,
+            tokenHubPermissionProvider: permission)
+        defer { model.shutdown() }
+        model.config.dataSource = "localCodex"
+        model.config.refreshSeconds = 60
+        model.tokenHubAutomaticReadingEnabled = false
+        model.refreshTokenHubQuota(observationNow: now)
+        for _ in 0..<100 where model.tokenHubQuotaSnapshot?.observedAt != now {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(workerCalls.withLock { $0 }, 1)
+        XCTAssertEqual(legacyCalls.withLock { $0 }, 0)
+        XCTAssertEqual(model.tokenHubQuotaSnapshot?.monthly?.resetAt, monthlyReset)
+
+        let before = monthlyReset.addingTimeInterval(-0.001)
+        let beforeProjection = model.quotaPresentation(at: before)
+        XCTAssertTrue(beforeProjection.snapshotFresh)
+        XCTAssertEqual(beforeProjection.monthlyCurrent?.resetAt, monthlyReset)
+        XCTAssertEqual(model.freshTokenHubQuota(at: before)?.monthly?.resetAt, monthlyReset)
+        XCTAssertTrue(model.title(at: before, quotaPresentation: beforeProjection).contains("🪙 25.50"))
+        let beforeCard = TokenHubQuotaCard(presentation: beforeProjection, status: "ready", enabled: true,
+            refreshSeconds: 60, directSource: true)
+        XCTAssertEqual(beforeCard.snapshot?.monthly?.resetAt, monthlyReset)
+        let beforeWidget = model.makeWidgetQuotaSnapshot(at: before)
+        XCTAssertEqual(beforeWidget.monthly?.resetsAt, monthlyReset)
+        XCTAssertNotNil(beforeWidget.currentMonthly(at: before))
+        XCTAssertNotNil(beforeWidget.currentMonthly(at: before, field: .monthly))
+        XCTAssertTrue(beforeWidget.timelineDates(after: before).contains(monthlyReset),
+                      "Widget timeline includes the monthly reset independently of validUntil")
+
+        model.tick() // Capture the current monthly reset baseline.
+        var publications = 0
+        let observer = model.objectWillChange.sink { publications += 1 }
+        wall.set(monthlyReset)
+        model.tick()
+        XCTAssertEqual(publications, 1, "normal numeric monthly reset notifies an open panel at equality")
+
+        let atProjection = model.quotaPresentation(at: monthlyReset)
+        XCTAssertTrue(atProjection.snapshotFresh, "the full snapshot remains within its TTL")
+        XCTAssertNil(atProjection.monthlyCurrent, "normal monthly numeric expires at its own reset")
+        XCTAssertNotNil(atProjection.fiveHourCurrent, "the later-reset sibling remains current")
+        let atFresh = try XCTUnwrap(model.freshTokenHubQuota(at: monthlyReset))
+        XCTAssertNil(atFresh.monthly)
+        XCTAssertNotNil(atFresh.fiveHour)
+        XCTAssertEqual(model.title(at: monthlyReset, quotaPresentation: atProjection)
+            .components(separatedBy: "|").last?.trimmingCharacters(in: .whitespaces), "—")
+        let atCard = TokenHubQuotaCard(presentation: atProjection, status: "ready", enabled: true,
+            refreshSeconds: 60, directSource: true)
+        XCTAssertNil(atCard.snapshot?.monthly)
+        XCTAssertNotNil(atCard.snapshot?.fiveHour)
+        let atWidget = model.makeWidgetQuotaSnapshot(at: monthlyReset)
+        XCTAssertTrue(atWidget.hubIsCurrent(at: monthlyReset))
+        XCTAssertNil(atWidget.currentMonthly(at: monthlyReset))
+        XCTAssertNil(atWidget.currentMonthly(at: monthlyReset, field: .monthly))
+        XCTAssertNil(atWidget.monthly)
+        XCTAssertNotNil(atWidget.fiveHour)
+        XCTAssertFalse(atWidget.timelineDates(after: monthlyReset).contains(monthlyReset))
+
+        wall.set(monthlyReset.addingTimeInterval(0.001))
+        model.tick()
+        XCTAssertEqual(publications, 1, "immediately after reset does not repeat the same panel transition")
+        let afterProjection = model.quotaPresentation(at: wall.now)
+        XCTAssertTrue(afterProjection.snapshotFresh)
+        XCTAssertNil(afterProjection.monthlyCurrent)
+        let afterFresh = try XCTUnwrap(model.freshTokenHubQuota(at: wall.now))
+        XCTAssertNil(afterFresh.monthly)
+        XCTAssertNotNil(afterFresh.fiveHour)
+        XCTAssertEqual(model.title(at: wall.now, quotaPresentation: afterProjection)
+            .components(separatedBy: "|").last?.trimmingCharacters(in: .whitespaces), "—")
+        let afterCard = TokenHubQuotaCard(presentation: afterProjection, status: "ready", enabled: true,
+            refreshSeconds: 60, directSource: true)
+        XCTAssertNil(afterCard.snapshot?.monthly)
+        XCTAssertNotNil(afterCard.snapshot?.fiveHour)
+        let afterWidget = model.makeWidgetQuotaSnapshot(at: wall.now)
+        XCTAssertNil(afterWidget.monthly)
+        XCTAssertNil(afterWidget.currentMonthly(at: wall.now, field: .monthly))
+        XCTAssertNotNil(afterWidget.fiveHour)
+        withExtendedLifetime(observer) {}
+
+        let ttlEdge = now.addingTimeInterval(119.999)
+        let stillFreshWidget = model.makeWidgetQuotaSnapshot(at: ttlEdge)
+        XCTAssertTrue(stillFreshWidget.hubIsCurrent(at: ttlEdge), "monthly reset does not expire the whole snapshot")
+        XCTAssertNil(stillFreshWidget.currentMonthly(at: ttlEdge))
+        XCTAssertNotNil(stillFreshWidget.currentWindow(stillFreshWidget.fiveHour, at: ttlEdge),
+                        "unreset sibling remains available until its own reset")
+    }
+
+    func testTHCR6PositiveHalfExpandCoinRoundingAcrossMenuAndPanel() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let identity = TokenHubIdentity(pid: 92_602, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Applications/Synthetic Coin Rounding Hub.app/Contents/MacOS/Hub")
+        let cases: [(String, String)] = [("12.345", "12.35"), ("12.355", "12.36")]
+        let model = AppModel(preview: true)
+        defer { model.shutdown() }
+        for (literal, expected) in cases {
+            let body = "{\"data\":{\"currency\":\"USD\",\"windows\":[{\"kind\":\"user_month\",\"quota_amount\":100,\"used_amount\":\(literal)}]}}"
+            let snapshot = try TokenHubDirectQuotaDecoder.decode(Data(body.utf8), identity: identity,
+                now: now, timeZone: TimeZone(secondsFromGMT: 0)!)
+            XCTAssertEqual(snapshot.monthly?.usedAmount, Decimal(string: literal))
+            XCTAssertEqual(snapshot.monthly?.sourceSymbol, "🪙")
+            let presentation = TokenHubQuotaPresentation.project(snapshot: snapshot, now: now,
+                refreshSeconds: 60)
+            let title = model.title(at: now, quotaPresentation: presentation)
+            XCTAssertEqual(title, "— | 🪙 \(expected)", "menu coin amount uses positive halfExpand: \(literal)")
+            XCTAssertEqual(TokenHubDecimalFormatter.string(Decimal(string: literal)!), expected,
+                           "panel amount formatter uses the same positive halfExpand boundary")
+        }
+
+        let panelFixture = #"""
+        {"data":{"currency":"USD","windows":[
+          {"kind":"fixed_5h","quota_amount":100,"used_amount":12.345},
+          {"kind":"fixed_7d","quota_amount":100,"used_amount":12.355},
+          {"kind":"user_month","quota_amount":100,"used_amount":12.345}]}}
+        """#
+        let snapshot = try TokenHubDirectQuotaDecoder.decode(Data(panelFixture.utf8), identity: identity,
+            now: now, timeZone: TimeZone(secondsFromGMT: 0)!)
+        let presentation = TokenHubQuotaPresentation.project(snapshot: snapshot, now: now,
+            refreshSeconds: 60)
+        let card = TokenHubQuotaCard(presentation: presentation, status: "ready", enabled: true,
+                                     refreshSeconds: 60, directSource: true)
+            .frame(width: 460, height: 280, alignment: .topLeading)
+            .groupBoxStyle(PanelCardStyle())
+        let bounds = NSRect(x: 0, y: 0, width: 460, height: 280)
+        let containerBounds = NSRect(x: 0, y: 0, width: bounds.width + 248, height: bounds.height)
+        let host = NSHostingView(rootView: card)
+        host.frame = bounds
+        let contentView = NSView(frame: containerBounds)
+        contentView.addSubview(host)
+        let capabilityProbe = NSHostingView(rootView: Text("Synthetic AX capability probe"))
+        capabilityProbe.frame = NSRect(x: bounds.maxX + 8, y: 0, width: 240, height: 24)
+        contentView.addSubview(capabilityProbe)
+        let window = NSWindow(contentRect: containerBounds, styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        defer { window.close() }
+        window.contentView = contentView
+        window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
+        contentView.layoutSubtreeIfNeeded()
+        host.layoutSubtreeIfNeeded()
+        capabilityProbe.layoutSubtreeIfNeeded()
+        window.makeKeyAndOrderFront(nil)
+        XCTAssertTrue(capabilityProbe.window === window, "the SwiftUI AX probe belongs to the same test window")
+        window.displayIfNeeded()
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        guard let bitmap = host.bitmapImageRepForCachingDisplay(in: bounds) else {
+            XCTFail("synthetic coin panel bitmap should be available"); return
+        }
+        host.cacheDisplay(in: bounds, to: bitmap)
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["en-US", "zh-Hans"]
+        request.usesLanguageCorrection = false
+        try VNImageRequestHandler(cgImage: try XCTUnwrap(bitmap.cgImage), options: [:]).perform([request])
+        let text = (request.results ?? []).flatMap { $0.topCandidates(10) }.map(\.string).joined(separator: "\n")
+        let compact = text.replacingOccurrences(of: " ", with: "")
+        XCTAssertTrue(compact.contains("12.35"), "actual panel renders the 12.345 half boundary: \(text)")
+        XCTAssertTrue(compact.contains("12.36"), "actual panel renders the 12.355 half boundary: \(text)")
+        let accessibilityText = hubVisibleAccessibilityStrings(in: window, hosts: [contentView, host])
+        let probeText = hubVisibleAccessibilityStrings(in: window, hosts: [capabilityProbe])
+        guard !accessibilityText.isEmpty || probeText.contains(where: { $0.contains("Synthetic AX capability probe") }) else {
+            throw XCTSkip("The test-owned NSWindow host (key=\(window.isKeyWindow)) exposes no plain SwiftUI AX text; coin AX was not observable")
+        }
+        XCTAssertTrue(accessibilityText.contains(where: { $0.contains("🪙 12.35") }),
+                      "actual panel AX retains the 12.345 coin prefix and separating space: \(accessibilityText)")
+        XCTAssertTrue(accessibilityText.contains(where: { $0.contains("🪙 12.36") }),
+                      "actual panel AX retains the 12.355 coin prefix and separating space: \(accessibilityText)")
+    }
+}
+
+private func hubVisibleAccessibilityStrings(in window: NSWindow, hosts: [NSView]) -> [String] {
+    var queue: [(object: AnyObject, depth: Int)] = [(window, 0)]
+        + hosts.map { ($0 as AnyObject, 0) }
+    var visited = Set<ObjectIdentifier>()
+    var strings: [String] = []
+    while let next = queue.first, visited.count < 128 {
+        queue.removeFirst()
+        let (object, depth) = next
+        guard visited.insert(ObjectIdentifier(object)).inserted else { continue }
+        if let item = object as? any NSAccessibilityProtocol {
+            if let label = item.accessibilityLabel(), !label.isEmpty { strings.append(label) }
+            if let value = item.accessibilityValue() as? String, !value.isEmpty { strings.append(value) }
+            if let value = item.accessibilityValue() as? NSAttributedString, !value.string.isEmpty {
+                strings.append(value.string)
+            }
+            guard depth < 6 else { continue }
+            let routes = [item.accessibilityChildren() ?? [],
+                          item.accessibilityChildrenInNavigationOrder() ?? [],
+                          item.accessibilityContents() ?? []]
+            for child in routes.flatMap({ Array($0.prefix(32)) }) {
+                queue.append((child as AnyObject, depth + 1))
+            }
+        }
+        if let text = object as? any NSAccessibilityStaticText,
+           let value = text.accessibilityValue(), !value.isEmpty {
+            strings.append(value)
+        }
+        if let button = object as? any NSAccessibilityButton,
+           let label = button.accessibilityLabel(), !label.isEmpty {
+            strings.append(label)
+        }
+    }
+    return strings
 }
 
 private final class BP38LockedMonotonicClock: Sendable {
@@ -150,10 +702,11 @@ private final class HubDirectHarness {
         })
     }
 
-    func complete(_ request: Int, failure: TokenHubDirectQuotaFailure? = nil) {
+    func complete(_ request: Int, failure: TokenHubDirectQuotaFailure? = nil,
+                  snapshot: TokenHubQuotaSnapshot? = nil) {
         guard let (now, continuation) = pending.removeValue(forKey: request) else { return }
         if let failure { continuation.resume(throwing: failure); return }
-        continuation.resume(returning: TokenHubQuotaSnapshot(identity: identity,
+        continuation.resume(returning: snapshot ?? TokenHubQuotaSnapshot(identity: identity,
             fiveHour: TokenHubWindowQuota(kind: .fiveHour, usedAmount: 3, limitAmount: 10,
                 sourceSymbol: "$", usedPercent: 30, resetDisplay: "synthetic reset"),
             sevenDay: TokenHubWindowQuota(kind: .sevenDay, usedAmount: 4, limitAmount: 10,
@@ -257,7 +810,7 @@ extension TokenHubQuotaStateTests {
         XCTAssertNil(model.quotaPresentation.sevenDay?.resetAt)
         XCTAssertFalse(model.menuTitleContainsTokenHubSuffix, "BP46 failed source has no stale remaining-percent suffix")
         XCTAssertEqual(model.alertColor, .labelColor, "BP46 discarded quota cannot drive a current warning")
-        XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
+        XCTAssertFalse(model.menuTooltip.contains("5 小时"))
         XCTAssertTrue(model.menuTooltip.contains("7 天未知"))
         let card = DashboardView(model: model).tokenHubCard
         XCTAssertTrue(card.enabled, "BP46 direct failure stays visible with optional AX disabled")
@@ -399,14 +952,14 @@ final class TokenHubQuotaStateTests: XCTestCase {
         now = observedAt.addingTimeInterval(15.001)
         model.tick()
         XCTAssertEqual(publications, 1, "expiry must notify an open dashboard once")
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
         for _ in 0..<100 { model.tick() }
         XCTAssertEqual(publications, 1)
         XCTAssertEqual(menuChecks, 102, "the menu cadence is independent of dashboard notifications")
         now = observedAt
         model.tick()
         XCTAssertEqual(publications, 2, "clock rollback must recompute time-dependent presentation")
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
         withExtendedLifetime(observer) {}
     }
 
@@ -571,13 +1124,13 @@ final class TokenHubQuotaStateTests: XCTestCase {
         model.fiveHourQuota = try QuotaReport.parse(quotaData, config: AppConfiguration(),
             now: observedAt.addingTimeInterval(2)).fiveHour
         model.tick()
-        XCTAssertTrue(displayedTooltip.contains("异常时间戳"))
+        XCTAssertFalse(displayedTooltip.contains("5 小时"))
         now = observedAt.addingTimeInterval(2)
         model.tick()
         XCTAssertFalse(displayedTooltip.contains("异常时间戳"))
         now = observedAt.addingTimeInterval(10)
         model.tick()
-        XCTAssertTrue(displayedTooltip.contains("重置已过期"), "a cached historical reset label must still expire")
+        XCTAssertFalse(displayedTooltip.contains("5 小时"), "a reset quota without current data stays hidden")
         model.config.dataSource = "proxy"
         controller.refreshTitle()
         XCTAssertTrue(displayedTooltip.contains("已配置企业用量接口数据"), "configuration and source changes invalidate the cache")
@@ -613,7 +1166,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         clock.now = observedAt.addingTimeInterval(120.001)
         model.tick()
         XCTAssertFalse(model.title.contains("30.00%"))
-        XCTAssertTrue(displayedTooltip.contains("5 小时未知"))
+        XCTAssertFalse(displayedTooltip.contains("5 小时"))
         XCTAssertEqual(model.tokenHubQuotaStatus, .stale)
         let afterExpiry = tooltipBuilds
         for _ in 0..<100 { model.tick() }
@@ -659,14 +1212,14 @@ final class TokenHubQuotaStateTests: XCTestCase {
             fiveHour: nil, sevenDay: nil, knownThreadCount: 1,
             liveTurn: LocalLiveTurnSummary(inputTPS: 10, outputTPS: 24.5,
                 observedAt: initial.addingTimeInterval(-14.9)))
-        XCTAssertEqual(model.title, "— | — | —", "菜单栏不显示本地速度")
+        XCTAssertEqual(model.title, "— | —", "菜单栏不显示本地速度")
         var publicationsAfterData = 0
         let observer = model.objectWillChange.sink { publicationsAfterData += 1 }
         now = initial.addingTimeInterval(0.2)
         model.tick()
         XCTAssertEqual(publicationsAfterData, 1,
                        "expiry must compare against the presented new input, not only the last timer tick")
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
         for _ in 0..<100 { model.tick() }
         XCTAssertEqual(publicationsAfterData, 1, "expired input must not restore blanket redraws")
         withExtendedLifetime(observer) {}
@@ -727,7 +1280,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         now = initial.addingTimeInterval(0.2)
         model.tick()
         XCTAssertEqual(publicationsAfterData, 1, "a new window reset can also cross between timer ticks")
-        XCTAssertTrue(model.menuTooltip.contains("重置已过期"))
+        XCTAssertFalse(model.menuTooltip.contains("5 小时"))
         model.tick()
         XCTAssertEqual(publicationsAfterData, 1)
         withExtendedLifetime(observer) {}
@@ -785,15 +1338,15 @@ final class TokenHubQuotaStateTests: XCTestCase {
             lastTurn: LocalTurnSummary(outputTokens: 50, durationSeconds: 2, completedAt: observedAt),
             liveTurn: LocalLiveTurnSummary(inputTPS: 10, outputTPS: 24.5, observedAt: observedAt))
 
-        XCTAssertEqual(model.title, "— | — | —", "菜单栏只显示额度，不显示本地速度")
+        XCTAssertEqual(model.title, "— | —", "菜单栏只显示额度，不显示本地速度")
         XCTAssertTrue(model.menuTooltip.contains("实时估算：输入 10.0 · 输出 24.5 tok/s"))
         now = observedAt.addingTimeInterval(15)
-        XCTAssertEqual(model.title, "— | — | —", "菜单栏不随本地速度变化")
+        XCTAssertEqual(model.title, "— | —", "菜单栏不随本地速度变化")
         now = observedAt.addingTimeInterval(15.001)
-        XCTAssertEqual(model.title, "— | — | —", "菜单栏不显示本地速度")
+        XCTAssertEqual(model.title, "— | —", "菜单栏不显示本地速度")
         XCTAssertTrue(model.menuTooltip.contains("实时估算：未知"), "tooltip freshness must match menu freshness")
         now = observedAt.addingTimeInterval(-0.001)
-        XCTAssertEqual(model.title, "— | — | —", "菜单栏不显示本地速度")
+        XCTAssertEqual(model.title, "— | —", "菜单栏不显示本地速度")
         XCTAssertTrue(model.menuTooltip.contains("实时估算：未知"))
     }
 
@@ -801,7 +1354,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
         let model = AppModel(preview: true)
         defer { model.shutdown() }
         model.config.dataSource = "localCodex"
-        XCTAssertEqual(model.title, "— | — | —", "无额度数据时三个位置都显示未知")
+        XCTAssertEqual(model.title, "— | —", "缺失的五小时额度不占标题位置")
     }
 
     func testUnknownAndAccountingLabelsRemainExplicitWhenSourcesAreMissing() {
@@ -815,9 +1368,9 @@ final class TokenHubQuotaStateTests: XCTestCase {
             sessionCount: 0, filesScanned: 0, isLimited: false, latestEventAt: nil,
             fiveHour: nil, sevenDay: nil, knownThreadCount: 0,
             unknownThreadCount: 0)
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
         XCTAssertTrue(model.menuTooltip.contains("实时估算：未知"))
-        XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
+        XCTAssertFalse(model.menuTooltip.contains("5 小时"))
         XCTAssertTrue(model.menuTooltip.contains("7 天未知"))
 
         model.localSnapshot = LocalCodexSnapshot(input: 120, output: 80, total: 200,
@@ -974,6 +1527,72 @@ final class TokenHubQuotaStateTests: XCTestCase {
         XCTAssertEqual(model.tokenHubDirectFailure, .transportFailed)
         XCTAssertNil(model.tokenHubQuotaSnapshot)
         XCTAssertEqual(scanner.calls, 0, "the compatibility preference controls only the optional AX fallback")
+    }
+
+    func testAXFallbackReplacesPreviousDirectStatesAndVoucherAsCompatibilitySource() async throws {
+        let harness = HubDirectHarness()
+        let permission = HubTestPermission()
+        let clock = HubManualClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let scanner = HubTestScanner(result: result(now: clock.now))
+        let axStarted = expectation(description: "synthetic AX compatibility fallback started")
+        scanner.started = { axStarted.fulfill() }
+        let model = directModel(harness, clock: clock, permission: permission, axSource: scanner.source)
+        defer { model.shutdown(); harness.finishPending() }
+
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(1, harness: harness) else { return }
+        let fiveReset = clock.now.addingTimeInterval(30)
+        let sevenReset = clock.now.addingTimeInterval(60)
+        let monthlyReset = clock.now.addingTimeInterval(90)
+        let priorDirect = TokenHubQuotaSnapshot(identity: harness.identity,
+            fiveHour: nil,
+            sevenDay: TokenHubWindowQuota(kind: .sevenDay, usedAmount: 97, limitAmount: 100,
+                sourceSymbol: "🪙", usedPercent: 97, resetDisplay: "synthetic direct 7d",
+                resetAt: sevenReset),
+            monthly: TokenHubMonthlyUsage(usedAmount: 98, sourceSymbol: "🪙", limitAmount: 100),
+            resetVoucherCount: 7, observedAt: clock.now,
+            states: [.fiveHour: .unlimited(resetAt: fiveReset),
+                     .sevenDay: .exceeded(resetAt: sevenReset),
+                     .monthly: .exceeded(resetAt: monthlyReset)])
+        harness.complete(1, snapshot: priorDirect)
+        await settle(model, status: .connected)
+        XCTAssertTrue(model.tokenHubQuotaIsDirect)
+        XCTAssertEqual(model.tokenHubQuotaSnapshot?.states, priorDirect.states)
+        XCTAssertEqual(model.tokenHubQuotaSnapshot?.resetVoucherCount, 7)
+
+        // Existing late-result and generation tests below continue to cover
+        // request ordering; this case specifically covers source-state isolation.
+        clock.now = clock.now.addingTimeInterval(1)
+        scanner.nextResult = result(now: clock.now)
+        model.refreshTokenHubQuota()
+        guard await waitForDirectRequests(2, harness: harness) else { return }
+        harness.complete(2, failure: .transportFailed)
+        await fulfillment(of: [axStarted], timeout: 2)
+        for _ in 0..<100 where model.tokenHubQuotaSnapshot?.observedAt != clock.now
+            || model.tokenHubQuotaIsDirect || model.tokenHubQuotaStatus != .connected {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+
+        let compatibility = try XCTUnwrap(model.tokenHubQuotaSnapshot)
+        XCTAssertFalse(model.tokenHubQuotaIsDirect)
+        XCTAssertEqual(model.tokenHubQuotaStatus, .connected)
+        XCTAssertNil(model.tokenHubDirectFailure, "successful AX fallback becomes the selected compatibility source")
+        XCTAssertEqual(compatibility.observedAt, clock.now)
+        XCTAssertTrue(compatibility.states.isEmpty, "compatibility read cannot inherit direct states")
+        XCTAssertNil(compatibility.resetVoucherCount, "compatibility read cannot inherit direct vouchers")
+        XCTAssertEqual(compatibility.fiveHour?.usedAmount, Decimal(string: "3.75"),
+                       "AX five-hour value replaces the prior unlimited direct placeholder")
+        XCTAssertEqual(compatibility.sevenDay?.usedAmount, Decimal(4), "AX value replaces prior direct 7d amount")
+        XCTAssertEqual(compatibility.monthly?.usedAmount, Decimal(string: "12.5"),
+                       "AX value replaces prior direct monthly amount")
+        XCTAssertEqual(compatibility.sevenDay?.sourceSymbol, "$", "AX retains its legacy dollar unit")
+        XCTAssertEqual(compatibility.monthly?.sourceSymbol, "$", "AX monthly retains its legacy dollar unit")
+        XCTAssertNil(compatibility.sevenDay?.resetAt, "direct reset time does not leak into AX compatibility data")
+        let widget = model.makeWidgetQuotaSnapshot(at: clock.now)
+        XCTAssertEqual(widget.hubSource, .compatibility)
+        XCTAssertTrue(widget.states.isEmpty)
+        XCTAssertNil(widget.resetVoucherCount)
+        XCTAssertEqual(widget.sevenDay?.sourceSymbol, "$", "Widget projection preserves AX compatibility source")
     }
 
     func testRevokedAXFallbackKeepsDirectFailureAndAutomaticallyRetriesDirectSource() async {
@@ -1359,7 +1978,7 @@ final class TokenHubQuotaStateTests: XCTestCase {
     func testMenuTitleShowsDashForMissingQuota() {
         let model = AppModel(preview: true)
         defer { model.shutdown() }
-        XCTAssertEqual(model.title, "— | — | —")
+        XCTAssertEqual(model.title, "— | —")
     }
 
     func testTokenHubDecimalDisplayPreservesFractionsAtModelAndCardCallsites() async {
@@ -1833,7 +2452,7 @@ extension TokenHubQuotaStateTests {
             "timer expiry projects current facts while retaining the raw source snapshot")
         XCTAssertFalse(model.title.contains("95.00%"))
         XCTAssertTrue(model.title.contains("80.00%"))
-        XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
+        XCTAssertFalse(model.menuTooltip.contains("5 小时"))
         XCTAssertTrue(model.menuTooltip.contains("7 天"))
         XCTAssertEqual(model.alertColor, .systemYellow,
             "the live seven-day window alone continues to drive the 80% menu alert")
@@ -1896,7 +2515,7 @@ extension TokenHubQuotaStateTests {
         XCTAssertEqual(model.alertColor, .labelColor)
         XCTAssertFalse(model.title.contains("60.00%"))
         XCTAssertTrue(model.title.contains("50.00%"))
-        XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
+        XCTAssertFalse(model.menuTooltip.contains("5 小时"))
         XCTAssertTrue(model.menuTooltip.contains("7 天额度"))
         let fiveHourData = try await waitForDiagnosticData(at: fiveHourOutput)
         let fiveHourDiagnostic = try XCTUnwrap(try JSONSerialization.jsonObject(with: fiveHourData) as? [String: Any])
@@ -1917,9 +2536,9 @@ extension TokenHubQuotaStateTests {
         XCTAssertNil(model.quotaPresentation.sevenDayCurrent,
             "the following tick expires the seven-day window at its own reset")
         XCTAssertNotNil(model.quotaPresentation.monthlyCurrent)
-        XCTAssertTrue(model.title.hasPrefix("— | — |"))
-        XCTAssertTrue(model.title.hasPrefix("— | — |"))
-        XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
+        XCTAssertTrue(model.title.hasPrefix("— |"))
+        XCTAssertTrue(model.title.hasPrefix("— |"))
+        XCTAssertFalse(model.menuTooltip.contains("5 小时"))
         XCTAssertTrue(model.menuTooltip.contains("7 天未知"))
         let sevenDayData = try await waitForDiagnosticData(at: sevenDayOutput)
         let sevenDayDiagnostic = try XCTUnwrap(try JSONSerialization.jsonObject(with: sevenDayData) as? [String: Any])
@@ -2664,7 +3283,7 @@ extension TokenHubQuotaStateTests {
         XCTAssertEqual(current.sevenDay?.remainingPercent, 60)
         XCTAssertEqual(current.monthly?.remainingAmount, Decimal(string: "62.5"))
         XCTAssertEqual(current.monthly?.usedPercent, Decimal(string: "37.5"))
-        XCTAssertTrue(model.menuTooltip.contains("5 小时未知"))
+        XCTAssertFalse(model.menuTooltip.contains("5 小时"))
         XCTAssertTrue(model.title.contains("40.00%"))
 
         let card = TokenHubQuotaCard(snapshot: current, status: model.tokenHubQuotaStatusText,

@@ -352,7 +352,7 @@ final class SeasunStartupContractTests: XCTestCase {
                     completedAt: Date(timeIntervalSince1970: 1_797_000_000))),
              ["输入 120", "输出 80", "总计 200 tokens", "本次扫描记录量 200 tokens",
               "线程 2", "子代理 1", "分叉 1", "顶层对话 2", "上轮记录均速：15.0 tok/s",
-              "5 小时额度：本地", "7 天额度：本地"]),
+              "7 天额度：本地"]),
             ("partial", LocalCodexSnapshot(input: 30, output: 20, total: 50,
                 sessionCount: 1, filesScanned: 4, isLimited: false,
                 latestEventAt: nil, fiveHour: nil, sevenDay: nil,
@@ -375,6 +375,7 @@ final class SeasunStartupContractTests: XCTestCase {
             for detail in expectedLocalDetails {
                 XCTAssertTrue(tooltip.contains(detail), "\(name) formal tooltip preserves local history detail: \(detail)")
             }
+            XCTAssertFalse(tooltip.contains("5 小时额度：本地"), "\(name) missing five-hour quota stays hidden")
             XCTAssertTrue(tooltip.contains("不是模型瞬时生成速度"), "\(name) tooltip keeps the non-instantaneous speed qualification")
             XCTAssertTrue(tooltip.contains("Seasun Token Hub"), "\(name) tooltip identifies the enterprise direct source")
             let directLine = tooltip.split(separator: "\n").first { $0.contains("企业后台直接来源") }

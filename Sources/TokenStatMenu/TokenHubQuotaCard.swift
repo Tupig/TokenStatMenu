@@ -11,6 +11,19 @@ enum TokenHubDecimalFormatter {
         formatter.usesGroupingSeparator = true
         formatter.minimumFractionDigits = 0
         formatter.maximumFractionDigits = 2
+        formatter.roundingMode = .halfUp
+        return formatter.string(from: NSDecimalNumber(decimal: value))
+            ?? NSDecimalNumber(decimal: value).stringValue
+    }
+
+    static func coinString(_ value: Decimal) -> String {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        formatter.roundingMode = .halfUp
         return formatter.string(from: NSDecimalNumber(decimal: value))
             ?? NSDecimalNumber(decimal: value).stringValue
     }
@@ -41,10 +54,11 @@ enum TokenHubDecimalFormatter {
     private static func currentSnapshot(_ presentation: TokenHubQuotaPresentation) -> TokenHubQuotaSnapshot? {
         guard presentation.snapshotFresh, let raw = presentation.snapshot,
               presentation.fiveHourCurrent != nil || presentation.sevenDayCurrent != nil
-                || presentation.monthlyCurrent != nil else { return nil }
+                || presentation.monthlyCurrent != nil || !presentation.states.isEmpty else { return nil }
         return TokenHubQuotaSnapshot(identity: raw.identity, fiveHour: presentation.fiveHourCurrent,
             sevenDay: presentation.sevenDayCurrent, monthly: presentation.monthlyCurrent,
-            resetVoucherCount: raw.resetVoucherCount, observedAt: raw.observedAt)
+            resetVoucherCount: raw.resetVoucherCount, observedAt: raw.observedAt,
+            states: presentation.states)
     }
     var emptyStateText: String { enabled ? status : "自动读取已关闭" }
     static func resetLabel(_ value: String) -> String {
@@ -62,12 +76,13 @@ enum TokenHubDecimalFormatter {
                 Text(directSource ? "本次后台读取时间已记录。" : "Token Hub 后台更新时间未提供。")
                     .font(.system(size: 9)).foregroundStyle(.secondary)
                 if let snapshot = rawSnapshot {
-                    if let window = snapshot.fiveHour { projectedRow("5 小时", window, state: presentation.fiveHour) }
-                    else { unknownWindowRow("5 小时") }
-                    if let window = snapshot.sevenDay { projectedRow("7 天", window, state: presentation.sevenDay) }
-                    else { unknownWindowRow("7 天") }
-                    if let monthly = snapshot.monthly { monthlyRow(monthly, isCurrent: presentation.monthlyCurrent != nil) }
-                    else { unknownWindowRow("月度用量") }
+                    if presentation.fiveHourCurrent != nil || presentation.states[.fiveHour] != nil {
+                        quotaFieldRow("5 小时", field: .fiveHour, raw: snapshot.fiveHour,
+                                      current: presentation.fiveHourCurrent, projection: presentation.fiveHour)
+                    }
+                    quotaFieldRow("7 天", field: .sevenDay, raw: snapshot.sevenDay,
+                                  current: presentation.sevenDayCurrent, projection: presentation.sevenDay)
+                    monthlyFieldRow(snapshot.monthly)
                     voucherRow(presentation.snapshotFresh ? snapshot.resetVoucherCount : nil)
                     Text("\(directSource ? "后台读取" : "界面读取")于 \(snapshot.observedAt.formatted(.dateTime.hour().minute()))；快照有效期 \(Int(max(120, refreshSeconds * 2))) 秒")
                         .font(.system(size: 9)).foregroundStyle(.secondary)
@@ -77,6 +92,21 @@ enum TokenHubDecimalFormatter {
             }.frame(maxWidth: .infinity, alignment: .leading)
         } label: { Label(directSource ? "Token Hub 企业额度" : "Token Hub 界面额度快照", systemImage: "window.ceiling") }
     }
+    private func monthlyFieldRow(_ raw: TokenHubMonthlyUsage?) -> some View {
+        switch presentation.states[.monthly] {
+        case .unlimited(let resetAt)?:
+            return AnyView(stateOnlyRow("月度用量", status: "不限额", detail: "不设上限", resetAt: resetAt))
+        case .exceeded(let resetAt)?:
+            if let monthly = presentation.monthlyCurrent {
+                return AnyView(monthlyStateRow(monthly, status: "已超限"))
+            }
+            return AnyView(stateOnlyRow("月度用量", status: "已超限", detail: nil, resetAt: resetAt))
+        case nil:
+            if let raw { return AnyView(monthlyRow(raw, isCurrent: presentation.monthlyCurrent != nil)) }
+            return AnyView(unknownWindowRow("月度用量"))
+        }
+    }
+
     private func monthlyRow(_ monthly: TokenHubMonthlyUsage, isCurrent: Bool) -> some View {
         HStack(spacing: 6) {
             Text("月度用量").fontWeight(.medium)
@@ -85,15 +115,67 @@ enum TokenHubDecimalFormatter {
                 Text("时间异常 · 当前用量未知")
                     .fontWeight(.semibold).foregroundStyle(.secondary)
             } else if isCurrent {
-                Text("\(monthly.sourceSymbol)\(monthlyAmount(monthly.usedAmount))")
+                Text(formattedAmount(monthly.sourceSymbol, monthly.usedAmount, fixed: true))
                     .font(.system(size: 14, weight: .semibold))
                     .monospacedDigit()
             } else {
-                Text("历史已用 \(monthly.sourceSymbol)\(monthlyAmount(monthly.usedAmount))")
+                Text("历史已用 \(formattedAmount(monthly.sourceSymbol, monthly.usedAmount, fixed: true))")
                     .fontWeight(.semibold).monospacedDigit().foregroundStyle(.secondary)
             }
         }
         .font(.system(size: 10))
+    }
+
+    private func monthlyStateRow(_ monthly: TokenHubMonthlyUsage, status: String) -> some View {
+        HStack(spacing: 6) {
+            Text("月度用量").fontWeight(.medium)
+            Spacer(minLength: 0)
+            Text("\(status) \(formattedAmount(monthly.sourceSymbol, monthly.usedAmount, fixed: true))")
+                .font(.system(size: 14, weight: .semibold)).monospacedDigit()
+        }
+        .font(.system(size: 10))
+    }
+
+    private func quotaFieldRow(_ title: String, field: TokenHubQuotaField,
+                               raw: TokenHubWindowQuota?, current: TokenHubWindowQuota?,
+                               projection: TokenHubQuotaPresentation.WindowProjection?) -> AnyView {
+        if presentation.futureObservation {
+            return AnyView(unknownWindowRow("\(title) · 时间异常，当前数据未知"))
+        }
+        if let state = presentation.states[field] {
+            switch state {
+            case .unlimited(let resetAt):
+                return AnyView(stateOnlyRow(title, status: "不限额", detail: "不设上限", resetAt: resetAt))
+            case .exceeded(let resetAt):
+                if let current {
+                    return AnyView(row(title, current.usedPercent, current.usedAmount, current.limitAmount,
+                                       current.sourceSymbol, current.resetDisplay, state: state))
+                }
+                return AnyView(stateOnlyRow(title, status: "已超限", detail: nil, resetAt: resetAt))
+            }
+        }
+        guard let raw else { return AnyView(unknownWindowRow(title)) }
+        if let current, presentation.snapshotFresh, projection?.resetPassed != true {
+            return AnyView(row(title, current.usedPercent, current.usedAmount, current.limitAmount,
+                               current.sourceSymbol, current.resetDisplay))
+        }
+        return AnyView(historyRow(title, raw, stale: !presentation.snapshotFresh))
+    }
+
+    private func stateOnlyRow(_ title: String, status: String, detail: String?, resetAt: Date?) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(title).fontWeight(.medium)
+                Spacer(minLength: 0)
+                Text(status).fontWeight(.semibold)
+            }
+            HStack(alignment: .center) {
+                Text(detail ?? status).fontWeight(.medium)
+                Spacer(minLength: 0)
+                Text(Self.resetLabel(resetAt?.formatted(.dateTime.month(.twoDigits).day(.twoDigits)
+                    .hour().minute()) ?? "未知")).foregroundStyle(.secondary)
+            }
+        }.font(.system(size: 10))
     }
     private func voucherRow(_ count: Int?) -> some View {
         HStack(spacing: 6) {
@@ -113,15 +195,22 @@ enum TokenHubDecimalFormatter {
         }
         .font(.system(size: 10))
     }
-    private func row(_ title: String, _ usedPercent: Decimal, _ used: Decimal, _ limit: Decimal, _ symbol: String, _ reset: String) -> some View {
-        let remainingPercent = Decimal(100) - usedPercent
+    private func row(_ title: String, _ usedPercent: Decimal, _ used: Decimal, _ limit: Decimal,
+                     _ symbol: String, _ reset: String,
+                     state: TokenHubQuotaValueState? = nil) -> some View {
+        let remainingPercent = max(Decimal(0), Decimal(100) - usedPercent)
         let usedFraction = min(1, max(0, NSDecimalNumber(decimal: usedPercent / 100).doubleValue))
         return VStack(alignment: .leading, spacing: 3) {
             HStack {
                 Text(title).fontWeight(.medium)
                 Spacer(minLength: 0)
-            Text("剩余 \(TwoDecimalPercentFormatter.string(remainingPercent))")
-                .fontWeight(.semibold).monospacedDigit()
+                if case .exceeded? = state {
+                    Text("已超限 \(TwoDecimalPercentFormatter.string(usedPercent))")
+                        .fontWeight(.semibold).monospacedDigit()
+                } else {
+                    Text("剩余 \(TwoDecimalPercentFormatter.string(remainingPercent))")
+                        .fontWeight(.semibold).monospacedDigit()
+                }
             }
             GeometryReader { geometry in
                 Capsule().fill(PanelPalette.blue.opacity(0.12))
@@ -133,24 +222,13 @@ enum TokenHubDecimalFormatter {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("\(directSource ? "后台已用" : "界面已用") \(TwoDecimalPercentFormatter.string(usedPercent))")
                         .monospacedDigit()
-                    Text("\(symbol)\(amount(used)) / \(symbol)\(amount(limit))")
+                    Text("\(formattedAmount(symbol, used, fixed: false)) / \(formattedAmount(symbol, limit, fixed: false))")
                         .monospacedDigit()
                 }
                 Spacer(minLength: 0)
                 Text(Self.resetLabel(reset)).foregroundStyle(.secondary)
             }
         }.font(.system(size: 10))
-    }
-    private func projectedRow(_ title: String, _ window: TokenHubWindowQuota,
-                              state: TokenHubQuotaPresentation.WindowProjection?) -> some View {
-        if presentation.futureObservation {
-            return AnyView(unknownWindowRow("\(title) · 时间异常，当前数据未知"))
-        }
-        guard presentation.snapshotFresh, let state, !state.resetPassed else {
-            return AnyView(historyRow(title, window, stale: !presentation.snapshotFresh))
-        }
-        return AnyView(row(title, window.usedPercent, window.usedAmount, window.limitAmount,
-            window.sourceSymbol, window.resetDisplay))
     }
     private func historyRow(_ title: String, _ window: TokenHubWindowQuota, stale: Bool) -> some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -165,7 +243,7 @@ enum TokenHubDecimalFormatter {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("\(directSource ? "后台已用" : "界面已用") \(TwoDecimalPercentFormatter.string(window.usedPercent))")
                         .monospacedDigit()
-                    Text("\(window.sourceSymbol)\(amount(window.usedAmount)) / \(window.sourceSymbol)\(amount(window.limitAmount))")
+                    Text("\(formattedAmount(window.sourceSymbol, window.usedAmount, fixed: false)) / \(formattedAmount(window.sourceSymbol, window.limitAmount, fixed: false))")
                         .monospacedDigit()
                 }
                 Spacer(minLength: 0)
@@ -180,6 +258,11 @@ enum TokenHubDecimalFormatter {
         return PanelPalette.blue
     }
     private func amount(_ value: Decimal) -> String { TokenHubDecimalFormatter.string(value) }
+
+    private func formattedAmount(_ symbol: String, _ value: Decimal, fixed: Bool) -> String {
+        if symbol == "🪙" { return "🪙 \(TokenHubDecimalFormatter.coinString(value))" }
+        return "\(symbol)\(fixed ? monthlyAmount(value) : amount(value))"
+    }
 
     /// 月度用量只展示已花金额：千分位、两位小数，不显示进度或上限。
     private func monthlyAmount(_ value: Decimal) -> String {

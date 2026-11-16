@@ -31,7 +31,7 @@ tokenstatmenu
 | [CI/CD](CI-CD.md) | 无签名构建、GitHub Release 与 Homebrew 配方 |
 | [贡献指南](贡献指南.md) | 修改流程、双语文档与隐私要求 |
 
-文档只保留根 README 和 `docs/wiki/`，每页先中文、后英文。数字和命令以源码为准；当前发布版本以 Releases 和 Homebrew 配方为准。
+日常入口为根 README 与 `docs/wiki/`；`Sources/`、`Tests/`、`Resources/` 和 `script/` 保留各自约定，`dist/` 中活动 App 和预览保留。清理历史派生资料前，应先建立可恢复归档、校验内容并记录恢复方法；忽略文件不能依靠 Git 自动恢复。每页先中文、后英文。数字和命令以源码为准；当前发布版本以 Releases 和 Homebrew 配方为准。
 
 ---
 
@@ -68,4 +68,4 @@ The current public release is [1.2.1](https://github.com/Tupig/TokenStatMenu/rel
 | [CI/CD](CI-CD.md#cicd-english) | Unsigned build, GitHub Release and Homebrew formula |
 | [Contributing](贡献指南.md#contributing-english) | Workflow, bilingual docs and privacy |
 
-Documentation lives only in the root README and `docs/wiki/`. Each page has Chinese first and English second. Source code defines behavior; Releases and the Homebrew formula identify what is publicly available.
+The root README and `docs/wiki/` are the daily documentation entry points. `Sources/`, `Tests/`, `Resources/` and `script/` retain their existing roles; the active App and previews under `dist/` are retained. Before cleaning historical derivatives, create a recoverable archive, verify its contents and document recovery; Git cannot automatically restore ignored files. Each page has Chinese first and English second. Source code defines behavior; Releases and the Homebrew formula identify what is publicly available.

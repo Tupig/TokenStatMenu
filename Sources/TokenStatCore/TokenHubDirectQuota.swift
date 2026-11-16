@@ -325,9 +325,13 @@ public struct TokenHubDirectQuotaClient: Sendable {
         catch let error as TokenHubDirectQuotaFailure { throw error }
         catch { throw TokenHubDirectQuotaFailure.exchangeFailed }
         try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
-        var response = try await quotaResponse(endpoint: endpoint.url, access: access)
-        // 按 Token Hub 的业务流程，在 401 后刷新一次代理令牌；其他状态不重试，令牌不落盘。
-        if response.statusCode == 401 {
+        var refreshUsed = false
+        let selectorURL = try Self.fixedAPIURL(baseURL: settings.aiManagerBaseURL,
+                                               path: "/api/v1/auth/me/base-url")
+        var selector = try await quotaResponse(endpoint: selectorURL, access: access)
+        // Selector 与所选额度请求共用一次代理令牌刷新预算。
+        if selector.statusCode == 401 {
+            refreshUsed = true
             // 再次换取令牌前重新读取配置；若会话或接口变化，留待下次刷新，避免混用身份。
             let refreshed = try TokenHubConnectionDiscovery.readDefaultStoredSettings(home: home, now: nowProvider())
             guard refreshed == settings else { throw TokenHubDirectQuotaFailure.identityChanged }
@@ -336,20 +340,37 @@ public struct TokenHubDirectQuotaClient: Sendable {
             catch let error as TokenHubDirectQuotaFailure { throw error }
             catch { throw TokenHubDirectQuotaFailure.exchangeFailed }
             try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
-            response = try await quotaResponse(endpoint: endpoint.url, access: access)
+            selector = try await quotaResponse(endpoint: selectorURL, access: access)
+        }
+        let selection = try Self.selectedQuotaEndpoint(selector, direct: endpoint, baseURL: settings.aiManagerBaseURL)
+        let selectedEndpoint = selection.url
+        var response = try await quotaResponse(endpoint: selectedEndpoint, access: access)
+        if response.statusCode == 401, !refreshUsed {
+            refreshUsed = true
+            let refreshed = try TokenHubConnectionDiscovery.readDefaultStoredSettings(home: home, now: nowProvider())
+            guard refreshed == settings else { throw TokenHubDirectQuotaFailure.identityChanged }
+            let refreshedCallbackURL = try Self.callbackURL(baseURL: refreshed.aiManagerBaseURL, session: refreshed.session)
+            do { access = try await callbackRequest(refreshedCallbackURL) }
+            catch let error as TokenHubDirectQuotaFailure { throw error }
+            catch { throw TokenHubDirectQuotaFailure.exchangeFailed }
+            try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
+            response = try await quotaResponse(endpoint: selectedEndpoint, access: access)
         }
         guard (200..<300).contains(response.statusCode) else {
             throw TokenHubDirectQuotaFailure.httpStatus(response.statusCode)
         }
         guard response.data.count <= 1_048_576 else { throw TokenHubDirectQuotaFailure.responseTooLarge }
         try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
-        let decoded = try TokenHubDirectQuotaDecoder.decode(response.data, identity: identity, now: observedAt)
+        let decoded = try selection.isDirect
+            ? TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(response.data, identity: identity, now: observedAt)
+            : TokenHubDirectQuotaDecoder.decode(response.data, identity: identity, now: observedAt)
         // 先确认额度有效，再用同一个可注入transport读取券；失败仅令券未知。
         let voucherCount = await resetVoucherCount(baseURL: settings.aiManagerBaseURL, access: access)
         try Self.requireUnchangedSettings(settings, home: home, now: nowProvider())
         return TokenHubQuotaSnapshot(identity: decoded.identity, fiveHour: decoded.fiveHour,
                                      sevenDay: decoded.sevenDay, monthly: decoded.monthly,
-                                     resetVoucherCount: voucherCount, observedAt: decoded.observedAt)
+                                     resetVoucherCount: voucherCount, observedAt: decoded.observedAt,
+                                     states: decoded.states)
     }
 
     /// 读取当前可用的重置券数量；接口不可用或响应异常时返回 nil。
@@ -379,6 +400,43 @@ public struct TokenHubDirectQuotaClient: Sendable {
             URLQueryItem(name: "page_size", value: "100"),
         ]
         return components?.url
+    }
+
+    private static func fixedAPIURL(baseURL: URL, path: String) throws -> URL {
+        guard baseURL.scheme?.lowercased() == "https", let host = baseURL.host, !host.isEmpty,
+              baseURL.user == nil, baseURL.password == nil, baseURL.query == nil,
+              baseURL.fragment == nil, baseURL.port == nil || baseURL.port == 443,
+              !baseURL.path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              !baseURL.path.split(separator: "/").contains(".."),
+              var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw TokenHubDirectQuotaFailure.endpointRejected
+        }
+        let prefix = baseURL.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        components.path = prefix.isEmpty ? path : "/\(prefix)\(path)"
+        components.query = nil; components.fragment = nil
+        guard let url = components.url else { throw TokenHubDirectQuotaFailure.endpointRejected }
+        return url
+    }
+
+    private static func selectedQuotaEndpoint(_ response: TokenHubDirectQuotaHTTPResponse,
+                                               direct: TokenHubDirectQuotaEndpoint,
+                                               baseURL: URL) throws -> (url: URL, isDirect: Bool) {
+        guard (200..<300).contains(response.statusCode), response.data.count <= 1_048_576,
+              let root = try? JSONSerialization.jsonObject(with: response.data) as? [String: Any],
+              let code = root["code"] as? NSNumber, CFGetTypeID(code) != CFBooleanGetTypeID(),
+              code.stringValue == "0", let data = root["data"] as? [String: Any],
+              let raw = data["is_direct"] as? NSNumber, CFGetTypeID(raw) == CFBooleanGetTypeID() else {
+            if !(200..<300).contains(response.statusCode) {
+                throw TokenHubDirectQuotaFailure.httpStatus(response.statusCode)
+            }
+            if response.data.count > 1_048_576 { throw TokenHubDirectQuotaFailure.responseTooLarge }
+            throw TokenHubDirectQuotaFailure.malformedResponse
+        }
+        let isDirect = raw.boolValue
+        let url = isDirect
+            ? try Self.fixedAPIURL(baseURL: baseURL, path: "/api/v1/auth/me/direct-key/usage")
+            : direct.url
+        return (url, isDirect)
     }
 
     private static func requireUnchangedSettings(_ expected: TokenHubStoredSettings, home: URL, now: Date) throws {
@@ -536,6 +594,79 @@ private final class TokenHubRedirectCapture: NSObject, URLSessionTaskDelegate {
 /// 解码 `/api/v1/auth/me/quota-usage` 响应，不从本地 token 计数推算额度。
 /// 通过 `kind` 识别窗口，未知类型不分配到五小时或七天窗口。
 public enum TokenHubDirectQuotaDecoder {
+    /// 解码 direct-key usage 的 subscription_usage 原生结构。
+    public static func decodeSubscriptionUsage(_ data: Data, identity: TokenHubIdentity,
+                                               now: Date = Date(),
+                                               timeZone: TimeZone = .current) throws -> TokenHubQuotaSnapshot {
+        guard data.count <= 1_048_576,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let code = root["code"] as? NSNumber, CFGetTypeID(code) != CFBooleanGetTypeID(),
+              code.stringValue == "0", let envelope = root["data"] as? [String: Any],
+              let usage = envelope["subscription_usage"] as? [String: Any],
+              usage["currency"] is String, let windows = usage["windows"] as? [[String: Any]] else {
+            throw TokenHubDirectQuotaFailure.malformedResponse
+        }
+        let symbol = "🪙"
+        var five: TokenHubWindowQuota?
+        var seven: TokenHubWindowQuota?
+        var monthly: TokenHubMonthlyUsage?
+        var states: [TokenHubQuotaField: TokenHubQuotaValueState] = [:]
+        var seen = Set<TokenHubQuotaField>()
+
+        func amount(_ window: [String: Any], _ key: String) throws -> Decimal? {
+            guard let raw = window[key], !(raw is NSNull) else { return nil }
+            guard let value = decimal(raw) else { throw TokenHubDirectQuotaFailure.malformedResponse }
+            return value
+        }
+        func reset(_ window: [String: Any]) throws -> Date? {
+            guard let raw = window["resets_at"], !(raw is NSNull) else { return nil }
+            guard let value = date(raw) else { throw TokenHubDirectQuotaFailure.malformedResponse }
+            return value
+        }
+
+        for window in windows {
+            guard let period = window["period"] as? String else { continue }
+            let field: TokenHubQuotaField
+            switch period {
+            case "5h": field = .fiveHour
+            case "7d": field = .sevenDay
+            case "30d": field = .monthly
+            default: continue
+            }
+            guard seen.insert(field).inserted else {
+                if field == .monthly { throw TokenHubDirectQuotaFailure.duplicateMonthly }
+                throw TokenHubDirectQuotaFailure.duplicateWindow(field == .fiveHour ? .fiveHour : .sevenDay)
+            }
+            let resetAt = try reset(window)
+            let used = try amount(window, "used")
+            let limitValue = try amount(window, "limit")
+            guard let used else { throw TokenHubDirectQuotaFailure.malformedResponse }
+            if field == .monthly {
+                let limit = limitValue.flatMap { $0 > 0 ? $0 : nil }
+                monthly = TokenHubMonthlyUsage(usedAmount: used, sourceSymbol: symbol,
+                                               limitAmount: limit, resetAt: resetAt)
+                if let limit, used > limit { states[field] = .exceeded(resetAt: resetAt) }
+                continue
+            }
+            guard let limit = limitValue, limit > 0 else {
+                throw TokenHubDirectQuotaFailure.malformedResponse
+            }
+            let kind: TokenHubWindowKind = field == .fiveHour ? .fiveHour : .sevenDay
+            let percent = (used / limit) * Decimal(100)
+            guard percent.isFinite, percent >= 0 else { throw TokenHubDirectQuotaFailure.malformedResponse }
+            let quota = TokenHubWindowQuota(kind: kind, usedAmount: used, limitAmount: limit,
+                sourceSymbol: symbol, usedPercent: percent, resetDisplay: resetAt.map { format($0, timeZone: timeZone) } ?? "未知",
+                resetAt: resetAt)
+            if field == .fiveHour { five = quota } else { seven = quota }
+            if used > limit { states[field] = .exceeded(resetAt: resetAt) }
+        }
+        guard five != nil || seven != nil || monthly != nil else {
+            throw TokenHubDirectQuotaFailure.noRecognizedWindows
+        }
+        return TokenHubQuotaSnapshot(identity: identity, fiveHour: five, sevenDay: seven,
+                                     monthly: monthly, observedAt: now, states: states)
+    }
+
     public static func decode(_ data: Data, identity: TokenHubIdentity, now: Date = Date(),
                               timeZone: TimeZone = .current) throws -> TokenHubQuotaSnapshot {
         guard data.count <= 1_048_576,
@@ -549,67 +680,130 @@ public enum TokenHubDirectQuotaDecoder {
               let windows = (dataObject["windows"] as? [[String: Any]]) ?? (object["windows"] as? [[String: Any]]) else {
             throw TokenHubDirectQuotaFailure.malformedResponse
         }
-        let symbol = displaySymbol(currency)
-        let fallbackResetRaw = dataObject["reset_at"] ?? object["reset_at"]
-        if let fallbackResetRaw, !(fallbackResetRaw is NSNull), date(fallbackResetRaw) == nil {
-            throw TokenHubDirectQuotaFailure.malformedResponse
-        }
-        let fallbackReset = date(fallbackResetRaw)
+        // The current Hub card uses its fixed coin denomination regardless of
+        // currency metadata; this adapter does not perform currency conversion.
+        let symbol = "🪙"
+        _ = currency
         var five: TokenHubWindowQuota?
         var seven: TokenHubWindowQuota?
         var monthly: TokenHubMonthlyUsage?
-        for window in windows {
-            guard let kind = windowKind(window["kind"] as? String) else {
-                if monthlyKind(window["kind"] as? String) {
-                    guard monthly == nil else { throw TokenHubDirectQuotaFailure.duplicateMonthly }
-                    guard let used = decimal(window["used_amount"]), used >= 0 else {
-                        throw TokenHubDirectQuotaFailure.malformedResponse
-                    }
-                    let monthlyLimit: Decimal?
-                    if let rawLimit = window["quota_amount"], !(rawLimit is NSNull) {
-                        guard let limit = decimal(rawLimit), limit > 0, used <= limit else {
-                            throw TokenHubDirectQuotaFailure.malformedResponse
-                        }
-                        monthlyLimit = limit
-                    } else {
-                        monthlyLimit = nil
-                    }
-                    monthly = TokenHubMonthlyUsage(usedAmount: used, sourceSymbol: symbol, limitAmount: monthlyLimit)
-                }
-                continue
-            }
-            if kind == .fiveHour, five != nil { throw TokenHubDirectQuotaFailure.duplicateWindow(kind) }
-            if kind == .sevenDay, seven != nil { throw TokenHubDirectQuotaFailure.duplicateWindow(kind) }
-            guard let limit = decimal(window["quota_amount"]),
-                  let used = decimal(window["used_amount"]),
-                  limit > 0, used >= 0, used <= limit else {
+        var states: [TokenHubQuotaField: TokenHubQuotaValueState] = [:]
+        var seenFields = Set<TokenHubQuotaField>()
+
+        func strictFlag(_ window: [String: Any], _ key: String) throws -> Bool? {
+            guard let raw = window[key] else { return nil }
+            guard let value = raw as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else {
                 throw TokenHubDirectQuotaFailure.malformedResponse
             }
-            let percent = (used / limit) * Decimal(100)
-            guard percent >= 0, percent <= Decimal(100) else {
-                throw TokenHubDirectQuotaFailure.malformedResponse
-            }
+            return value.boolValue
+        }
+        func checkedAmount(_ window: [String: Any], _ key: String) throws -> Decimal? {
+            guard let raw = window[key], !(raw is NSNull) else { return nil }
+            guard let value = decimal(raw) else { throw TokenHubDirectQuotaFailure.malformedResponse }
+            return value
+        }
+        func localReset(_ window: [String: Any]) throws -> Date? {
             let rawStart = window["period_start"]
             let rawEnd = window["period_end"]
+            let rawReset = window["reset_at"]
             if let rawStart, !(rawStart is NSNull), date(rawStart) == nil {
                 throw TokenHubDirectQuotaFailure.malformedResponse
             }
             if let rawEnd, !(rawEnd is NSNull), date(rawEnd) == nil {
                 throw TokenHubDirectQuotaFailure.malformedResponse
             }
-            if let start = date(rawStart), let end = date(rawEnd), end <= start {
+            if let rawReset, !(rawReset is NSNull), date(rawReset) == nil {
                 throw TokenHubDirectQuotaFailure.malformedResponse
             }
-            let resetAt = date(rawEnd) ?? fallbackReset
-            let reset = resetAt.map { format($0, timeZone: timeZone) } ?? "未知"
-            let quota = TokenHubWindowQuota(kind: kind, usedAmount: used, limitAmount: limit,
-                                             sourceSymbol: symbol, usedPercent: percent, resetDisplay: reset,
-                                             resetAt: resetAt)
-            if kind == .fiveHour { five = quota } else { seven = quota }
+            let start = date(rawStart)
+            let end = date(rawEnd)
+            if let start, let end, end <= start {
+                throw TokenHubDirectQuotaFailure.malformedResponse
+            }
+            return date(rawReset) ?? end
         }
-        guard five != nil || seven != nil || monthly != nil else { throw TokenHubDirectQuotaFailure.noRecognizedWindows }
+
+        for window in windows {
+            let rawKind = window["kind"] as? String
+            let kind = windowKind(rawKind)
+            let isMonthly = kind == nil && monthlyKind(rawKind)
+            guard let field = kind.map({ $0 == .fiveHour ? TokenHubQuotaField.fiveHour : .sevenDay })
+                    ?? (isMonthly ? .monthly : nil) else { continue }
+
+            // Duplicate recognition is independent of enabled state and value completeness.
+            guard seenFields.insert(field).inserted else {
+                if field == .monthly { throw TokenHubDirectQuotaFailure.duplicateMonthly }
+                throw TokenHubDirectQuotaFailure.duplicateWindow(field == .fiveHour ? .fiveHour : .sevenDay)
+            }
+
+            let resetAt = try localReset(window)
+            let enabled = try strictFlag(window, "enabled")
+            let violated = try strictFlag(window, "violated") ?? false
+            // Validate every present, non-null amount before status precedence can hide it.
+            let limitValue = try checkedAmount(window, "quota_amount")
+            let usedValue = try checkedAmount(window, "used_amount")
+            let enabledFalse = enabled == false
+            let positiveLimit = limitValue.flatMap { $0 > 0 ? $0 : nil }
+
+            if violated {
+                // Disabled or incomplete fields still retain their explicit status;
+                // only a complete positive-cap pair may carry numeric data.
+                if !enabledFalse, let limit = positiveLimit, let used = usedValue {
+                    if field == .monthly {
+                        monthly = TokenHubMonthlyUsage(usedAmount: used, sourceSymbol: symbol,
+                                                      limitAmount: limit, resetAt: resetAt)
+                    } else {
+                        let kind = field == .fiveHour ? TokenHubWindowKind.fiveHour : .sevenDay
+                        let percent = (used / limit) * Decimal(100)
+                        guard percent.isFinite, percent >= 0 else {
+                            throw TokenHubDirectQuotaFailure.malformedResponse
+                        }
+                        let reset = resetAt.map { format($0, timeZone: timeZone) } ?? "未知"
+                        let quota = TokenHubWindowQuota(kind: kind, usedAmount: used,
+                            limitAmount: limit, sourceSymbol: symbol, usedPercent: percent,
+                            resetDisplay: reset, resetAt: resetAt)
+                        if field == .fiveHour { five = quota } else { seven = quota }
+                    }
+                }
+                states[field] = .exceeded(resetAt: resetAt)
+                continue
+            }
+
+            if enabledFalse {
+                states[field] = .unlimited(resetAt: resetAt)
+                continue
+            }
+
+            if field == .monthly {
+                guard let used = usedValue else { throw TokenHubDirectQuotaFailure.malformedResponse }
+                monthly = TokenHubMonthlyUsage(usedAmount: used, sourceSymbol: symbol,
+                                              limitAmount: positiveLimit, resetAt: resetAt)
+                if let limit = positiveLimit, used > limit {
+                    states[field] = .exceeded(resetAt: resetAt)
+                }
+                continue
+            }
+
+            guard let limit = positiveLimit, let used = usedValue else {
+                throw TokenHubDirectQuotaFailure.malformedResponse
+            }
+            let quotaKind = field == .fiveHour ? TokenHubWindowKind.fiveHour : .sevenDay
+            let percent = (used / limit) * Decimal(100)
+            guard percent.isFinite, percent >= 0 else {
+                throw TokenHubDirectQuotaFailure.malformedResponse
+            }
+            let reset = resetAt.map { format($0, timeZone: timeZone) } ?? "未知"
+            let quota = TokenHubWindowQuota(kind: quotaKind, usedAmount: used, limitAmount: limit,
+                                             sourceSymbol: symbol, usedPercent: percent,
+                                             resetDisplay: reset, resetAt: resetAt)
+            if field == .fiveHour { five = quota } else { seven = quota }
+            if used > limit { states[field] = .exceeded(resetAt: resetAt) }
+        }
+        guard five != nil || seven != nil || monthly != nil || !states.isEmpty else {
+            throw TokenHubDirectQuotaFailure.noRecognizedWindows
+        }
         return TokenHubQuotaSnapshot(identity: identity, fiveHour: five, sevenDay: seven,
-                                     monthly: monthly, observedAt: now)
+                                     monthly: monthly, observedAt: now, states: states)
     }
 
     private static func windowKind(_ raw: String?) -> TokenHubWindowKind? {
@@ -655,17 +849,6 @@ public enum TokenHubDirectQuotaDecoder {
         if let date = formatter.date(from: text) { return date }
         formatter.formatOptions.insert(.withFractionalSeconds)
         return formatter.date(from: text)
-    }
-
-    private static func displaySymbol(_ currency: String) -> String {
-        switch currency.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
-        case "USD", "$": return "$"
-        case "CNY", "RMB", "¥": return "¥"
-        case "EUR", "€": return "€"
-        case "GBP", "£": return "£"
-        case "JPY", "JP¥": return "¥"
-        default: return "¤"
-        }
     }
 
     private static func format(_ date: Date, timeZone: TimeZone) -> String {

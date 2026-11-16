@@ -25,7 +25,7 @@ public struct TokenHubWindowQuota: Equatable, Sendable {
     public let limitAmount: Decimal
     public let sourceSymbol: String
     public let usedPercent: Decimal
-    public var remainingPercent: Decimal { Decimal(100) - usedPercent }
+    public var remainingPercent: Decimal { max(Decimal(0), Decimal(100) - usedPercent) }
     public let resetDisplay: String
     /// 来源重置时间戳，当直连接口提供了该值时。AX
     /// 仅显示的行将此值留空，而不是猜测一个日期。
@@ -43,19 +43,34 @@ public struct TokenHubWindowQuota: Equatable, Sendable {
 public struct TokenHubMonthlyUsage: Equatable, Sendable {
     public let usedAmount: Decimal
     public let sourceSymbol: String
+    /// 来源明确提供的月度窗口 reset；兼容性扫描没有可用时间时为 nil。
+    public let resetAt: Date?
     /// 月度总量是可选的，因为部分企业响应会
     /// 只暴露用量而不含额度。此时派生值保持未知。
     public let limitAmount: Decimal?
     public var remainingAmount: Decimal? {
-        guard let limitAmount, limitAmount > 0, usedAmount >= 0, usedAmount <= limitAmount else { return nil }
-        return limitAmount - usedAmount
+        guard let limitAmount, limitAmount > 0, usedAmount >= 0 else { return nil }
+        return max(Decimal(0), limitAmount - usedAmount)
     }
     public var usedPercent: Decimal? {
-        guard let limitAmount, limitAmount > 0, usedAmount >= 0, usedAmount <= limitAmount else { return nil }
+        guard let limitAmount, limitAmount > 0, usedAmount >= 0 else { return nil }
         return (usedAmount / limitAmount) * Decimal(100)
     }
-    public init(usedAmount: Decimal, sourceSymbol: String, limitAmount: Decimal? = nil) {
+    public init(usedAmount: Decimal, sourceSymbol: String, limitAmount: Decimal? = nil,
+                resetAt: Date? = nil) {
         self.usedAmount = usedAmount; self.sourceSymbol = sourceSymbol; self.limitAmount = limitAmount
+        self.resetAt = resetAt
+    }
+}
+
+public enum TokenHubQuotaValueState: Equatable, Sendable {
+    case unlimited(resetAt: Date?)
+    case exceeded(resetAt: Date?)
+
+    public var resetAt: Date? {
+        switch self {
+        case .unlimited(let resetAt), .exceeded(let resetAt): return resetAt
+        }
     }
 }
 
@@ -67,11 +82,14 @@ public struct TokenHubQuotaSnapshot: Equatable, Sendable {
     /// 可用重置券数量；接口未提供或读取失败时为 nil，不猜测为 0。
     public let resetVoucherCount: Int?
     public let observedAt: Date
+    /// 明确的非数值额度状态。正常有限值仍由对应 numeric 字段表示。
+    public let states: [TokenHubQuotaField: TokenHubQuotaValueState]
     public init(identity: TokenHubIdentity, fiveHour: TokenHubWindowQuota?, sevenDay: TokenHubWindowQuota?,
-                monthly: TokenHubMonthlyUsage?, resetVoucherCount: Int? = nil, observedAt: Date) {
+                monthly: TokenHubMonthlyUsage?, resetVoucherCount: Int? = nil, observedAt: Date,
+                states: [TokenHubQuotaField: TokenHubQuotaValueState] = [:]) {
         self.identity = identity; self.fiveHour = fiveHour; self.sevenDay = sevenDay
         self.monthly = monthly; self.resetVoucherCount = resetVoucherCount
-        self.observedAt = observedAt
+        self.observedAt = observedAt; self.states = states
     }
 }
 
@@ -80,7 +98,7 @@ public enum TokenHubQuotaStatus: Equatable, Sendable {
     case quotaGroupUnavailable, unsupportedLayout, accessFailed, stale, connected
 }
 
-public enum TokenHubQuotaField: Equatable, Sendable { case fiveHour, sevenDay, monthly }
+public enum TokenHubQuotaField: Hashable, Sendable { case fiveHour, sevenDay, monthly }
 
 public enum TokenHubQuotaFailure: Error, Equatable, Sendable {
     case permissionMissing, noTarget, multipleTargets, identityChanged, elementPIDMismatch
@@ -296,19 +314,25 @@ public enum TokenHubQuotaParser {
 
     private struct ParsedAmount { let used: Decimal; let limit: Decimal; let symbol: String }
     private static func parseAmountPair(_ text: String) -> ParsedAmount? {
-        let pattern = #"^\s*(\$)([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*/\s*\$(?:\s*)([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*$"#
+        let pattern = #"^\s*(\$|🪙)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*/\s*(\$\s*)?([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*$"#
         guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)), match.numberOfRanges == 4,
-              let usedRange = Range(match.range(at: 2), in: text), let limitRange = Range(match.range(at: 3), in: text) else { return nil }
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)), match.numberOfRanges == 5,
+              let symbolRange = Range(match.range(at: 1), in: text),
+              let usedRange = Range(match.range(at: 2), in: text), let limitRange = Range(match.range(at: 4), in: text) else { return nil }
         guard let used = parseDecimalAmount(String(text[usedRange])), let limit = parseDecimalAmount(String(text[limitRange])) else { return nil }
-        return ParsedAmount(used: used, limit: limit, symbol: "$")
+        let symbol = String(text[symbolRange])
+        // Only the legacy dollar form requires and repeats its unit on the limit.
+        if symbol == "$", match.range(at: 3).location == NSNotFound { return nil }
+        if symbol == "🪙", match.range(at: 3).location != NSNotFound { return nil }
+        return ParsedAmount(used: used, limit: limit, symbol: symbol)
     }
     private static func parseSingleAmount(_ text: String) -> ParsedAmount? {
-        let pattern = #"^\s*(\$)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*$"#
+        let pattern = #"^\s*(\$|🪙)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*$"#
         guard let regex = try? NSRegularExpression(pattern: pattern),
               let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)), match.numberOfRanges == 3,
+              let symbolRange = Range(match.range(at: 1), in: text),
               let range = Range(match.range(at: 2), in: text), let value = parseDecimalAmount(String(text[range])) else { return nil }
-        return ParsedAmount(used: value, limit: 0, symbol: "$")
+        return ParsedAmount(used: value, limit: 0, symbol: String(text[symbolRange]))
     }
     private static func parseDecimalAmount(_ raw: String) -> Decimal? {
         let pieces = raw.split(separator: ".", omittingEmptySubsequences: false)

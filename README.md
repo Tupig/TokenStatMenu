@@ -10,7 +10,7 @@
 
 <img src="Resources/AppIcon.png" width="96" alt="TokenStatMenu 图标">
 
-在 macOS 菜单栏查看 **Seasun Token Hub** 的 5 小时、7 天额度和月度用量。用 Swift、SwiftUI、AppKit 和 WidgetKit 编写，没有 Electron，也不需要另填 API Key。
+在 macOS 菜单栏查看 **Seasun Token Hub** 的 5 小时、7 天额度和月度积分用量。应用使用 Swift、SwiftUI、AppKit 和 WidgetKit，复用 Hub 现有登录态只读查询，不需要另填 API Key。
 
 [文档中心](docs/wiki/Home.md) · [安装与使用](docs/wiki/安装与使用.md) · [常见问题](docs/wiki/常见问题.md) · [下载 Release](https://github.com/Tupig/TokenStatMenu/releases)
 
@@ -29,13 +29,13 @@
 
 | 位置 | 显示内容 |
 | --- | --- |
-| 菜单栏 | `38.10% \| 74.40% \| $3,488.22`：依次为 5 小时已用、7 天已用、月度用量 |
-| 概览面板 | 5 小时和 7 天的剩余比例、已用金额、额度与重置时间；月度用量和重置券 |
+| 菜单栏 | `38.10% \| 74.40% \| 🪙 3,488.22`：依次为 5 小时已用、7 天已用、月度积分用量 |
+| 概览面板 | 5 小时和 7 天的剩余比例、已用量、额度与重置时间；月度用量和重置券 |
 | 小尺寸小组件 | 5 小时、7 天进度条；条下左侧为最大额度，右侧为重置时间；月度用量和重置券 |
 
-百分比显示两位小数，金额最多两位小数，月度金额固定两位。缺失、过期或已经重置的数据显示“未知”或 `—`，不会用零或另一个窗口填补。上面的数字只是格式示例。
+百分比显示两位小数，后台积分以 `🪙` 为单位并固定两位小数，不进行货币或 Token 换算；旧界面兼容来源保留原有单位。明确的不限额度和超限分别显示“不限额”“已超限”，有真实超额数值时保留其用量与比例。缺失、过期或已经重置的数据显示“未知”或 `—`，不会用零或另一个窗口填补。上面的数字只是格式示例。
 
-菜单栏只显示三个额度数字。概览只显示 Seasun Token Hub 的 5 小时、7 天、月度用量和重置券。[统计口径](docs/wiki/统计口径.md)介绍各项数字的来源和计算方法。
+菜单栏、概览和小组件会在 5 小时窗口没有当前有效数据或明确状态时隐藏该项；有效零、不限额和超限仍保留。概览显示 Seasun Token Hub 的当前窗口、月度用量和可用重置券。[统计口径](docs/wiki/统计口径.md)介绍按 TokenHub 来源选择接口的规则、各项数字与状态，以及当前账户实测的验证范围。
 
 ## 安装、更新、卸载
 
@@ -54,7 +54,7 @@ tokenstatmenu
 
 ## 小组件
 
-只提供 **small** 尺寸。支持的系统上，在小组件图库中搜索 TokenStatMenu 并添加；桌面小组件需要 macOS 14+。文字统一为 10pt，月度只显示已用金额，没有月度进度条。
+只提供 **small** 尺寸。支持的系统上，在小组件图库中搜索 TokenStatMenu 并添加；桌面小组件需要 macOS 14+。文字统一为 10pt，月度只显示已用数值或明确状态，没有月度进度条。
 
 > [!IMPORTANT]
 > 小组件读写依赖 App Group 授权。本机 Apple Development 签名候选已验证；公开 DMG 和 Homebrew 的 ad hoc 签名不能保证获得该权限。包内含扩展不等于小组件能够读取数据。菜单栏与面板不受这项限制影响；分发签名问题见 [#88](https://github.com/Tupig/TokenStatMenu/issues/88)。
@@ -100,6 +100,12 @@ git diff --check
 | `Tests/` | 核心检查、状态回归和合成 UI 基线 |
 | `script/` | 构建、检查、打包和发布工具 |
 | `docs/wiki/` | 中英双语使用及开发文档 |
+| `dist/` | 当前 App、预览等生成输出；构建入口仍使用原有路径 |
+| `governance/` | 被忽略的本地工作包、审查、验证和历史工件归档，不进入公开源码包 |
+
+日常开发从本文件和文档中心进入，构建与检查统一使用 `script/` 中的既有入口。源码、测试、资源和 Xcode 工程保留原路径；目录整理不通过搬迁这些入口破坏引用。
+
+`status.md`、`spec.md` 和 `governance/` 仅是维护者本机资料，不随公开仓库或源码包提供。公开项目的维护入口为本文件、`docs/wiki/` 和 `script/`。历史发行工件须先保存原始文件、摘要和恢复映射，核验归档及隔离恢复副本后再清理原位置；同名版本不代表内容相同。当前 App 和预览属于活动输出，按其生成流程维护。
 
 ## 隐私与限制
 
@@ -121,7 +127,7 @@ git diff --check
 
 [简体中文](#tokenstatmenu) | **English**
 
-A native macOS menu bar app for **Seasun Token Hub** quotas: five-hour usage, seven-day usage, and monthly spend. Built with Swift, SwiftUI, AppKit, and WidgetKit. No Electron and no API Key to enter.
+A native macOS menu bar app for **Seasun Token Hub** quotas: five-hour usage, seven-day usage, and monthly credit usage. Built with Swift, SwiftUI, AppKit, and WidgetKit, it queries quotas read-only through the existing Hub session without an additional API Key.
 
 [Documentation](docs/wiki/Home.md#documentation-hub-english) · [Installation](docs/wiki/安装与使用.md#installation-and-usage-english) · [FAQ](docs/wiki/常见问题.md#faq-english) · [Releases](https://github.com/Tupig/TokenStatMenu/releases)
 
@@ -129,13 +135,13 @@ A native macOS menu bar app for **Seasun Token Hub** quotas: five-hour usage, se
 
 | Surface | Contents |
 | --- | --- |
-| Menu bar | `38.10% \| 74.40% \| $3,488.22`: five-hour used, seven-day used, monthly spend |
-| Panel | Remaining percentages, used amounts, limits and reset times; monthly spend and reset vouchers |
-| Small widget | Five-hour and seven-day bars, limits on the left and reset times on the right; monthly spend and vouchers |
+| Menu bar | `38.10% \| 74.40% \| 🪙 3,488.22`: five-hour used, seven-day used, monthly credit usage |
+| Panel | Remaining percentages, usage, limits and reset times; monthly usage and reset vouchers |
+| Small widget | Five-hour and seven-day bars, limits on the left and reset times on the right; monthly usage and vouchers |
 
-Percentages use two decimal places. Amounts use up to two, with monthly spend fixed at two. Missing, expired or reset data stays unknown; another window or a zero never fills the gap. The numbers above are examples.
+Percentages use two decimal places. Direct Hub credit amounts use `🪙` and exactly two decimals, without currency or Token conversion; legacy UI compatibility data retains its original unit. Explicit unlimited and exceeded states are displayed separately, retaining genuine usage and percentages when over-limit values are available. Missing, expired or reset data stays unknown; another window or a zero never fills the gap. The numbers above are examples.
 
-The menu bar contains only the three quota figures. The panel shows Seasun Token Hub five-hour, seven-day, monthly usage and reset vouchers. See [Metric definitions](docs/wiki/统计口径.md#metric-definitions-english).
+The menu bar, panel and widget hide the five-hour item when it has no current valid value or explicit state; valid zero, unlimited and exceeded states remain visible. The panel shows current Seasun Token Hub windows, monthly usage and available reset vouchers. See [Metric definitions](docs/wiki/统计口径.md#metric-definitions-english) for source-specific API selection, values, states and the limits of current-account validation.
 
 ## Install, Update, Uninstall
 
@@ -154,7 +160,7 @@ Quit the running App before upgrading. `brew upgrade` does not replace a running
 
 ## Widget
 
-Only **small** is supported. Add TokenStatMenu from the widget gallery on supported systems; desktop widgets require macOS 14+. Text uses 10pt throughout. Monthly spend is an amount, not a progress bar.
+Only **small** is supported. Add TokenStatMenu from the widget gallery on supported systems; desktop widgets require macOS 14+. Text uses 10pt throughout. Monthly usage shows its value or explicit state, without a progress bar.
 
 > [!IMPORTANT]
 > Widget sharing needs App Group authorization. The local Apple Development-signed candidate has been tested; public DMG and Homebrew ad hoc signatures cannot guarantee that authorization. An embedded extension does not establish working data access. The menu bar and panel remain usable. See [#88](https://github.com/Tupig/TokenStatMenu/issues/88).
@@ -200,6 +206,12 @@ Tests use synthetic data. Pixel snapshots depend on the rendering environment; C
 | `Tests/` | Core checks, state regressions and synthetic UI references |
 | `script/` | Build, validation, packaging and release tools |
 | `docs/wiki/` | Chinese and English documentation |
+| `dist/` | Generated App and previews; existing build output paths remain in use |
+| `governance/` | Ignored local work packages, reviews, verification and historical artifact archives; excluded from public source packages |
+
+Start daily work from this README and the documentation hub, using the existing `script/` build and check entry points. Source, tests, resources and the Xcode project retain their paths so directory maintenance preserves their references.
+
+`status.md`, `spec.md` and `governance/` are maintainer-local records and are excluded from the public repository and source archive. Public maintenance starts with this README, `docs/wiki/` and `script/`. Preserve original historical release artifacts, checksums and recovery mappings, then verify the archive and an isolated restore before removing the original paths; matching version names do not establish matching contents. Maintain the current App and previews through their generating workflows.
 
 ## Privacy and Limitations
 

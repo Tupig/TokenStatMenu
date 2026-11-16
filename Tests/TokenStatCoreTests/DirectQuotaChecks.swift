@@ -45,6 +45,7 @@ private struct DirectQuotaClock: Sendable {
 
 extension CoreChecks {
     static func directQuotaChecks() throws {
+        try directSubscriptionSourceChecks()
 #if TOKENSTAT_BP38_C01
         try bp38C01DirectQuotaChecks()
 #endif
@@ -52,6 +53,8 @@ extension CoreChecks {
         try directDatabaseReplacementChecks()
         try directDatabaseReadChecks()
         try directAmountLexicalChecks()
+        try directQuotaStateChecks()
+        try directMonthlyResetChecks()
         try directVoucherTransportChecks()
         let identity = TokenHubIdentity(pid: 47816,
             bundleID: TokenHubTarget.bundleID,
@@ -84,8 +87,8 @@ extension CoreChecks {
         check(decoded.fiveHour?.resetAt == Date(timeIntervalSince1970: 1_800_000_000)
             && decoded.sevenDay?.resetAt == Date(timeIntervalSince1970: 1_800_000_000),
               "direct quota retains source period end for freshness checks")
-        check(decoded.fiveHour?.sourceSymbol == "$" && decoded.sevenDay?.sourceSymbol == "$",
-              "direct quota normalizes USD currency to a display symbol")
+        check(decoded.fiveHour?.sourceSymbol == "🪙" && decoded.sevenDay?.sourceSymbol == "🪙",
+              "direct quota uses the fixed coin display symbol for USD")
 
         let wrapped = json("""
         {"data":{"currency":"CNY","windows":[
@@ -97,7 +100,7 @@ extension CoreChecks {
                                                                     timeZone: TimeZone(secondsFromGMT: 0)!)
         check(wrappedDecoded.fiveHour?.usedPercent == Decimal(0) && wrappedDecoded.sevenDay?.usedPercent == Decimal(100),
               "direct quota accepts numeric Unix period timestamps")
-        check(wrappedDecoded.fiveHour?.sourceSymbol == "¥", "direct quota normalizes CNY currency")
+        check(wrappedDecoded.fiveHour?.sourceSymbol == "🪙", "direct quota coin display does not vary with CNY metadata")
         let unknownCurrency = json(#"{"data":{"currency":"https://example.invalid/account","windows":[{"kind":"fixed_5h","quota_amount":10,"used_amount":2}]}}"#)
         let unknownCurrencyDecoded = try TokenHubDirectQuotaDecoder.decode(
             unknownCurrency,
@@ -105,7 +108,7 @@ extension CoreChecks {
             now: now,
             timeZone: TimeZone(secondsFromGMT: 0)!
         )
-        check(unknownCurrencyDecoded.fiveHour?.sourceSymbol == "¤", "unknown currency cannot leak a URL or account label into UI")
+        check(unknownCurrencyDecoded.fiveHour?.sourceSymbol == "🪙", "unknown currency cannot alter the fixed coin display")
         let rootShape = json("""
         {"code":"OK","currency":"USD","windows":[{"kind":"fixed_5h","quota_amount":10,"used_amount":2}]}
         """)
@@ -129,6 +132,55 @@ extension CoreChecks {
             && monthlyDecoded.monthly?.remainingAmount == Decimal(string: "87.5")
             && monthlyDecoded.monthly?.usedPercent == Decimal(string: "12.5"),
               "direct quota preserves monthly limit and derives remaining percentage")
+
+        let resetPriority = json(#"""
+        {"data":{"currency":"USD","windows":[
+          {"kind":"fixed_5h","quota_amount":100,"used_amount":25,
+           "reset_at":"2027-01-15T09:00:00Z","period_end":"2027-01-15T10:00:00Z"},
+          {"kind":"fixed_7d","quota_amount":200,"used_amount":50,
+           "period_end":null}],"reset_at":"2027-01-15T11:00:00Z"}}
+        """#)
+        let resetPriorityDecoded = try TokenHubDirectQuotaDecoder.decode(
+            resetPriority, identity: identity, now: now, timeZone: TimeZone(secondsFromGMT: 0)!)
+        check(resetPriorityDecoded.fiveHour?.resetAt == Date(timeIntervalSince1970: 1_800_003_600),
+              "window reset_at takes precedence over its period_end")
+        check(resetPriorityDecoded.sevenDay?.resetAt == nil,
+              "missing local reset values do not borrow the top-level reset_at")
+
+        let localPeriodEndFallback = json(#"""
+        {"data":{"currency":"USD","windows":[
+          {"kind":"fixed_5h","quota_amount":100,"used_amount":25,
+           "period_end":"2027-01-15T10:00:00Z"}]}}
+        """#)
+        let localPeriodEndDecoded = try TokenHubDirectQuotaDecoder.decode(
+            localPeriodEndFallback, identity: identity, now: now,
+            timeZone: TimeZone(secondsFromGMT: 0)!)
+        check(localPeriodEndDecoded.fiveHour?.resetAt == Date(timeIntervalSince1970: 1_800_007_200),
+              "window period_end is the local reset fallback when reset_at is absent")
+
+        let invalidPreferredReset = json(#"""
+        {"data":{"currency":"USD","windows":[
+          {"kind":"fixed_5h","quota_amount":100,"used_amount":25,
+           "reset_at":"not-a-date","period_end":"2027-01-15T10:00:00Z"}]}}
+        """#)
+        do {
+            _ = try TokenHubDirectQuotaDecoder.decode(invalidPreferredReset, identity: identity, now: now)
+            check(false, "invalid present reset_at rejects even with a valid period_end")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .malformedResponse, "invalid preferred reset candidate is malformed")
+        }
+        let invalidFallbackReset = json(#"""
+        {"data":{"currency":"USD","windows":[
+          {"kind":"fixed_5h","quota_amount":100,"used_amount":25,
+           "reset_at":"2027-01-15T09:00:00Z","period_end":"not-a-date"}]}}
+        """#)
+        do {
+            _ = try TokenHubDirectQuotaDecoder.decode(invalidFallbackReset, identity: identity, now: now)
+            check(false, "invalid present period_end rejects despite valid reset_at")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .malformedResponse, "invalid non-selected reset candidate is malformed")
+        }
+
         let userMonth = json(#"{"data":{"currency":"USD","windows":[{"kind":"user_month","quota_amount":100,"used_amount":12.5}]}}"#)
         let userMonthDecoded = try TokenHubDirectQuotaDecoder.decode(userMonth, identity: identity, now: now)
         check(userMonthDecoded.monthly != nil,
@@ -155,9 +207,13 @@ extension CoreChecks {
             check(error == .malformedResponse, "invalid direct reset date reports malformed response")
         }
 
-        let malformed = json(#"{"data":{"currency":"USD","windows":[{"kind":"five_hours","quota_amount":10,"used_amount":11}]}}"#)
-        do { _ = try TokenHubDirectQuotaDecoder.decode(malformed, identity: identity, now: now); check(false, "used above limit rejects direct quota") }
-        catch let error as TokenHubDirectQuotaFailure { check(error == .malformedResponse, "used above limit reports malformed response") }
+        let malformed = json(#"{"data":{"currency":"USD","windows":[{"kind":"fixed_5h","quota_amount":10,"used_amount":11}]}}"#)
+        let overLimit = try? TokenHubDirectQuotaDecoder.decode(malformed, identity: identity, now: now)
+        check(overLimit?.fiveHour?.usedAmount == Decimal(11)
+            && overLimit?.fiveHour?.limitAmount == Decimal(10)
+            && overLimit?.fiveHour?.usedPercent == Decimal(110)
+            && overLimit?.fiveHour?.remainingPercent == Decimal(0),
+              "over-limit direct usage retains real amount and percent while remaining floors at zero")
 
         let bodyWithSecrets = json(#"{"data":{"currency":"USD","windows":[]},"access_token":"fixture-secret"}"#)
         do { _ = try TokenHubDirectQuotaDecoder.decode(bodyWithSecrets, identity: identity, now: now); check(false, "empty direct windows reject") }
@@ -193,7 +249,7 @@ extension CoreChecks {
         for scenario in 0..<3 {
             try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-session")
             let counter = DirectQuotaCounter()
-            let client = TokenHubDirectQuotaClient(request: { url, bearer in
+            let client = TokenHubDirectQuotaClient(request: routedSelectorFixture({ url, bearer in
                 if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
                 let call = counter.noteQuota(url.path == "/api/v1/auth/me/quota-usage" && bearer == "fixture-access")
                 if scenario == 2 && call == 1 {
@@ -201,7 +257,7 @@ extension CoreChecks {
                 }
                 return call == 1 || scenario == 1 ? TokenHubDirectQuotaHTTPResponse(statusCode: 401, data: Data())
                     : TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: valid)
-            }, callbackRequest: { url in
+            }), callbackRequest: { url in
                 let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
                 let shape = components?.path == "/api/v1/auth/it-sso/callback"
                     && Set(components?.queryItems?.map(\.name) ?? []).isSuperset(of: ["token", "verifySign", "redirect", "sourceChannel", "sourceTokenType"])
@@ -230,17 +286,572 @@ extension CoreChecks {
         }
     }
 
+    /// Synthetic native subscription decode and selector transport contract.
+    /// These fixtures contain no live Hub account data.
+    private static func directSubscriptionSourceChecks() throws {
+        let identity = TokenHubIdentity(pid: 47_100, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Synthetic/Direct-Subscription-Hub")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let direct = json(#"""
+        {"code":0,"data":{"windows":[
+          {"kind":"fixed_5h","quota_amount":9999,"used_amount":9998,"reset_at":"2027-01-15T10:00:00Z"}
+        ],"subscription_usage":{"currency":"USD","windows":[
+          {"period":"5h","limit":"120.00","used":"24.5","remaining":"999.99",
+           "duration_seconds":17,"started_at":{"ignored":"metadata"},"resets_at":"2027-01-15T09:00:00Z"},
+          {"period":"7d","limit":1000,"used":300.25,"remaining":"0",
+           "duration_seconds":1,"resets_at":"2027-01-22T08:00:00Z"},
+          {"period":"30d","limit":"2000","used":"450.25","remaining":"2000",
+           "duration_seconds":2,"resets_at":"2027-02-14T08:00:00Z"}
+        ]}}}
+        """#)
+        let decoded = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(
+            direct, identity: identity, now: now, timeZone: TimeZone(secondsFromGMT: 0)!)
+        check(decoded.fiveHour?.limitAmount == Decimal(120)
+            && decoded.fiveHour?.usedAmount == Decimal(string: "24.5"),
+              "native direct 5h consumes exact limit and used, ignoring conflicting metadata")
+        check(decoded.sevenDay?.limitAmount == Decimal(1000)
+            && decoded.sevenDay?.usedAmount == Decimal(string: "300.25"),
+              "native direct 7d consumes its own exact amount fields")
+        check(decoded.monthly?.limitAmount == Decimal(2000)
+            && decoded.monthly?.usedAmount == Decimal(string: "450.25"),
+              "native direct 30d maps to monthly and consumes exact amounts")
+        check(decoded.fiveHour?.resetAt == Date(timeIntervalSince1970: 1_800_003_600)
+            && decoded.sevenDay?.resetAt == Date(timeIntervalSince1970: 1_800_604_800)
+            && decoded.monthly?.resetAt == Date(timeIntervalSince1970: 1_802_592_000),
+              "native direct resets_at stays attached to its own period")
+
+        let sevenOnly = json(#"{"code":0,"data":{"subscription_usage":{"currency":"USD","windows":[{"period":"7d","limit":"80","used":"20","resets_at":"2027-01-22T08:00:00Z"}]}}}"#)
+        let sevenDecoded = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(
+            sevenOnly, identity: identity, now: now, timeZone: TimeZone(secondsFromGMT: 0)!)
+        check(sevenDecoded.sevenDay?.usedAmount == Decimal(20) && sevenDecoded.fiveHour == nil,
+              "native direct 7d-only snapshot is valid and leaves 5h absent")
+        let missingReset = json(#"{"code":0,"data":{"subscription_usage":{"currency":"USD","windows":[{"period":"30d","limit":100,"used":20}]}}}"#)
+        let missingResetDecoded = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(
+            missingReset, identity: identity, now: now, timeZone: TimeZone(secondsFromGMT: 0)!)
+        check(missingResetDecoded.monthly?.resetAt == nil,
+              "native direct missing reset remains unknown without borrowing another date")
+        let nullReset = json(#"{"code":0,"data":{"subscription_usage":{"currency":"USD","windows":[{"period":"30d","limit":100,"used":20,"resets_at":null}]}}}"#)
+        let nullResetDecoded = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(
+            nullReset, identity: identity, now: now, timeZone: TimeZone(secondsFromGMT: 0)!)
+        check(nullResetDecoded.monthly?.resetAt == nil, "native direct null resets_at remains unknown")
+        for limitFragment in ["", ",\"limit\":null", ",\"limit\":0"] {
+            let monthlyOnly = json("{\"code\":0,\"data\":{\"subscription_usage\":{\"currency\":\"USD\",\"windows\":[{\"period\":\"30d\"\(limitFragment),\"used\":\"20.5\"}]}}}")
+            let monthlyOnlyDecoded = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(
+                monthlyOnly, identity: identity, now: now, timeZone: TimeZone(secondsFromGMT: 0)!)
+            check(monthlyOnlyDecoded.monthly?.usedAmount == Decimal(string: "20.5")
+                && monthlyOnlyDecoded.monthly?.limitAmount == nil
+                && monthlyOnlyDecoded.monthly?.usedPercent == nil,
+                  "native direct monthly preserves used-only for missing/null/zero limit")
+        }
+        for limitFragment in ["", ",\"limit\":null", ",\"limit\":0"] {
+            let monthlyOnly = json("{\"code\":0,\"data\":{\"subscription_usage\":{\"currency\":\"USD\",\"windows\":[{\"period\":\"30d\"\(limitFragment),\"used\":\"20.5\"}]}}}")
+            let monthlyOnlyDecoded = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(
+                monthlyOnly, identity: identity, now: now, timeZone: TimeZone(secondsFromGMT: 0)!)
+            check(monthlyOnlyDecoded.monthly?.usedAmount == Decimal(string: "20.5")
+                && monthlyOnlyDecoded.monthly?.limitAmount == nil
+                && monthlyOnlyDecoded.monthly?.usedPercent == nil,
+                  "native direct monthly preserves used-only for missing/null/zero limit")
+        }
+        let overLimit = json(#"{"code":0,"data":{"subscription_usage":{"currency":"USD","windows":[{"period":"5h","limit":100,"used":120,"resets_at":"2027-01-15T09:00:00Z"}]}}}"#)
+        let overLimitDecoded = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(
+            overLimit, identity: identity, now: now, timeZone: TimeZone(secondsFromGMT: 0)!)
+        check(overLimitDecoded.fiveHour?.usedAmount == Decimal(120)
+            && overLimitDecoded.fiveHour?.usedPercent == Decimal(120)
+            && overLimitDecoded.fiveHour?.remainingPercent == Decimal(0)
+            && overLimitDecoded.states[.fiveHour] == .exceeded(resetAt: Date(timeIntervalSince1970: 1_800_003_600)),
+              "native direct over-limit preserves true amount and derived exceeded state")
+
+        for invalid in [
+            #"{"period":"5h","limit":true,"used":1}"#,
+            #"{"period":"5h","limit":-1,"used":1}"#,
+            #"{"period":"5h","limit":100,"used":-1}"#,
+            #"{"period":"5h","limit":"NaN","used":1}"#,
+            #"{"period":"5h","limit":"999999999999999999999999999999999999999999999999999999999999999999999999999999","used":1}"#,
+        ] {
+            let body = json("{\"code\":0,\"data\":{\"subscription_usage\":{\"currency\":\"USD\",\"windows\":[\(invalid)]}}}")
+            do {
+                _ = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(body, identity: identity, now: now)
+                check(false, "native direct malformed consumed amount rejects")
+            } catch let error as TokenHubDirectQuotaFailure {
+                check(error == .malformedResponse, "native direct malformed consumed amount is typed")
+            }
+        }
+        let zeroLimit = json(#"{"code":0,"data":{"subscription_usage":{"currency":"USD","windows":[{"period":"5h","limit":0,"used":20}]}}}"#)
+        do {
+            let zeroDecoded = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(zeroLimit, identity: identity, now: now)
+            check(zeroDecoded.fiveHour == nil && zeroDecoded.states[.fiveHour] == nil,
+                  "native direct zero limit never creates a finite ratio or unlimited state")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .noRecognizedWindows || error == .malformedResponse,
+                  "native direct zero limit fails safely without claiming unlimited")
+        }
+        let badReset = json(#"{"code":0,"data":{"subscription_usage":{"currency":"USD","windows":[{"period":"7d","limit":10,"used":2,"resets_at":"not-a-date"}]}}}"#)
+        do {
+            _ = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(badReset, identity: identity, now: now)
+            check(false, "native direct invalid present resets_at rejects")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .malformedResponse, "native direct invalid present resets_at is typed")
+        }
+        for duplicate in [
+            #"{"period":"5h","limit":10,"used":1},{"period":"5h","limit":10,"used":2}"#,
+            #"{"period":"7d","limit":10,"used":1},{"period":"7d","limit":10,"used":2}"#,
+            #"{"period":"30d","limit":10,"used":1},{"period":"30d","limit":10,"used":2}"#,
+        ] {
+            let body = json("{\"code\":0,\"data\":{\"subscription_usage\":{\"currency\":\"USD\",\"windows\":[\(duplicate)]}}}")
+            do {
+                _ = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(body, identity: identity, now: now)
+                check(false, "native direct duplicate period rejects")
+            } catch let error as TokenHubDirectQuotaFailure {
+                let expected: TokenHubDirectQuotaFailure = duplicate.contains("30d")
+                    ? .duplicateMonthly : .duplicateWindow(duplicate.contains("7d") ? .sevenDay : .fiveHour)
+                check(error == expected, "native direct duplicate period reports its typed identity")
+            }
+        }
+        let empty = json(#"{"code":0,"data":{"subscription_usage":{"currency":"USD","windows":[]}}}"#)
+        do {
+            _ = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(empty, identity: identity, now: now)
+            check(false, "native direct empty windows fail safely")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .noRecognizedWindows, "native direct empty windows do not become unlimited or numeric zero")
+        }
+        for malformedWindows in [
+            #"{"code":0,"data":{"subscription_usage":{"currency":"USD"}}}"#,
+            #"{"code":0,"data":{"subscription_usage":{"currency":"USD","windows":{}}}}"#,
+        ] {
+            do {
+                _ = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(json(malformedWindows), identity: identity, now: now)
+                check(false, "native direct missing/non-array windows fail safely")
+            } catch let error as TokenHubDirectQuotaFailure {
+                check(error == .malformedResponse, "native direct missing/non-array windows are malformed")
+            }
+        }
+        let unknownPeriods = json(#"{"code":0,"data":{"subscription_usage":{"currency":"USD","windows":[{"period":"quarter","limit":100,"used":20}]}}}"#)
+        do {
+            _ = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(unknownPeriods, identity: identity, now: now)
+            check(false, "native direct all-unknown periods fail safely")
+        } catch let error as TokenHubDirectQuotaFailure {
+            check(error == .noRecognizedWindows, "native direct all-unknown periods are never remapped")
+        }
+        for period in ["7-d", "7 d", "7D", "30-d"] {
+            let body = json("{\"code\":0,\"data\":{\"subscription_usage\":{\"currency\":\"USD\",\"windows\":[{\"period\":\"\(period)\",\"limit\":100,\"used\":20}]}}}")
+            do {
+                _ = try TokenHubDirectQuotaDecoder.decodeSubscriptionUsage(body, identity: identity, now: now)
+                check(false, "native direct near-match period \(period) must not normalize to a known window")
+            } catch let error as TokenHubDirectQuotaFailure {
+                check(error == .noRecognizedWindows, "native direct near-match period \(period) remains unknown")
+            }
+        }
+
+        // A complete synthetic transaction proves explicit source selection,
+        // request ordering, path-prefix preservation, and no source fallback.
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("direct-source-fixture-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let database = TokenHubConnectionDiscovery.defaultDatabaseURL(home: home)
+        try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-session",
+                                    aiManagerBaseURL: "https://aihub.example.test/tenant")
+        let events = OSAllocatedUnfairLock(initialState: [String]())
+        let client = TokenHubDirectQuotaClient(request: { url, bearer in
+            let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            guard url.host == "aihub.example.test", url.user == nil, url.password == nil,
+                  !url.absoluteString.contains(bearer) else { throw TokenHubDirectQuotaFailure.endpointRejected }
+            events.withLock { $0.append(url.path) }
+            if url.path == "/tenant/api/v1/auth/me/base-url" {
+                guard query.isEmpty else { throw TokenHubDirectQuotaFailure.endpointRejected }
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json(#"{"code":0,"data":{"is_direct":true}}"#))
+            }
+            if url.path == "/tenant/api/v1/auth/me/direct-key/usage" {
+                guard query.isEmpty else { throw TokenHubDirectQuotaFailure.endpointRejected }
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: direct)
+            }
+            if url.path == "/tenant/api/v1/me/reset-vouchers" {
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data())
+            }
+            throw TokenHubDirectQuotaFailure.endpointRejected
+        }, callbackRequest: { _ in "synthetic-access" })
+        let fetched = try awaitDirectQuota { try await client.fetch(identity: identity, now: now, home: home) }
+        check(fetched.sevenDay?.usedAmount == Decimal(string: "300.25") && fetched.monthly?.usedAmount == Decimal(string: "450.25"),
+              "explicit direct selector returns the native direct quota values")
+        check(events.withLock { $0 } == ["/tenant/api/v1/auth/me/base-url", "/tenant/api/v1/auth/me/direct-key/usage", "/tenant/api/v1/me/reset-vouchers"],
+              "direct selector calls only direct usage in order and preserves trusted path prefix")
+
+        let routedHome = FileManager.default.temporaryDirectory.appendingPathComponent("routed-source-fixture-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: routedHome) }
+        try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: routedHome), now: now,
+                                    sessionToken: "fixture-session")
+        let routedEvents = OSAllocatedUnfairLock(initialState: [String]())
+        let routedBody = json(#"{"data":{"currency":"USD","windows":[{"kind":"fixed_5h","quota_amount":100,"used_amount":7,"reset_at":"2027-01-15T09:00:00Z"}],"subscription_usage":{"currency":"USD","windows":[{"period":"5h","limit":999,"used":998,"resets_at":"2027-01-16T08:00:00Z"}]}}}"#)
+        let routedClient = TokenHubDirectQuotaClient(request: { url, _ in
+            routedEvents.withLock { $0.append(url.path) }
+            if url.path == "/api/v1/auth/me/base-url" {
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json(#"{"code":0,"data":{"is_direct":false}}"#))
+            }
+            if url.path == "/api/v1/auth/me/quota-usage" {
+                guard URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.isEmpty ?? true else {
+                    throw TokenHubDirectQuotaFailure.endpointRejected
+                }
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: routedBody)
+            }
+            if url.path == "/api/v1/me/reset-vouchers" { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
+            if url.path == "/api/v1/auth/me/direct-key/usage" { throw TokenHubDirectQuotaFailure.endpointRejected }
+            throw TokenHubDirectQuotaFailure.endpointRejected
+        }, callbackRequest: { _ in "synthetic-access" })
+        let routedResult = try awaitDirectQuota { try await routedClient.fetch(identity: identity, now: now, home: routedHome) }
+        check(routedResult.fiveHour?.usedAmount == Decimal(7)
+            && routedResult.fiveHour?.resetAt == Date(timeIntervalSince1970: 1_800_003_600),
+              "explicit routed selector retains legacy amount and reset over conflicting direct values")
+        check(routedEvents.withLock { $0 } == ["/api/v1/auth/me/base-url", "/api/v1/auth/me/quota-usage", "/api/v1/me/reset-vouchers"],
+              "explicit routed selector requests only legacy quota usage in order")
+
+        let invalidSelectors: [(status: Int, body: Data)] = [
+            (200, json(#"{"code":0,"data":{}}"#)),
+            (200, json(#"{"code":0,"data":{"is_direct":null}}"#)),
+            (200, json(#"{"code":0,"data":{"is_direct":"true"}}"#)),
+            (200, json(#"{"code":0,"data":{"is_direct":1}}"#)),
+            (200, Data("not-json".utf8)),
+            (200, json(#"{"code":1,"data":{"is_direct":true}}"#)),
+            (503, json(#"{"code":0,"data":{"is_direct":true}}"#)),
+        ]
+        for (index, selectorCase) in invalidSelectors.enumerated() {
+            let invalidHome = FileManager.default.temporaryDirectory.appendingPathComponent("invalid-selector-\(index)-" + UUID().uuidString, isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: invalidHome) }
+            try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: invalidHome), now: now,
+                                        sessionToken: "fixture-session")
+            let invalidEvents = OSAllocatedUnfairLock(initialState: [String]())
+            let invalidClient = TokenHubDirectQuotaClient(request: { url, _ in
+                invalidEvents.withLock { $0.append(url.path) }
+                if url.path == "/api/v1/auth/me/base-url" {
+                    return TokenHubDirectQuotaHTTPResponse(statusCode: selectorCase.status, data: selectorCase.body)
+                }
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: direct)
+            }, callbackRequest: { _ in "synthetic-access" })
+            let invalidResult = awaitDirectQuotaOutcome { try await invalidClient.fetch(identity: identity, now: now, home: invalidHome) }
+            check(!invalidResult.succeeded,
+                  "invalid selector \(index) fails closed without inferring source")
+            check(invalidEvents.withLock { $0 } == ["/api/v1/auth/me/base-url"],
+                  "invalid selector \(index) stops before either quota endpoint")
+        }
+
+        // A selected empty direct source must fail closed without issuing the
+        // otherwise valid routed request.
+        let emptyHome = FileManager.default.temporaryDirectory.appendingPathComponent("direct-empty-fixture-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: emptyHome) }
+        try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: emptyHome), now: now,
+                                    sessionToken: "fixture-session")
+        let noFallbackEvents = OSAllocatedUnfairLock(initialState: [String]())
+        let emptyClient = TokenHubDirectQuotaClient(request: { url, _ in
+            noFallbackEvents.withLock { $0.append(url.path) }
+            if url.path == "/api/v1/auth/me/base-url" {
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json(#"{"code":0,"data":{"is_direct":true}}"#))
+            }
+            if url.path == "/api/v1/auth/me/direct-key/usage" { return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: empty) }
+            if url.path == "/api/v1/auth/me/quota-usage" {
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json(#"{"data":{"currency":"USD","windows":[{"kind":"fixed_5h","quota_amount":100,"used_amount":1}]}}"#))
+            }
+            return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data())
+        }, callbackRequest: { _ in "synthetic-access" })
+        let emptyOutcome = awaitDirectQuotaOutcome { try await emptyClient.fetch(identity: identity, now: now, home: emptyHome) }
+        check(!emptyOutcome.succeeded && emptyOutcome.failure == .noRecognizedWindows,
+              "empty selected direct subscription fails without manufacturing a quota")
+        check(noFallbackEvents.withLock { $0 } == ["/api/v1/auth/me/base-url", "/api/v1/auth/me/direct-key/usage"],
+              "empty selected direct subscription never falls back to routed usage")
+
+        // One refresh budget is shared across selector and selected usage.
+        let retryHome = FileManager.default.temporaryDirectory.appendingPathComponent("direct-shared-refresh-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: retryHome) }
+        try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: retryHome), now: now,
+                                    sessionToken: "fixture-session")
+        let retryEvents = OSAllocatedUnfairLock(initialState: [String]())
+        let callbackCount = OSAllocatedUnfairLock(initialState: 0)
+        let retryClient = TokenHubDirectQuotaClient(request: { url, _ in
+            retryEvents.withLock { $0.append(url.path) }
+            if url.path == "/api/v1/auth/me/base-url" {
+                let selectors = retryEvents.withLock { $0.filter { $0 == url.path }.count }
+                if selectors == 1 { return TokenHubDirectQuotaHTTPResponse(statusCode: 401, data: Data()) }
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json(#"{"code":0,"data":{"is_direct":true}}"#))
+            }
+            if url.path == "/api/v1/auth/me/direct-key/usage" { return TokenHubDirectQuotaHTTPResponse(statusCode: 401, data: Data()) }
+            return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data())
+        }, callbackRequest: { _ in
+            callbackCount.withLock { $0 += 1 }
+            return "synthetic-access"
+        })
+        let retryOutcome = awaitDirectQuotaOutcome { try await retryClient.fetch(identity: identity, now: now, home: retryHome) }
+        check(!retryOutcome.succeeded && retryOutcome.failure == .httpStatus(401),
+              "selector and selected usage share one 401 refresh budget")
+        check(callbackCount.withLock { $0 } == 2
+            && retryEvents.withLock { $0 } == ["/api/v1/auth/me/base-url", "/api/v1/auth/me/base-url", "/api/v1/auth/me/direct-key/usage"],
+              "one selector retry cannot authorize a second quota retry or source switch")
+
+        let quotaRetryHome = FileManager.default.temporaryDirectory.appendingPathComponent("direct-quota-retry-success-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: quotaRetryHome) }
+        try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: quotaRetryHome), now: now,
+                                    sessionToken: "fixture-session")
+        let quotaRetryEvents = OSAllocatedUnfairLock(initialState: [String]())
+        let quotaRetryCallbacks = OSAllocatedUnfairLock(initialState: 0)
+        let quotaRetryCount = OSAllocatedUnfairLock(initialState: 0)
+        let quotaRetryClient = TokenHubDirectQuotaClient(request: { url, _ in
+            quotaRetryEvents.withLock { $0.append(url.path) }
+            if url.path == "/api/v1/auth/me/base-url" {
+                return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json(#"{"code":0,"data":{"is_direct":true}}"#))
+            }
+            if url.path == "/api/v1/auth/me/direct-key/usage" {
+                let attempt = quotaRetryCount.withLock { value -> Int in value += 1; return value }
+                return attempt == 1
+                    ? TokenHubDirectQuotaHTTPResponse(statusCode: 401, data: Data())
+                    : TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: direct)
+            }
+            if url.path == "/api/v1/auth/me/quota-usage" { throw TokenHubDirectQuotaFailure.endpointRejected }
+            if url.path == "/api/v1/me/reset-vouchers" { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
+            throw TokenHubDirectQuotaFailure.endpointRejected
+        }, callbackRequest: { _ in
+            quotaRetryCallbacks.withLock { $0 += 1 }
+            return "synthetic-access"
+        })
+        let quotaRetryResult = try awaitDirectQuota {
+            try await quotaRetryClient.fetch(identity: identity, now: now, home: quotaRetryHome)
+        }
+        check(quotaRetryResult.sevenDay?.usedAmount == Decimal(string: "300.25")
+            && quotaRetryResult.monthly?.usedAmount == Decimal(string: "450.25"),
+              "direct quota 401 refresh retries the same source and returns its values")
+        check(quotaRetryCallbacks.withLock { $0 } == 2
+            && quotaRetryEvents.withLock { $0 } == ["/api/v1/auth/me/base-url",
+                "/api/v1/auth/me/direct-key/usage", "/api/v1/auth/me/direct-key/usage",
+                "/api/v1/me/reset-vouchers"],
+              "direct quota 401 consumes one refresh without reselecting or switching source")
+    }
+
+    /// Strict raw-state oracle for THC-TC-R7. These fixtures use no live Hub
+    /// account data; typed state assertions intentionally bind to the frozen
+    /// public contract and are not treated as behavior RED until implemented.
+    private static func directQuotaStateChecks() throws {
+        let identity = TokenHubIdentity(pid: 47_101, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Synthetic/R6-State-Hub")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let fiveReset = Date(timeIntervalSince1970: 1_800_003_600)
+        let sevenReset = Date(timeIntervalSince1970: 1_800_007_200)
+        func decode(_ windows: [String]) throws -> TokenHubQuotaSnapshot {
+            let body = "{\"data\":{\"currency\":\"USD\",\"windows\":[\(windows.joined(separator: ","))]}}"
+            return try TokenHubDirectQuotaDecoder.decode(json(body), identity: identity, now: now,
+                timeZone: TimeZone(secondsFromGMT: 0)!)
+        }
+        func rejected(_ window: String, _ label: String) throws {
+            do {
+                _ = try decode([window])
+                check(false, "direct state malformed input rejects: \(label)")
+            } catch let error as TokenHubDirectQuotaFailure {
+                check(error == .malformedResponse, "direct state malformed input is typed: \(label)")
+            }
+        }
+        let numeric = #"{"kind":"fixed_5h","quota_amount":100,"used_amount":20,"reset_at":"2027-01-15T09:00:00Z"}"#
+        let missingFlags = try decode([numeric])
+        check(missingFlags.fiveHour?.usedAmount == Decimal(20)
+            && missingFlags.states[.fiveHour] == nil,
+              "missing enabled/violated preserves legacy finite numeric semantics")
+        let explicitNormal = try decode([#"{"kind":"fixed_5h","enabled":true,"violated":false,"quota_amount":100,"used_amount":20}"#])
+        check(explicitNormal.fiveHour?.usedPercent == Decimal(20)
+            && explicitNormal.states[.fiveHour] == nil,
+              "enabled true with violated false is ordinary finite quota")
+        let enabledTrueMissingViolation = try decode([#"{"kind":"fixed_5h","enabled":true,"quota_amount":100,"used_amount":20}"#])
+        check(enabledTrueMissingViolation.fiveHour?.usedAmount == Decimal(20)
+            && enabledTrueMissingViolation.states[.fiveHour] == nil,
+              "enabled true with missing violated remains finite quota")
+        let normalZero = try decode([#"{"kind":"fixed_5h","quota_amount":100,"used_amount":0}"#])
+        check(normalZero.fiveHour?.usedAmount == Decimal(0)
+            && normalZero.fiveHour?.usedPercent == Decimal(0)
+            && normalZero.states[.fiveHour] == nil,
+              "numeric zero remains a finite normal value, not unlimited")
+        let exactLimit = try decode([#"{"kind":"fixed_5h","quota_amount":100,"used_amount":100}"#])
+        check(exactLimit.fiveHour?.usedPercent == Decimal(100)
+            && exactLimit.states[.fiveHour] == nil,
+              "exactly reaching the limit is normal unless source marks violated")
+
+        let unlimited = try decode([#"{"kind":"fixed_5h","enabled":false,"violated":false,"reset_at":"2027-01-15T09:00:00Z"}"#])
+        check(unlimited.fiveHour == nil
+            && unlimited.states[.fiveHour] == .unlimited(resetAt: fiveReset),
+              "disabled state-only window is unlimited, reset-aware, and has no numeric zero")
+        let disabledMissingViolation = try decode([#"{"kind":"fixed_5h","enabled":false,"reset_at":"2027-01-15T09:00:00Z"}"#])
+        check(disabledMissingViolation.states[.fiveHour] == .unlimited(resetAt: fiveReset),
+              "enabled false with missing violated remains unlimited")
+        let disabledWithAmounts = try decode([#"{"kind":"fixed_5h","enabled":false,"quota_amount":100,"used_amount":20,"reset_at":"2027-01-15T09:00:00Z"}"#])
+        check(disabledWithAmounts.fiveHour == nil
+            && disabledWithAmounts.states[.fiveHour] == .unlimited(resetAt: fiveReset),
+              "enabled false never leaks coexisting numbers into a fabricated finite quota")
+        let disabledStringOnly = try decode([#"{"kind":"fixed_5h","enabled":false,"used_amount":"20","reset_at":"2027-01-15T09:00:00Z"}"#])
+        check(disabledStringOnly.fiveHour == nil
+            && disabledStringOnly.states[.fiveHour] == .unlimited(resetAt: fiveReset),
+              "disabled accepts a legal decimal string without a paired cap as unlimited state-only")
+        let disabledZeroCap = try decode([#"{"kind":"fixed_5h","enabled":false,"quota_amount":0,"used_amount":20,"reset_at":"2027-01-15T09:00:00Z"}"#])
+        check(disabledZeroCap.fiveHour == nil
+            && disabledZeroCap.states[.fiveHour] == .unlimited(resetAt: fiveReset),
+              "disabled accepts a zero cap placeholder without manufacturing numeric usage")
+        let disabledNullAmounts = try decode([#"{"kind":"fixed_5h","enabled":false,"quota_amount":null,"used_amount":null,"reset_at":"2027-01-15T09:00:00Z"}"#])
+        check(disabledNullAmounts.fiveHour == nil
+            && disabledNullAmounts.states[.fiveHour] == .unlimited(resetAt: fiveReset),
+              "disabled accepts null amount placeholders as state-only unlimited")
+        let unlimitedUnknownReset = try decode([#"{"kind":"fixed_5h","enabled":false,"period_end":null,"reset_at":null}"#])
+        check(unlimitedUnknownReset.states[.fiveHour] == .unlimited(resetAt: nil),
+              "disabled state retains unknown reset without borrowing a global date")
+        let violatedOverridesDisabled = try decode([#"{"kind":"fixed_5h","enabled":false,"violated":true,"reset_at":"2027-01-15T09:00:00Z"}"#])
+        check(violatedOverridesDisabled.fiveHour == nil
+            && violatedOverridesDisabled.states[.fiveHour] == .exceeded(resetAt: fiveReset),
+              "source violated true takes precedence over disabled unlimited")
+        let violatedZeroCap = try decode([#"{"kind":"fixed_5h","enabled":true,"violated":true,"quota_amount":0,"used_amount":20,"reset_at":"2027-01-15T09:00:00Z"}"#])
+        check(violatedZeroCap.fiveHour == nil
+            && violatedZeroCap.states[.fiveHour] == .exceeded(resetAt: fiveReset),
+              "source violated true with a zero cap is state-only and never computes a ratio")
+        let violatedNullUsage = try decode([#"{"kind":"fixed_5h","enabled":true,"violated":true,"quota_amount":100,"used_amount":null,"reset_at":"2027-01-15T09:00:00Z"}"#])
+        check(violatedNullUsage.fiveHour == nil
+            && violatedNullUsage.states[.fiveHour] == .exceeded(resetAt: fiveReset),
+              "source violated true allows null usage as state-only when numeric is incomplete")
+        let violatedWithNumeric = try decode([#"{"kind":"fixed_7d","enabled":true,"violated":true,"quota_amount":100,"used_amount":80,"reset_at":"2027-01-15T10:00:00Z"}"#])
+        check(violatedWithNumeric.sevenDay?.usedAmount == Decimal(80)
+            && violatedWithNumeric.states[.sevenDay] == .exceeded(resetAt: sevenReset),
+              "violated true preserves real numeric value while marking exceeded")
+        let violatedWithoutEnable = try decode([#"{"kind":"fixed_5h","violated":true,"reset_at":"2027-01-15T09:00:00Z"}"#])
+        check(violatedWithoutEnable.fiveHour == nil
+            && violatedWithoutEnable.states[.fiveHour] == .exceeded(resetAt: fiveReset),
+              "source violated true is exceeded even when enabled is missing and amounts are absent")
+        let arithmeticExceeded = try decode([#"{"kind":"fixed_5h","enabled":true,"violated":false,"quota_amount":100,"used_amount":120,"reset_at":"2027-01-15T09:00:00Z"}"#])
+        check(arithmeticExceeded.fiveHour?.usedAmount == Decimal(120)
+            && arithmeticExceeded.fiveHour?.usedPercent == Decimal(120)
+            && arithmeticExceeded.fiveHour?.remainingPercent == Decimal(0)
+            && arithmeticExceeded.states[.fiveHour] == .exceeded(resetAt: fiveReset),
+              "arithmetic over-limit is exceeded without falsely changing raw violated=false")
+
+        let monthlyUnlimited = try decode([#"{"kind":"user_month","enabled":false,"reset_at":"2027-01-15T10:00:00Z"}"#])
+        check(monthlyUnlimited.monthly == nil
+            && monthlyUnlimited.states[.monthly] == .unlimited(resetAt: sevenReset),
+              "monthly disabled state has its own reset and no fabricated usage")
+        let monthlyUsedOnly = try decode([#"{"kind":"user_month","used_amount":"20"}"#])
+        check(monthlyUsedOnly.monthly?.usedAmount == Decimal(20)
+            && monthlyUsedOnly.monthly?.limitAmount == nil
+            && monthlyUsedOnly.monthly?.usedPercent == nil
+            && monthlyUsedOnly.states[.monthly] == nil,
+              "normal monthly without a cap preserves legal used-only value without a ratio")
+        let monthlyNullCap = try decode([#"{"kind":"user_month","quota_amount":null,"used_amount":20}"#])
+        check(monthlyNullCap.monthly?.usedAmount == Decimal(20)
+            && monthlyNullCap.monthly?.limitAmount == nil
+            && monthlyNullCap.monthly?.usedPercent == nil,
+              "normal monthly null cap keeps the existing used-only branch")
+        let monthlyZeroCap = try decode([#"{"kind":"user_month","quota_amount":0,"used_amount":20}"#])
+        check(monthlyZeroCap.monthly?.usedAmount == Decimal(20)
+            && monthlyZeroCap.monthly?.limitAmount == nil
+            && monthlyZeroCap.monthly?.usedPercent == nil,
+              "normal monthly zero cap is not a denominator and preserves used-only value")
+        let monthlyExceeded = try decode([#"{"kind":"user_month","violated":true,"reset_at":null}"#])
+        check(monthlyExceeded.monthly == nil
+            && monthlyExceeded.states[.monthly] == .exceeded(resetAt: nil),
+              "monthly violated state can be state-only with unknown reset")
+        let monthlyExceededNumeric = try decode([#"{"kind":"user_month","quota_amount":100,"used_amount":120,"violated":true,"reset_at":"2027-01-15T10:00:00Z"}"#])
+        check(monthlyExceededNumeric.monthly?.usedAmount == Decimal(120)
+            && monthlyExceededNumeric.monthly?.usedPercent == Decimal(120)
+            && monthlyExceededNumeric.states[.monthly] == .exceeded(resetAt: sevenReset),
+              "monthly exceeded retains its real numeric amount and percentage")
+        let siblingAndDisabled = try decode([
+            #"{"kind":"fixed_5h","enabled":false}"#,
+            #"{"kind":"fixed_7d","quota_amount":100,"used_amount":20}"#
+        ])
+        check(siblingAndDisabled.sevenDay?.usedAmount == Decimal(20)
+            && siblingAndDisabled.states[.fiveHour] == .unlimited(resetAt: nil),
+              "disabled state-only field coexists with a healthy sibling")
+        for duplicate in [
+            [#"{"kind":"fixed_5h","enabled":false}"#, #"{"kind":"fixed_5h","enabled":false}"#],
+            [#"{"kind":"user_month","enabled":false}"#, #"{"kind":"user_month","enabled":false}"#]
+        ] {
+            do {
+                _ = try decode(duplicate)
+                check(false, "duplicate disabled window/monthly kind rejects")
+            } catch let error as TokenHubDirectQuotaFailure {
+                let expected: TokenHubDirectQuotaFailure = duplicate[0].contains("user_month")
+                    ? .duplicateMonthly : .duplicateWindow(.fiveHour)
+                check(error == expected, "disabled duplicates retain the ordinary duplicate error")
+            }
+        }
+
+        for literal in ["null", "0", "1", "\"false\""] {
+            try rejected(#"{"kind":"fixed_5h","enabled":\#(literal),"quota_amount":100,"used_amount":20}"#,
+                         "enabled present non-boolean \(literal)")
+        }
+        for literal in ["null", "0", "1", "\"true\""] {
+            try rejected(#"{"kind":"fixed_5h","violated":\#(literal),"quota_amount":100,"used_amount":20}"#,
+                         "violated present non-boolean \(literal)")
+        }
+        for invalid in [
+            #"{"kind":"fixed_5h","enabled":false,"quota_amount":-1}"#,
+            #"{"kind":"fixed_5h","enabled":false,"quota_amount":100,"used_amount":true}"#,
+            #"{"kind":"fixed_5h","enabled":false,"quota_amount":true}"#,
+            #"{"kind":"fixed_5h","enabled":false,"used_amount":"NaN"}"#,
+            #"{"kind":"fixed_5h","enabled":false,"quota_amount":"NaN"}"#,
+            #"{"kind":"fixed_5h","violated":true,"quota_amount":-1}"#,
+            #"{"kind":"fixed_5h","violated":true,"used_amount":true}"#,
+            #"{"kind":"fixed_5h","violated":true,"used_amount":"NaN"}"#,
+            #"{"kind":"fixed_5h","enabled":true,"quota_amount":100,"used_amount":-1}"#,
+            #"{"kind":"fixed_5h","enabled":true,"quota_amount":100,"used_amount":"NaN"}"#
+        ] { try rejected(invalid, "invalid present numeric value cannot be hidden by status") }
+    }
+
+    /// BASE-03 monthly numeric reset is independent from whole-snapshot TTL.
+    private static func directMonthlyResetChecks() throws {
+        let identity = TokenHubIdentity(pid: 47_102, bundleID: TokenHubTarget.bundleID,
+            executablePath: "/Synthetic/Monthly-Reset-Hub")
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func decode(_ resetFields: String, rootReset: String? = nil) throws -> TokenHubQuotaSnapshot {
+            let rootResetField = rootReset.map { ",\($0)" } ?? ""
+            let localResetFields = resetFields.isEmpty ? "" : ",\(resetFields)"
+            let body = """
+            {"data":{"currency":"USD","windows":[{"kind":"user_month","used_amount":20,"quota_amount":100\(localResetFields)}]\(rootResetField)}}
+            """
+            return try TokenHubDirectQuotaDecoder.decode(json(body), identity: identity, now: now,
+                timeZone: TimeZone(secondsFromGMT: 0)!)
+        }
+        let localReset = try decode(#""reset_at":"2027-01-15T09:00:00Z","period_end":"2027-01-15T10:00:00Z""#)
+        check(localReset.monthly?.resetAt == now.addingTimeInterval(3_600),
+              "monthly reset_at takes precedence over period_end")
+        let periodEndFallback = try decode(#""period_end":"2027-01-15T10:00:00Z""#)
+        check(periodEndFallback.monthly?.resetAt == now.addingTimeInterval(7_200),
+              "monthly period_end is the local reset fallback")
+        let nullResetFallback = try decode(#""reset_at":null,"period_end":"2027-01-15T10:00:00Z""#)
+        check(nullResetFallback.monthly?.resetAt == now.addingTimeInterval(7_200),
+              "null monthly reset_at falls back to its local period_end")
+        let unknownReset = try decode("", rootReset: #""reset_at":"2027-01-15T11:00:00Z""#)
+        check(unknownReset.monthly?.resetAt == nil,
+              "monthly without local reset fields does not borrow root reset_at")
+
+        for (fields, label) in [
+            (#""reset_at":"not-a-date","period_end":"2027-01-15T10:00:00Z""#, "invalid preferred reset_at"),
+            (#""reset_at":"2027-01-15T09:00:00Z","period_end":"not-a-date""#, "invalid fallback period_end"),
+        ] {
+            do {
+                _ = try decode(fields)
+                check(false, "monthly \(label) rejects")
+            } catch let error as TokenHubDirectQuotaFailure {
+                check(error == .malformedResponse, "monthly \(label) reports malformed response")
+            }
+        }
+    }
+
     private static func directVoucherTransportChecks() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let identity = TokenHubIdentity(pid: 47095, bundleID: TokenHubTarget.bundleID, executablePath: "/Synthetic/Hub")
-        let quota = json(#"{"data":{"currency":"USD","windows":[{"kind":"fixed_5h","quota_amount":100,"used_amount":20}]}}"#)
+        let quota = json(#"""
+        {"data":{"currency":"USD","windows":[
+          {"kind":"fixed_5h","enabled":false,"reset_at":"2027-01-15T09:00:00Z"},
+          {"kind":"fixed_7d","quota_amount":100,"used_amount":120,"violated":true,
+           "reset_at":"2027-01-15T10:00:00Z"},
+          {"kind":"user_month","violated":true,"reset_at":null}]}}
+        """#)
+        let expectedStates: [TokenHubQuotaField: TokenHubQuotaValueState] = [
+            .fiveHour: .unlimited(resetAt: now.addingTimeInterval(3_600)),
+            .sevenDay: .exceeded(resetAt: now.addingTimeInterval(7_200)),
+            .monthly: .exceeded(resetAt: nil),
+        ]
         for scenario in ["valid", "zero", "http", "malformed", "throw", "quota-error", "quota-malformed", "callback-error", "identity-change", "retry"] {
             let home = FileManager.default.temporaryDirectory.appendingPathComponent("voucher-transport-" + UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: home) }
             let database = TokenHubConnectionDiscovery.defaultDatabaseURL(home: home)
             try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-session")
             let calls = OSAllocatedUnfairLock(initialState: [String]())
-            let client = TokenHubDirectQuotaClient(request: { url, bearer in
+            let client = TokenHubDirectQuotaClient(request: routedSelectorFixture({ url, bearer in
                 let quotaCalls = calls.withLock {
                     $0.append("\(url.path)|\(bearer)")
                     return $0.filter { $0.hasPrefix("/api/v1/auth/me/quota-usage|") }.count
@@ -271,7 +882,9 @@ extension CoreChecks {
                 }
                 return TokenHubDirectQuotaHTTPResponse(statusCode: scenario == "http" ? 503 : 200,
                     data: scenario == "malformed" ? Data("{}".utf8) : json(!filtersMatch ? #"{"data":{"total":9}}"# : scenario == "zero" ? #"{"data":{"total":0}}"# : #"{"data":{"total":3}}"#))
-            }, callbackRequest: { url in
+            }, recordSelector: { url, bearer in
+                calls.withLock { $0.append("selector|\(url.path)|\(bearer)") }
+            }), callbackRequest: { url in
                 let access = calls.withLock {
                     let number = $0.filter { $0.hasPrefix("callback|") }.count + 1
                     let access = scenario == "retry" && number == 2 ? "fixture-refreshed-access" : "fixture-access"
@@ -303,7 +916,10 @@ extension CoreChecks {
             let events = calls.withLock { $0 }
             let noVoucher = ["quota-error", "quota-malformed", "callback-error"].contains(scenario)
             var expectedEvents = ["callback|fixture-access"]
-            if scenario != "callback-error" { expectedEvents.append("/api/v1/auth/me/quota-usage|fixture-access") }
+            if scenario != "callback-error" {
+                expectedEvents += ["selector|/api/v1/auth/me/base-url|fixture-access",
+                                   "/api/v1/auth/me/quota-usage|fixture-access"]
+            }
             if scenario == "retry" {
                 expectedEvents += ["callback|fixture-refreshed-access", "/api/v1/auth/me/quota-usage|fixture-refreshed-access"]
             }
@@ -317,7 +933,12 @@ extension CoreChecks {
                 check(failure == expected, "voucher transport \(scenario) preserves exact typed failure")
             } else {
                 check(failure == nil && result != nil, "voucher transport \(scenario) returns quota without a typed or unknown failure")
-                check(result?.fiveHour?.usedPercent == 20, "voucher failure does not discard valid quota \(scenario)")
+                check(result?.fiveHour == nil && result?.sevenDay?.usedAmount == Decimal(120)
+                    && result?.sevenDay?.usedPercent == Decimal(120)
+                    && result?.sevenDay?.remainingPercent == Decimal(0),
+                      "voucher failure does not discard the current quota values \(scenario)")
+                check(result?.states == expectedStates,
+                      "Core client return rebuild preserves all states and per-field resets for \(scenario)")
                 check(result?.resetVoucherCount == (["valid", "retry"].contains(scenario) ? 3 : scenario == "zero" ? 0 : nil),
                       "voucher \(scenario) preserves count or unknown without live transport")
             }
@@ -338,14 +959,14 @@ extension CoreChecks {
 
         let counter = DirectQuotaCounter()
         let clock = DirectQuotaClock(startedAt)
-        let client = TokenHubDirectQuotaClient(request: { url, _ in
+        let client = TokenHubDirectQuotaClient(request: routedSelectorFixture({ url, _ in
             if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
             counter.noteQuota(true)
             clock.set(startedAt.addingTimeInterval(2))
             return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
             {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100,"period_end":"2027-01-15T08:05:00Z"}]}}
             """))
-        }, callbackRequest: { _ in
+        }), callbackRequest: { _ in
             counter.noteCallback(true)
             clock.set(startedAt.addingTimeInterval(1))
             return "synthetic-access"
@@ -384,7 +1005,7 @@ extension CoreChecks {
             let boundaryClock = DirectQuotaClock(startedAt)
             let exactBoundary = expiration.addingTimeInterval(-30)
             let checkpointCounts = DirectQuotaCounter()
-            let checkpointClient = TokenHubDirectQuotaClient(request: { url, _ in
+            let checkpointClient = TokenHubDirectQuotaClient(request: routedSelectorFixture({ url, _ in
                 if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
                 let number = checkpointCounts.noteQuota(true)
                 if checkpoint.transition == "quota-\(number)" { boundaryClock.set(exactBoundary) }
@@ -394,7 +1015,7 @@ extension CoreChecks {
                 return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
                 {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100}]}}
                 """))
-            }, callbackRequest: { _ in
+            }), callbackRequest: { _ in
                 let number = checkpointCounts.noteCallback(true)
                 if checkpoint.transition == "callback-\(number)" { boundaryClock.set(exactBoundary) }
                 return "synthetic-access"
@@ -420,13 +1041,13 @@ extension CoreChecks {
                 now: startedAt, sessionToken: "bp38-boundary-\(remaining)",
                 expiresAt: startedAt.addingTimeInterval(remaining))
             let calls = DirectQuotaCounter()
-            let boundedClient = TokenHubDirectQuotaClient(request: { url, _ in
+            let boundedClient = TokenHubDirectQuotaClient(request: routedSelectorFixture({ url, _ in
                 if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
                 calls.noteQuota(true)
                 return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
                 {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100}]}}
                 """))
-            }, callbackRequest: { _ in calls.noteCallback(true); return "synthetic-access" })
+            }), callbackRequest: { _ in calls.noteCallback(true); return "synthetic-access" })
             let outcome = awaitDirectQuotaOutcome {
                 try await boundedClient.fetch(identity: identity, nowProvider: { startedAt }, home: boundaryHome)
             }
@@ -449,13 +1070,13 @@ extension CoreChecks {
             now: startedAt, sessionToken: "bp38-current-exact-30", expiresAt: expiresAt)
         let exactCurrentClock = DirectQuotaClock(startedAt.addingTimeInterval(70))
         let exactCurrentCalls = DirectQuotaCounter()
-        let exactCurrentClient = TokenHubDirectQuotaClient(request: { url, _ in
+        let exactCurrentClient = TokenHubDirectQuotaClient(request: routedSelectorFixture({ url, _ in
             if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
             _ = exactCurrentCalls.noteQuota(true)
             return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
             {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100}]}}
             """))
-        }, callbackRequest: { _ in
+        }), callbackRequest: { _ in
             _ = exactCurrentCalls.noteCallback(true)
             return "synthetic-access"
         })
@@ -476,13 +1097,13 @@ extension CoreChecks {
             expiresAt: expiresAt)
         let aboveBoundaryClock = DirectQuotaClock(startedAt.addingTimeInterval(69.999))
         let aboveBoundaryCalls = DirectQuotaCounter()
-        let aboveBoundaryClient = TokenHubDirectQuotaClient(request: { url, bearer in
+        let aboveBoundaryClient = TokenHubDirectQuotaClient(request: routedSelectorFixture({ url, bearer in
             if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
             _ = aboveBoundaryCalls.noteQuota(url.path == "/api/v1/auth/me/quota-usage" && bearer == "synthetic-access")
             return TokenHubDirectQuotaHTTPResponse(statusCode: 200, data: json("""
             {"data":{"currency":"USD","windows":[{"kind":"fixed_5h","used_amount":20,"quota_amount":100}]}}
             """))
-        }, callbackRequest: { url in
+        }), callbackRequest: { url in
             let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
             let shape = components?.path == "/api/v1/auth/it-sso/callback"
                 && Set(components?.queryItems?.map(\.name) ?? []).isSuperset(of: [
@@ -864,12 +1485,12 @@ extension CoreChecks {
                 try writeDirectQuotaFixture(at: TokenHubConnectionDiscovery.defaultDatabaseURL(home: home),
                                             now: now, sessionToken: "fixture-session")
                 let calls = DirectQuotaCounter()
-                let client = TokenHubDirectQuotaClient(request: { url, bearer in
+                let client = TokenHubDirectQuotaClient(request: routedSelectorFixture({ url, bearer in
                     if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
                     let count = calls.noteQuota(url.absoluteString == "https://aihub.example.test/api/v1/auth/me/quota-usage"
                         && bearer == "fixture-access")
                     return TokenHubDirectQuotaHTTPResponse(statusCode: rejectedCallback == 2 && count == 1 ? 401 : 200, data: data)
-                }, callbackRequest: { url in
+                }), callbackRequest: { url in
                     let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
                     let expected = ["token": "fixture-session", "verifySign": "fixture-signature", "redirect": "/me/api-key",
                         "sourceChannel": "fixture-channel", "sourceTokenType": "fixture-type"]
@@ -895,7 +1516,38 @@ extension CoreChecks {
     }
 }
 
+/// Explicitly selects the legacy routed contract for pre-existing transport
+/// scenarios. Quota traffic before the selector, duplicate selection, direct
+/// quota traffic, and unknown paths are rejected instead of silently defaulted.
+private func routedSelectorFixture(
+    _ request: @escaping TokenHubDirectQuotaClient.Request,
+    recordSelector: @escaping @Sendable (URL, String) -> Void = { _, _ in }
+) -> TokenHubDirectQuotaClient.Request {
+    let selectorSeen = OSAllocatedUnfairLock(initialState: false)
+    return { url, bearer in
+        if url.path.hasSuffix("/api/v1/auth/me/base-url") {
+            guard URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.isEmpty ?? true,
+                  url.host == "aihub.example.test",
+                  selectorSeen.withLock({ seen -> Bool in
+                      guard !seen else { return false }
+                      seen = true
+                      return true
+                  }) else { throw TokenHubDirectQuotaFailure.endpointRejected }
+            recordSelector(url, bearer)
+            return TokenHubDirectQuotaHTTPResponse(statusCode: 200,
+                data: Data(#"{"code":0,"data":{"is_direct":false}}"#.utf8))
+        }
+        guard selectorSeen.withLock({ $0 }),
+              url.path.hasSuffix("/api/v1/auth/me/quota-usage")
+                || url.path.hasSuffix("/api/v1/me/reset-vouchers") else {
+            throw TokenHubDirectQuotaFailure.endpointRejected
+        }
+        return try await request(url, bearer)
+    }
+}
+
 private func writeDirectQuotaFixture(at database: URL, now: Date, sessionToken: String,
+                                     aiManagerBaseURL: String = "https://aihub.example.test",
                                      expiresAt: Date? = nil) throws {
     try FileManager.default.createDirectory(at: database.deletingLastPathComponent(), withIntermediateDirectories: true,
                                            attributes: [.posixPermissions: 0o700])
@@ -905,7 +1557,7 @@ private func writeDirectQuotaFixture(at database: URL, now: Date, sessionToken: 
         throw NSError(domain: "SyntheticDirectQuotaFixture", code: 1)
     }
     defer { sqlite3_close(db) }
-    let connection = "{\"aiManagerBaseUrl\":\"https://aihub.example.test\",\"ssoBaseUrl\":\"https://sso.example.test\"}"
+    let connection = "{\"aiManagerBaseUrl\":\"\(aiManagerBaseURL)\",\"ssoBaseUrl\":\"https://sso.example.test\"}"
     let session = try JSONSerialization.data(withJSONObject: [
         "token": sessionToken, "verifySign": "fixture-signature", "channel": "fixture-channel",
         "tokenType": "fixture-type", "expiresAt": ((expiresAt ?? now.addingTimeInterval(3600)).timeIntervalSince1970) * 1000
@@ -962,7 +1614,7 @@ extension CoreChecks {
             let database = TokenHubConnectionDiscovery.defaultDatabaseURL(home: home)
             try writeDirectQuotaFixture(at: database, now: now, sessionToken: "fixture-session")
             let counter = DirectQuotaCounter()
-            let client = TokenHubDirectQuotaClient(request: { url, _ in
+            let client = TokenHubDirectQuotaClient(request: routedSelectorFixture({ url, _ in
                 if url.path.hasSuffix("/reset-vouchers") { return TokenHubDirectQuotaHTTPResponse(statusCode: 404, data: Data()) }
                 let call = counter.noteQuota(true)
                 if (scenario == 2 || scenario == 3) && call == 1 {
@@ -970,7 +1622,7 @@ extension CoreChecks {
                 }
                 let status = (scenario == 3 || scenario == 4) && call == 1 ? 401 : 200
                 return TokenHubDirectQuotaHTTPResponse(statusCode: status, data: valid)
-            }, callbackRequest: { _ in
+            }), callbackRequest: { _ in
                 let call = counter.noteCallback(true)
                 if (scenario == 1 && call == 1) || (scenario == 4 && call == 2) {
                     try replaceDirectQuotaFixture(at: database, now: now)
