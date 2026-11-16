@@ -1844,6 +1844,9 @@ def workflow_contract(document: dict, raw: str) -> None:
         "TokenStatUISnapshotTests/testC11QuotaCardRenderExportsLocalAndEnterpriseSyntheticExamples",
         "TokenStatUISnapshotTests/testHistoricalQuotaPresentationPreservesOriginalSourceValues",
         "TokenStatUISnapshotTests/testEnterpriseQuotaAlertsUseOnlyFreshIndependentWindows",
+        "WidgetCoinRoundingTests/testActualWidgetUsesPositiveHalfExpandForCoinAmounts",
+        "WidgetEntryViewTests/testActualWidgetRendersCurrentUnknownExpiredResetAndUnavailableStates",
+        "WidgetEntryViewTests/testActualWidgetRendersSchemaV2UnlimitedAndExceededStates",
     ]
     full_step = next(
         step
@@ -1964,6 +1967,12 @@ class WorkflowChecks(unittest.TestCase):
             "filtered-shell",
             "full-shell",
             "remove-skip",
+            "remove-coin-render",
+            "class-skip-coin-render",
+            "remove-unknown-render",
+            "class-skip-unknown-render",
+            "remove-schema-render",
+            "class-skip-schema-render",
             "dev-dd",
         ]:
             value = copy.deepcopy(baseline)
@@ -2005,6 +2014,33 @@ class WorkflowChecks(unittest.TestCase):
             elif mutation == "remove-skip":
                 full["run"] = full["run"].replace(
                     "--skip TokenStatUISnapshotTests/testDashboardLightAndDark", ""
+                )
+            elif mutation == "remove-coin-render":
+                full["run"] = full["run"].replace(
+                    " --skip WidgetCoinRoundingTests/testActualWidgetUsesPositiveHalfExpandForCoinAmounts", "", 1
+                )
+            elif mutation == "class-skip-coin-render":
+                full["run"] = full["run"].replace(
+                    "WidgetCoinRoundingTests/testActualWidgetUsesPositiveHalfExpandForCoinAmounts",
+                    "WidgetCoinRoundingTests", 1
+                )
+            elif mutation == "remove-unknown-render":
+                full["run"] = full["run"].replace(
+                    " --skip WidgetEntryViewTests/testActualWidgetRendersCurrentUnknownExpiredResetAndUnavailableStates", "", 1
+                )
+            elif mutation == "class-skip-unknown-render":
+                full["run"] = full["run"].replace(
+                    "WidgetEntryViewTests/testActualWidgetRendersCurrentUnknownExpiredResetAndUnavailableStates",
+                    "WidgetEntryViewTests", 1
+                )
+            elif mutation == "remove-schema-render":
+                full["run"] = full["run"].replace(
+                    " --skip WidgetEntryViewTests/testActualWidgetRendersSchemaV2UnlimitedAndExceededStates", "", 1
+                )
+            elif mutation == "class-skip-schema-render":
+                full["run"] = full["run"].replace(
+                    "WidgetEntryViewTests/testActualWidgetRendersSchemaV2UnlimitedAndExceededStates",
+                    "WidgetEntryViewTests", 1
                 )
             elif mutation == "dev-dd":
                 dev = next(
