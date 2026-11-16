@@ -1669,7 +1669,7 @@ extension TokenStatUISnapshotTests {
         let routes: [(String, [Any])] = [
             ("children", provider.accessibilityChildren() ?? []),
             ("navigationOrder", provider.accessibilityChildrenInNavigationOrder() ?? []),
-            ("contents", provider.accessibilityContents() ?? [])
+            ("contents", (provider.accessibilityContents() as? [Any]) ?? [])
         ]
         let routeLimit = 32
         var routeRecords: [[String: Any]] = []

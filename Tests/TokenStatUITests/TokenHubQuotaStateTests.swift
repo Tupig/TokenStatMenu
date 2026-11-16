@@ -551,9 +551,9 @@ private func hubVisibleAccessibilityStrings(in window: NSWindow, hosts: [NSView]
                 strings.append(value.string)
             }
             guard depth < 6 else { continue }
-            let routes = [item.accessibilityChildren() ?? [],
-                          item.accessibilityChildrenInNavigationOrder() ?? [],
-                          item.accessibilityContents() ?? []]
+            let routes: [[Any]] = [item.accessibilityChildren() ?? [],
+                                   item.accessibilityChildrenInNavigationOrder() ?? [],
+                                   (item.accessibilityContents() as? [Any]) ?? []]
             for child in routes.flatMap({ Array($0.prefix(32)) }) {
                 queue.append((child as AnyObject, depth + 1))
             }
